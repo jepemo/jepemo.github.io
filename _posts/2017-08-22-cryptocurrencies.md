@@ -2,7 +2,7 @@
 layout: post
 title:  Cryptocurrencies
 category:
-    - Software
+    - decentralization
 description: Simple installation of cryptosoftware
 ---
 
