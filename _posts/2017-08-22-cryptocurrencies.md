@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  Cryptocurrencies
+title: cryptocurrencies
 category:
     - decentralization
 description: Simple installation of cryptosoftware
