@@ -7,11 +7,13 @@ description: Simple installation of cryptosoftware
 ---
 
 - [Mining](#mining)
+  - [cpuminer-multi](#cpuminer-multi)
+  - [ccminer-cryptonight](#ccminer-cryptonight)
 - [Trading](#trading)
 
 ## Mining
 
-### cpuminer-multi
+### [cpuminer-multi](https://github.com/tpruvot/cpuminer-multi)
 
 ```bash
 # Ubuntu/Debian deps
@@ -37,7 +39,7 @@ cd cpuminer-multi
 ./cpuminer -a cryptonight -o stratum+tcp://fcn-xmo.pool.minergate.com:45590 -u $USER -p $PASS
 ```
 
-### ccminer-cryptonight (With GPU)
+### [ccminer-cryptonight](https://github.com/tsiv/ccminer-cryptonight)
 
 ```bash
 sudo apt-get install automake autoconf pkg-config libcurl4-openssl-dev libjansson-dev libssl-dev libgmp-dev make g++
