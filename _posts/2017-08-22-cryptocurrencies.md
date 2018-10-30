@@ -75,5 +75,10 @@ ccminer -a cryptonight -o stratum+tcp://fcn-xmo.pool.minergate.com:45590 -u $USE
 
 ## Trading
 
-xxx
+### Signals
+
+- [**Golden Cross**](https://www.investopedia.com/terms/g/goldencross.asp): Fast MA crosses above Slow MA. 15 -> 50 or 50 -> 200.
+![Golden Cross](https://i.investopedia.com/inv/dictionary/terms/GoldenCross.gif)
+- [**Death Cross**](https://www.investopedia.com/terms/d/deathcross.asp): Fast MA crosses below Slow MA.
+![Death Cross](https://ei.marketwatch.com/Multimedia/2016/08/26/Photos/NS/MW-EU833_AAPL20_20160826154203_NS.png?uuid=29b12b5e-6bc5-11e6-800f-0015c588dfa6)
 
