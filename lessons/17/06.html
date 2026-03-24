@@ -22,181 +22,227 @@
     <main>
       <h1>Day 262: Kafka Replication, ISR, and Leader Election</h1>
 <blockquote>
-<p><strong>Kafka Replication &amp; ISR becomes useful when design choices are made explicit and testable.</strong></p>
+<p><strong>In Kafka, having replicas is not enough. What matters is which replica leads, which followers are sufficiently caught up to count, and when the system should refuse progress rather than lie about durability.</strong></p>
 </blockquote>
 <hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: Kafka Replication &amp; ISR is easier to master when you separate three layers of reasoning: why it exists, how it works mechanically, and what changes in production decisions.</p>
-<p><strong>Why this matters</strong>: Teams often know the vocabulary but still mis-design systems because they skip one layer. This lesson makes the internal mechanism explicit so design choices become defensible.</p>
-<p><strong>The universal pattern</strong>: abstraction -&gt; mechanism -&gt; operational consequence.</p>
-<p><strong>Concrete anchor</strong>: A real engineering system needs both correct design and reliable operation; this concept explains how to move from abstract understanding to predictable production behavior.</p>
+<p><strong>The insight</strong>: Kafka replication is not just "store several copies." It is a leadership and freshness problem. One replica leads writes, followers copy the log, and only the replicas that are close enough to the leader belong to the in-sync replica set, or ISR.</p>
+<p><strong>Why this matters</strong>: Teams often hear "replication factor 3" and assume durability is straightforward. It is not. The important questions are: which replica is currently authoritative, how many replicas are genuinely up to date, and whether the system should keep accepting writes when too few good replicas remain.</p>
+<p><strong>The universal pattern</strong>: partition leader accepts writes -&gt; followers replicate the leader's log -&gt; replicas that stay sufficiently current remain in ISR -&gt; writes and failover semantics depend on ISR size and leader election policy.</p>
+<p><strong>Concrete anchor</strong>: A partition has three replicas. One is leader, two are followers. If one follower falls behind, you still have three copies on paper, but fewer replicas are truly current. The system's real durability now depends on the leader, the remaining in-sync followers, and the producer's acknowledgement settings.</p>
 <p><strong>How to recognize when this applies</strong>:</p>
 <ul>
-<li>You need to explain not only what to do, but why the mechanism behaves that way.</li>
-<li>A design choice looks attractive until constraints expose hidden costs.</li>
-<li>The same concept appears in different domains with different names but similar structure.</li>
+<li>You need to know what "durable write" really means in Kafka.</li>
+<li>Broker failures or lagging replicas are part of your threat model.</li>
+<li>You care about the trade-off between write availability and stronger durability guarantees.</li>
 </ul>
 <p><strong>Common misconceptions</strong>:</p>
 <ul>
-<li>[INCORRECT] "This is mostly conceptual and does not affect architecture decisions."</li>
-<li>[INCORRECT] "If the baseline works, deeper mechanism is optional."</li>
-<li>[CORRECT] <strong>The truth</strong>: Mechanistic understanding is what lets you predict failures, limits, and scaling behavior before incidents.</li>
+<li>[INCORRECT] "Replication factor alone tells me the effective safety of a write."</li>
+<li>[INCORRECT] "Any follower can become leader with no semantic consequences."</li>
+<li>[CORRECT] <strong>The truth</strong>: Kafka's durability and failover behavior depend on ISR membership, acknowledgement policy, and which replica is elected leader after failure.</li>
 </ul>
 <p><strong>Real-world examples</strong>:</p>
 <ol>
-<li><strong>System design</strong>: Teams that model internals early avoid expensive late-stage rewrites.</li>
-<li><strong>Production ops</strong>: Clear mechanism models speed up debugging and reduce guesswork during incidents.</li>
+<li><strong>Healthy partition</strong>: Leader and followers are in sync, so <code>acks=all</code> can wait for a stronger durability boundary.</li>
+<li><strong>Degraded partition</strong>: Replicas exist but some are out of sync, so the cluster may need to choose between keeping writes available and preserving stronger guarantees.</li>
 </ol>
 <hr />
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: Without a precise model of Kafka Replication &amp; ISR, teams rely on defaults and folklore, which breaks under scale, noisy inputs, or changing constraints.</p>
+<p><strong>The problem</strong>: Replication sounds simple until a broker slows down or fails. Then the system must decide whether a follower is fresh enough to count, whether writes should still be accepted, and who becomes leader without corrupting the partition's continuity guarantees.</p>
 <p><strong>Before</strong>:</p>
 <ul>
-<li>Decisions are copied from examples without understanding assumptions.</li>
-<li>Failures are diagnosed symptom-first instead of mechanism-first.</li>
-<li>Trade-offs are discovered only after production impact.</li>
+<li>Replication is treated as a static number of copies.</li>
+<li>Leader election is assumed to be a routine failover detail.</li>
+<li>ISR shrinkage is ignored until producers or consumers start behaving unexpectedly.</li>
 </ul>
 <p><strong>After</strong>:</p>
 <ul>
-<li>Decisions are tied to explicit mechanisms and measurable outcomes.</li>
-<li>Teams can predict expected behavior before implementation.</li>
-<li>Trade-offs are chosen intentionally with known costs.</li>
+<li>Replication is understood as leader-led log copying plus an explicit "trusted current replicas" set.</li>
+<li>ISR and <code>min.insync.replicas</code> are seen as part of the write contract.</li>
+<li>Leader election is recognized as a correctness-sensitive transition, not just an availability feature.</li>
 </ul>
-<p><strong>Real-world impact</strong>: Better design review quality, fewer regressions during scaling, and faster incident resolution because the team shares the same causal model.</p>
+<p><strong>Real-world impact</strong>: This understanding prevents false confidence, improves failure response, and makes producer durability settings much more meaningful.</p>
 <hr />
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain why Kafka Replication &amp; ISR exists</strong> - Identify the system pressure or limitation it addresses.</li>
-<li><strong>Describe how Kafka Replication &amp; ISR works internally</strong> - Trace the technical flow of data, control, and state.</li>
-<li><strong>Evaluate practical implications</strong> - Choose an approach based on explicit trade-offs and operational constraints.</li>
+<li><strong>Explain what Kafka replication is protecting</strong> - Understand that partitions are replicated logs with a single leader at a time.</li>
+<li><strong>Describe how ISR shapes write guarantees</strong> - Distinguish existing replicas from replicas that are current enough to count for stronger acknowledgements.</li>
+<li><strong>Evaluate leader election trade-offs</strong> - Reason about when failover preserves continuity and when the system may need to prefer safety over write availability.</li>
 </ol>
 <hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Why Kafka Replication &amp; ISR Exists</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A team ships a feature quickly, but behavior becomes unstable once traffic, data variability, or dependency latency rises.</p>
-<p><strong>Intuition</strong>: Kafka Replication &amp; ISR exists to control a recurring source of instability, inefficiency, or ambiguity that appears when systems move from local correctness to real workloads.</p>
-<p><strong>Technical structure (how it works)</strong>: The system defines a clear boundary (where the concept applies), an invariant (what must stay true), and a control mechanism (how that invariant is maintained as inputs change).</p>
-<p><strong>Practical implications</strong>: You can design interfaces and tests around the invariant instead of patching symptoms after deployment.</p>
-<p><strong>Fundamental trade-off</strong>: You gain predictability and clearer failure modes, but you pay with extra modeling effort and stricter constraints on implementation choices.</p>
-<p><strong>Mental model</strong>: A good protocol: fewer implicit assumptions, more explicit contracts.</p>
-<p><strong>Connection to other fields</strong>: Similar to control theory and economics: stable behavior comes from explicit feedback and constraints, not from ad-hoc local optimizations.</p>
-<p><strong>When to use it</strong>:</p>
+<h3>Concept 1: Every Partition Has One Leader and Several Followers</h3>
+<p>Kafka replicates <strong>partitions</strong>, not whole topics as one monolithic structure.</p>
+<p>For each partition:</p>
 <ul>
-<li>[Ideal situation] A subsystem repeatedly fails under growth or variability.</li>
-<li>[Anti-pattern] Low-risk toy scopes where added structure only increases friction.</li>
+<li>one broker hosts the <strong>leader</strong></li>
+<li>other brokers host <strong>followers</strong></li>
 </ul>
-<h3>Concept 2: How Kafka Replication &amp; ISR Works End to End</h3>
-<p><strong>Concrete example / mini-scenario</strong>: The same request path is traced from input through transformation, decision points, and output validation to observe where behavior diverges from expectation.</p>
-<p><strong>Intuition</strong>: Mechanistic understanding means you can point to the exact stage where behavior is created, amplified, or constrained.</p>
-<p><strong>Technical structure (how it works)</strong>:
-1. Define inputs and preconditions.
-2. Apply the core transformation or decision mechanism.
-3. Propagate state and side effects through downstream stages.
-4. Observe output against invariants and operational metrics.</p>
-<p><strong>Practical implications</strong>: This makes debugging systematic: isolate stage, verify assumption, and correct the narrowest cause instead of rewriting broad areas.</p>
-<p><strong>Fundamental trade-off</strong>: You gain transparent diagnostics and reproducibility, but you pay with additional instrumentation and stricter interface discipline.</p>
-<p><strong>Mental model</strong>: Assembly line with checkpoints; defects are easier to localize when each station has explicit contracts.</p>
-<p><strong>Connection to other fields</strong>: Mirrors compiler pipelines and signal processing: staged transformations with measurable intermediate states.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run_pipeline</span><span class="p">(</span><span class="n">input_signal</span><span class="p">):</span>
-    <span class="n">normalized</span> <span class="o">=</span> <span class="n">preprocess</span><span class="p">(</span><span class="n">input_signal</span><span class="p">)</span>
-    <span class="n">internal_state</span> <span class="o">=</span> <span class="n">core_mechanism</span><span class="p">(</span><span class="n">normalized</span><span class="p">)</span>
-    <span class="n">output</span> <span class="o">=</span> <span class="n">postprocess</span><span class="p">(</span><span class="n">internal_state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">output</span>
-</code></pre></div>
-
-<p><strong>When to use it</strong>:</p>
+<p>The leader is the authoritative entry point for:</p>
 <ul>
-<li>[Ideal situation] You need predictable behavior under changing load or data distributions.</li>
-<li>[Anti-pattern] One-off scripts where lifecycle and observability do not matter.</li>
+<li>producer writes</li>
+<li>consumer reads in normal operation</li>
 </ul>
-<h3>Concept 3: Practical Implications and Decision Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two valid designs satisfy correctness; one optimizes fast iteration, the other optimizes long-term operational stability.</p>
-<p><strong>Intuition</strong>: Engineering decisions around Kafka Replication &amp; ISR are rarely about right vs wrong; they are about which risk profile matches system goals.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare alternatives on latency, throughput, failure isolation, operability, and team complexity, then select the design that optimizes the bottleneck that matters now.</p>
-<p><strong>Practical implications</strong>: The right choice can change as scale, team size, and reliability targets evolve. Decisions should be revisited when assumptions shift.</p>
-<p><strong>Fundamental trade-off</strong>: You gain alignment with current constraints, but you accept opportunity cost in dimensions you deprioritize.</p>
-<p><strong>Mental model</strong>: Budget allocation: every optimization spends limited complexity budget somewhere else.</p>
-<p><strong>Connection to other fields</strong>: Similar to portfolio optimization: maximizing one dimension always changes exposure in others.</p>
-<p><strong>When to use it</strong>:</p>
+<p>Followers pull data from the leader and append it to their own local copy of the partition log.</p>
+<p>This matters because Kafka does not try to accept concurrent writes on every replica. It chooses:</p>
 <ul>
-<li>[Ideal situation] Architecture reviews, migrations, scaling milestones, or reliability initiatives.</li>
-<li>[Anti-pattern] Treating past decisions as permanent truths despite new constraints.</li>
+<li><strong>one write leader at a time</strong></li>
+</ul>
+<p>That simplifies ordering and replication logic.</p>
+<p>The cost is that leader health matters a lot. If the leader fails:</p>
+<ul>
+<li>another replica must take over</li>
+</ul>
+<p>So the key design pattern is:</p>
+<ul>
+<li><strong>replicated log</strong></li>
+<li><strong>single active writer per partition</strong></li>
+<li><strong>followers catching up behind it</strong></li>
+</ul>
+<p>This is why replication and leader election naturally belong together. They are not separate features. Election only matters because the data structure being replicated has an active leader.</p>
+<h3>Concept 2: ISR Means "Replicas Current Enough to Count"</h3>
+<p>A replica can exist without being sufficiently up to date to deserve trust in durability decisions.</p>
+<p>That is what ISR captures:</p>
+<ul>
+<li><strong>in-sync replicas</strong> are the leader plus followers that are caught up enough to be considered current</li>
+</ul>
+<p>This is the key distinction:</p>
+<ul>
+<li><strong>replication factor</strong> = how many configured copies should exist</li>
+<li><strong>ISR size</strong> = how many replicas are currently healthy enough to count</li>
+</ul>
+<p>That difference becomes operationally important during lag or failure.</p>
+<p>Suppose replication factor is 3:</p>
+<ul>
+<li>leader is current</li>
+<li>follower A is current</li>
+<li>follower B is far behind</li>
+</ul>
+<p>Then the real picture is not "we have 3 good copies." It is:</p>
+<ul>
+<li>"we have 2 replicas in ISR, and one lagging copy"</li>
+</ul>
+<p>This is why producer durability settings interact with ISR:</p>
+<ul>
+<li><code>acks=all</code> means the producer waits for acknowledgement from the full in-sync set</li>
+<li><code>min.insync.replicas</code> defines how many in-sync replicas must exist before the broker will accept such writes safely</li>
+</ul>
+<p>That is the core trade-off:</p>
+<ul>
+<li><strong>higher ISR requirements improve durability</strong></li>
+<li><strong>but they can reduce write availability when replicas fall behind</strong></li>
+</ul>
+<p>So Kafka's write contract is not just a producer flag. It is a negotiation between producer settings and current ISR health.</p>
+<h3>Concept 3: Leader Election Chooses Availability Boundaries Under Failure</h3>
+<p>When the leader fails, Kafka must elect a new leader from the remaining replicas.</p>
+<p>The subtle part is not election itself. The subtle part is:</p>
+<ul>
+<li><strong>which replica is safe enough to promote?</strong></li>
+</ul>
+<p>If leadership moves to a replica that was not sufficiently caught up, the partition may appear available but continuity and acknowledged-write guarantees can degrade.</p>
+<p>That is why leader election policy is a correctness question, not just an uptime question.</p>
+<p>The practical lesson is:</p>
+<ul>
+<li>clean failover depends on current replicas being truly current</li>
+</ul>
+<p>This is also why ISR health matters so much <em>before</em> failure happens. The safest leader election is the one where there are healthy in-sync followers ready to take over.</p>
+<p>This framing produces the right mental model:</p>
+<ul>
+<li>replication is not static redundancy</li>
+<li>ISR is the live set of trusted replicas</li>
+<li>leader election is the moment the system decides whether it still has a safe authority to continue</li>
+</ul>
+<p>And it sets up the next lessons cleanly:</p>
+<ul>
+<li>partitioning will explain how scale and ordering are sliced</li>
+<li>delivery semantics will explain how producer and consumer contracts sit on top of these replication guarantees</li>
 </ul>
 <hr />
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: The concept is understood in theory but fails in production scenarios.</p>
-<p><strong>Why it happens / is confusing</strong>: The team reasons from a happy-path abstraction and misses where real inputs violate hidden assumptions.</p>
-<p><strong>Clarification / Fix</strong>: Re-map the flow with explicit invariants at each stage, then validate those invariants with representative production-like cases.</p>
-<p><strong>Issue</strong>: Teams disagree on whether to optimize speed, quality, or reliability first.</p>
-<p><strong>Why it happens / is confusing</strong>: Trade-offs are implicit, so each person optimizes a different objective.</p>
-<p><strong>Clarification / Fix</strong>: Define a primary bottleneck metric and a clear failure budget, then choose the design that best matches that objective.</p>
+<p><strong>Issue</strong>: "Replication factor is 3, so why are writes failing?"</p>
+<p><strong>Why it happens / is confusing</strong>: Teams equate configured replicas with currently healthy replicas.</p>
+<p><strong>Clarification / Fix</strong>: Check ISR size and <code>min.insync.replicas</code>. Replicas may exist but not be in sync enough to satisfy the configured write guarantee.</p>
+<p><strong>Issue</strong>: "A follower exists, so failover should always be harmless."</p>
+<p><strong>Why it happens / is confusing</strong>: Existence of a copy is confused with freshness of that copy.</p>
+<p><strong>Clarification / Fix</strong>: A lagging replica is not equivalent to a current replica. Leader election safety depends on how caught up the candidate really is.</p>
+<p><strong>Issue</strong>: "Why did producer latency increase even before anything failed?"</p>
+<p><strong>Why it happens / is confusing</strong>: Replication is often thought of only as a failure feature.</p>
+<p><strong>Clarification / Fix</strong>: With stronger acknowledgement settings, producers may wait for more in-sync replicas to confirm the write path. Durability usually costs some write latency.</p>
 <hr />
 <h2>Advanced Connections</h2>
-<h3>Connection 1: Kafka Replication &amp; ISR &lt;-&gt; Control Loops</h3>
-<p><strong>The parallel</strong>: Both rely on explicit feedback to keep behavior within acceptable bounds under changing conditions.</p>
-<p><strong>Real-world case</strong>: Autoscaling, retry/circuit-breaker policies, and model calibration all use this pattern.</p>
-<h3>Connection 2: Kafka Replication &amp; ISR &lt;-&gt; Systems Economics</h3>
-<p><strong>The parallel</strong>: Every design decision allocates limited resources (latency budget, compute budget, cognitive budget).</p>
-<p><strong>Real-world case</strong>: Production architectures that look different often solve the same optimization problem under different constraints.</p>
+<h3>Connection 1: Kafka Replication, ISR, and Leader Election &lt;-&gt; Log-Structured Storage</h3>
+<p><strong>The parallel</strong>: The previous lesson explained what Kafka is replicating: ordered partition logs stored in segments. This lesson explains how those logs stay durable and authoritative across brokers.</p>
+<p><strong>Real-world case</strong>: Segment files and offsets define the storage model; ISR and leader election define whether that storage model survives broker failure cleanly.</p>
+<h3>Connection 2: Kafka Replication, ISR, and Leader Election &lt;-&gt; Delivery Semantics</h3>
+<p><strong>The parallel</strong>: Delivery semantics later in the month only make sense once replication semantics are clear. Producer acknowledgements depend on how many in-sync replicas confirm a write and whether leadership changes preserve committed progress.</p>
+<p><strong>Real-world case</strong>: At-least-once or stronger producer behavior is meaningful only because there is a replicated partition log and a policy about who counts as safely current.</p>
 <hr />
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[DOC] Official documentation for the main framework/tooling in this lesson.<ul>
-<li>Focus: Exact API behavior and edge cases.</li>
+<li>[DOCS] Apache Kafka Documentation<ul>
+<li>Link: <a href="https://kafka.apache.org/documentation/">https://kafka.apache.org/documentation/</a></li>
+<li>Focus: Use it as the main project documentation for replication, brokers, and producer durability settings.</li>
 </ul>
 </li>
-<li>[ARTICLE] Postmortems and engineering write-ups related to this concept.<ul>
-<li>Focus: How trade-offs play out under production pressure.</li>
+<li>[DOCS] Apache Kafka 0.10 Documentation: Replication and <code>min.insync.replicas</code><ul>
+<li>Link: <a href="https://kafka.apache.org/0100/documentation/">https://kafka.apache.org/0100/documentation/</a></li>
+<li>Focus: Read the replication and replica-management sections to connect <code>acks=all</code>, ISR, and write availability trade-offs.</li>
 </ul>
 </li>
-<li>[PAPER] Foundational reference for the mechanism discussed today.<ul>
-<li>Focus: Original assumptions, guarantees, and limitations.</li>
+<li>[DOCS] Apache Kafka Topic-Level Configs<ul>
+<li>Link: <a href="https://kafka.apache.org/28/configuration/topic-level-configs/">https://kafka.apache.org/28/configuration/topic-level-configs/</a></li>
+<li>Focus: Use it to see how topic configuration shapes durability and availability behavior per partition.</li>
+</ul>
+</li>
+<li>[DOCS] Confluent Documentation: Kafka Replication<ul>
+<li>Link: <a href="https://docs.confluent.io/platform/current/kafka/design.html">https://docs.confluent.io/platform/current/kafka/design.html</a></li>
+<li>Focus: Treat it as a practical explanation of leaders, followers, ISR, and the replication trade-offs operators see in real clusters.</li>
 </ul>
 </li>
 </ul>
 <hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Mechanism beats memorization</strong> - Understanding the internal flow of Kafka Replication &amp; ISR makes behavior predictable under change.</li>
-<li><strong>Trade-offs are first-class</strong> - Good design decisions optimize for the current bottleneck, not for all dimensions at once.</li>
-<li><strong>Abstractions transfer</strong> - The same causal patterns appear across ML, distributed systems, and production engineering.</li>
+<li><strong>Replication factor is not the whole story</strong> - What matters operationally is which replicas are current enough to belong to ISR.</li>
+<li><strong>Leader election is a correctness boundary</strong> - Promoting a replica is not just about uptime; it is about preserving a safe authoritative log.</li>
+<li><strong>Durability and availability trade against each other</strong> - Stronger write guarantees require enough healthy in-sync replicas and can reduce availability under degradation.</li>
 </ol>
 <hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the best reason to model Kafka Replication &amp; ISR as mechanism + invariants instead of only definitions?</strong></p>
+<p><strong>What does ISR represent in Kafka?</strong></p>
 <ul>
-<li>A) It reduces the need for testing.</li>
-<li>B) It improves prediction of behavior under non-happy-path conditions.</li>
-<li>C) It guarantees zero production incidents.</li>
+<li>A) Every broker in the cluster.</li>
+<li>B) The replicas of a partition that are currently in sync enough to count for stronger write guarantees.</li>
+<li>C) Every consumer currently reading from the topic.</li>
 </ul>
 </li>
 <li>
-<p><strong>Which statement captures the main design trade-off?</strong></p>
+<p><strong>Why can writes fail even when replication factor is greater than one?</strong></p>
 <ul>
-<li>A) You can maximize performance, simplicity, and flexibility simultaneously.</li>
-<li>B) You gain clarity and control, but pay in implementation and operational discipline.</li>
-<li>C) Trade-offs disappear once the system reaches scale.</li>
+<li>A) Because Kafka only allows one replica per topic.</li>
+<li>B) Because the number of current in-sync replicas may have dropped below the required threshold for safe writes.</li>
+<li>C) Because producers always require every configured replica to be online.</li>
 </ul>
 </li>
 <li>
-<p><strong>When should a team revisit an existing design decision?</strong></p>
+<p><strong>Why does leader election matter so much?</strong></p>
 <ul>
-<li>A) Only when the technology stack changes.</li>
-<li>B) Never; consistency is always best.</li>
-<li>C) When constraints or bottlenecks change enough to invalidate original assumptions.</li>
+<li>A) Because leadership determines which replica is authoritative for writes and whether failover preserves safe log continuity.</li>
+<li>B) Because it only affects dashboard labels.</li>
+<li>C) Because consumers cannot exist without electing themselves leader.</li>
 </ul>
 </li>
 </ol>
 <hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Mechanistic models are what allow causal debugging and reliable behavior prediction under realistic variability.</p>
-<p><strong>2. B</strong>: Every robust design adds structure and cost; the benefit is better control, diagnosability, and predictable operation.</p>
-<p><strong>3. C</strong>: Engineering choices are conditional on assumptions. When assumptions shift, re-evaluation is necessary.</p>
+<p><strong>1. B</strong>: ISR is the set of replicas current enough to count for replication and stronger acknowledgement guarantees.</p>
+<p><strong>2. B</strong>: Replicas may exist on paper, but if too few are in sync, the broker may reject writes to preserve durability guarantees.</p>
+<p><strong>3. A</strong>: Leader election is how Kafka decides which replica can safely continue as the authoritative write path after failure.</p>
 
       
       <hr>
@@ -216,7 +262,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-03-24 12:48 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>
