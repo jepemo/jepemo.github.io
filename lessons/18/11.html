@@ -22,181 +22,189 @@
     <main>
       <h1>Day 283: MVCC Internals: Snapshot Reads and Write Visibility</h1>
 <blockquote>
-<p><strong>MVCC becomes powerful when limits and trade-offs are modeled directly.</strong></p>
+<p><strong>The core idea</strong>: MVCC lets readers observe a stable snapshot without forcing them to wait on every concurrent writer, by keeping multiple logical versions of rows and applying visibility rules at read time.</p>
 </blockquote>
 <hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: MVCC is easier to master when you separate three layers of reasoning: why it exists, how it works mechanically, and what changes in production decisions.</p>
-<p><strong>Why this matters</strong>: Teams often know the vocabulary but still mis-design systems because they skip one layer. This lesson makes the internal mechanism explicit so design choices become defensible.</p>
-<p><strong>The universal pattern</strong>: abstraction -&gt; mechanism -&gt; operational consequence.</p>
-<p><strong>Concrete anchor</strong>: A real engineering system needs both correct design and reliable operation; this concept explains how to move from abstract understanding to predictable production behavior.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You need to explain not only what to do, but why the mechanism behaves that way.</li>
-<li>A design choice looks attractive until constraints expose hidden costs.</li>
-<li>The same concept appears in different domains with different names but similar structure.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "This is mostly conceptual and does not affect architecture decisions."</li>
-<li>[INCORRECT] "If the baseline works, deeper mechanism is optional."</li>
-<li>[CORRECT] <strong>The truth</strong>: Mechanistic understanding is what lets you predict failures, limits, and scaling behavior before incidents.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>System design</strong>: Teams that model internals early avoid expensive late-stage rewrites.</li>
-<li><strong>Production ops</strong>: Clear mechanism models speed up debugging and reduce guesswork during incidents.</li>
-</ol>
+<p><strong>The insight</strong>: MVCC is not "magic non-blocking reads." It works because the database stores version metadata and decides, for each row version, whether that version is visible to the current transaction's snapshot.</p>
+<p><strong>Why this matters</strong>: Once you see MVCC as "versions + snapshot + cleanup," many database behaviors stop feeling mysterious: why readers often do not block writers, why old row versions accumulate, and why vacuum or garbage collection is operationally important.</p>
+<p><strong>Concrete anchor</strong>: Transaction A starts a long report. Transaction B updates the same customer row and commits. Transaction A still sees the old version because its snapshot says that B's newer version does not yet belong to A's view of the world.</p>
+<p><strong>The practical sentence to remember</strong>:<br />
+<strong>MVCC trades waiting now for extra versions and later cleanup.</strong></p>
 <hr />
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: Without a precise model of MVCC, teams rely on defaults and folklore, which breaks under scale, noisy inputs, or changing constraints.</p>
-<p><strong>Before</strong>:</p>
+<p><strong>The problem</strong>: If every read had to wait on every concurrent write, databases would become painful under mixed workloads. But if reads simply ignored writes without rules, snapshots would be inconsistent and anomalies would explode.</p>
+<p><strong>Without this model</strong>:</p>
 <ul>
-<li>Decisions are copied from examples without understanding assumptions.</li>
-<li>Failures are diagnosed symptom-first instead of mechanism-first.</li>
-<li>Trade-offs are discovered only after production impact.</li>
+<li>Teams think "reads don't block writes" means there is no coordination cost.</li>
+<li>Storage growth from old versions feels surprising.</li>
+<li>Isolation levels are discussed without understanding the mechanism they depend on.</li>
 </ul>
-<p><strong>After</strong>:</p>
+<p><strong>With this model</strong>:</p>
 <ul>
-<li>Decisions are tied to explicit mechanisms and measurable outcomes.</li>
-<li>Teams can predict expected behavior before implementation.</li>
-<li>Trade-offs are chosen intentionally with known costs.</li>
+<li>You can explain how snapshot reads work.</li>
+<li>You can see why long-running transactions create cleanup pressure.</li>
+<li>You can connect row versions directly to visibility rules and later to isolation semantics.</li>
 </ul>
-<p><strong>Real-world impact</strong>: Better design review quality, fewer regressions during scaling, and faster incident resolution because the team shares the same causal model.</p>
+<p><strong>Operational payoff</strong>: Better debugging of long transactions, bloat, vacuum pressure, and unexpected read behavior under concurrent writes.</p>
 <hr />
 <h2>Learning Objectives</h2>
-<p>By the end of this session, you will be able to:</p>
+<p>By the end of this lesson, you should be able to:</p>
 <ol>
-<li><strong>Explain why MVCC exists</strong> - Identify the system pressure or limitation it addresses.</li>
-<li><strong>Describe how MVCC works internally</strong> - Trace the technical flow of data, control, and state.</li>
-<li><strong>Evaluate practical implications</strong> - Choose an approach based on explicit trade-offs and operational constraints.</li>
+<li><strong>Explain why MVCC exists</strong> as a way to reduce reader-writer blocking without giving up transaction semantics.</li>
+<li><strong>Describe how row versions and snapshots interact</strong> to decide visibility.</li>
+<li><strong>Reason about the cost side of MVCC</strong> including version churn, cleanup, and long-running transaction side effects.</li>
 </ol>
 <hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Why MVCC Exists</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A team ships a feature quickly, but behavior becomes unstable once traffic, data variability, or dependency latency rises.</p>
-<p><strong>Intuition</strong>: MVCC exists to control a recurring source of instability, inefficiency, or ambiguity that appears when systems move from local correctness to real workloads.</p>
-<p><strong>Technical structure (how it works)</strong>: The system defines a clear boundary (where the concept applies), an invariant (what must stay true), and a control mechanism (how that invariant is maintained as inputs change).</p>
-<p><strong>Practical implications</strong>: You can design interfaces and tests around the invariant instead of patching symptoms after deployment.</p>
-<p><strong>Fundamental trade-off</strong>: You gain predictability and clearer failure modes, but you pay with extra modeling effort and stricter constraints on implementation choices.</p>
-<p><strong>Mental model</strong>: A good protocol: fewer implicit assumptions, more explicit contracts.</p>
-<p><strong>Connection to other fields</strong>: Similar to control theory and economics: stable behavior comes from explicit feedback and constraints, not from ad-hoc local optimizations.</p>
-<p><strong>When to use it</strong>:</p>
+<h3>Concept 1: MVCC Turns One Logical Row into Multiple Physical Versions</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A product row is updated from price <code>10</code> to <code>12</code>. Instead of overwriting the only copy in place for every reader immediately, the system may create a new version while preserving metadata that lets old snapshots still reason about the earlier state.</p>
+<p><strong>Intuition</strong>: Under MVCC, a "row" is really a chain or set of versions, each with metadata describing when it became visible and when it stopped being current.</p>
+<p><strong>Typical metadata ideas</strong>:</p>
 <ul>
-<li>[Ideal situation] A subsystem repeatedly fails under growth or variability.</li>
-<li>[Anti-pattern] Low-risk toy scopes where added structure only increases friction.</li>
+<li>Creating transaction ID</li>
+<li>Deleting or superseding transaction ID</li>
+<li>Commit state or commit timestamp</li>
+<li>Pointers to older/newer versions, depending on the engine</li>
 </ul>
-<h3>Concept 2: How MVCC Works End to End</h3>
-<p><strong>Concrete example / mini-scenario</strong>: The same request path is traced from input through transformation, decision points, and output validation to observe where behavior diverges from expectation.</p>
-<p><strong>Intuition</strong>: Mechanistic understanding means you can point to the exact stage where behavior is created, amplified, or constrained.</p>
-<p><strong>Technical structure (how it works)</strong>:
-1. Define inputs and preconditions.
-2. Apply the core transformation or decision mechanism.
-3. Propagate state and side effects through downstream stages.
-4. Observe output against invariants and operational metrics.</p>
-<p><strong>Practical implications</strong>: This makes debugging systematic: isolate stage, verify assumption, and correct the narrowest cause instead of rewriting broad areas.</p>
-<p><strong>Fundamental trade-off</strong>: You gain transparent diagnostics and reproducibility, but you pay with additional instrumentation and stricter interface discipline.</p>
-<p><strong>Mental model</strong>: Assembly line with checkpoints; defects are easier to localize when each station has explicit contracts.</p>
-<p><strong>Connection to other fields</strong>: Mirrors compiler pipelines and signal processing: staged transformations with measurable intermediate states.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run_pipeline</span><span class="p">(</span><span class="n">input_signal</span><span class="p">):</span>
-    <span class="n">normalized</span> <span class="o">=</span> <span class="n">preprocess</span><span class="p">(</span><span class="n">input_signal</span><span class="p">)</span>
-    <span class="n">internal_state</span> <span class="o">=</span> <span class="n">core_mechanism</span><span class="p">(</span><span class="n">normalized</span><span class="p">)</span>
-    <span class="n">output</span> <span class="o">=</span> <span class="n">postprocess</span><span class="p">(</span><span class="n">internal_state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">output</span>
-</code></pre></div>
-
-<p><strong>When to use it</strong>:</p>
+<p><strong>What this enables</strong>:</p>
 <ul>
-<li>[Ideal situation] You need predictable behavior under changing load or data distributions.</li>
-<li>[Anti-pattern] One-off scripts where lifecycle and observability do not matter.</li>
+<li>Readers can walk visibility rules rather than waiting for the newest writer to finish</li>
+<li>Writers can produce a new version instead of always blocking all concurrent readers</li>
 </ul>
-<h3>Concept 3: Practical Implications and Decision Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two valid designs satisfy correctness; one optimizes fast iteration, the other optimizes long-term operational stability.</p>
-<p><strong>Intuition</strong>: Engineering decisions around MVCC are rarely about right vs wrong; they are about which risk profile matches system goals.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare alternatives on latency, throughput, failure isolation, operability, and team complexity, then select the design that optimizes the bottleneck that matters now.</p>
-<p><strong>Practical implications</strong>: The right choice can change as scale, team size, and reliability targets evolve. Decisions should be revisited when assumptions shift.</p>
-<p><strong>Fundamental trade-off</strong>: You gain alignment with current constraints, but you accept opportunity cost in dimensions you deprioritize.</p>
-<p><strong>Mental model</strong>: Budget allocation: every optimization spends limited complexity budget somewhere else.</p>
-<p><strong>Connection to other fields</strong>: Similar to portfolio optimization: maximizing one dimension always changes exposure in others.</p>
-<p><strong>When to use it</strong>:</p>
+<p><strong>Why this is useful</strong>: It separates <em>logical freshness</em> from <em>physical overwrite</em>. The engine does not need one global current value for all transactions at the same instant.</p>
+<p><strong>Important caveat</strong>: MVCC does not remove write-write conflicts. Two writers trying to update the same logical row still need coordination. MVCC mainly improves how reads interact with concurrent writes.</p>
+<hr />
+<h3>Concept 2: Snapshots Decide What a Transaction Is Allowed to See</h3>
+<p><strong>Concrete example / mini-scenario</strong>: Transaction T1 starts, then T2 updates and commits a row. T1 reads after T2 commits, but still sees the older version because its snapshot was taken earlier.</p>
+<p><strong>Intuition</strong>: A snapshot is a rule about which committed transactions "exist" from this transaction's point of view.</p>
+<p><strong>How it works mechanically</strong>:</p>
+<ol>
+<li>The transaction begins and captures a snapshot boundary.</li>
+<li>When it reads a row, the engine checks row-version metadata.</li>
+<li>Versions created by transactions outside the snapshot may be invisible.</li>
+<li>Versions deleted by transactions outside or after the snapshot may still remain visible depending on the rules.</li>
+</ol>
+<p><strong>This is the heart of MVCC</strong>:</p>
 <ul>
-<li>[Ideal situation] Architecture reviews, migrations, scaling milestones, or reliability initiatives.</li>
-<li>[Anti-pattern] Treating past decisions as permanent truths despite new constraints.</li>
+<li>The row version stored physically is not enough</li>
+<li>Visibility depends on the reader's snapshot</li>
 </ul>
+<p>That is why two concurrent transactions can read the "same row" and legally get different visible versions.</p>
+<p><strong>Mental model</strong>:<br />
+Think of the database as a library of edited documents.<br />
+Your transaction is allowed to open only the editions that existed in your assigned reading window.</p>
+<p><strong>Why this connects directly to isolation levels</strong>: Different systems define snapshots and visibility boundaries differently, and those choices determine which anomalies are still possible.</p>
+<hr />
+<h3>Concept 3: Old Versions Must Eventually Be Cleaned Up</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A busy table is updated all day. Readers keep using snapshots, so old row versions accumulate. Disk usage grows, index maintenance gets heavier, and vacuum falls behind.</p>
+<p><strong>Intuition</strong>: MVCC makes concurrent reads easier by preserving history temporarily. That history becomes debt if it is not reclaimed.</p>
+<p><strong>Why cleanup is needed</strong>:</p>
+<ul>
+<li>Old versions consume disk and cache space</li>
+<li>Long version chains make reads and maintenance more expensive</li>
+<li>Indexes may still reference tuples or states that are no longer useful to any active snapshot</li>
+</ul>
+<p><strong>Why cleanup cannot be immediate</strong>:</p>
+<ul>
+<li>A long-running transaction may still need an older version</li>
+<li>Replication or recovery mechanisms may still depend on history</li>
+<li>The engine must be sure no active snapshot can legally see the version anymore</li>
+</ul>
+<p><strong>Operational consequences</strong>:</p>
+<ul>
+<li>Long transactions delay cleanup</li>
+<li>Vacuum or garbage collection becomes part of steady-state performance</li>
+<li>Write-heavy workloads can create version churn even if reads look cheap</li>
+</ul>
+<p><strong>The trade-off</strong>:</p>
+<ul>
+<li>MVCC improves concurrency for readers</li>
+<li>But it introduces background cleanup, storage amplification, and operational sensitivity to transaction age</li>
+</ul>
+<p>This is why MVCC should be understood as a concurrency <em>and</em> storage design, not just an isolation feature.</p>
 <hr />
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: The concept is understood in theory but fails in production scenarios.</p>
-<p><strong>Why it happens / is confusing</strong>: The team reasons from a happy-path abstraction and misses where real inputs violate hidden assumptions.</p>
-<p><strong>Clarification / Fix</strong>: Re-map the flow with explicit invariants at each stage, then validate those invariants with representative production-like cases.</p>
-<p><strong>Issue</strong>: Teams disagree on whether to optimize speed, quality, or reliability first.</p>
-<p><strong>Why it happens / is confusing</strong>: Trade-offs are implicit, so each person optimizes a different objective.</p>
-<p><strong>Clarification / Fix</strong>: Define a primary bottleneck metric and a clear failure budget, then choose the design that best matches that objective.</p>
+<p><strong>Issue</strong>: Reads do not block writers, but storage bloat keeps growing.</p>
+<p><strong>Why it happens</strong>: MVCC is preserving old versions faster than cleanup can reclaim them.</p>
+<p><strong>Clarification / Fix</strong>: Look for long-lived transactions, cleanup lag, and write-heavy tables with high version churn.</p>
+<p><strong>Issue</strong>: A reporting query sees older data than expected.</p>
+<p><strong>Why it happens</strong>: The query may be reading from a snapshot that legitimately excludes more recent committed versions.</p>
+<p><strong>Clarification / Fix</strong>: Check transaction boundaries and isolation semantics before assuming replication lag or caching bugs.</p>
+<p><strong>Issue</strong>: Autovacuum or background cleanup seems to be the source of pressure.</p>
+<p><strong>Why it happens</strong>: MVCC turned concurrency benefits into cleanup debt, and the engine is now trying to pay it down.</p>
+<p><strong>Clarification / Fix</strong>: Treat cleanup as a first-class workload, not background trivia. If it falls behind, read and write costs both drift upward.</p>
+<p><strong>Issue</strong>: Long-running transactions cause system-wide pain.</p>
+<p><strong>Why it happens</strong>: Their snapshots keep old versions alive, which blocks reclamation and stretches version history.</p>
+<p><strong>Clarification / Fix</strong>: Limit transaction lifetime where possible, especially for interactive or analytical sessions that hold snapshots open far longer than OLTP paths.</p>
 <hr />
 <h2>Advanced Connections</h2>
-<h3>Connection 1: MVCC &lt;-&gt; Control Loops</h3>
-<p><strong>The parallel</strong>: Both rely on explicit feedback to keep behavior within acceptable bounds under changing conditions.</p>
-<p><strong>Real-world case</strong>: Autoscaling, retry/circuit-breaker policies, and model calibration all use this pattern.</p>
-<h3>Connection 2: MVCC &lt;-&gt; Systems Economics</h3>
-<p><strong>The parallel</strong>: Every design decision allocates limited resources (latency budget, compute budget, cognitive budget).</p>
-<p><strong>Real-world case</strong>: Production architectures that look different often solve the same optimization problem under different constraints.</p>
+<h3>Connection 1: MVCC &lt;-&gt; Optimistic Concurrency</h3>
+<p><strong>The parallel</strong>: Both reduce eager blocking and push more of the concurrency story into validation, visibility, or version rules.</p>
+<p><strong>Why this matters</strong>: The previous lesson explained the idea at the control-policy level. MVCC is one of the most important concrete mechanisms that makes that philosophy practical for reads.</p>
+<h3>Connection 2: MVCC &lt;-&gt; Isolation Levels</h3>
+<p><strong>The bridge</strong>: MVCC gives the engine the raw material for snapshot-based reads, but isolation levels still decide which anomalies are allowed or forbidden.</p>
+<p><strong>Why this matters</strong>: The next lesson is easier once you see that isolation levels are not magic labels. They are policies built on top of concrete visibility rules.</p>
 <hr />
 <h2>Resources</h2>
-<h3>Optional Deepening Resources</h3>
+<h3>Suggested Resources</h3>
 <ul>
-<li>[DOC] Official documentation for the main framework/tooling in this lesson.<ul>
-<li>Focus: Exact API behavior and edge cases.</li>
-</ul>
-</li>
-<li>[ARTICLE] Postmortems and engineering write-ups related to this concept.<ul>
-<li>Focus: How trade-offs play out under production pressure.</li>
-</ul>
-</li>
-<li>[PAPER] Foundational reference for the mechanism discussed today.<ul>
-<li>Focus: Original assumptions, guarantees, and limitations.</li>
-</ul>
-</li>
+<li>[DOC] PostgreSQL MVCC Introduction - <a href="https://www.postgresql.org/docs/current/mvcc-intro.html">Documentation</a><br />
+  Focus: a production-grade explanation of snapshots, row versions, and visibility.</li>
+<li>[DOC] InnoDB Multi-Versioning - <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-multi-versioning.html">Documentation</a><br />
+  Focus: practical MVCC behavior in a widely used transactional engine.</li>
+<li>[BOOK] <em>Designing Data-Intensive Applications</em> - <a href="https://dataintensive.net/">Book site</a><br />
+  Focus: strong conceptual grounding for MVCC, snapshots, and transaction semantics.</li>
 </ul>
 <hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Mechanism beats memorization</strong> - Understanding the internal flow of MVCC makes behavior predictable under change.</li>
-<li><strong>Trade-offs are first-class</strong> - Good design decisions optimize for the current bottleneck, not for all dimensions at once.</li>
-<li><strong>Abstractions transfer</strong> - The same causal patterns appear across ML, distributed systems, and production engineering.</li>
+<li><strong>MVCC works because rows have versions and reads apply visibility rules</strong>, not because reads somehow ignore concurrency.</li>
+<li><strong>Snapshot reads reduce reader-writer blocking</strong>, but write-write conflicts and cleanup work still remain.</li>
+<li><strong>Old versions are not free</strong>: they improve concurrency now and create storage and maintenance debt later.</li>
 </ol>
 <hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the best reason to model MVCC as mechanism + invariants instead of only definitions?</strong></p>
+<p><strong>What is the main mechanism behind MVCC?</strong></p>
 <ul>
-<li>A) It reduces the need for testing.</li>
-<li>B) It improves prediction of behavior under non-happy-path conditions.</li>
-<li>C) It guarantees zero production incidents.</li>
+<li>A) A single global lock for all readers</li>
+<li>B) Multiple row versions plus per-transaction visibility rules</li>
+<li>C) Replaying WAL for every query</li>
 </ul>
 </li>
 <li>
-<p><strong>Which statement captures the main design trade-off?</strong></p>
+<p><strong>Why can two concurrent transactions read different visible versions of the same row?</strong></p>
 <ul>
-<li>A) You can maximize performance, simplicity, and flexibility simultaneously.</li>
-<li>B) You gain clarity and control, but pay in implementation and operational discipline.</li>
-<li>C) Trade-offs disappear once the system reaches scale.</li>
+<li>A) Because SQL syntax is ambiguous</li>
+<li>B) Because each transaction reads through its own snapshot rules</li>
+<li>C) Because indexes are randomly chosen</li>
 </ul>
 </li>
 <li>
-<p><strong>When should a team revisit an existing design decision?</strong></p>
+<p><strong>Why does MVCC need vacuum or garbage collection?</strong></p>
 <ul>
-<li>A) Only when the technology stack changes.</li>
-<li>B) Never; consistency is always best.</li>
-<li>C) When constraints or bottlenecks change enough to invalidate original assumptions.</li>
+<li>A) Because old row versions must be reclaimed once no active snapshot can see them</li>
+<li>B) Because transactions cannot commit without it</li>
+<li>C) Because replication requires schema rewrites</li>
+</ul>
+</li>
+<li>
+<p><strong>What is a common operational risk of long-running transactions under MVCC?</strong></p>
+<ul>
+<li>A) They make parsing slower</li>
+<li>B) They keep old versions alive and delay cleanup</li>
+<li>C) They disable indexes</li>
 </ul>
 </li>
 </ol>
 <hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Mechanistic models are what allow causal debugging and reliable behavior prediction under realistic variability.</p>
-<p><strong>2. B</strong>: Every robust design adds structure and cost; the benefit is better control, diagnosability, and predictable operation.</p>
-<p><strong>3. C</strong>: Engineering choices are conditional on assumptions. When assumptions shift, re-evaluation is necessary.</p>
+<p><strong>1. B</strong>: MVCC relies on multiple versions and rules about which version each transaction may see.</p>
+<p><strong>2. B</strong>: Visibility is defined relative to the transaction's snapshot, not by one universal "current row" for everyone.</p>
+<p><strong>3. A</strong>: Old versions are useful only while some snapshot may still need them; after that they become reclaimable debt.</p>
+<p><strong>4. B</strong>: Long-lived snapshots often prevent the engine from cleaning up obsolete versions promptly.</p>
 
       
       <hr>
@@ -216,7 +224,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-03-25 08:38 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>
