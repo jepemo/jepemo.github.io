@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="../../css/style.css" />
   </head>
   <body>
-    <h1>ML Model Deployment</h1>
+    <h1>Secure Model Deployment and Runtime Hardening</h1>
 
     <nav>
       <a href="../../index.html">Home</a> |
@@ -20,203 +20,145 @@
     </nav>
 
     <main>
-      <h1>Day 183: ML Model Deployment</h1>
+      <h1>Day 183: Secure Model Deployment and Runtime Hardening</h1>
 <blockquote>
-<p><strong>Deploying a model is not just publishing weights. It is publishing a full inference contract: inputs, preprocessing, runtime, outputs, policy, observability, and rollback.</strong></p>
+<p><strong>A model is not securely deployed just because it passed evaluation; the live system must prove what it is running, limit what it can touch, and recover quickly when a release goes bad.</strong></p>
 </blockquote>
 <hr />
 <h2>Today's "Aha!" Moment</h2>
-<p>Teams often talk about “deploying the model” as if the model were one file that can simply be copied into production. That framing is incomplete. A model only works correctly when many surrounding assumptions also hold:</p>
-<ul>
-<li>the request schema matches what the model expects</li>
-<li>preprocessing is identical to what training assumed</li>
-<li>the serving runtime can load the artifact correctly</li>
-<li>output semantics are stable for downstream consumers</li>
-<li>rollout and rollback are controlled</li>
-</ul>
-<p>If any of those assumptions drift, the deployment can be “successful” from the platform’s perspective while still being wrong from the product’s perspective. The endpoint is up, but the predictions are garbage, skewed, or incompatible with the systems that depend on them.</p>
-<p>That is why ML deployment is really the publication of an inference system, not the publication of a file. The model artifact is one component inside a contract that has to stay coherent end to end.</p>
-<p>That is the aha. A model deployment is only safe when code, preprocessing, artifact version, runtime, traffic policy, and observability move together as one controlled release.</p>
+<p><a href="05.html">ML Pipeline Security</a> asked whether you can trust the chain that produced a model. <a href="06.html">Model Security</a> asked what attackers can do through the model's input and output surface once it is live. This lesson sits between those two concerns. It asks a narrower operational question: what exactly happens between "approved model artifact" and "process serving real traffic"?</p>
+<p>That gap is where many production failures hide. A warehouse company may approve a new delivery-risk model after offline evaluation, yet still deploy it through a generic container image that downloads weights at startup, runs with a broad cloud role, writes temporary files anywhere in the filesystem, and has unrestricted outbound access. In that situation, the model itself may be fine, but the serving environment is too trusting.</p>
+<p>The important shift is to treat model serving as a high-trust runtime, not as a normal stateless web handler. The deployment has to preserve provenance from the approved artifact, the runtime has to expose as little privilege as possible, and the rollout has to include a fast retreat path. If any one of those is missing, "we reviewed the model" does not mean "the production system is safe."</p>
 <hr />
 <h2>Why This Matters</h2>
-<p>Suppose the warehouse company deploys models for fraud scoring and delivery-risk prediction. A model version that looked good offline is now ready to serve real traffic. The team promotes the artifact quickly, but several operational failure modes are waiting:</p>
-<ul>
-<li>the request feature schema in production differs subtly from the training pipeline</li>
-<li>preprocessing code changed in serving but not in training</li>
-<li>the new model is slower and causes timeouts under real load</li>
-<li>downstream services interpret the output differently than expected</li>
-<li>the “better” model harms one traffic segment that was underrepresented in validation</li>
-</ul>
-<p>None of these are hypothetical edge cases. They are normal deployment risks whenever learned behavior meets production traffic.</p>
-<p>That is why model deployment needs stronger discipline than “the model passed evaluation.” Production is where the model meets latency budgets, live data, client expectations, and rollback pressure. The deployment path has to protect all of those at once.</p>
+<p>Suppose the warehouse company uses a delivery-risk model to decide whether parcels should be rerouted before the daily cutoff. The model server receives order metadata, fetches features from an internal feature service, scores the shipment, and sends the result to dispatch software. Every prediction can influence cost, SLA performance, and customer communication.</p>
+<p>Now imagine a weak deployment path. The serving pod starts by pulling the "latest" model from object storage with a long-lived access key. The container runs as root because that made debugging easier. Operators can <code>kubectl exec</code> into the pod and patch files in place. The service account can read several unrelated buckets because nobody narrowed it after the first prototype. A bad rollout or a compromised pod now has multiple ways to cause harm: serve an unreviewed model, exfiltrate data, move laterally, or quietly degrade dispatch decisions.</p>
+<p>A hardened deployment looks different. The approved model version is referenced by digest, its signature is verified before admission, the runtime gets only the permissions needed to read that model and call the feature service, and the rollout begins with shadow or canary traffic plus a one-click rollback to the previous model. The result is not perfect safety. It is a system where trust, privilege, and recovery are explicit enough to defend under incident pressure.</p>
 <hr />
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain what a model deployment really includes</strong> - Recognize that schemas, preprocessing, runtime, and rollout policy are part of the deployable unit.</li>
-<li><strong>Reason about safe rollout patterns</strong> - Understand shadowing, canaries, versioning, and rollback for model-serving systems.</li>
-<li><strong>Design a production-ready inference contract</strong> - Know how to tie model artifacts to observability, compatibility, and downstream expectations.</li>
+<li><strong>Explain why deployment is its own security boundary</strong> - Recognize why provenance can be lost between model approval and live inference.</li>
+<li><strong>Describe the main runtime-hardening controls for model serving</strong> - Understand how identity, isolation, filesystem policy, and network policy shrink blast radius.</li>
+<li><strong>Design safer rollout and recovery paths</strong> - Compare canary, shadowing, fallback, and rollback controls for high-impact model releases.</li>
 </ol>
 <hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: The Real Deployable Unit Is Model + Inference Contract</h3>
-<p>A model file by itself is not enough to make valid predictions. The serving system also needs:</p>
-<ul>
-<li>input schema</li>
-<li>preprocessing or feature transformation logic</li>
-<li>model artifact format</li>
-<li>postprocessing and output schema</li>
-<li>resource/runtime assumptions</li>
-</ul>
-<p>A useful mental model is:</p>
-<div class="codehilite"><pre><span></span><code>client request
-    |
-    v
-schema validation
-    |
-    v
-preprocessing / feature assembly
-    |
-    v
-model inference
-    |
-    v
-postprocessing / thresholding
-    |
-    v
-response contract
+<h3>Concept 1: Secure Deployment Preserves the Trust Chain All the Way Into the Serving Process</h3>
+<p>The warehouse company's delivery-risk model does not reach production as a single object. In practice, the live service depends on several pieces moving together: a serving image, model weights, tokenizer or feature-schema metadata, environment configuration, and deployment policy. If any of those pieces are mutable at startup, the reviewed artifact and the running artifact can quietly diverge.</p>
+<p>That is why secure deployment begins with immutability and verification. Instead of saying "start the model server and fetch whatever is in this bucket," the deployment should name exact image and model digests, and policy should reject anything unsigned or unapproved. In container platforms, this is often enforced through admission controls, registry policy, or signed attestations. The mechanism matters because it answers a concrete question later: what exact model binary and configuration served request <code>R</code> at time <code>T</code>?</p>
+<p>A useful mental picture is:</p>
+<div class="codehilite"><pre><span></span><code>approved model digest + approved serving image digest
+                        |
+                        v
+              signature / policy verification
+                        |
+                        v
+                 deployment admission
+                        |
+                        v
+            workload identity for this service only
+                        |
+                        v
+                  live inference runtime
 </code></pre></div>
 
-<p>If training used one preprocessing path and serving uses another, the deployment is broken even if the artifact is correct. If the output contract changes and downstream services are not updated, the deployment is also broken even if the model is accurate.</p>
-<p>This is why mature ML teams version more than weights. They version the whole inference contract or at least keep tight traceability between its components.</p>
-<h3>Concept 2: Safe Model Rollout Is More Like Feature Rollout Than File Replacement</h3>
-<p>Even a valid model can behave badly on live traffic. Offline evaluation cannot perfectly predict production conditions:</p>
-<ul>
-<li>real distributions drift</li>
-<li>latency spikes under concurrency</li>
-<li>long-tail inputs appear that were rare in validation</li>
-<li>downstream systems respond differently to changed score distributions</li>
-</ul>
-<p>So safe deployment usually means progressive exposure, not instant replacement.</p>
-<p>Common patterns:</p>
-<ul>
-<li><strong>shadow deployment</strong>: the new model sees real traffic without affecting decisions</li>
-<li><strong>canary rollout</strong>: a small percentage of real decisions use the new model first</li>
-<li><strong>A/B or champion-challenger evaluation</strong>: compare models on live outcomes under controlled conditions</li>
-<li><strong>fast rollback</strong>: revert traffic and artifact references quickly when metrics degrade</li>
-</ul>
-<p>That makes model deployment look much closer to progressive delivery than to static asset publishing.</p>
-<p>The practical lesson is that deployment should answer:</p>
-<ul>
-<li>how do we expose the new model gradually?</li>
-<li>what metrics decide whether to continue or stop?</li>
-<li>how quickly can we revert?</li>
-</ul>
-<p>If those answers are vague, the rollout process is too fragile.</p>
-<h3>Concept 3: Good Model Deployment Makes Observability and Compatibility First-Class</h3>
-<p>A common anti-pattern is to treat observability as something added after the model is already live. That is too late. To operate model deployments safely, the team needs visibility into:</p>
-<ul>
-<li>latency and throughput</li>
-<li>error rates and load failures</li>
-<li>feature schema mismatches</li>
-<li>score distributions and drift indicators</li>
-<li>traffic segmented by model version</li>
-<li>downstream outcomes after rollout</li>
-</ul>
-<p>This is what turns deployment from a blind replacement into a controlled experiment with rollback.</p>
-<p>Compatibility matters just as much. Downstream clients need stable expectations:</p>
-<ul>
-<li>What does the score mean?</li>
-<li>Did the threshold policy change?</li>
-<li>Is the response schema backward compatible?</li>
-<li>Are explanations or labels still comparable across versions?</li>
-</ul>
-<p>That is why a secure and reliable deployment path often treats model versions almost like API versions. The model may change internally, but the contract and operational semantics need careful control.</p>
-<p>The trade-off is more engineering work up front. But without that discipline, every model deployment becomes a risky combination of runtime experiment and hidden schema migration.</p>
+<p>Notice what is missing from that diagram: mutable "latest" tags, manual file copies, and generic admin credentials embedded in environment variables. Those shortcuts feel convenient during prototyping, but they break the line between review and execution. Once the live runtime can drift away from what was approved, the release process is no longer a trustworthy control.</p>
+<p>The trade-off is operational discipline. Immutable references and signed promotion paths make emergency changes slightly slower and require better release tooling. The payoff is that the production answer to "what are we running?" becomes factual instead of conversational.</p>
+<h3>Concept 2: Runtime Hardening Shrinks the Blast Radius of a Serving Pod</h3>
+<p>Once the model server is admitted, the next question is what that process can do if it is compromised or simply misbehaves. A model-serving container is attractive to attackers because it often sits near sensitive features, customer-facing traffic, expensive compute, and business-critical decision paths. Hardening is the work of making that process boring and constrained.</p>
+<p>For the delivery-risk service, the runtime should run as a non-root user, use a read-only root filesystem, and drop unnecessary Linux capabilities. If it needs scratch space for batching or model cache files, that space should be explicit and narrow rather than an invitation to write anywhere. In Kubernetes terms, this usually means combining a strict <code>securityContext</code>, pod-security policy or Pod Security Standards, and node-placement rules when the workload deserves extra isolation.</p>
+<p>Identity is equally important. The inference service should not receive a shared cloud key that also works for training jobs or registry administration. It should get short-lived workload identity and only the permissions required for live inference, such as read access to one approved model location and mTLS-authenticated access to the feature service. If the pod never needs internet egress, deny it. If it only needs the feature service, telemetry sink, and model storage endpoint, allow only those destinations. Network policy is part of runtime hardening, not an afterthought.</p>
+<p>The same principle applies to debugging and operations. "Just exec into the pod" is operationally seductive, but it turns a production inference process into a mutable snowflake. A stronger pattern is to push configuration through the release system, keep forensic logs outside the container, and expose only the observability needed to operate the service. The price is less convenience for ad hoc fixes. The gain is that one misstep or compromise has far less room to spread.</p>
+<h3>Concept 3: A Hardened Release Includes Rollout Gates, Fallbacks, and Forensic Signals</h3>
+<p>A perfectly locked-down container can still serve the wrong model, the wrong thresholds, or the wrong feature mapping. Secure deployment therefore has to include controlled rollout. For the warehouse company, that means the new delivery-risk model should not go from registry approval directly to 100% of dispatch traffic.</p>
+<p>A safer sequence is to begin with shadow traffic or a small canary slice. The platform compares infrastructure signals such as latency and error rate, but it also compares model-specific signals: score distribution, abstain rate, feature-fetch failures, unexpected spikes in manual-review decisions, and abuse patterns identified in the previous lesson. Security and reliability overlap here. A rollout that looks fine on CPU and p95 latency may still be unsafe if it suddenly causes much more aggressive routing or starts logging raw feature payloads during failures.</p>
+<p>The release system needs a real abort path. That can be a rollback to the last known-good model digest, a feature flag that routes requests back to the previous scorer, or a rules-based fallback for especially high-risk flows. What matters is that the mechanism is pre-built. During an incident, operators should not be inventing a rollback plan while the model is still influencing business decisions.</p>
+<p>This is also where hardening prepares the ground for <a href="08.html">Data Privacy &amp; Compliance</a>. The more telemetry you add for canaries and incidents, the easier it becomes to over-collect feature values, user identifiers, or raw prompts. Good runtime hardening therefore includes selective logging and traceability: enough evidence to diagnose the release, but not a habit of dumping sensitive inputs into every error path.</p>
 <hr />
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: The new model looked better offline but performs badly after deployment.</p>
-<p><strong>Why it happens / is confusing</strong>: Offline evaluation missed live-distribution effects, latency constraints, or downstream business interactions.</p>
-<p><strong>Clarification / Fix</strong>: Use shadow or canary rollout, segment metrics by model version, and require explicit rollback criteria before broad promotion.</p>
-<p><strong>Issue</strong>: The serving endpoint is healthy, but the predictions are clearly wrong.</p>
-<p><strong>Why it happens / is confusing</strong>: The platform health check only proves the service is up, not that training and serving preprocessing stayed aligned.</p>
-<p><strong>Clarification / Fix</strong>: Validate feature schemas, monitor input distributions, and keep preprocessing tightly versioned with the model artifact.</p>
-<p><strong>Issue</strong>: Downstream systems break after a model update even though inference still works.</p>
-<p><strong>Why it happens / is confusing</strong>: Output semantics or response shape changed without being treated as a contract change.</p>
-<p><strong>Clarification / Fix</strong>: Version the output contract explicitly and treat model deployment like a client-facing interface change when downstream consumers depend on it.</p>
+<p><strong>Issue</strong>: The model was approved in the registry, but the live service still ended up serving the wrong version.</p>
+<p><strong>Why it happens / is confusing</strong>: The deployment used mutable tags, startup downloads, or manual override steps, so the approved artifact was not the same thing as the running artifact.</p>
+<p><strong>Clarification / Fix</strong>: Pin image and model digests, verify signatures or attestations at admission, and remove boot-time fetch logic that can silently change behavior.</p>
+<p><strong>Issue</strong>: The serving service "needs" a broad cloud role because it touches many systems.</p>
+<p><strong>Why it happens / is confusing</strong>: Prototype permissions were never separated into model-read, feature-read, logging, and deployment responsibilities, so the runtime inherited far more privilege than inference actually needs.</p>
+<p><strong>Clarification / Fix</strong>: Split identities by purpose, move deployment privileges out of the runtime, and use workload identity plus network policy so the pod can only reach the dependencies required for serving.</p>
+<p><strong>Issue</strong>: Canary rollout passed infrastructure checks, but business behavior drifted hours later.</p>
+<p><strong>Why it happens / is confusing</strong>: The rollout watched generic service metrics only, not the model-specific outputs and downstream actions that reveal semantic regressions.</p>
+<p><strong>Clarification / Fix</strong>: Add rollout gates for prediction distributions, fallback rate, manual-review volume, and sensitive logging behavior, then keep a fast rollback to the prior model version.</p>
 <hr />
 <h2>Advanced Connections</h2>
-<h3>Connection 1: ML Model Deployment &lt;-&gt; Model Security</h3>
-<p><strong>The parallel</strong>: Secure deployment limits what happens when a model behaves unexpectedly by controlling exposure, observability, and rollback rather than assuming the model is always safe.</p>
-<p><strong>Real-world case</strong>: A canary or shadow rollout can reduce the blast radius of a model that turns out to be easy to game or brittle under real traffic.</p>
-<h3>Connection 2: ML Model Deployment &lt;-&gt; Progressive Delivery</h3>
-<p><strong>The parallel</strong>: Both rely on small exposure, explicit success criteria, and fast rollback instead of all-at-once replacement.</p>
-<p><strong>Real-world case</strong>: Model serving stacks often borrow canary, champion-challenger, and traffic-splitting patterns from modern service deployment practice.</p>
+<h3>Connection 1: Secure Model Deployment and Runtime Hardening &lt;-&gt; ML Pipeline Security</h3>
+<p><strong>The parallel</strong>: Pipeline security proves how a model was produced; deployment hardening preserves that proof through admission, identity, and runtime controls so production is still running the reviewed artifact.</p>
+<p><strong>Real-world case</strong>: A signed model in the registry is not enough if the inference pod can download a different file at startup or if operators can patch the container after deployment.</p>
+<h3>Connection 2: Secure Model Deployment and Runtime Hardening &lt;-&gt; Data Privacy &amp; Compliance</h3>
+<p><strong>The parallel</strong>: Runtime hardening limits not only attacker movement but also unnecessary data exposure through logs, traces, debug dumps, and overbroad service permissions.</p>
+<p><strong>Real-world case</strong>: A canary pipeline that captures full feature vectors for every failed request may help debugging, but it also expands retention and access scope for personal or sensitive data.</p>
 <hr />
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[DOCS] KServe Documentation<ul>
-<li>Link: <a href="https://kserve.github.io/website/">https://kserve.github.io/website/</a></li>
-<li>Focus: Study a production-oriented model serving framework where rollout, inference services, and platform integration are explicit.</li>
+<li>[DOCS] <a href="https://kubernetes.io/docs/concepts/security/pod-security-standards/">Kubernetes Pod Security Standards</a><ul>
+<li>Link: <a href="https://kubernetes.io/docs/concepts/security/pod-security-standards/">https://kubernetes.io/docs/concepts/security/pod-security-standards/</a></li>
+<li>Focus: Use it to see the concrete runtime controls that reduce privilege for serving workloads.</li>
 </ul>
 </li>
-<li>[DOCS] NVIDIA Triton Inference Server<ul>
-<li>Link: <a href="https://docs.nvidia.com/deeplearning/triton-inference-server/">https://docs.nvidia.com/deeplearning/triton-inference-server/</a></li>
-<li>Focus: Use it to understand model serving runtimes, model repositories, batching, and operational concerns at inference time.</li>
+<li>[DOCS] <a href="https://docs.sigstore.dev/cosign/overview/">Sigstore Cosign Overview</a><ul>
+<li>Link: <a href="https://docs.sigstore.dev/cosign/overview/">https://docs.sigstore.dev/cosign/overview/</a></li>
+<li>Focus: Study how signed artifacts and attestations help preserve trust from registry to runtime.</li>
 </ul>
 </li>
-<li>[DOCS] BentoML Documentation<ul>
-<li>Link: <a href="https://docs.bentoml.com/">https://docs.bentoml.com/</a></li>
-<li>Focus: See how packaging, serving, and versioning can be treated as one deployable inference unit.</li>
+<li>[DOCS] <a href="https://spiffe.io/docs/latest/spire-about/">SPIFFE and SPIRE</a><ul>
+<li>Link: <a href="https://spiffe.io/docs/latest/spire-about/">https://spiffe.io/docs/latest/spire-about/</a></li>
+<li>Focus: Connect workload identity and mTLS to the problem of giving inference services short-lived, least-privilege credentials.</li>
 </ul>
 </li>
-<li>[DOCS] MLflow Model Registry<ul>
-<li>Link: <a href="https://mlflow.org/docs/latest/model-registry.html">https://mlflow.org/docs/latest/model-registry.html</a></li>
-<li>Focus: Connect model versioning and staged promotion to controlled deployment workflows.</li>
+<li>[DOCS] <a href="https://argo-rollouts.readthedocs.io/en/stable/features/canary/">Argo Rollouts Canary Strategy</a><ul>
+<li>Link: <a href="https://argo-rollouts.readthedocs.io/en/stable/features/canary/">https://argo-rollouts.readthedocs.io/en/stable/features/canary/</a></li>
+<li>Focus: See how progressive delivery turns rollback and traffic shaping into first-class deployment controls.</li>
 </ul>
 </li>
 </ul>
 <hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>A model deployment is a contract, not just an artifact</strong> - Input schema, preprocessing, runtime, and output semantics all belong to the deployable unit.</li>
-<li><strong>Safe rollout matters because offline success is not enough</strong> - Shadowing, canaries, and fast rollback reduce the cost of real-world surprises.</li>
-<li><strong>Observability and compatibility are deployment features</strong> - Without version-aware metrics and stable consumer expectations, model releases are too opaque and fragile.</li>
+<li><strong>Secure deployment preserves provenance into production</strong> - If the running model can drift away from the reviewed artifact, the approval process has lost its meaning.</li>
+<li><strong>Runtime hardening is about limiting blast radius</strong> - Least-privilege identity, filesystem controls, and network policy matter because model servers sit near sensitive data and critical decisions.</li>
+<li><strong>A release is not hardened unless it can retreat safely</strong> - Canary checks, selective telemetry, and fast rollback are as important as container-level controls.</li>
 </ol>
 <hr />
 <h2>Knowledge Check (Test Questions)</h2>
 <ol>
 <li>
-<p><strong>Why is “deploying the model file” an incomplete view of ML deployment?</strong></p>
+<p><strong>Why is pinning model and image digests important in a secure deployment path?</strong></p>
 <ul>
-<li>A) Because model files are always encrypted.</li>
-<li>B) Because the deployment also depends on schemas, preprocessing, runtime behavior, and output contracts.</li>
-<li>C) Because models can never be served in production.</li>
+<li>A) It makes the container start faster on every cluster.</li>
+<li>B) It keeps the running service tied to the exact artifacts that were reviewed and approved.</li>
+<li>C) It removes the need for rollback controls.</li>
 </ul>
 </li>
 <li>
-<p><strong>What is the main advantage of shadow or canary rollout for models?</strong></p>
+<p><strong>Which control best reduces the blast radius of a compromised inference pod?</strong></p>
 <ul>
-<li>A) It proves the model is mathematically optimal.</li>
-<li>B) It reduces blast radius while the team learns how the model behaves on real traffic.</li>
-<li>C) It removes the need for rollback.</li>
+<li>A) Giving the pod the same cloud role as the training pipeline for convenience.</li>
+<li>B) Allowing operators to patch files inside the container during incidents.</li>
+<li>C) Using workload identity, least-privilege permissions, and restrictive network policy.</li>
 </ul>
 </li>
 <li>
-<p><strong>What is a strong signal that model deployment discipline is weak?</strong></p>
+<p><strong>Why are infrastructure-only canary metrics insufficient for model rollout?</strong></p>
 <ul>
-<li>A) The team can version artifacts, inputs, and outputs together.</li>
-<li>B) The serving endpoint is healthy, but no one can explain score drift, schema mismatches, or version-specific behavior.</li>
-<li>C) The team defines rollback criteria before rollout.</li>
+<li>A) Because secure model deployment never involves performance metrics.</li>
+<li>B) Because a model can keep latency stable while still changing business behavior or leaking sensitive data through error paths.</li>
+<li>C) Because canaries should only be judged by offline accuracy.</li>
 </ul>
 </li>
 </ol>
 <hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: A model only works correctly when the surrounding inference contract stays aligned with what training and consumers expect.</p>
-<p><strong>2. B</strong>: Progressive rollout lets teams observe live effects before exposing the new model broadly.</p>
-<p><strong>3. B</strong>: If the system is up but version-specific behavior is opaque, the deployment path is not providing enough operational control.</p>
+<p><strong>1. B</strong>: Digest pinning keeps admission and runtime tied to the exact artifacts that were approved instead of whatever "latest" happens to resolve to later.</p>
+<p><strong>2. C</strong>: Least-privilege identity and network boundaries prevent a compromised pod from reaching unrelated systems or using overly broad credentials.</p>
+<p><strong>3. B</strong>: A rollout can look healthy on CPU and latency while still shifting decision quality, triggering unsafe actions, or exposing too much data in telemetry.</p>
 
       
       <hr>
@@ -236,7 +178,7 @@ response contract
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-30 14:11 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-03-30 16:21 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>
