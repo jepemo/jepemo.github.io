@@ -22,183 +22,126 @@
     <main>
       <h1>Day 386: Page Layouts and Slotted Pages</h1>
 <blockquote>
-<p><strong>Page Layouts and Slotted Pages starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: A slotted page separates a record's stable identity from its byte position, so a database can update, delete, and compact tuples inside a fixed-size page without breaking references from indexes or higher layers.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In page layouts and slotted pages, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How fixed-size pages store variable-size records without rewriting whole pages. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding page layouts and slotted pages lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="01.html">01.md</a>, the page became the DBMS's basic unit of I/O, caching, and recovery. That still leaves a harder question: once an 8 KB page is in memory, how do rows actually fit inside it? Harbor Point's <code>municipal_quotes</code> table makes the pressure obvious. Some rows only carry CUSIP, bid, ask, and timestamp. Others also carry a longer desk note explaining why the quote was widened during a storm-driven selloff. If the engine stored those rows as a simple packed byte array, a longer update to one row could force every later row to move.</p>
+<p>That becomes a correctness problem, not just a packing problem. Higher layers want stable record references such as "page 812, slot 7." Index entries, lock targets, and recovery records cannot afford to mean "whatever happens to start at byte 3184 right now." A slotted page solves this by putting a small directory near the front of the page and letting each slot entry point to the current location of a tuple body elsewhere in the page.</p>
+<p>The important mental shift is that the slot number, not the byte offset, is the durable name of the record within the page. Tuple bytes may move during compaction or after an update that changes size. The slot entry is what stays stable enough for the rest of the engine to follow.</p>
+<p>That is why page layout sits between high-level storage architecture and the next lesson on <a href="03.html">03.md</a>. Before you can reason about null bitmaps, varlen headers, or alignment, you need the physical contract that says where a record lives, how free space is tracked, and which identifiers are allowed to remain stable while bytes move.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How fixed-size pages store variable-size records without rewriting whole pages.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Suppose Harbor Point ingests a new wave of municipal quotes while analysts keep querying the freshest page range. Every insert, delete, and quote revision happens inside fixed-size pages. If the page layout cannot absorb variable-length rows and local reshuffling, the engine pays for that weakness everywhere else: more page splits, more index maintenance, more write-ahead log traffic, and harder crash recovery.</p>
+<p>A slotted-page design localizes the damage. Adding a record usually means carving tuple bytes from one side of the free space region and adding a slot entry on the other side. Deleting or moving a record means updating metadata in the slot directory rather than rewriting every external reference. The page is still a constrained physical unit, but its internal bookkeeping is now flexible enough to survive realistic workloads.</p>
+<p>Production teams feel this directly. Page fragmentation changes how full a relation really is. Free-space accounting determines whether inserts can reuse old pages or must allocate new ones. Compaction policies change write amplification and vacuum pressure. If you treat page layout as an implementation detail, those behaviors show up later as mysterious bloat, tail-latency spikes, or "why did this small update touch so much data?" incidents.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind page layouts and slotted pages</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain the anatomy of a slotted page</strong> - Identify the roles of the page header, slot directory, free space region, and tuple bodies.</li>
+<li><strong>Trace how inserts, deletes, updates, and compaction work</strong> - Describe which bytes move, which identifiers stay stable, and why that distinction matters.</li>
+<li><strong>Evaluate the trade-offs of slotted pages in production</strong> - Connect indirection, fragmentation, and local page maintenance to broader storage-engine behavior.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for page layouts and slotted pages</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to page layouts and slotted pages.</p>
-<p><strong>Intuition</strong>: page layouts and slotted pages exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain stable tuple identifiers during updates, but you pay with extra indirection and fragmentation management.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of page layouts and slotted pages</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full page layouts and slotted pages pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Maintain page header with lower/upper free-space pointers</li>
-<li>Store slot directory entries that map logical tuple IDs to offsets</li>
-<li>Append tuple bytes from page tail and update slot metadata</li>
-<li>Compact fragmented pages during vacuum or background cleanup</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: A slotted page gives the page an internal naming system</h3>
+<p>Return to Harbor Point's <code>municipal_quotes</code> page. The buffer manager has already pulled the page into memory because the executor needs several recent quotes. Inside that page, the engine needs more structure than "records laid out one after another." It needs a way to refer to a record even if the bytes later move.</p>
+<p>A typical slotted page uses four regions: a header, a slot directory, a free-space gap, and the tuple bodies themselves. The header stores page-level facts such as checksum or LSN, plus free-space boundaries. The slot directory grows upward from the front of the page. Each slot entry stores metadata such as the tuple's offset, length, and status. The tuple bodies grow downward from the end of the page. Free space sits between the two.</p>
+<div class="codehilite"><pre><span></span><code>low addresses
++-------------------------------+
+| page header                   |
+| lower = 96, upper = 8000      |
++-------------------------------+
+| slot 1 -&gt; off 8128 len 40     |
+| slot 2 -&gt; off 8080 len 48     |
+| slot 3 -&gt; DEAD                |
+| slot 4 -&gt; off 8000 len 80     |
++-------------------------------+  &lt;- lower
+|           free space          |
++-------------------------------+  &lt;- upper
+| tuple 4 bytes                 |
+| tuple 2 bytes                 |
+| tuple 1 bytes                 |
++-------------------------------+
+high addresses
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for page layouts and slotted pages; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for page layouts and slotted pages.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain stable tuple identifiers during updates, but operationally absorb extra indirection and fragmentation management.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>The key idea is that slot 4 is the stable handle. If tuple 4 later moves from offset 8000 to offset 7920 during compaction, the rest of the system can still refer to the same record by the same page-and-slot identifier. Only the slot entry changes. This is the local indirection layer that makes page maintenance possible.</p>
+<p>The trade-off is small but fundamental. Every record now costs some slot metadata and one extra lookup step inside the page. In exchange, the engine gains the freedom to reorganize payload bytes without forcing every higher layer to rewrite its references.</p>
+<h3>Concept 2: Inserts, updates, and deletes are page-maintenance operations, not just row operations</h3>
+<p>Now imagine that Harbor Point receives another quote for a bond already on the page, but the new version carries a longer desk note because liquidity is deteriorating. On insert, the engine checks whether the page has enough space for both the tuple body and, if needed, a new slot entry. If it does, the tuple bytes are written near the <code>upper</code> boundary, <code>upper</code> moves downward, the slot entry is filled in, and <code>lower</code> moves upward if a new slot was added.</p>
+<p>A delete is usually lazier than newcomers expect. The engine often marks the slot or tuple as deleted, dead, or reusable rather than immediately sliding every later tuple forward. That choice protects correctness and reduces short-term work. Concurrent readers, MVCC visibility rules, or recovery logic may still need to reason about the old entry. Immediate compaction would turn every delete into a much larger rewrite.</p>
+<p>An update depends on whether the new tuple version still fits cleanly. If the new bytes fit in place, the engine may overwrite the payload directly. If the tuple grows, the engine may move the payload to a different position in the same page and update the slot offset, or it may place a new version elsewhere and leave a redirect or dead entry behind, depending on the engine's concurrency model. The stable part is still the slot-level identity, not the old byte position.</p>
+<p>That distinction is why slotted pages are so common. A logical "row update" is really a physical page-maintenance operation governed by free space, visibility rules, and the cost of moving bytes. The page layout decides how much of that maintenance stays local and how much spills outward into index churn or page allocation.</p>
+<h3>Concept 3: Fragmentation is the price of flexibility, and compaction is how the engine buys space back</h3>
+<p>After enough quote updates and deletions, Harbor Point's page starts to look untidy. Slot 3 is dead, tuple 2 was shortened, and tuple 4 moved. Total free bytes may look healthy, but they can be scattered across several holes. A new 120-byte tuple cannot be placed unless there is one sufficiently large contiguous region or the engine compacts the page.</p>
+<p>Compaction rewrites the live tuple bodies into a tighter arrangement, typically packing them back toward one end of the page and updating slot offsets as it goes. Because the slots remain the stable names, the compaction can restore contiguous free space without changing the page-and-slot identifiers used elsewhere. That is the hidden payoff of the design.</p>
+<p>But compaction is not free. It consumes CPU, dirties the page, and can increase WAL volume because many bytes and metadata fields change at once. Engines therefore make policy choices about when to compact eagerly, when to defer cleanup to background work, and when to leave some fragmentation in place because the page is not yet under enough pressure to justify the rewrite.</p>
+<p>This is also the handoff to <a href="03.html">03.md</a>. Once you understand how a page tracks slots and free space, the next question is why one tuple body is 40 bytes while another is 120. That answer lives inside the record format: null bitmaps, length prefixes, alignment, and variable-length attributes.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: page layouts and slotted pages works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: A page appears to have free bytes, but inserts still spill to another page.</p>
+<p><strong>Why it happens / is confusing</strong>: Slotted pages need contiguous space for the tuple body and room in the slot directory. Scattered holes from deletes do not automatically count as usable insertion space.</p>
+<p><strong>Clarification / Fix</strong>: Inspect contiguous free space and slot availability, not just total free bytes. If fragmentation is the limit, compaction, fillfactor tuning, or background cleanup may recover the page.</p>
+<p><strong>Issue</strong>: After defragmentation, engineers expect all existing record references to become invalid.</p>
+<p><strong>Why it happens / is confusing</strong>: They are thinking in raw offsets rather than slots. Compaction changes tuple locations, but the slot directory can preserve the logical record identifier within the page.</p>
+<p><strong>Clarification / Fix</strong>: Verify what higher layers actually reference. In slotted-page engines, indexes or heap pointers generally target <code>(page_id, slot_id)</code> or an equivalent indirection, not a byte offset.</p>
+<p><strong>Issue</strong>: Deleting rows does not immediately shrink the table file.</p>
+<p><strong>Why it happens / is confusing</strong>: Reclaiming space inside a page is different from returning pages to the filesystem. A dead tuple can make space reusable for future inserts without reducing file size.</p>
+<p><strong>Clarification / Fix</strong>: Distinguish page-local reuse, relation-level free-space tracking, and file truncation. Vacuum or cleanup may make space reusable long before storage on disk becomes smaller.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: page layouts and slotted pages &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: page layouts and slotted pages &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: Slotted pages &lt;-&gt; buffer pools and dirty-page policy</h3>
+<p>The buffer manager only knows that page 812 became dirty; it does not flush "just slot 4." That means frequent tuple movement inside slotted pages can affect eviction pressure and write amplification. PostgreSQL's line pointers and page <code>pd_lower</code> and <code>pd_upper</code> fields are a concrete example of how page layout and buffer management meet.</p>
+<h3>Connection 2: Slotted pages &lt;-&gt; B-tree pages and record formats</h3>
+<p>Heap pages, B-tree nodes, and SQLite B-tree pages all use variants of slot or cell directories because internal references must survive local byte movement. The exact bytes inside each tuple or cell are the next problem, which is why <a href="03.html">03.md</a> follows immediately.</p>
 <h2>Resources</h2>
-<h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PostgreSQL Database Page Layout</a><ul>
+<li>Focus: Map <code>pd_lower</code>, <code>pd_upper</code>, and line pointers to the generic slotted-page model from this lesson.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.sqlite.org/fileformat.html">SQLite Database File Format</a><ul>
+<li>Focus: Compare SQLite's cell pointer array and freeblock management with a classic slotted-page design.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[PAPER] <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">Architecture of a Database System</a><ul>
+<li>Focus: Place page layout inside the broader contracts between buffer management, record storage, and recovery.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>A page layout is a contract about identity and movement</strong> - The engine needs a stable way to name records even when their bytes are reorganized.</li>
+<li><strong>Slots make local rewrites safe</strong> - Updates, deletes, and compaction can stay page-local because external references target slot identities rather than raw offsets.</li>
+<li><strong>Flexibility creates fragmentation pressure</strong> - Slotted pages trade simple packed storage for indirection, cleanup work, and free-space policy decisions.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model page layouts and slotted pages as explicit state transitions and invariants?</strong></p>
+<p><strong>Why is a slot number more useful than a raw byte offset as a record identifier inside a page?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because tuple bytes never move once inserted</li>
+<li>B) Because the slot can keep a stable identity even if the tuple payload is relocated</li>
+<li>C) Because offsets cannot be stored in memory</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>A page has 180 free bytes spread across several small holes and only 24 bytes of contiguous free space between <code>lower</code> and <code>upper</code>. Why might a 64-byte insert still fail?</strong></p>
 <ul>
-<li>A) Gaining stable tuple identifiers during updates while paying extra indirection and fragmentation management.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Because slotted pages can only insert fixed-length records</li>
+<li>B) Because total free bytes matter more than contiguous free space</li>
+<li>C) Because the page may need one contiguous region for the tuple body and extra room for slot metadata</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>What usually changes during page compaction in a slotted-page design?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) The tuple payload offsets stored in slot entries</li>
+<li>B) The logical page identifier referenced by the buffer manager</li>
+<li>C) The SQL schema of the table</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves stable tuple identifiers during updates, but that benefit is purchased with extra indirection and fragmentation management.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: The slot directory provides indirection. That lets the engine move tuple bytes during updates or compaction without invalidating the record's page-local identity.</p>
+<p><strong>2. C</strong>: Inserts need usable contiguous space for the tuple body, and sometimes a slot entry as well. Fragmented holes do not automatically combine into one insertable region.</p>
+<p><strong>3. A</strong>: Compaction repacks live tuple bytes and rewrites the offsets recorded in slot entries. The page itself remains the same page, and the table schema is unchanged.</p>
 
       
       <hr>
@@ -218,7 +161,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-03-31 16:16 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

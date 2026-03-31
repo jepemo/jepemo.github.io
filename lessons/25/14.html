@@ -22,183 +22,122 @@
     <main>
       <h1>Day 398: Crash Recovery Walkthrough: Analysis, Redo, Undo</h1>
 <blockquote>
-<p><strong>Crash Recovery Walkthrough: Analysis, Redo, Undo is valuable when integrated into end-to-end system decisions under production constraints.</strong></p>
+<p><strong>The core idea</strong>: ARIES recovery does not "restore the last checkpoint." It rebuilds recovery state during analysis, repeats history during redo, and then removes uncommitted work during undo so the final database matches exactly what committed log records allow.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In aries crash recovery phases, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How ARIES-style recovery reconstructs consistent state after process failure. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding aries crash recovery phases lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="13.html">13.md</a>, Harbor Point learned that a checkpoint is only a recovery boundary plus a picture of which pages were dirty. That picture matters because, at 09:47, the primary database loses power in the middle of the market-open burst. One transaction has already committed a municipal-bond quote update, another transaction has inserted a secondary-index entry but has not committed yet, and several dirty pages are still only partially reflected on disk. After restart, the engine cannot trust memory, but it also cannot afford to guess.</p>
+<p>The tempting mental model is "load the checkpoint and replay committed transactions." ARIES is stricter than that because the disk image after a crash is not a clean snapshot. Some committed updates may never have reached the data files; some uncommitted updates may already be present on disk because steal/no-force buffering allowed the engine to flush pages before commit. Recovery therefore has to answer three separate questions in order. Which transactions were still active when the crash happened? Which logged actions might be missing from disk? Which of those actions belong to losers and must be backed out?</p>
+<p>That is why the three phases exist as a chain, not as optional extras. Analysis reconstructs the transaction table and dirty page table that memory lost. Redo repeats history from the earliest relevant <code>recLSN</code>, even for transactions that will later be undone, because recovery first needs the on-disk pages to reflect the exact pre-crash state. Undo then walks the loser transactions backward and logs compensation log records so recovery itself remains crash-safe. Once that sequence clicks, the transition to <a href="15.html">15.md</a> becomes natural: commit latency and <code>fsync</code> policy decide how much of this work is waiting for recovery after a crash.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How ARIES-style recovery reconstructs consistent state after process failure.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's on-call engineer does not get paged with the abstract complaint "recovery theory is confusing." They get paged because a database restarted, the process came back, and the trading desk wants to know whether quote corrections, risk flags, and settlement adjustments are actually consistent. If the engineer cannot explain what analysis, redo, and undo are doing, they also cannot tell whether a long recovery is expected, whether a repeated redo pass is harmless, or whether the system is stuck behind a pathological loser transaction.</p>
+<p>The production stakes are high because steal/no-force buffering makes crash recovery the price of normal write performance. You let dirty pages reach disk before commit, and you let commit complete before data pages are forced, because that keeps the foreground path fast. In return, restart logic must be able to reconstruct the exact state implied by the WAL. If recovery is misunderstood, teams misread symptoms. They may blame the buffer pool when redo is the bottleneck, or blame redo when the real problem is an enormous undo chain created by one long-running transaction.</p>
+<p>Framed that way, crash recovery is not a postscript to WAL design. It is the mechanism that makes the whole design safe. Checkpoints from the previous lesson limit how far recovery must search. The recovery phases in this lesson explain how the engine uses that checkpoint metadata. The next lesson will tighten the loop by showing how <code>fsync</code> and group commit change the durability boundary that recovery has to respect.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind aries crash recovery phases</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain what analysis reconstructs after a crash</strong> - Describe how checkpoint metadata and WAL records rebuild the dirty page table and transaction table.</li>
+<li><strong>Trace why redo repeats history instead of replaying committed work only</strong> - Use <code>recLSN</code> and <code>page_lsn</code> to decide which logged changes must be applied again.</li>
+<li><strong>Explain how undo safely removes loser transactions</strong> - Show why compensation log records and backward traversal are necessary for crash-safe rollback.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for aries crash recovery phases</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to aries crash recovery phases.</p>
-<p><strong>Intuition</strong>: aries crash recovery phases exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain strict durability and atomicity guarantees, but you pay with complex logging protocol and recovery metadata.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of aries crash recovery phases</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full aries crash recovery phases pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Analysis phase rebuilds dirty page and transaction tables</li>
-<li>Redo replays idempotent actions from safe LSN point</li>
-<li>Undo rolls back loser transactions using compensation log records</li>
-<li>Finalize with transaction-end records and checkpoint handoff</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: Analysis rebuilds the recovery bookkeeping that disappeared with memory</h3>
+<p>Harbor Point's last completed checkpoint was taken two minutes before the outage. At that moment, the checkpoint recorded a fuzzy snapshot of active transactions and dirty pages, but transactions kept running afterward. When the database restarts, analysis begins from that checkpoint because it is the newest durable summary of the engine's in-flight state.</p>
+<p>Assume the end-checkpoint record says the dirty page table contains <code>P17 -&gt; recLSN 880</code> and <code>P21 -&gt; recLSN 892</code>, while the transaction table says <code>T41</code> is active with <code>lastLSN = 905</code>. The WAL after the checkpoint then contains these records:</p>
+<div class="codehilite"><pre><span></span><code>LSN 910  T41 update P21
+LSN 918  T42 begin
+LSN 924  T42 update P44
+LSN 930  T41 commit
+LSN 934  T41 end
+LSN 938  T42 update P17
+LSN 940  crash
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for aries crash recovery phases; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for aries crash recovery phases.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain strict durability and atomicity guarantees, but operationally absorb complex logging protocol and recovery metadata.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>Analysis walks forward through those log records and recreates the runtime tables the buffer manager and lock manager had before the crash. <code>T41</code> moves from active to committed and then disappears once the <code>end</code> record is seen. <code>T42</code> is discovered as an active loser because it has updates but no commit record. <code>P44</code> is added to the dirty page table with <code>recLSN 924</code>, while <code>P17</code> stays dirty with its older <code>recLSN 880</code> because that older value still bounds redo.</p>
+<p>The important point is that analysis is not yet fixing data pages. It is reconstructing the questions recovery must answer next: where redo should start, which pages might be stale on disk, and which transactions will eventually need undo. The trade-off is extra log metadata and checkpoint complexity in exchange for bounded restart logic. Without that bookkeeping, the engine would have to make much weaker guesses after every crash.</p>
+<h3>Concept 2: Redo repeats history from the oldest relevant dirty page, including loser updates</h3>
+<p>Once analysis has rebuilt the dirty page table, redo starts from the smallest <code>recLSN</code> still present. In Harbor Point's case that is <code>880</code> because page <code>P17</code> has been dirty since before the checkpoint. This often surprises people: redo does not start at the first loser transaction, and it does not start at the checkpoint LSN blindly. It starts at the earliest log record that could still matter for any page that may be stale on disk.</p>
+<p>Redo then scans forward and asks, record by record, whether the logged effect is already reflected on the target page. ARIES uses the page's durable <code>page_lsn</code> as the test. If the on-disk <code>page_lsn</code> for <code>P21</code> is already <code>910</code> or newer, the engine can skip reapplying <code>T41</code>'s update because that page image already contains the change. If <code>P44</code> is still at <code>page_lsn 900</code>, redo must reapply the <code>LSN 924</code> update even though <code>T42</code> never committed. At this stage recovery is trying to reconstruct the exact state of the database at the instant before the crash, not the final committed state after rollback.</p>
+<p>That "repeat history" rule is what makes the later undo phase reliable. Suppose <code>T42</code> inserted a row into a secondary index and also changed the base table. If redo applied only committed work, the engine might reach a physically inconsistent state in which one page reflects the loser transaction and the other does not. Repeating history first ensures that every page is brought to the same logical moment in time before rollback begins.</p>
+<p>The cost is that recovery may intentionally redo work it already knows will be undone. That sounds wasteful until you compare it with the alternative: bespoke reasoning about every possible partially flushed page combination. ARIES pays some extra scan and replay work so correctness reduces to a small set of idempotent tests based on <code>recLSN</code> and <code>page_lsn</code>.</p>
+<h3>Concept 3: Undo walks loser transactions backward and logs the rollback itself</h3>
+<p>After redo, Harbor Point's pages now reflect the exact pre-crash history, including <code>T42</code>'s uncommitted changes. Undo can finally remove that work. Recovery takes the loser transactions from the analysis phase and processes them in reverse log order, typically by keeping a priority queue keyed by each transaction's <code>lastLSN</code>. In the example above, <code>T42</code> begins undo at <code>LSN 938</code>, then continues to <code>LSN 924</code>, and stops when it reaches the begin record.</p>
+<p>For each undoable record, ARIES does two things. It applies the inverse action to the page, and it writes a compensation log record (CLR) describing that rollback step. A simplified sketch looks like this:</p>
+<div class="codehilite"><pre><span></span><code>redo finished
+undo T42 at LSN 938 -&gt; write CLR 946 (undoNextLSN = 924)
+undo T42 at LSN 924 -&gt; write CLR 952 (undoNextLSN = 918)
+write T42 end at 956
+</code></pre></div>
+
+<p>The CLR is not bookkeeping decoration. It is what makes recovery itself crash-safe. If the database crashes again after writing <code>CLR 946</code> but before finishing <code>T42</code>, the next restart will see that part of the undo already happened and will continue from <code>undoNextLSN = 924</code> rather than undoing the same action twice. In other words, redo can safely replay CLRs too, because they are just more durable evidence about the state transition history.</p>
+<p>Operationally, undo is where long-running loser transactions become painful. A single transaction that touched thousands of hot pages can dominate restart time even when redo is short. That is why production teams watch not only WAL volume and checkpoint age, but also the size and age of active transactions. The trade-off behind steal/no-force buffering shows up here in full: faster commits during normal operation mean recovery must sometimes pay the rollback bill later.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: aries crash recovery phases works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: Recovery logs show redo applying records from a transaction that never committed, and the team assumes the engine is corrupting data.</p>
+<p><strong>Why it happens / is confusing</strong>: Redo's job is to repeat history up to the crash point, not to produce the final committed state by itself. Loser updates may need to be restored on disk temporarily so undo can remove them from a physically consistent page set.</p>
+<p><strong>Clarification / Fix</strong>: Check whether undo is still in progress and whether the suspect records belong to transactions marked as losers during analysis. If so, the behavior is expected.</p>
+<p><strong>Issue</strong>: Restart time is much longer than checkpoint frequency suggests.</p>
+<p><strong>Why it happens / is confusing</strong>: A recent checkpoint only limits where analysis begins. Redo still starts from the oldest dirty <code>recLSN</code>, and undo can still be dominated by one large active transaction that survived until crash time.</p>
+<p><strong>Clarification / Fix</strong>: Inspect the dirty page table age and the loser transaction list separately. If redo is short but undo is huge, the operational fix is transaction design and timeout discipline, not merely more frequent checkpoints.</p>
+<p><strong>Issue</strong>: The database crashes again during recovery, and operators worry that rollback work will be duplicated or skipped.</p>
+<p><strong>Why it happens / is confusing</strong>: Recovery is doing real writes, so a second crash feels like it invalidates the whole process.</p>
+<p><strong>Clarification / Fix</strong>: Verify that compensation log records are being written and flushed according to the engine's WAL rules. CLRs are what let the next recovery pass resume undo safely instead of starting from scratch.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: aries crash recovery phases &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: aries crash recovery phases &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: ARIES redo ↔ replicated log catch-up</h3>
+<p>A Raft follower catching up after downtime also replays a durable log to reconstruct state it missed while offline. The difference is that ARIES can skip some records using each page's <code>page_lsn</code>, while a follower usually reasons in terms of log index and committed prefix. Both systems rely on durable history plus idempotent replay tests rather than trusting volatile memory.</p>
+<h3>Connection 2: ARIES undo ↔ filesystem journaling and repair logs</h3>
+<p>Filesystems such as ext3 and ext4 journal metadata so crash recovery can safely replay or complete interrupted operations, but ARIES goes further by tracking loser transactions explicitly and logging compensation steps. The common pattern is that repair work must itself be durable; otherwise a crash during repair creates a second, harder-to-explain inconsistency.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[PAPER] <a href="https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging">ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging</a><ul>
+<li>Focus: Read the original explanation of analysis, repeating history during redo, and compensation log records during undo.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-internals.html">PostgreSQL Documentation: WAL Internals</a><ul>
+<li>Focus: Connect ARIES-style reasoning to production details such as LSNs, page state, checkpoints, and redo-oriented restart behavior.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-recovery.html">MySQL 8.0 Reference Manual: InnoDB Recovery</a><ul>
+<li>Focus: See how crash recovery phases appear operationally in a widely deployed storage engine and what administrators monitor during restart.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Analysis recreates recovery state, not user data</strong> - It rebuilds the dirty page table and transaction table so the later phases know where to start and what must be undone.</li>
+<li><strong>Redo repeats history before it enforces commit status</strong> - Replaying loser updates is necessary because the disk image after a crash is a partial, page-by-page snapshot.</li>
+<li><strong>Undo must be logged to be trustworthy</strong> - Compensation log records make rollback idempotent and allow recovery to survive a second crash mid-rollback.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model aries crash recovery phases as explicit state transitions and invariants?</strong></p>
+<p><strong>Why does ARIES redo reapply some updates from transactions that never committed?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because redo is reconstructing the exact pre-crash page state before undo decides what to remove</li>
+<li>B) Because ARIES cannot distinguish committed and uncommitted transactions during analysis</li>
+<li>C) Because loser transactions are sometimes promoted to winners after restart</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>What determines the earliest WAL position where redo must begin?</strong></p>
 <ul>
-<li>A) Gaining strict durability and atomicity guarantees while paying complex logging protocol and recovery metadata.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) The LSN of the most recent commit record</li>
+<li>B) The smallest <code>recLSN</code> among pages still listed in the dirty page table</li>
+<li>C) The <code>lastLSN</code> of the oldest active transaction in the checkpoint</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Why are compensation log records essential during undo?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) They make undo faster by avoiding all page writes</li>
+<li>B) They let the engine skip analysis on the next restart</li>
+<li>C) They record completed rollback steps so recovery can resume safely after another crash</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves strict durability and atomicity guarantees, but that benefit is purchased with complex logging protocol and recovery metadata.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. A</strong>: Redo is about repeating history so the page set reflects the exact state at crash time. Only after that does undo remove the loser transactions. Options B and C are false because analysis does identify winners and losers, and restart does not promote losers to committed work.</p>
+<p><strong>2. B</strong>: The smallest surviving <code>recLSN</code> marks the earliest change that might still be absent from some dirty page on disk. Starting later risks missing needed history.</p>
+<p><strong>3. C</strong>: CLRs make rollback durable and restartable. If recovery crashes during undo, the next recovery pass can redo those CLRs and continue from the recorded <code>undoNextLSN</code> instead of undoing the same action twice.</p>
 
       
       <hr>
@@ -218,7 +157,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-03-31 16:16 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

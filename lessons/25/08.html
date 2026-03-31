@@ -22,183 +22,121 @@
     <main>
       <h1>Day 392: B-Tree Insert, Split, and Merge Maintenance</h1>
 <blockquote>
-<p><strong>B-Tree Insert, Split, and Merge Maintenance becomes practical when you can trace each internal step to an operational effect.</strong></p>
+<p><strong>The core idea</strong>: A B-tree stays searchable only because every insert and delete repairs page boundaries locally, so parent separators, sibling links, and durable page images continue to describe the same key ranges after the write lands.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In b-tree structural modifications, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How engines keep B-Tree balance under continuous inserts and deletes. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding b-tree structural modifications lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="07.html">07.md</a>, Harbor Point's municipal-bond index was a clean routing structure: each internal page described a key interval, and one root-to-leaf walk found the right quote range quickly. That picture is true only between writes. The hard part is not searching a stable tree; it is changing the tree while traders are still inserting new quotes and retention jobs are deleting old ones.</p>
+<p>Consider Harbor Point during a rate announcement. Quotes for a handful of hot CUSIPs arrive in bursts, all targeting the same small region of the index on <code>(cusip, quote_ts DESC)</code>. When the target leaf has room, the insert is just a page-local shuffle. When it does not, the engine has to split the leaf, choose a separator that cleanly divides the key space, update the parent, and sometimes repeat that work all the way to the root. Every one of those steps is structural maintenance, not optional optimization.</p>
+<p>Deletes create the mirror image. Harbor Point's nightly retention job removes expired quotes in timestamp order. Leaves that were once packed can become sparse, which wastes space and deepens the tree unless the engine redistributes entries with a sibling or merges pages entirely. The main realization is that insert, split, redistribution, and merge are all ways of preserving the search contract from the previous lesson. The next lesson on <a href="09.html">09.md</a> matters because B-trees pay that maintenance cost on the write path, while LSM trees move the same maintenance burden into flushes and compaction.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How engines keep B-Tree balance under continuous inserts and deletes.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point has two conflicting goals. During market hours, the trading desk wants the newest quote for a bond with very low tail latency. Overnight, the platform wants to purge expired rows without letting the index become bloated. A B-tree can serve both needs, but only if structural changes stay local, correct, and cheap enough that the write path does not collapse under hot-key pressure.</p>
+<p>This is where many production mistakes happen. Teams often observe a symptom such as rising write latency or index bloat and reach for a tuning knob without asking which structural maintenance path is dominating. If leaf pages keep splitting on one hot range, the problem is very different from a tree that is too sparse because delete-heavy workloads never trigger reclamation effectively. Knowing the maintenance mechanics lets you tell apart healthy rebalancing, pathological churn, and outright correctness risk.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind b-tree structural modifications</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Trace a B-tree insert path</strong> - Explain when an insert stays inside one leaf and when it must trigger a split and parent update.</li>
+<li><strong>Explain split and merge mechanics</strong> - Follow how separator keys, sibling relationships, and tree height change during structural modification.</li>
+<li><strong>Reason about production consequences</strong> - Connect page occupancy, latch pressure, write amplification, and index bloat to real workload behavior.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for b-tree structural modifications</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to b-tree structural modifications.</p>
-<p><strong>Intuition</strong>: b-tree structural modifications exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain bounded tree height over time, but you pay with latch contention and write bursts during rebalancing.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of b-tree structural modifications</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full b-tree structural modifications pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Insert key/value into target leaf when free space allows</li>
-<li>Split overflowing page and promote separator key</li>
-<li>Cascade split upward if parent also overflows</li>
-<li>Merge or redistribute underfull siblings after deletes</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: Most inserts are local page edits until free space runs out</h3>
+<p>Harbor Point's index leaf for <code>CUSIP 13042AB7</code> stores recent quotes in descending timestamp order. When a new quote arrives, the engine follows the search path from <a href="07.html">07.md</a> to the target leaf and checks whether the leaf still has enough free space for one more entry. If it does, the structural work is limited: shift a suffix of entries, insert the new key in sorted position, update slot metadata, mark the page dirty, and eventually log the change for recovery.</p>
+<p>That sounds simple, but even the "cheap" case depends on an invariant: after insertion, the page must still contain a sorted subset of the same key interval the parent expects it to cover. The parent separator does not change because the leaf's boundary did not move. This is why engines try hard to keep some free space on pages with fill-factor settings or page compaction. A little slack turns many writes into local edits instead of structural events.</p>
+<p>For Harbor Point, that distinction shows up directly in latency. A page-local insert usually means one hot leaf latch, one WAL record, and no parent traffic. The write still pays durability cost, but it does not force a chain reaction through upper levels of the tree. On a workload with many distinct CUSIPs, most inserts look like this. On a workload concentrated on a few hot bonds, the free space for those leaves disappears quickly, and the "local edit" fast path stops being the common case.</p>
+<p>The trade-off is straightforward: leaving more free space delays splits and reduces contention spikes, but it also lowers leaf density and makes the index larger. B-tree tuning is therefore not just about read depth. It is about deciding how much spare capacity to reserve so that the write path remains smooth under the expected skew.</p>
+<h3>Concept 2: A split rewrites key boundaries and may propagate upward</h3>
+<p>When Harbor Point receives another quote for a full leaf, the engine can no longer preserve sorted order by shuffling entries in place. It allocates a new sibling page, redistributes the leaf's entries across the old and new pages, and picks a separator key that tells the parent where the boundary now lies.</p>
+<p>An abstract split looks like this:</p>
+<div class="codehilite"><pre><span></span><code>before
+parent: [... | 13042AB7@09:34 | ...]
+             |
+             v
+leaf: [09:37 09:36 09:35 09:34 09:33 09:32]  (full)
+
+after
+parent: [... | 13042AB7@09:35 | ...]
+             /               \
+            v                 v
+left leaf:  [09:37 09:36 09:35]
+right leaf: [09:34 09:33 09:32]
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for b-tree structural modifications; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for b-tree structural modifications.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain bounded tree height over time, but operationally absorb latch contention and write bursts during rebalancing.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>The exact promoted separator depends on the engine's B-tree variant, but the rule is constant: every key in the left child must compare on one side of the separator, and every key in the right child must compare on the other. If Harbor Point inserts many quotes into the same hot range, the parent page that receives new separators can fill too. Then the split cascades upward. In the extreme case, the old root splits and the tree grows by one level under a newly created root.</p>
+<p>This is where search correctness and concurrency meet. Readers descending the tree must never observe a parent boundary that points to the wrong child interval, even while the split is happening. Engines use careful latch ordering, WAL logging, and page-link conventions so that a reader can either see the old valid structure or the new valid structure, but not a broken hybrid. The split path is therefore one of the main places where B-tree implementations earn their reputation for subtlety.</p>
+<p>For operations, the split mechanism explains why write amplification in a B-tree is bursty rather than uniform. Most inserts touch one leaf; a minority suddenly touch the leaf, its parent, possibly several ancestors, and the log. That burstiness is exactly the pressure that motivates the comparison with LSM trees in <a href="09.html">09.md</a>: B-trees keep data ordered in place, so they occasionally pay expensive structural maintenance on the critical write path.</p>
+<h3>Concept 3: Deletes can redistribute or merge pages, but engines are conservative for good reasons</h3>
+<p>Harbor Point's nightly retention job deletes quotes older than the compliance window. A delete usually starts as a local change, just like an insert: find the leaf entry, remove it, compact the page if needed, and preserve sorted order among what remains. The harder question is what to do when many deletes leave a leaf half empty or nearly empty.</p>
+<p>One option is redistribution. If the left leaf is sparse and its right sibling still has slack, the engine can move a few entries across the boundary and update the parent separator so both pages remain reasonably full. Redistribution keeps the tree height stable and avoids deallocating pages immediately. Another option is merge: if two siblings together fit comfortably in one page, move all surviving entries into one page, delete the other page, and remove the redundant separator from the parent.</p>
+<p>Those operations sound like the obvious mirror image of splitting, but production systems often apply them more cautiously than textbook descriptions suggest. Merge-heavy delete paths can cause oscillation when a workload alternates between removing and reinserting keys in the same range. Harbor Point would feel that if overnight retention merged pages aggressively and the morning quote burst forced the same range to split again. Some engines therefore tolerate underfull pages for a while, preferring mild space inefficiency over repeated churn.</p>
+<p>The practical trade-off is between space discipline and write stability. Aggressive merging shrinks the tree and improves cache density, but it adds foreground work and can increase contention on hot ranges. Conservative merging avoids thrash, but it leaves behind bloat that raises scan cost and storage footprint. Once you understand that tension, index maintenance metrics such as split rate, page occupancy, and deleted-page reuse stop looking like obscure internals and start looking like direct workload signals.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: b-tree structural modifications works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: Insert latency spikes even though the average insert rate has not changed much.</p>
+<p><strong>Why it happens / is confusing</strong>: A small number of hot key ranges can keep hitting full leaves, so the system pays repeated split cascades while the global workload still looks moderate.</p>
+<p><strong>Clarification / Fix</strong>: Measure split frequency by index and by key range, not just total write volume. Fill factor changes, workload partitioning, or a different key design can matter more than raw hardware.</p>
+<p><strong>Issue</strong>: The index keeps growing after large delete jobs.</p>
+<p><strong>Why it happens / is confusing</strong>: Deleting rows does not guarantee immediate page reclamation. Underfull pages may remain in place if the engine chooses not to merge them aggressively.</p>
+<p><strong>Clarification / Fix</strong>: Distinguish logical deletion from structural compaction. Inspect page occupancy and the engine's maintenance policy before assuming the purge job is ineffective.</p>
+<p><strong>Issue</strong>: A correctness bug appears only during crash recovery or high concurrency.</p>
+<p><strong>Why it happens / is confusing</strong>: Split and merge paths update multiple related pages, so ordering mistakes may stay invisible until recovery replays the log or readers race with a structural change.</p>
+<p><strong>Clarification / Fix</strong>: Audit the invariant boundaries explicitly: child key ranges, parent separators, sibling links, and WAL ordering. Structural bugs are rarely fixed by retry logic alone.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: b-tree structural modifications &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: b-tree structural modifications &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: B-tree maintenance ↔ WAL and crash recovery</h3>
+<p>Page splits and merges are multi-page updates, so their correctness depends on logging enough information for recovery to rebuild the same valid tree shape after a crash. That is why upcoming lessons on WAL ordering and redo logic are not separate concerns; they are the durability half of structural maintenance.</p>
+<h3>Connection 2: B-tree maintenance ↔ LSM-tree write design</h3>
+<p>Harbor Point's hot-leaf split problem illustrates the central B-tree trade-off: writes preserve sorted structure immediately. LSM trees relax that requirement by buffering writes in memory and restoring global order later during flush and compaction. The next lesson on <a href="09.html">09.md</a> is easier to understand once this B-tree maintenance cost is concrete.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/btree.html">PostgreSQL Documentation: B-Tree Indexes</a><ul>
+<li>Focus: Read the sections on page splits, deduplication, and implementation behavior to see how a production engine preserves B-tree invariants under concurrent writes.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.sqlite.org/fileformat.html">SQLite File Format: B-Tree Pages</a><ul>
+<li>Focus: Inspect how interior and leaf pages are laid out on disk so split and merge discussion stays tied to concrete page structures.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[BOOK] <a href="https://www.oreilly.com/library/view/database-internals/9781492040330/">Database Internals by Alex Petrov</a><ul>
+<li>Focus: Use the chapters on B-trees and storage-engine trade-offs to compare local page maintenance with log-structured alternatives.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>A cheap B-tree insert is a page-local event</strong> - The write becomes expensive only when free space is exhausted and the page boundary has to move.</li>
+<li><strong>Splits repair the routing contract, not just space pressure</strong> - Promoted separators and sibling pages exist so every root-to-leaf search still reaches the correct key interval.</li>
+<li><strong>Delete handling is a policy choice as much as a data-structure rule</strong> - Merge aggressively and you risk churn; merge cautiously and you accept temporary bloat.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model b-tree structural modifications as explicit state transitions and invariants?</strong></p>
+<p><strong>When can Harbor Point insert a new quote without changing any parent page in the B-tree?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) When the target leaf still has enough free space for the new entry</li>
+<li>B) Only when the root page is empty</li>
+<li>C) Only when the insert key is smaller than every existing key</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Why does a leaf split sometimes force work on ancestor pages as well?</strong></p>
 <ul>
-<li>A) Gaining bounded tree height over time while paying latch contention and write bursts during rebalancing.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Because the engine must update every leaf in the index after any insert</li>
+<li>B) Because the new sibling needs a separator in the parent, and that parent may also overflow</li>
+<li>C) Because B-trees always rebuild the entire root-to-leaf path on writes</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Why might an engine avoid merging sparse pages immediately after Harbor Point's retention delete job?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Because underfull pages are always incorrect and must be preserved for recovery</li>
+<li>B) Because merge-heavy behavior can cause split/merge thrashing when the same key range becomes hot again</li>
+<li>C) Because delete operations do not affect page occupancy at all</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves bounded tree height over time, but that benefit is purchased with latch contention and write bursts during rebalancing.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. A</strong>: If the leaf has room, the engine can insert the entry in sorted order and keep the existing parent separator unchanged because the child interval boundary did not move.</p>
+<p><strong>2. B</strong>: A split creates a new child page and therefore requires a new routing boundary in the parent. If that parent is also full, the structural change can cascade upward.</p>
+<p><strong>3. B</strong>: Immediate merging can save space, but it may also create oscillation if future inserts force the same range to split again soon after. Real systems often trade some temporary bloat for better write stability.</p>
 
       
       <hr>
@@ -218,7 +156,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-03-31 16:16 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>
