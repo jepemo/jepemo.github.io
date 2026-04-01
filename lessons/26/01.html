@@ -22,183 +22,144 @@
     <main>
       <h1>Day 401: Transaction Model and ACID in Practice</h1>
 <blockquote>
-<p><strong>Transaction Model and ACID in Practice starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: A transaction is the database's promise that a multi-step state change crosses one visibility and durability boundary, so other sessions never have to interpret half-finished work.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In transaction model and acid guarantees, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: What ACID means operationally beyond textbook definitions. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding transaction model and acid guarantees lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="../25/16.html">../25/16.md</a>, Harbor Point's <code>quotevault</code> engine was intentionally narrow: one correction in, one durable row change out. That was enough while each market update was a single-record replacement. The next requirement changes the shape of the problem. A correction for quote <code>Q7742</code> must now update the current <code>quotes</code> row, append a <code>quote_events</code> audit record, and adjust the issuer's intraday exposure total that risk checks read during the market open.</p>
+<p>The storage engine already knows how to make bytes durable. What it still needs is a way to say that these three changes become real together or not at all. If the process dies after the audit row is inserted but before the exposure total is updated, operators should not have to inspect tables manually and guess which state is authoritative. The system needs one unit of work whose success or failure has a clear boundary.</p>
+<p>That unit is the transaction model. In production, ACID matters because it answers three operational questions precisely: what happens if the server crashes in the middle, what can concurrent sessions observe while the work is in flight, and what exactly does a commit acknowledgement mean? Atomicity, consistency, isolation, and durability are useful only when each letter maps to a real mechanism such as undo, constraints, concurrency control, and write-ahead logging.</p>
+<p>The next lesson on <a href="02.html">02.md</a> zooms in on isolation failures and dependency cycles. This lesson establishes the base contract first: what a transaction actually is, what ACID does and does not guarantee, and why the guarantees cost real coordination and I/O.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: What ACID means operationally beyond textbook definitions.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point first implemented the correction flow as three autocommit statements from application code. Most mornings that looked acceptable. Then a timeout arrived after the <code>quote_events</code> insert but before the exposure update, and the desk ended up with a complete audit trail next to an outdated risk total. Nothing was physically corrupted, but the database had no single answer to the question "did this correction happen?" Each statement had crossed its own visibility and durability boundary.</p>
+<p>A transaction fixes that ambiguity by turning the correction into one state transition. The application can begin the unit, make all three changes, and ask the database for one final outcome: commit or abort. Recovery, constraint checking, lock release, and client acknowledgement all align around that outcome instead of three loosely related statements.</p>
+<p>This matters operationally because transaction design is not only about correctness. It drives lock lifetimes, WAL volume, replica lag, retry behavior, and incident analysis. Once the transaction boundary is explicit, the team can reason clearly about what was committed, what was rolled back, and which invariants were or were not supposed to hold at a given moment.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind transaction model and acid guarantees</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain why a transaction exists as a database primitive</strong> - Show why Harbor Point's correction flow needs one commit boundary instead of three autocommit statements.</li>
+<li><strong>Trace how ACID is enforced internally</strong> - Connect atomicity, consistency, isolation, and durability to concrete mechanisms such as constraints, concurrency control, and WAL.</li>
+<li><strong>Evaluate production trade-offs around transaction scope</strong> - Reason about lock duration, abort cost, durability latency, and when stronger guarantees are worth the overhead.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for transaction model and acid guarantees</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to transaction model and acid guarantees.</p>
-<p><strong>Intuition</strong>: transaction model and acid guarantees exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain strong correctness guarantees, but you pay with coordination overhead on high-concurrency workloads.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of transaction model and acid guarantees</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full transaction model and acid guarantees pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Define transaction boundaries and failure domains</li>
-<li>Track commit intent in WAL before visibility</li>
-<li>Enforce atomic apply/rollback paths</li>
-<li>Expose durability and isolation semantics to clients</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: A transaction turns a business action into one database state transition</h3>
+<p>Harbor Point's correction flow is not really three unrelated SQL statements. It is one business action: replace the live quote, record who changed it, and update the issuer's used-risk figure before the next check runs. If those statements execute under autocommit, the database treats them as three separate transactions. A crash or timeout can therefore leave the system in an intermediate state that is perfectly legal at the storage level but wrong for the desk's workflow.</p>
+<p>The transaction model gives the engine a stronger unit of reasoning. Instead of asking "did statement two finish," the database tracks one transaction identifier, one read/write context, and one final outcome. Internally, the engine may hold locks, create tentative row versions, stage page changes in memory, and collect WAL records, but none of that work is allowed to become fully committed until the transaction crosses its commit boundary.</p>
+<p>For Harbor Point, the correction path should look like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">BEGIN</span><span class="p">;</span>
+<span class="k">UPDATE</span><span class="w"> </span><span class="n">quotes</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">price</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">99</span><span class="p">.</span><span class="mi">125</span><span class="p">,</span><span class="w"> </span><span class="n">updated_at</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">now</span><span class="p">()</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">quote_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;Q7742&#39;</span><span class="p">;</span>
+
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">quote_events</span><span class="w"> </span><span class="p">(</span><span class="n">quote_id</span><span class="p">,</span><span class="w"> </span><span class="n">event_type</span><span class="p">,</span><span class="w"> </span><span class="n">actor</span><span class="p">,</span><span class="w"> </span><span class="n">new_price</span><span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;Q7742&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;correction&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;ops-bot&#39;</span><span class="p">,</span><span class="w"> </span><span class="mi">99</span><span class="p">.</span><span class="mi">125</span><span class="p">);</span>
+
+<span class="k">UPDATE</span><span class="w"> </span><span class="n">issuer_exposure</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">used_intraday</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">used_intraday</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">250000</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">issuer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;MUNI-77&#39;</span><span class="p">;</span>
+<span class="k">COMMIT</span><span class="p">;</span>
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
+<p>The important point is not the SQL syntax itself. It is that the engine now knows these changes belong to one logical unit. That lets it decide which reads must wait, which changes stay invisible until commit, and what recovery should do after a crash. This is the step that extends the storage-engine work from <a href="../25/16.html">../25/16.md</a>: durable pages are necessary, but transactions decide when a set of page changes counts as one authoritative state change.</p>
+<p>Consistency is often misunderstood at this stage. The database does not magically infer Harbor Point's business rules just because the statements are wrapped in <code>BEGIN</code> and <code>COMMIT</code>. If the desk cares that exposure never exceeds a limit or that every correction has a matching audit row, those invariants must be expressed through constraints, triggers, or application logic executed inside the transaction. The transaction model gives those checks one place to succeed or fail together.</p>
+<h3>Concept 2: ACID is a bundle of mechanisms, not one feature flag</h3>
+<p>ACID sounds like one property, but each letter answers a different failure mode in Harbor Point's correction flow. Atomicity says the transaction is all-or-nothing. Engines implement that either by keeping tentative versions invisible until commit, by recording enough undo information to roll changes back, or by using shadow-page techniques that swap a new state into place only at commit time. The mechanism differs by engine; the contract is the same.</p>
+<p>Consistency is the most overloaded letter. In practice, it means the transaction moves the database from one valid state to another valid state according to declared rules. A foreign key, a <code>CHECK</code> constraint, a uniqueness rule, or a trigger can participate in that guarantee. A business invariant that is never encoded anywhere cannot be protected just because the system claims to be ACID.</p>
+<p>Isolation is about concurrent visibility. While the correction is running, another session might be reading <code>quotes</code> to price a portfolio. The database must decide whether that reader can see the new <code>quotes</code> row before the exposure table is updated, whether it must wait, or whether it should see an earlier snapshot. That decision comes from a concurrency-control mechanism such as locking or MVCC, not from durability machinery. The next lesson on <a href="02.html">02.md</a> formalizes these cases as anomalies and serialization edges.</p>
+<p>Durability is the last step in the chain. Once Harbor Point sees <code>COMMIT</code> succeed, the correction must survive restart even if the updated heap or index pages are still only in memory. That is why the commit boundary sits on top of the WAL rules from <a href="../25/14.html">../25/14.md</a> and <a href="../25/15.html">../25/15.md</a>:</p>
+<div class="codehilite"><pre><span></span><code>BEGIN tx 9817
+  -&gt; take locks or snapshot
+  -&gt; create new row versions / page updates
+  -&gt; check constraints
+  -&gt; append WAL records
+  -&gt; flush commit record to durable media
+  -&gt; make changes visible and release coordination state
+</code></pre></div>
+
+<p>If the server crashes before the commit record is durable, recovery treats the transaction as aborted or incomplete. If it crashes after that point, redo can reconstruct the committed state even when data pages were not flushed yet. ACID is therefore not a slogan layered on top of the engine. It is the combined behavior of recovery, constraint enforcement, and concurrency control.</p>
+<h3>Concept 3: Transaction boundaries are also performance and operability boundaries</h3>
+<p>Every open transaction holds something the rest of the system cares about. In a lock-based engine it may hold row or predicate locks. In an MVCC engine it may pin old versions that vacuum cannot reclaim yet. In either design it generates WAL, delays some cleanup work, and enlarges the amount of state that has to be replayed or undone if the transaction aborts late.</p>
+<p>That is why "make the whole batch one transaction" is often the wrong production instinct. Suppose Harbor Point backfills 200,000 corrections after a feed repair and wraps the entire replay in one transaction. Atomicity looks attractive, but the side effects are severe: long lock retention, a large rollback surface if one row fails near the end, more version retention, and a burst of commit work when the final flush arrives. The right scope is usually "one transaction per invariant boundary," not "one transaction per job."</p>
+<p>Stronger guarantees also cost more under concurrency. Read Committed may permit anomalies that break a subtle invariant, while Serializable prevents more of them at the price of additional locking, validation, or abort-and-retry behavior. Durable commit has its own price because the engine must wait for the log to cross a real persistence boundary, even if group commit amortizes that wait across multiple clients.</p>
+<p>The operational signals worth watching come directly from that cost model:</p>
 <ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
+<li>lock wait time and deadlock count</li>
+<li>age of the oldest open transaction</li>
+<li>commit latency at the WAL flush boundary</li>
+<li>rollback or serialization-failure rate under load</li>
 </ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for transaction model and acid guarantees; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for transaction model and acid guarantees.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain strong correctness guarantees, but operationally absorb coordination overhead on high-concurrency workloads.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>Once those metrics move, transaction design stops being a purely logical topic. It becomes visible in tail latency, restart time, and application retry behavior. That is the production meaning of ACID in practice.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: transaction model and acid guarantees works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: "We used a transaction, but the exposure total is still wrong."</p>
+<p><strong>Why it happens / is confusing</strong>: Atomicity alone does not encode the invariant. The transaction can still commit an application bug, and weaker isolation can still allow anomalies if two sessions derive and write values concurrently.</p>
+<p><strong>Clarification / Fix</strong>: Put the invariant somewhere the engine can evaluate or protect, and choose an isolation level that matches the read/write pattern. <a href="02.html">02.md</a> picks up exactly where this confusion starts.</p>
+<p><strong>Issue</strong>: "The correction committed on the primary, but a read replica still shows the old value."</p>
+<p><strong>Why it happens / is confusing</strong>: Durability is about the commit node's persistence boundary. An asynchronous replica may still be replaying WAL and therefore lag behind a committed primary transaction.</p>
+<p><strong>Clarification / Fix</strong>: Separate local commit guarantees from replica-read guarantees. Use primary reads, synchronous replication, or session stickiness when the workflow requires read-your-writes behavior.</p>
+<p><strong>Issue</strong>: "Wrapping a huge batch in one transaction made the system slower, not safer."</p>
+<p><strong>Why it happens / is confusing</strong>: Large transactions retain locks or old versions for longer, enlarge the rollback surface, and create bigger bursts of commit and recovery work.</p>
+<p><strong>Clarification / Fix</strong>: Scope transactions to one coherent invariant boundary. If a backfill can be safely chunked, use smaller transactions with idempotent retry logic around the batch controller rather than one giant unit inside the database.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: transaction model and acid guarantees &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: transaction model and acid guarantees &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: Transaction model ↔ recovery manager</h3>
+<p>The transaction boundary only means anything because recovery can reconstruct it after a crash. Commit records, LSN ordering, redo, and sometimes undo are the bridge between "the client saw success" and "the database can prove that success after restart." That is why transaction design sits directly on top of the WAL and recovery mechanics from <a href="../25/14.html">../25/14.md</a> and <a href="../25/15.html">../25/15.md</a>.</p>
+<h3>Connection 2: ACID isolation ↔ serialization theory</h3>
+<p>Once multiple Harbor Point sessions update related quotes at the same time, "isolated enough" becomes a formal question rather than a slogan. The right tool is not intuition alone but dependency reasoning: which read-write and write-write edges are allowed, and when do they create a schedule that could not happen in any serial execution? That is the bridge into <a href="02.html">02.md</a>.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/tutorial-transactions.html">PostgreSQL Tutorial: Transactions</a><ul>
+<li>Focus: Review the SQL-level transaction boundary and map <code>BEGIN</code>, <code>COMMIT</code>, and <code>ROLLBACK</code> to the correction flow in this lesson.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Documentation: Transaction Isolation</a><ul>
+<li>Focus: See how the isolation letter of ACID becomes concrete guarantees and anomalies in a production engine.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://www.sqlite.org/atomiccommit.html">SQLite Atomic Commit</a><ul>
+<li>Focus: Study a detailed single-node implementation narrative for atomicity and durability.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging">ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging</a><ul>
+<li>Focus: Connect commit records, redo, and undo to a general-purpose transaction engine.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>A transaction is one state transition, not a bag of statements</strong> - The value of <code>BEGIN</code> and <code>COMMIT</code> is that visibility, rollback, and recovery all align around one outcome.</li>
+<li><strong>ACID letters come from different subsystems</strong> - Constraints, concurrency control, undo or hidden versions, and WAL each carry a different part of the contract.</li>
+<li><strong>Transaction scope determines system cost</strong> - Lock time, version retention, commit latency, and retry behavior all follow from where the boundary is drawn.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model transaction model and acid guarantees as explicit state transitions and invariants?</strong></p>
+<p><strong>Why is Harbor Point's three-statement correction flow unsafe under autocommit when viewed as one business action?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because autocommit disables WAL durability</li>
+<li>B) Because each statement becomes its own visibility and durability boundary, so crashes or timeouts can expose partial business state</li>
+<li>C) Because SQL cannot update more than one table correctly</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Which ACID letter is primarily about preserving declared invariants rather than about one specific storage mechanism?</strong></p>
 <ul>
-<li>A) Gaining strong correctness guarantees while paying coordination overhead on high-concurrency workloads.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Consistency</li>
+<li>B) Durability</li>
+<li>C) Atomicity</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Why can a transaction be durable even if the final heap and index pages were not flushed before the client saw <code>COMMIT</code> succeed?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Because durability only requires the client to retry after restart</li>
+<li>B) Because the commit record and its WAL records can be durable first, allowing recovery to replay the change later</li>
+<li>C) Because once a transaction starts, its pages are automatically persisted in the background before any failure</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves strong correctness guarantees, but that benefit is purchased with coordination overhead on high-concurrency workloads.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: Autocommit treats each statement as a separate transaction. The database can therefore preserve storage correctness while still exposing a half-applied business action to readers or crash recovery.</p>
+<p><strong>2. A</strong>: Consistency is about valid-before and valid-after states according to declared rules. Atomicity, isolation, and durability each address different parts of the problem.</p>
+<p><strong>3. B</strong>: Write-ahead logging makes the commit durable before every affected data page reaches its long-term location. Recovery can then redo the committed work after a crash.</p>
 
       
       <hr>
@@ -218,7 +179,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

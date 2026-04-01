@@ -22,183 +22,126 @@
     <main>
       <h1>Day 414: Hot/Cold Data Tiering and Working Set Control</h1>
 <blockquote>
-<p><strong>Hot/Cold Data Tiering and Working Set Control is valuable when integrated into end-to-end system decisions under production constraints.</strong></p>
+<p><strong>The core idea</strong>: Tiering works only when the engine protects the true working set and keeps the metadata that locates colder data on a fast path; moving bytes to cheaper storage without controlling promotions, cache pollution, and metadata locality just converts storage savings into unpredictable tail latency.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In data tiering internals, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How systems place data across memory, SSD, and object storage tiers. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding data tiering internals lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="13.html">13.md</a>, Harbor Point learned that dead MVCC versions can quietly occupy pages that should belong to live traffic. Vacuum helped, but the market-open slowdown did not disappear. The next bottleneck was retention. Harbor Point must keep seven years of reservation history for compliance, yet the matching and risk systems care almost entirely about today's open and recently filled reservations. When the quarterly surveillance job scanned older history, the fast tier and buffer pool were still being asked to host both the trading path and a mountain of data that almost never mattered to that path.</p>
+<p>That is the shift for this lesson: hot/cold tiering is not "archive old rows somewhere else." It is the discipline of deciding which physical pages, index levels, manifests, filters, and partition summaries must stay on the fastest media so the latency-sensitive workload does not keep rediscovering cold history. A system can retain all of its data and still behave as if only a small active footprint exists, but only if it treats the working set as a first-class design target.</p>
+<p>The common misconception is that age alone defines temperature. Harbor Point still replays some previous-day partitions constantly during risk checks, while some fresh compliance exports become cold almost immediately after landing. Temperature is therefore an operational property: how often the bytes are touched, how expensive a miss is, and whether a lookup can cheaply decide that the answer lives on a slower tier.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How systems place data across memory, SSD, and object storage tiers.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's retention policy is fixed, but its latency budget is not. Before tiering, one large historical scan could evict current-day index and heap pages, expand checkpoint pressure, and make every failover slower because the storage engine had to warm an enormous undifferentiated footprint. After tiering, the latest trading-day partitions, their hottest secondary indexes, and the metadata needed to route cold lookups stay on NVMe and in cache, while older immutable partitions move to cheaper SSD or object-backed storage. The result is not free performance. Cold reads become intentionally slower, and the engine needs background movement logic, promotion limits, and careful observability. But the system finally pays premium latency only for data that actually earns it.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind data tiering internals</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain what a storage working set really is</strong> - Distinguish the active physical footprint from the total logical dataset and from simple age-based retention buckets.</li>
+<li><strong>Trace how hot/cold tiering works inside an engine</strong> - Follow how data is classified, moved, and found again without making every cold lookup expensive.</li>
+<li><strong>Diagnose tiering failures in production</strong> - Identify cache pollution, metadata-locality problems, and promotion storms before they turn storage savings into user-facing latency spikes.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for data tiering internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to data tiering internals.</p>
-<p><strong>Intuition</strong>: data tiering internals exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain lower infrastructure cost at scale, but you pay with higher tail latency for cold reads.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of data tiering internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full data tiering internals pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Classify blocks by access frequency and recency</li>
-<li>Promote/demote data between tiers on policy triggers</li>
-<li>Preserve metadata locality for fast lookup of cold segments</li>
-<li>Expose tier hit ratios for operational tuning</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: The working set is a physical footprint, not a business label</h3>
+<p>At Harbor Point, the logical dataset is enormous: years of filled and canceled reservations, audit events, and surveillance extracts. The trading path, however, repeatedly touches a much smaller slice: today's open reservations, a short band of recently filled orders, the top levels of a few secondary indexes, and the metadata structures that describe where those records live. That slice is the working set. The storage engine pays latency in pages, blocks, and index fan-out, not in abstract rows or tables.</p>
+<p>This distinction matters because a single cold analytical scan can touch enough pages to displace the hot footprint even if it returns data no trading service will request again today. The problem is not that the historical query is illegitimate. The problem is that without explicit working-set control, the engine treats one-time scans and high-frequency operational lookups as equally deserving of the same premium cache and device space.</p>
+<p>The lesson from <a href="13.html">13.md</a> carries forward cleanly: dead versions were one way to bloat the hot footprint with bytes the foreground workload did not truly need. Hot/cold tiering tackles the next layer of the same problem by asking which live data should remain in the fastest tier and which live data can tolerate a slower path. In practice, temperature is estimated from a mix of recency, frequency, and miss cost. A partition that is six months old may still be hot if every risk recalculation touches it. A partition created this morning may already be cold if it exists only for a one-off export.</p>
+<p>The trade-off is direct. A smaller hot tier lowers cost and keeps the fast path dense, but every misclassified page raises the chance that a user request has to wait for a slower fetch or an emergency promotion. Tiering is valuable only when the latency-sensitive workload has a bounded, learnable footprint.</p>
+<h3>Concept 2: Real tiering systems move coarse data units and keep routing metadata hot</h3>
+<p>Very few engines move individual rows between storage classes on every access. The bookkeeping would be worse than the problem. Real systems usually tier at a coarser unit: a partition in a heap-oriented database, an SSTable in an LSM engine, or an immutable part or stripe in an analytical store. Harbor Point uses daily partitions for recent reservations and weekly immutable partitions once trading closes, which gives the storage layer something stable to classify and move.</p>
+<p>The internal loop looks roughly like this:</p>
+<div class="codehilite"><pre><span></span><code>foreground read
+  -&gt; consult hot partition map / sparse index / Bloom filter
+  -&gt; if data is on fast tier, serve normally
+  -&gt; if data is cold, fetch the needed block or segment
+  -&gt; optionally promote if repeated access justifies it
+
+background control loop
+  -&gt; collect hit-rate and recency signals
+  -&gt; demote cooled partitions or files to slower media
+  -&gt; pin top-level indexes, manifests, and filters on the fast tier
+  -&gt; throttle promotions so one burst does not displace the hot set
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for data tiering internals; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for data tiering internals.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain lower infrastructure cost at scale, but operationally absorb higher tail latency for cold reads.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>The subtle requirement is metadata locality. A cold lookup should not need three cold lookups just to discover where the real data lives. If the partition directory, sparse index, Bloom filter, or zone-map summary for an older partition is also cold, one user request can trigger multiple remote reads before it even knows whether the row exists. Good tiering therefore keeps the routing structures compact and warm, even when the data blocks themselves are far away.</p>
+<p>This is why systems such as RocksDB expose partitioned index and filter structures, and why relational systems often combine partitioning with carefully chosen local indexes rather than trying to tier one giant monolithic table file. The main trade-off is precision versus overhead. Fine-grained temperature tracking reacts better to mixed workloads, but it costs more CPU, metadata, and movement churn. Coarse-grained tiering is cheaper to manage, but it can strand moderately hot data on a slow tier or waste fast-tier space on partitions that are mostly cold.</p>
+<h3>Concept 3: Working-set control is mostly policy about what not to promote</h3>
+<p>Harbor Point's worst regressions came from cold scans that looked harmless in isolation. A compliance job reading eighteen months of reservations once per quarter did not need those pages to become part of the hot working set, yet a naive cache would happily admit them and evict current-day pages on the way. That is why working-set control is not only about demotion; it is also about refusing to let one-time traffic pollute the fast path.</p>
+<p>Production systems use several defenses. Scan-resistant admission policies keep sequential one-touch reads from displacing frequently reused blocks. Pinned or prewarmed structures keep the latest trading-day partitions and their top index levels resident after restart or failover. Promotion limits prevent a thundering herd of cold misses from copying an entire historical partition back to NVMe because one incident investigation suddenly touched it from many workers at once. Some systems also separate caches or I/O budgets by workload class so that analytics and operational traffic do not compete as if they had the same latency target.</p>
+<p>These controls all encode the same principle: misses are acceptable when they are rare, bounded, and intentional. They become dangerous when the system promotes too aggressively and teaches itself that every cold burst is now hot. The trade-off is that stronger admission and tighter promotion budgets can make legitimate exploratory analysis feel slower. That is usually the correct bargain for an operational store, but it has to be chosen explicitly and measured against real SLOs.</p>
+<p>This also sets up <a href="15.html">15.md</a>. Once data is spread across hot and cold tiers, an online schema migration can no longer assume one immediate rewrite of one local file. The migration has to preserve readable structure across tiers, often for a long overlap period.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: data tiering internals works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: Historical compliance queries still blow up market-open latency even after older partitions were moved to a colder tier.</p>
+<p><strong>Why it happens / is confusing</strong>: The cold bytes moved, but the read path still admits those fetched blocks into the main cache or promotes entire partitions back to the fast tier. The system saved storage money without protecting the working set.</p>
+<p><strong>Clarification / Fix</strong>: Use scan-resistant admission, non-promoting reads for one-off analytics, or workload-level cache isolation. Then verify that hot-partition hit rate stays stable while the cold query runs.</p>
+<p><strong>Issue</strong>: Point lookups into old reservations are much slower than expected, even though each lookup returns only one row.</p>
+<p><strong>Why it happens / is confusing</strong>: The real latency is often in the routing path, not the data row itself. If manifests, sparse indexes, or filters for cold partitions are also remote, each lookup pays several serial reads before the row fetch begins.</p>
+<p><strong>Clarification / Fix</strong>: Keep partition maps and summary metadata on a fast tier, and prefer tiering units that let one metadata check rule out large amounts of irrelevant cold data.</p>
+<p><strong>Issue</strong>: An age-based policy demoted partitions that the risk service still reuses heavily every morning.</p>
+<p><strong>Why it happens / is confusing</strong>: Age is only a proxy. Repeated read bursts can make yesterday's partition more valuable to the fast tier than a newer export that nobody will touch again.</p>
+<p><strong>Clarification / Fix</strong>: Classify temperature with recency plus observed reuse, and allow explicit pinning for business-critical slices whose access pattern is predictable but not well captured by simple aging.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: data tiering internals &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: data tiering internals &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: <a href="13.html">13.md</a> and this lesson are both about keeping irrelevant bytes out of the hot path</h3>
+<p>Vacuum removes obsolete versions that distort the physical footprint of a table. Tiering removes or isolates live but infrequently used data that would otherwise compete with the active working set. One lesson is about historical bytes that are no longer logically needed; the other is about logically valid bytes that are operationally cold. Both are working-set control problems.</p>
+<h3>Connection 2: <a href="15.html">15.md</a> turns tier placement into a schema-compatibility problem</h3>
+<p>Online schema migrations are harder once some data lives on a hot local tier and some lives in cold immutable storage. A new index or column layout may be cheap to build for today's partition and expensive to backfill for old partitions, so migration safety depends on dual-read compatibility and careful rollout boundaries rather than one immediate rewrite.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-buffer-pool.html">MySQL 8.4 Reference Manual: The InnoDB Buffer Pool</a><ul>
+<li>Focus: How a mainstream transactional engine defines, caches, and protects hot pages in memory.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/ddl-partitioning.html">PostgreSQL Documentation: Declarative Partitioning</a><ul>
+<li>Focus: Practical partition boundaries for keeping recent data small and separating colder ranges cleanly.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Block-Cache">RocksDB Wiki: Block Cache</a><ul>
+<li>Focus: Cache admission, eviction, and block-level working-set behavior in an LSM engine.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters">RocksDB Wiki: Partitioned Index/Filters</a><ul>
+<li>Focus: Why lookup metadata often needs to stay compact and hot even when most data files are cold.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/pgprewarm.html">PostgreSQL Documentation: pg_prewarm</a><ul>
+<li>Focus: A concrete mechanism for restoring a known hot working set after restart or failover.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Hot/cold tiering is a working-set decision, not a retention decision</strong> - The key question is which physical bytes deserve premium latency, not which rows are oldest.</li>
+<li><strong>Metadata locality is part of data locality</strong> - If the structures that locate cold data are themselves cold, every miss multiplies into a slow chain of lookups.</li>
+<li><strong>Promotion policy matters as much as placement policy</strong> - Systems fail when they eagerly teach themselves that every rare cold burst now belongs in the hot tier.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model data tiering internals as explicit state transitions and invariants?</strong></p>
+<p><strong>Why is an age-only tiering policy usually insufficient for a production operational store?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because age says nothing about whether a partition is still repeatedly reused by latency-sensitive queries</li>
+<li>B) Because hot data is always the newest data by definition</li>
+<li>C) Because storage engines cannot measure access frequency</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Why should manifests, sparse indexes, or Bloom filters often stay on the fast tier even when the underlying data blocks are cold?</strong></p>
 <ul>
-<li>A) Gaining lower infrastructure cost at scale while paying higher tail latency for cold reads.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Because metadata files are legally required to stay on the fastest device</li>
+<li>B) Because the engine needs a cheap way to route or reject a lookup without paying several serial cold reads first</li>
+<li>C) Because keeping metadata hot automatically makes all cold reads as fast as hot reads</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Harbor Point moves historical partitions to object-backed storage, but quarterly scans still destroy cache residency for today's orders. What is the most likely missing control?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) A stronger cache-admission or non-promoting-read policy for one-time scans</li>
+<li>B) More aggressive promotion of scanned cold partitions into the hot tier</li>
+<li>C) Disabling partitioning so the cache sees one larger table</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves lower infrastructure cost at scale, but that benefit is purchased with higher tail latency for cold reads.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. A</strong>: Age is only a rough signal. Real temperature depends on reuse and miss cost, so yesterday's partition may be hotter than a brand-new export nobody reads twice.</p>
+<p><strong>2. B</strong>: Good tiering keeps the routing path short. If the engine must fetch several cold metadata structures before it can find or reject a row, even tiny point lookups become expensive.</p>
+<p><strong>3. A</strong>: The storage classes changed, but the working-set policy did not. One-time scans need scan-resistant admission or non-promoting reads so they do not evict the hot trading path.</p>
 
       
       <hr>
@@ -218,7 +161,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

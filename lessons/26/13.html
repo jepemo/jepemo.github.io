@@ -22,183 +22,134 @@
     <main>
       <h1>Day 413: Vacuum and Garbage Collection of Old Versions</h1>
 <blockquote>
-<p><strong>Vacuum and Garbage Collection of Old Versions is valuable when integrated into end-to-end system decisions under production constraints.</strong></p>
+<p><strong>The core idea</strong>: An old MVCC version is reclaimable only after the oldest snapshot that could still see it has moved past it, so vacuum is really visibility-horizon management plus background storage cleanup.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In mvcc garbage collection, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How engines reclaim dead tuples without breaking snapshot isolation. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding mvcc garbage collection lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="12.html">12.md</a>, Harbor Point fixed a bad market-open query by refreshing planner statistics and modeling skew more accurately. The estimate improved, but the query was still slower than it had been a week earlier. <code>EXPLAIN ANALYZE</code> now looked reasonable, yet the index scan on <code>reservations</code> touched far more heap pages than expected, and the table kept growing even though the number of live rows was nearly flat.</p>
+<p>The missing piece was old-version cleanup. Harbor Point's matching workflow updates each reservation several times in a short burst: <code>open</code>, then <code>routed</code>, then <code>partially_filled</code>, then <code>filled</code> or <code>canceled</code>. In an MVCC engine, those updates do not overwrite one row in place from every reader's perspective. They create a new visible version while older versions remain part of history for any snapshot that started earlier. During a long-running risk report, one old snapshot stayed open for twenty minutes, so autovacuum could see obsolete versions piling up but could not yet reclaim many of them.</p>
+<p>That is the shift for this lesson: vacuum is not janitorial work that runs "when the database has time." It is a correctness-constrained mechanism that asks a strict question for every old version: can any active snapshot still legally read this? If the answer is yes, reclaiming it would break snapshot semantics. If the answer is no, leaving it around inflates the heap, bloats indexes, and drags more cold pages into the working set. Cleanup policy therefore sits directly between concurrency control and storage efficiency.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How engines reclaim dead tuples without breaking snapshot isolation.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's <code>reservations</code> table is not unusual by OLTP standards: heavy updates, short read queries, and occasional long analytics sessions that want a stable historical view. That combination is exactly where MVCC shines for readers and exactly where old-version debt becomes operationally expensive. A planner can have accurate statistics and a well-designed index, yet the real query still slows down because the engine is scanning through dead tuple versions, following stale index pointers, and caching pages whose only current purpose is to preserve history for one lingering snapshot.</p>
+<p>Understanding vacuum changes the diagnosis. Before, storage growth and rising latency look like vague "database slowness." After, you can distinguish between live-data growth, dead-version backlog, and file-level bloat that persists even after tuples become reusable. You can also reason about why a replica with an old read view, an idle transaction, or an underpowered background worker can quietly hold the reclaim horizon in place.</p>
+<p>That matters for correctness as well as performance. MVCC engines must eventually retire transaction metadata safely, or they risk wraparound-style failure modes where visibility information itself becomes ambiguous. Vacuum is therefore not optional polish. It is part of the mechanism that keeps old history readable long enough, then proves when it is safe to forget it.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind mvcc garbage collection</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain when an old row version becomes safe to reclaim</strong> - Connect tuple visibility to the oldest active snapshot rather than to the moment an update commits.</li>
+<li><strong>Trace what vacuum or purge work actually does inside the engine</strong> - Follow how the system identifies dead versions, cleans indexes or undo state, and returns space to reuse.</li>
+<li><strong>Diagnose production symptoms of cleanup debt</strong> - Separate horizon blockers, reusable free space, and true relation or index bloat when performance degrades.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for mvcc garbage collection</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to mvcc garbage collection.</p>
-<p><strong>Intuition</strong>: mvcc garbage collection exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain bounded storage growth and stable scan cost, but you pay with background IO and potential autovacuum lag.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of mvcc garbage collection</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full mvcc garbage collection pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Compute oldest active snapshot horizon</li>
-<li>Scan pages for tuples no longer visible to any transaction</li>
-<li>Mark free space map entries for reuse</li>
-<li>Coordinate with index cleanup to remove stale pointers</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: A version is dead only relative to every active snapshot, not just to the newest writer</h3>
+<p>Harbor Point updates reservation <code>R-18422</code> three times in quick succession during market open. From the application's point of view, there is one reservation whose status changed. Inside an MVCC engine, the history is closer to this:</p>
+<div class="codehilite"><pre><span></span><code>time ----&gt;
+
+v1: status=open           xmin=8401 xmax=8408
+v2: status=routed         xmin=8408 xmax=8412
+v3: status=partially_fill xmin=8412 xmax=inf
+
+snapshot S_old starts before 8408  -&gt; can still see v1
+snapshot S_mid starts before 8412  -&gt; can still see v2
+new snapshot starts after 8412     -&gt; sees v3
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for mvcc garbage collection; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for mvcc garbage collection.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain bounded storage growth and stable scan cost, but operationally absorb background IO and potential autovacuum lag.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>The key invariant is that each reader gets a consistent snapshot. A reader that started before transaction <code>8408</code> committed must still be able to read <code>v1</code> even after <code>v2</code> and <code>v3</code> exist. That is why old versions cannot be reclaimed at commit time. The engine needs a global visibility horizon, usually expressed as the oldest transaction ID or oldest read view that any active session still needs. Only versions older than that horizon, and already superseded from every relevant snapshot, are candidates for cleanup.</p>
+<p>PostgreSQL and InnoDB package the details differently, but the rule is the same. PostgreSQL stores version metadata with heap tuples and decides visibility from <code>xmin</code> and <code>xmax</code>. InnoDB keeps prior versions in undo records and exposes them through read views. The implementation differs; the correctness boundary does not. Garbage collection is blocked by the oldest snapshot that still makes an old version reachable.</p>
+<p>This is the fundamental trade-off of MVCC. Readers avoid blocking writers because they can walk historical versions instead of waiting for in-place overwrites to finish. The cost is deferred cleanup. Cheap, nonblocking reads are financed by background work that must later discover which history is still needed and which history can finally disappear.</p>
+<h3>Concept 2: Vacuum is a pipeline of classification, cleanup, and reuse metadata, not a single "delete old rows" step</h3>
+<p>When Harbor Point's autovacuum worker visits <code>reservations</code>, it is not simply erasing rows marked old. It has to inspect pages, classify tuple versions by visibility, and decide what kind of cleanup is safe now. In a PostgreSQL-like heap, the sequence is roughly:</p>
+<div class="codehilite"><pre><span></span><code>scan page
+  -&gt; determine which tuple versions are live, dead, or still potentially visible
+  -&gt; remove or mark removable index references for versions that are definitely dead
+  -&gt; mark heap space reusable
+  -&gt; refresh free-space / visibility metadata
+  -&gt; freeze very old transaction IDs when needed
+</code></pre></div>
+
+<p>Each stage serves a different purpose. Identifying a tuple as dead is about correctness. Cleaning an index entry is about preventing future probes from landing on a version no query can use. Updating free-space metadata is about helping later inserts and updates reuse holes instead of extending the file. Freezing very old transaction IDs is about keeping visibility checks well-defined as transaction counters age.</p>
+<p>Two production nuances matter here. First, vacuum often makes space reusable inside the relation long before the operating system sees a smaller file. If dead tuples are scattered across many pages, the engine can reuse those holes for future writes without being able to truncate the file tail. Second, a vacuum pass can do real work and still leave a table looking bloated if one old snapshot prevents many versions from crossing the reclaim horizon. "Vacuum ran" is therefore not the same statement as "cleanup succeeded."</p>
+<p>InnoDB expresses the same idea with different structures. Purge threads retire undo records and remove delete-marked records only after no read view can need them. Again, the important lesson is the mechanism: old-version cleanup touches both the history structure and the live access paths. It is not just housekeeping at the edge of the system; it changes read amplification for future transactions.</p>
+<h3>Concept 3: Vacuum debt becomes performance debt by inflating scans, indexes, and the working set</h3>
+<p>Harbor Point first noticed the problem in query latency, not in a vacuum dashboard. The live row count stayed near twelve million, but the heap and its hot indexes expanded well past that footprint because every burst of reservation updates created more dead versions than cleanup could reclaim. As the backlog grew, ordered index scans had to traverse more stale pointers, more heap pages lost their all-visible status, and cache residency shifted from currently tradable reservations toward pages that mostly existed to preserve old history.</p>
+<p>That is why vacuum tuning is not merely a storage-admin chore. It directly affects the size of the active working set. A dead version that remains on a frequently touched page can force extra visibility checks and deny index-only scans. A dead version on a cold page can keep the table file larger than it needs to be, increasing checkpoint and backup work. If the backlog becomes extreme, the engine may need emergency anti-wraparound cleanup that is far more disruptive than steady routine maintenance would have been.</p>
+<p>The operational levers map cleanly to the mechanism. If the horizon is pinned by a long transaction, fix the transaction lifecycle or the replica feedback policy. If cleanup simply cannot keep pace with write churn, adjust autovacuum or purge capacity and thresholds so maintenance starts earlier. If the workload creates avoidable version churn, redesign the table or update path so hot rows generate fewer non-HOT updates, or partition old data so the newest, most frequently updated slice stays compact. Those choices all cost something: more background I/O, more planning around transaction lifetimes, or more schema complexity.</p>
+<p>This also sets up <a href="14.html">14.md</a>. Hot and cold data tiering is much easier to reason about once you see that dead versions are a hidden kind of cold data occupying hot storage. If garbage collection lags, the engine's working set expands with pages that no current transaction actually wants.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: mvcc garbage collection works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: <code>VACUUM</code> completed, but the table file on disk barely shrank.</p>
+<p><strong>Why it happens / is confusing</strong>: Standard vacuum usually returns space to the relation's own free-space pool first. If free bytes are spread across the file instead of concentrated at the end, the engine can reuse them later without being able to truncate the file immediately.</p>
+<p><strong>Clarification / Fix</strong>: Check whether live-row count is stable while free space inside the relation is increasing. If the real problem is file-level bloat rather than reuse debt, you may need a rewrite-style operation, partition rotation, or reindexing in addition to routine vacuum.</p>
+<p><strong>Issue</strong>: Autovacuum keeps visiting a table, but dead tuples remain high for hours.</p>
+<p><strong>Why it happens / is confusing</strong>: The worker may be blocked by the visibility horizon rather than by lack of effort. A long transaction, an idle session left open in a transaction block, or a replica holding an old snapshot can make many versions ineligible for reclamation.</p>
+<p><strong>Clarification / Fix</strong>: Find the oldest active snapshot or read view before tuning worker cost limits. Removing the blocker usually releases more reclaimable space than simply making vacuum scan faster.</p>
+<p><strong>Issue</strong>: Query plans look reasonable again after <a href="12.html">12.md</a>, but index scans are still getting slower over time.</p>
+<p><strong>Why it happens / is confusing</strong>: Statistics quality and version cleanup solve different problems. The planner may now estimate row counts correctly while the physical access path still pays for dead index entries, wider heap footprint, and lost visibility-map coverage.</p>
+<p><strong>Clarification / Fix</strong>: Measure dead tuples, index bloat, and long-lived transactions alongside <code>EXPLAIN ANALYZE</code>. If estimates are accurate but page reads and heap fetches keep climbing, the bottleneck has shifted from planning error to cleanup debt.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: mvcc garbage collection &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: mvcc garbage collection &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: <a href="12.html">12.md</a> and this lesson share the same maintenance budget</h3>
+<p>Yesterday's lesson showed how stale or underspecified statistics cause cardinality errors. Today's lesson shows a different maintenance failure mode: even with fresh statistics, old-version debt can make the chosen plan more expensive to execute than its logical shape suggests. In production, analyze work and garbage collection often compete for the same background I/O and scheduling attention, so plan quality and cleanup quality frequently drift together.</p>
+<h3>Connection 2: <a href="14.html">14.md</a> turns cleanup lag into a working-set design problem</h3>
+<p>Vacuum debt is not only about wasted bytes. It decides which pages stay in active circulation and which indexes remain slim enough for cache-friendly access. The next lesson broadens that idea from tuple history to the full storage hierarchy: once you know dead versions can pollute the hot set, hot/cold tiering becomes an extension of the same control problem.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PostgreSQL Documentation: Routine Vacuuming</a><ul>
+<li>Focus: The operational model for ordinary vacuum, autovacuum thresholds, and why old snapshots or wraparound pressure change cleanup behavior.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/sql-vacuum.html">PostgreSQL Documentation: VACUUM</a><ul>
+<li>Focus: What the command actually does, including index cleanup, freezing, and the difference between routine vacuuming and more aggressive rewrite-style operations.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-vm.html">PostgreSQL Documentation: Visibility Map</a><ul>
+<li>Focus: Why page-level visibility metadata matters for vacuum efficiency and index-only scans.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html">MySQL 8.4 Reference Manual: InnoDB Multi-Versioning</a><ul>
+<li>Focus: A second engine's explanation of read views and old-version access, useful for seeing which MVCC cleanup ideas are general rather than PostgreSQL-specific.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html">MySQL 8.4 Reference Manual: Purge Configuration</a><ul>
+<li>Focus: How InnoDB's purge threads retire obsolete history and what tuning knobs exist when cleanup lags behind write workload.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Old versions disappear only after the oldest snapshot releases them</strong> - The reclaim boundary is a visibility rule, not a timer that starts when an update commits.</li>
+<li><strong>Vacuum changes future read cost, not just past storage usage</strong> - Cleaning heap history, index entries, and visibility metadata reduces the amount of dead state that later queries must step around.</li>
+<li><strong>Cleanup debt is both performance debt and correctness debt</strong> - If background reclamation falls behind, scans bloat first and transaction-ID safety problems arrive later.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model mvcc garbage collection as explicit state transitions and invariants?</strong></p>
+<p><strong>Why could Harbor Point's autovacuum see many obsolete reservation versions and still be unable to reclaim them yet?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because MVCC allows vacuum to remove versions only after the oldest active snapshot or read view no longer needs them</li>
+<li>B) Because autovacuum can reclaim rows only when the table is fully idle</li>
+<li>C) Because index scans automatically preserve all historical versions forever</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>What is the most accurate explanation for a successful routine vacuum that does not noticeably shrink the table file on disk?</strong></p>
 <ul>
-<li>A) Gaining bounded storage growth and stable scan cost while paying background IO and potential autovacuum lag.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Vacuum failed silently and did no useful work</li>
+<li>B) Vacuum often returns scattered free space to internal reuse before the engine can truncate file pages at the end</li>
+<li>C) Vacuum never affects space usage, only transaction visibility</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Harbor Point fixed row-estimation errors, but ordered index scans still get slower each day. Which diagnosis best matches this lesson?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) The only remaining cause can be a broken SQL parser</li>
+<li>B) The planner must always prefer a sequential scan after statistics are refreshed</li>
+<li>C) Cleanup debt is increasing physical read amplification even though logical plan choice has improved</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves bounded storage growth and stable scan cost, but that benefit is purchased with background IO and potential autovacuum lag.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. A</strong>: An old version remains part of valid history until no active snapshot can still see it. Vacuum can discover obsolete-looking versions before it is legally allowed to reclaim them.</p>
+<p><strong>2. B</strong>: Routine vacuum usually makes space reusable inside the relation first. File shrink requires enough free space at the end of the relation, or a more invasive rewrite/truncation path.</p>
+<p><strong>3. C</strong>: Statistics and garbage collection address different layers. Better estimates can fix plan choice while dead versions, stale index entries, and a wider heap still make execution more expensive.</p>
 
       
       <hr>
@@ -218,7 +169,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

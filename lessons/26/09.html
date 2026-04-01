@@ -22,183 +22,129 @@
     <main>
       <h1>Day 409: Secondary Indexes and Covering Strategies</h1>
 <blockquote>
-<p><strong>Secondary Indexes and Covering Strategies matters most when you can reason about failure modes, invariants, and trade-offs.</strong></p>
+<p><strong>The core idea</strong>: Once <a href="08.html">08.md</a> makes secondary-index maintenance crash-safe, the next question is why the engine keeps those extra trees at all: a secondary index gives the table another search order, and a covering index works only when carrying extra payload in the leaf pages is cheaper than repeated trips back to the base rows.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In secondary index internals, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How non-clustered indexes interact with base table lookups. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding secondary index internals lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>At Harbor Point, the reservations table is physically organized by <code>reservation_id</code> because inserts arrive in commit order and the primary key is stable. That layout is fine for fetching one reservation by ID. It is terrible for the desk lead's opening dashboard query: "show all <code>open</code> reservations for issuer <code>MUNI-77</code>, newest first, with quantity and limit price." The heap pages are not arranged by issuer or status, so without another access path the engine must scan large parts of the table just to find a small working set.</p>
+<p>A secondary index is that extra access path. It is not a duplicate table and it is not merely a faster lookup cache. It is a second ordered structure whose leaf entries map a different key, such as <code>(issuer, status)</code>, back to the base row. The index lets the engine jump directly to "all open <code>MUNI-77</code> reservations," but the leaf entry usually contains only the search key plus a row locator, so the engine still has to visit the heap or clustered primary record to fetch the rest of the columns and confirm visibility.</p>
+<p>That is where covering changes the design. If Harbor Point extends the leaf entry to also carry <code>quantity</code>, <code>limit_price</code>, and <code>submitted_at</code>, many dashboard reads can be satisfied from the index pages alone. The read path gets shorter, but the index pages become wider, splits happen sooner, memory residency changes, and every write now has more bytes to maintain and recover. The win is real only when those read savings outweigh the extra write and storage cost.</p>
+<p>The misconception to drop is "using an index means the table is no longer involved." Sometimes it still is, because the index only narrows candidate rows. Sometimes it is not, because the index covers the query. Production tuning depends on knowing which of those two worlds you are actually in.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How non-clustered indexes interact with base table lookups.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's market-open dashboard is read-heavy for fifteen minutes and then mostly irrelevant for the rest of the day. During that burst, traders repeatedly filter by issuer and status, sort by recency, and project only a handful of fields. If the engine answers that query through a secondary index that still forces thousands of heap visits, the plan can look "indexed" in the query output while tail latency remains dominated by random page reads and buffer misses.</p>
+<p>The obvious reaction is to add more indexes or to widen the existing one until the dashboard becomes index-only. That helps reads, but it pushes cost onto the write path. Every new reservation, cancellation, or quantity update must now modify the base row and one or more secondary structures. Those modifications generate WAL, can trigger page splits, enlarge the working set, and make recovery responsible for more page families than the heap alone.</p>
+<p>This trade-off is production-critical because the wrong index design often fails asymmetrically. Benchmarks over a warm cache make the read path look excellent, while the live system later shows slower inserts, more vacuum or purge work, or unstable plans once the index grows beyond memory. Understanding secondary indexes and covering strategies is how you decide whether you are solving the real bottleneck or moving it.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind secondary index internals</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain what a secondary index stores and why it needs indirection</strong> - Describe how a non-primary search structure maps alternate keys back to base rows.</li>
+<li><strong>Analyze when an index actually covers a query</strong> - Distinguish between an index-assisted plan that still needs heap lookups and a plan that can return projected columns from the index leaf pages.</li>
+<li><strong>Evaluate the production trade-off</strong> - Reason about when lower read latency is worth the added write amplification, storage growth, and maintenance burden.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for secondary index internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to secondary index internals.</p>
-<p><strong>Intuition</strong>: secondary index internals exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain faster targeted query execution, but you pay with extra write amplification on updates.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of secondary index internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full secondary index internals pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Store key to row-identifier mapping in secondary structure</li>
-<li>Use predicate selectivity to choose index vs scan</li>
-<li>Avoid heap lookups with covering index columns</li>
-<li>Maintain index entries atomically with base-row updates</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: A secondary index is an alternate order over the table, not a second copy of it</h3>
+<p>The Harbor Point heap is organized for durable row storage, not for every predicate the application might issue. When the desk asks for open reservations by issuer, the engine needs a way to navigate by <code>(issuer, status)</code> even though the base table is laid out by <code>reservation_id</code>. A secondary index solves that by storing entries ordered by the secondary key and pointing each entry back to the row.</p>
+<p>For a B-tree implementation, the leaf entry usually looks conceptually like this:</p>
+<div class="codehilite"><pre><span></span><code>secondary key                    row locator
+---------------------------------------------------------
+(&quot;MUNI-77&quot;, &quot;open&quot;, 2026-03-31) -&gt; heap TID 842:17
+(&quot;MUNI-77&quot;, &quot;open&quot;, 2026-03-31) -&gt; heap TID 844:03
+(&quot;MUNI-77&quot;, &quot;open&quot;, 2026-03-31) -&gt; heap TID 850:91
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for secondary index internals; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for secondary index internals.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain faster targeted query execution, but operationally absorb extra write amplification on updates.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>The row locator is engine-specific. PostgreSQL stores a tuple ID that points into the heap. InnoDB stores the primary-key value because the primary key itself defines the clustered storage order. The important mechanism is the same: the secondary structure narrows the candidate set, then another lookup reaches the full row.</p>
+<p>That indirection exists because duplicating the whole row into every secondary index would make writes and recovery explode. Harbor Point already learned in <a href="08.html">08.md</a> that every page the engine mutates must participate in WAL and recovery. If each issuer/status index entry tried to be a full record copy, a simple quantity change would fan out into much heavier page churn. Secondary indexes stay compact by default and pay the extra heap visit only when the query needs more data.</p>
+<p>The production trade-off is therefore structural. A secondary index speeds predicates on columns that are not the storage order, but it introduces another tree whose pages must be cached, split, vacuumed, checkpointed, and recovered. That is usually worthwhile, but it is never free.</p>
+<h3>Concept 2: Covering is about eliminating base-row fetches for a specific query shape</h3>
+<p>Harbor Point's dashboard projects four columns: <code>issuer</code>, <code>status</code>, <code>quantity</code>, and <code>limit_price</code>, then sorts recent open reservations by <code>submitted_at</code>. If the index key is only <code>(issuer, status)</code>, the engine can find candidate rows quickly but still has to fetch each matching reservation from the heap or clustered primary record to get <code>quantity</code>, <code>limit_price</code>, and often <code>submitted_at</code>. That means thousands of random lookups when the result set is large.</p>
+<p>A covering strategy changes the leaf payload so the requested columns are already present where the search lands. In SQL terms, Harbor Point might use an index shaped like:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_reservations_issuer_status</span>
+<span class="k">ON</span><span class="w"> </span><span class="n">reservations</span><span class="w"> </span><span class="p">(</span><span class="n">issuer</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">submitted_at</span><span class="w"> </span><span class="k">DESC</span><span class="p">)</span>
+<span class="n">INCLUDE</span><span class="w"> </span><span class="p">(</span><span class="n">quantity</span><span class="p">,</span><span class="w"> </span><span class="n">limit_price</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Now the index leaf can satisfy the filter, the order, and the projected columns for that dashboard query. The engine can walk the leaf range for <code>("MUNI-77", "open")</code> and emit rows directly from index pages instead of bouncing back into the heap for every match.</p>
+<p>But "covering" is not identical across engines. PostgreSQL can perform an index-only scan only when the needed columns are present and the visibility map says the referenced heap pages are all-visible; otherwise it still consults the heap for MVCC visibility. InnoDB stores the primary key in every secondary leaf, so a secondary lookup still becomes a second B-tree traversal unless the projected columns are fully available in the secondary index entry. The mechanical lesson is that coverage is about the physical read path, not merely the SQL definition.</p>
+<p>The trade-off shows up inside the leaf pages. Adding <code>quantity</code> and <code>limit_price</code> makes each entry wider, which reduces fan-out, increases tree height sooner, and makes cache pressure worse. A covering index is excellent for a small, repetitive query surface like Harbor Point's desk dashboard. It is a poor default if the included columns are wide, volatile, or rarely queried together.</p>
+<h3>Concept 3: The read win from covering must be balanced against write amplification and lifecycle cost</h3>
+<p>Suppose Harbor Point adds the covering index above and the dashboard p95 drops from <code>180 ms</code> to <code>22 ms</code>. That is a real gain, but the engine has also changed the write path for every reservation event. Inserts add a new heap row plus a new secondary leaf entry. Updates that touch indexed key columns may delete and reinsert index entries. Even updates that touch only included columns still have to rewrite the leaf payload. Each of those changes generates WAL and may trigger page splits or extra purge work later.</p>
+<p>This is why secondary-index design belongs in storage-engine reasoning, not just query tuning. Wider leaf pages mean fewer entries per page, which makes checkpoint I/O and cache residency less forgiving. More secondary structures also widen the blast radius of recovery: a crash during a quantity update must reconcile both heap and index pages correctly, or Harbor Point risks an index that points to an old value or a row that has no matching search entry. The recovery invariants from <a href="08.html">08.md</a> are still active here; there are simply more pages participating.</p>
+<p>Operationally, the best covering strategy is tightly scoped. Harbor Point should cover the market-open dashboard because the read pattern is stable, latency-sensitive, and projects a narrow set of columns. It should not automatically cover ad hoc back-office queries with ten wide attributes, because that would drag a specialized access path into the hot write workload. Production index design is selective on purpose.</p>
+<p>This lesson also sets up the next one. Once you accept that the index key defines the search order and that coverage is a separate leaf-payload decision, the next design question is how to order multiple key columns so the planner gets good selectivity, sorting support, and prefix reuse. That is the job of <a href="10.html">10.md</a>.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: secondary index internals works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: The query plan says <code>Index Scan</code>, but latency is still high.</p>
+<p><strong>Why it happens / is confusing</strong>: An index scan can still perform thousands of heap or clustered-primary lookups after finding candidate keys. The plan is using the index to narrow the search, not to answer the query entirely from index pages.</p>
+<p><strong>Clarification / Fix</strong>: Check whether the projected columns and ordering are covered by the index, and inspect buffer activity. If heap fetches dominate, a covering strategy may help. If the predicate is simply not selective enough, the real issue may be key order, which <a href="10.html">10.md</a> addresses.</p>
+<p><strong>Issue</strong>: Adding included columns made writes slower and the index much larger.</p>
+<p><strong>Why it happens / is confusing</strong>: Covering improves reads by widening leaf entries. Wider entries reduce fan-out, increase split frequency, and enlarge the memory footprint of the tree.</p>
+<p><strong>Clarification / Fix</strong>: Cover only the columns needed by a stable, high-value query shape. Remove speculative included columns that do not save enough heap reads to justify their storage and maintenance cost.</p>
+<p><strong>Issue</strong>: A supposedly index-only plan still touches the heap in PostgreSQL.</p>
+<p><strong>Why it happens / is confusing</strong>: Coverage of projected columns is necessary but not sufficient. PostgreSQL also needs visibility information proving the heap pages are all-visible; otherwise it must check the heap tuple for MVCC correctness.</p>
+<p><strong>Clarification / Fix</strong>: Inspect visibility-map health and vacuum behavior. The index may be structurally covering, but MVCC visibility rules from <a href="05.html">05.md</a> can still require heap access.</p>
+<p><strong>Issue</strong>: Secondary indexes seem to multiply recovery time after a crash.</p>
+<p><strong>Why it happens / is confusing</strong>: Every insert, delete, and update affecting indexed columns creates additional page updates and WAL records beyond the heap change itself. Recovery has more history to replay and more page state to reconcile.</p>
+<p><strong>Clarification / Fix</strong>: Audit whether each secondary index serves a real workload. Unused or marginal indexes are not harmless metadata; they are recurring write and recovery work.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: secondary index internals &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: secondary index internals &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: <a href="05.html">05.md</a> explains why "covering" does not always mean "heap-free"</h3>
+<p>MVCC snapshots decide which row versions are visible, and some engines cannot prove visibility from the secondary index entry alone. That is why a query can be structurally covered yet still touch the base row. Secondary-index design and visibility rules are coupled, not independent topics.</p>
+<h3>Connection 2: <a href="08.html">08.md</a> explains why secondary indexes must be maintained with the same crash-safety discipline as heap pages</h3>
+<p>An insert into Harbor Point's reservations table is not durable merely because the heap row can be redone. If the secondary leaf entry for <code>(issuer, status)</code> is missing or half-applied after recovery, the query path is wrong even though the base row exists. Secondary indexes are part of the committed state, so they inherit WAL, redo, and undo obligations.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/indexes-index-only-scans.html">PostgreSQL Documentation: Index-Only Scans and Covering Indexes</a><ul>
+<li>Focus: How covering works in PostgreSQL, including why MVCC visibility can still force heap checks.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html">MySQL 8.4 Reference Manual: Clustered and Secondary Indexes</a><ul>
+<li>Focus: How InnoDB stores secondary entries and why a secondary lookup typically requires a second traversal through the clustered primary key.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://www.sqlite.org/queryplanner.html#covidx">SQLite Query Planner: Covering Indexes</a><ul>
+<li>Focus: A compact explanation of why returning data directly from the index can remove extra table lookups.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://www.oreilly.com/library/view/database-internals/9781492040330/">Database Internals</a><ul>
+<li>Focus: Storage-engine trade-offs around B-trees, page layout, and index maintenance cost.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>A secondary index is an alternate search order with indirection</strong> - Its normal job is to narrow the candidate rows quickly, not to replace the base table entirely.</li>
+<li><strong>Covering is a physical read-path optimization</strong> - A query is truly covered only when the engine can satisfy filtering, ordering, projection, and visibility requirements without repeated base-row fetches.</li>
+<li><strong>Read speed is purchased with write and recovery work</strong> - Every extra or wider secondary index adds page churn, WAL volume, cache pressure, and operational maintenance cost.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model secondary index internals as explicit state transitions and invariants?</strong></p>
+<p><strong>Why does Harbor Point's <code>(issuer, status)</code> secondary index still need a row locator instead of storing the full reservation by default?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because secondary indexes are only allowed to store keys and no references</li>
+<li>B) Because keeping entries compact reduces write amplification and lets the engine fetch the full row only when needed</li>
+<li>C) Because SQL requires every index to ignore non-key columns permanently</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>When is Harbor Point's dashboard query genuinely covered by its secondary index?</strong></p>
 <ul>
-<li>A) Gaining faster targeted query execution while paying extra write amplification on updates.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) As soon as the planner chooses any <code>Index Scan</code></li>
+<li>B) Only when the needed filter, order, projected columns, and engine-specific visibility checks can be satisfied from the index path without repeated base-row fetches</li>
+<li>C) Only when the table has no primary key</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>What is the main production downside of widening a secondary index to cover more queries?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) The index becomes logically incorrect for crash recovery</li>
+<li>B) The engine can no longer use the index for range scans</li>
+<li>C) Leaf entries grow, which increases storage, write amplification, and cache pressure even if reads become faster</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves faster targeted query execution, but that benefit is purchased with extra write amplification on updates.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: Secondary indexes stay compact by storing the alternate search key plus a row locator. That design preserves read speed without turning every secondary structure into a full duplicate of the table.</p>
+<p><strong>2. B</strong>: Coverage is about the actual physical read path. The index must provide the needed columns and ordering, and the engine must be able to satisfy visibility rules without repeatedly returning to the base row.</p>
+<p><strong>3. C</strong>: Covering widens the leaf payload. That can save heap lookups for important queries, but it also increases maintenance work on every write and makes the tree harder to keep hot in memory.</p>
 
       
       <hr>
@@ -218,7 +164,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

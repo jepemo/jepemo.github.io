@@ -22,183 +22,139 @@
     <main>
       <h1>Day 408: Recovery Correctness and Idempotent Redo</h1>
 <blockquote>
-<p><strong>Recovery Correctness and Idempotent Redo becomes practical when you can trace each internal step to an operational effect.</strong></p>
+<p><strong>The core idea</strong>: Once <a href="07.html">07.md</a> makes WAL durable before dirty pages outrun it, crash recovery becomes correct only if redo can be repeated safely after any number of restarts and undo can resume without losing track of unfinished work.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In recovery idempotence and correctness, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: Why redo must be repeatable and undo must be bounded. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding recovery idempotence and correctness lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>At Harbor Point, trader <code>R1</code> committed a <code>0.5M</code> reservation for <code>MUNI-77</code> and received success from the database. Trader <code>R2</code> started a second reservation against the same issuer, dirtied a heap page and an index page, and then the primary lost power before <code>R2</code> committed. When the node comes back, the storage engine is staring at a mixed world: some committed effects exist only in WAL, some uncommitted effects may already have reached disk because the engine uses <code>steal</code>, and the crash might happen again in the middle of recovery itself.</p>
+<p>That last part is the mental shift. Recovery is not a one-shot cleanup script that gets to run in perfect conditions. It is another crashable execution path. If redo simply "replays everything after the checkpoint," the same log record could be applied twice after repeated restarts and a reservation could be counted twice. If undo only keeps in-memory progress, the second crash can strand half-undone work and force the engine to guess which effects still need to be reversed.</p>
+<p>ARIES-style recovery solves this by turning recovery into a set of durable invariants. Redo repeats history, but it is idempotent because each page says how far into the WAL it already reflects through <code>pageLSN</code>. Undo is bounded because compensation log records, or CLRs, make the progress of rollback itself durable. The lesson is not "recovery is complicated." It is that recovery is only trustworthy when every recovery action can survive being interrupted and started again.</p>
+<p>The common misconception is that redo means "blindly write every logged change again." Real engines do not do that. They use WAL ordering from <a href="07.html">07.md</a>, page-local LSN checks, and undo metadata so restart after restart converges on the same committed state instead of drifting further away from it.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: Why redo must be repeatable and undo must be bounded.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point opens into a burst of reservations, checkpoint pressure, and dirty pages. In that environment, the engine cannot afford a <code>force</code> policy that flushes every touched page on every commit, so it relies on <code>steal/no-force</code>: committed changes may still be only in WAL at crash time, and uncommitted changes may already be on disk. That design keeps normal-path latency reasonable, but it means crash recovery is not optional bookkeeping. It is the mechanism that decides whether the post-crash book matches the promises already made to traders.</p>
+<p>If recovery correctness is weak, the failure modes are severe and confusing. A committed reservation may disappear because redo skipped too much. An aborted reservation may survive because undo lost its place. Worse, the first recovery attempt can appear to work, while the second crash during recovery exposes double-applied updates or an endless rollback loop. Those are production failures that often surface only under the worst operational timing.</p>
+<p>When recovery is designed correctly, Harbor Point can tolerate ugly restart sequences without inventing new history. Winners stay committed, losers are removed, and a second crash during restart only lengthens recovery time; it does not change the final answer. That is the real production benefit of idempotent redo.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind recovery idempotence and correctness</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain what recovery correctness guarantees after a crash</strong> - Distinguish committed effects that must survive from uncommitted effects that must be removed in a <code>steal/no-force</code> engine.</li>
+<li><strong>Trace why redo is idempotent instead of merely repeatable</strong> - Use <code>LSN</code> and <code>pageLSN</code> to decide when a redo record should be applied or skipped after one or more crashes.</li>
+<li><strong>Reason about bounded undo in production terms</strong> - Explain why CLRs and undo chains are necessary when recovery itself can be interrupted.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for recovery idempotence and correctness</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to recovery idempotence and correctness.</p>
-<p><strong>Intuition</strong>: recovery idempotence and correctness exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain safe restart after repeated failures, but you pay with longer and more complex log sequences.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of recovery idempotence and correctness</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full recovery idempotence and correctness pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Check pageLSN before applying redo record</li>
-<li>Skip already-applied operations safely</li>
-<li>Emit compensation records during undo</li>
-<li>Guarantee each loser transaction is undone exactly once logically</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: Recovery correctness starts by reconstructing which work is durable and which work is merely present</h3>
+<p>At the moment of the Harbor Point crash, the disk is allowed to be inconsistent in a very specific way. The WAL may contain <code>R1</code>'s update and commit record even if the heap page for the reservation is still old on disk. Meanwhile, the buffer manager may have flushed one of <code>R2</code>'s dirty pages early to relieve memory pressure even though <code>R2</code> never committed. That combination sounds alarming until you remember that <code>steal/no-force</code> is deliberately shifting complexity away from the commit path and into recovery.</p>
+<p>The first recovery question is therefore not "which bytes are on disk?" but "which transactions had reached a durable commit point, and which pages might still need work?" In ARIES terms, analysis walks the WAL from the last checkpoint, rebuilds the transaction table, and reconstructs a dirty page table. For Harbor Point, analysis concludes that <code>R1</code> is a winner because its commit record is durable, while <code>R2</code> is a loser because the crash happened first.</p>
+<p>You can picture the pre-crash history like this:</p>
+<div class="codehilite"><pre><span></span><code>LSN 9810240  UPDATE heap page 842   reserve 0.5M MUNI-77 for R1
+LSN 9810248  UPDATE index page 119  add open-reservation entry for R1
+LSN 9810312  COMMIT R1
+LSN 9810400  UPDATE heap page 842   provisional reserve 0.3M MUNI-77 for R2
+LSN 9810416  UPDATE index page 119  provisional entry for R2
+CRASH
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for recovery idempotence and correctness; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for recovery idempotence and correctness.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain safe restart after repeated failures, but operationally absorb longer and more complex log sequences.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>Recovery correctness means the post-restart database must contain both of <code>R1</code>'s effects and none of <code>R2</code>'s effects, regardless of which dirty pages happened to reach disk before the crash. That is why analysis needs both the durable transaction state and the earliest LSN from which redo must start. Without that bookkeeping, the engine would either redo too little and lose committed work or redo too much without a plan to clean up losers afterward.</p>
+<p>The trade-off is straightforward: <code>steal/no-force</code> improves steady-state throughput and commit latency, but it forces the engine to maintain enough recovery metadata to distinguish "durably committed," "written early," and "still needs undo." Fast commit is purchased with a more disciplined restart path.</p>
+<h3>Concept 2: Idempotent redo works because each page can prove whether it already absorbed a log record</h3>
+<p>Redo in ARIES repeats history, including updates from loser transactions, before undo removes the losers. That sounds wasteful until you look at why it works. The redo pass is not trying to reason transaction by transaction about the final answer. It is trying to restore pages to the exact state implied by the WAL prefix that existed at crash time. Only after that stable page state is rebuilt does undo walk backward through loser transactions.</p>
+<p>The reason redo can be repeated safely is the <code>pageLSN</code> contract from <a href="07.html">07.md</a>. For every redo record targeting a page, recovery compares the record's LSN with the <code>pageLSN</code> stored on the page image currently on disk. If the page already has <code>pageLSN &gt;= redo_lsn</code>, that change is already present and redo skips it. If the page is behind, recovery reapplies the change and advances the page's <code>pageLSN</code>.</p>
+<p>For Harbor Point's heap page 842, the decision is local and mechanical:</p>
+<div class="codehilite"><pre><span></span><code>redo record: LSN 9810400 -&gt; provisional reserve for R2 on page 842
+
+if disk.pageLSN &gt;= 9810400:
+    skip
+else:
+    apply update
+    set pageLSN = 9810400
+</code></pre></div>
+
+<p>Now imagine the database crashes again halfway through recovery. On the first restart, redo already restored page 842 and flushed it with <code>pageLSN = 9810400</code>, but recovery had not yet reached page 119. On the second restart, the engine reads the same WAL again. Page 842 now proves that <code>LSN 9810400</code> is already reflected, so the record is skipped. Page 119 may still need its redo. That is idempotence in the storage-engine sense: recovery can repeat the same scan and converge instead of amplifying the change.</p>
+<p>This page-local rule is why WAL correctness has to cover every page family, not just the heap. If Harbor Point logs the heap insertion for <code>R1</code> correctly but misses the index-page update or fails to maintain <code>pageLSN</code> on a split index page, a repeated restart can leave the base table and index disagreeing about which reservations exist. Idempotent redo is not a slogan; it is a per-page proof obligation.</p>
+<h3>Concept 3: Undo must be bounded so recovery can make forward progress even when rollback is interrupted</h3>
+<p>After redo, Harbor Point's pages reflect the full pre-crash history, including <code>R2</code>'s provisional reservation and index entry. Recovery still is not complete, because losers must be undone. The naive rollback plan would be "walk backward through <code>R2</code>'s log records, reverse each change, and hope the machine stays up." That plan fails under repeated crashes because the engine can lose track of which undo actions were already completed.</p>
+<p>CLRs solve that by logging the fact that an undo step happened. When recovery removes <code>R2</code>'s index entry from page 119, it emits a CLR describing that compensation and pointing to the next older log record that still needs undo. If the machine crashes immediately afterward, the next recovery run sees the CLR in WAL and knows not to re-undo the index entry blindly; it resumes from the recorded <code>undoNextLSN</code>. In other words, rollback progress becomes durable just like forward progress.</p>
+<p>For Harbor Point, a bounded undo chain might look like this:</p>
+<div class="codehilite"><pre><span></span><code>LSN 9810508  CLR for undo of R2 index entry on page 119, undoNextLSN=9810400
+LSN 9810520  CLR for undo of R2 heap reservation on page 842, undoNextLSN=null
+</code></pre></div>
+
+<p>The operational payoff is subtle but important. During a bad morning, Harbor Point may crash once from the original power event and again because recovery saturates I/O on a fragile node. With CLRs, each restart continues shrinking the remaining undo set. Without them, the same loser transaction can force recovery to revisit the same rollback work again and again, stretching restart time unpredictably or even leaving operators unsure whether progress is real.</p>
+<p>The trade-off is more WAL traffic and more recovery metadata. Every undo action now generates its own durable record. Production engines accept that cost because "rollback eventually finishes, even if recovery crashes" is a far stronger guarantee than "rollback is simple when nothing else goes wrong." The same discipline becomes even more important once a single transaction updates both data pages and secondary index pages, which is where <a href="09.html">09.md</a> goes next.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: recovery idempotence and correctness works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: A committed change is missing after crash recovery, even though the application received commit success.</p>
+<p><strong>Why it happens / is confusing</strong>: Engineers often inspect the data file and assume the page should have been flushed before commit. In a <code>no-force</code> engine, the durable guarantee comes from WAL, so the page image may legitimately be stale at crash time.</p>
+<p><strong>Clarification / Fix</strong>: Verify that the commit record and required redo records were present in durable WAL and that recovery started redo early enough. Missing committed effects usually point to a bad redo start point or an incorrect page-level skip check, not to the lack of an immediate data-page flush.</p>
+<p><strong>Issue</strong>: Crash drills appear to "replay the same WAL twice," and the team worries that redo is duplicating rows.</p>
+<p><strong>Why it happens / is confusing</strong>: Recovery may scan the same WAL records on every restart, especially if the first recovery itself crashes. That is normal. The correctness question is whether page-level checks make repeated scans harmless.</p>
+<p><strong>Clarification / Fix</strong>: Inspect <code>pageLSN</code> behavior on the affected heap and index pages. If <code>pageLSN</code> advances when redo applies and later restarts skip records whose LSN is already reflected, repeated redo is working as designed.</p>
+<p><strong>Issue</strong>: Recovery time grows sharply when the crash happened during rollback of a large transaction.</p>
+<p><strong>Why it happens / is confusing</strong>: Undo is doing real work and can itself be interrupted. If compensation records are missing or the undo chain is hard to resume, every restart reopens old rollback work instead of continuing from the remaining frontier.</p>
+<p><strong>Clarification / Fix</strong>: Check whether CLRs are being generated for undo actions and whether <code>undoNextLSN</code> chains are intact. Bounded undo depends on making rollback progress durable.</p>
+<p><strong>Issue</strong>: The base table is correct after restart, but a secondary index still contains stale entries.</p>
+<p><strong>Why it happens / is confusing</strong>: Teams sometimes validate WAL and redo behavior on heap pages only. Secondary indexes have their own page images, split records, and <code>pageLSN</code> values, so they need the same recovery discipline.</p>
+<p><strong>Clarification / Fix</strong>: Audit WAL coverage for every page mutation involved in index maintenance, including structural changes such as page splits. Recovery correctness is only as strong as the weakest page type it logs.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: recovery idempotence and correctness &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: recovery idempotence and correctness &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: The WAL ordering rule from <a href="07.html">07.md</a> is the prerequisite for idempotent redo</h3>
+<p>Yesterday's lesson established that a dirty page cannot legally reach disk before the WAL that explains it is durable. Today's lesson depends on that rule. <code>pageLSN</code> only means something if the log prefix up to that LSN is guaranteed to exist on stable storage. Without WAL-first ordering, redo would compare pages to a timeline that might be missing the records needed to reconstruct them.</p>
+<h3>Connection 2: Database redo and replicated-log replay share the same need for repeatable apply</h3>
+<p>State-machine replication systems such as Raft also replay a log after restart, but they usually reason in terms of a single applied index for the whole state machine. Storage engines need a more granular form because persistence is page-oriented and partially flushed. <code>pageLSN</code> is the page-local analogue of "last applied log index": it lets Harbor Point skip already-applied history on one page while continuing replay on another page that is still behind.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[PAPER] <a href="https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging">ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging</a><ul>
+<li>Focus: The original description of analysis, redo, undo, compensation log records, and why repeating history makes recovery correct.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-intro.html">PostgreSQL Documentation: Reliability and the Write-Ahead Log</a><ul>
+<li>Focus: How a production engine relies on WAL durability first and later replays changes after a crash.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PostgreSQL Documentation: Database Page Layout</a><ul>
+<li>Focus: The page-header fields, including the page LSN, that let recovery decide whether a page is already up to date.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-recovery.html">MySQL Reference Manual: InnoDB Recovery</a><ul>
+<li>Focus: A second production implementation of redo and undo recovery, useful for comparing the same invariants across engines.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Recovery correctness is about committed history, not raw disk contents</strong> - In a <code>steal/no-force</code> engine, pages on disk can contain too little or too much until recovery reconciles them with WAL.</li>
+<li><strong>Redo is idempotent because the page participates in the proof</strong> - <code>pageLSN</code> lets recovery ask a local yes-or-no question for each page instead of guessing globally whether a log record already took effect.</li>
+<li><strong>Undo must log its own progress</strong> - CLRs turn rollback from a fragile in-memory procedure into a crash-safe process that eventually finishes.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model recovery idempotence and correctness as explicit state transitions and invariants?</strong></p>
+<p><strong>Why does ARIES redo "repeat history," including updates from loser transactions, before undo runs?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because redo cannot know which transactions committed until after all pages are rewritten</li>
+<li>B) Because rebuilding the exact pre-crash page state first is simpler and safer than mixing page repair with transaction-level rollback decisions</li>
+<li>C) Because loser transactions are actually allowed to remain on disk permanently</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>What makes redo idempotent for Harbor Point's page 842?</strong></p>
 <ul>
-<li>A) Gaining safe restart after repeated failures while paying longer and more complex log sequences.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Recovery remembers in RAM which log records it already replayed on the previous boot</li>
+<li>B) The engine compares each redo record's LSN with the page's stored <code>pageLSN</code> and skips records the page already reflects</li>
+<li>C) The engine only ever replays commit records, never update records</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Why are compensation log records necessary when undoing <code>R2</code> after the crash?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) They guarantee that rollback progress survives another crash and tell recovery where to resume the remaining undo work</li>
+<li>B) They let the engine avoid writing WAL during rollback entirely</li>
+<li>C) They convert every aborted transaction into a committed transaction with a lower priority</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves safe restart after repeated failures, but that benefit is purchased with longer and more complex log sequences.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: Redo first rebuilds the exact page history implied by the WAL so the storage engine has a consistent starting point. Undo then removes loser effects in a controlled way. Mixing those steps would make recovery logic much harder to reason about and easier to break under repeated crashes.</p>
+<p><strong>2. B</strong>: <code>pageLSN</code> is the page-local proof of how far that page has already absorbed WAL history. If the page is already at or past the redo record's LSN, reapplying the record would be redundant and is skipped.</p>
+<p><strong>3. A</strong>: CLRs make rollback progress durable. After another crash, recovery can resume from the recorded <code>undoNextLSN</code> instead of redoing the same undo work blindly or losing track of what remains.</p>
 
       
       <hr>
@@ -218,7 +174,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

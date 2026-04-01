@@ -22,183 +22,131 @@
     <main>
       <h1>Day 404: Deadlock Detection, Timeout, and Avoidance</h1>
 <blockquote>
-<p><strong>Deadlock Detection, Timeout, and Avoidance starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: Once strict locking uses waiting to preserve correctness, the engine also needs a policy for impossible waits, because a cycle in the wait graph will never resolve on its own.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In deadlock handling in lock-based systems, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How databases recover progress when lock waits form cycles. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding deadlock handling in lock-based systems lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="03.html">03.md</a>, Harbor Point accepted the main bargain of strict 2PL: if two traders want to update the same <code>issuer_exposure['MUNI-77']</code> row, one of them must wait. That solved the over-allocation anomaly, but it introduced a new operational fact. Waiting is only safe when there is still some future commit or rollback that can release the resource. If every blocked transaction is waiting for another blocked transaction, the lock manager has preserved correctness and lost progress.</p>
+<p>That is exactly what happens during the desk's market-open rush. One transaction amends reservation <code>QR-1842</code>, so it locks the reservation row first and then reaches for the issuer summary row to recompute headroom. At the same time, a risk-control transaction tightens the <code>MUNI-77</code> limit, so it locks the issuer summary row first and then tries to mark <code>QR-1842</code> for review. Each transaction is behaving sensibly in isolation. Together they form a circle: each one needs the other to move first.</p>
+<p>Deadlock handling is the subsystem that turns that frozen circle back into forward progress. Detection proves a cycle exists and chooses a victim. Timeout gives up after a wait budget is exceeded, even if the engine cannot prove why the wait is long. Avoidance changes the waiting rules or lock acquisition pattern so the cycle never becomes possible. These are not interchangeable operational details. They shape how much work is wasted, how quickly the application gets a retryable error, and how often tail latency turns into a customer-visible incident.</p>
+<p>This also prepares the transition to <a href="05.html">05.md</a>. MVCC reduces many read-write waits by letting readers follow version visibility rules instead of entering the lock queue, but writer-writer conflicts and metadata locks still need a deadlock policy. Deadlocks are not an edge case bolted onto locking. They are the cost of using waiting as a correctness tool.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How databases recover progress when lock waits form cycles.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's approval API has a tight SLO at market open, but its real requirement is stronger than latency: the desk cannot oversubscribe an issuer and it cannot leave traders staring at requests that never finish. Deadlock handling sits directly on that boundary between correctness and operability. When it works well, one transaction is rolled back quickly, the application retries cleanly, and the exposure invariant remains intact. When it works poorly, threads pile up, timeouts fire far from the real blocker, and operators see a "slow database" incident that is actually a lock-cycle problem.</p>
+<p>The distinction matters because long waits and deadlocks are not the same failure. A long wait may be healthy backpressure behind one hot lock holder. A deadlock is a proof that no amount of patience will help. If the team responds to every wait by increasing timeout values, they simply stretch user-facing latency while preserving the cycle. If they disable detection to save CPU, they may reduce lock-manager overhead while turning a fast retryable abort into a multi-second outage pattern. Production engineering here is mostly about precision: knowing which waits are productive, which are impossible, and which design changes remove the cycle entirely.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind deadlock handling in lock-based systems</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain how a deadlock emerges from ordinary lock waits</strong> - Turn a Harbor Point contention incident into a wait-for graph and identify the cycle.</li>
+<li><strong>Compare detection, timeout, and victim-selection strategies</strong> - Reason about how engines decide that a wait is impossible and which transaction to abort.</li>
+<li><strong>Choose practical avoidance techniques for production workloads</strong> - Use lock ordering, shorter critical sections, and age-based policies to reduce deadlocks without abandoning correctness.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for deadlock handling in lock-based systems</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to deadlock handling in lock-based systems.</p>
-<p><strong>Intuition</strong>: deadlock handling in lock-based systems exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain guaranteed forward progress, but you pay with wasted work from victim rollbacks.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of deadlock handling in lock-based systems</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full deadlock handling in lock-based systems pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Build wait-for graph from blocked lock requests</li>
-<li>Run cycle detection periodically or on-demand</li>
-<li>Pick victim using age/work heuristics</li>
-<li>Abort victim and release locks to break cycle</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: A deadlock is a cycle in the wait-for graph, not just a slow queue</h3>
+<p>The Harbor Point scenario becomes a deadlock the moment both transactions hold one lock and wait on the other. Transaction <code>T1</code> is editing reservation <code>QR-1842</code>, so it already owns an exclusive lock on that reservation row. Transaction <code>T2</code> is tightening the issuer limit, so it already owns an exclusive lock on <code>issuer_exposure['MUNI-77']</code>. Each transaction then asks for the other resource:</p>
+<div class="codehilite"><pre><span></span><code>T1: X-lock quote_reservations[QR-1842] granted
+T2: X-lock issuer_exposure[&#39;MUNI-77&#39;] granted
+T1: X-lock issuer_exposure[&#39;MUNI-77&#39;] requested -&gt; waits for T2
+T2: X-lock quote_reservations[QR-1842] requested -&gt; waits for T1
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for deadlock handling in lock-based systems; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for deadlock handling in lock-based systems.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain guaranteed forward progress, but operationally absorb wasted work from victim rollbacks.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>The lock manager can rewrite that situation as a wait-for graph:</p>
+<div class="codehilite"><pre><span></span><code>T1 --&gt; T2
+^       |
+|       v
+T2 &lt;-- T1
+</code></pre></div>
+
+<p>Each edge means "this transaction cannot proceed until that one releases a conflicting lock." As soon as the graph contains a cycle, no local wakeup rule can fix it. Neither transaction can reach commit, so neither transaction can release what the other needs. That is the important distinction from ordinary contention. In a healthy queue, at least one path to commit still exists. In a deadlock, every path loops back into the wait graph.</p>
+<p>Strict 2PL makes this possible because it holds locks until the end of the transaction. That strictness is still the right choice for Harbor Point; it protects the exposure invariant and simplifies recovery. But it also means that a transaction does not gradually free resources as it moves through business logic. If lock acquisition order is inconsistent, the engine will eventually see a cycle created by otherwise valid transactions. Lock upgrades can create the same pattern: two transactions may both start with shared locks and then deadlock when each tries to upgrade to exclusive.</p>
+<p>The trade-off is subtle. Fine-grained locking lets Harbor Point process unrelated issuers concurrently and keeps the hot path narrower than a table lock would. At the same time, more lockable objects and more access paths increase the number of possible wait edges. Concurrency improves, but the state space where cycles can form also grows.</p>
+<h3>Concept 2: Detection and timeout both recover progress, but they answer different questions</h3>
+<p>A detector works from lock-manager state, not from elapsed time alone. When a transaction blocks, the engine already knows which lock request could not be granted and which transactions currently hold conflicting locks. That is enough to add edges to a wait-for graph and ask whether the newly blocked transaction closes a cycle. Some engines run this check immediately on each blocking event; others run it periodically to reduce overhead. Either way, a detector is doing proof, not guesswork.</p>
+<p>For Harbor Point, a simplified detector path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>1. T1 waits on a lock held by T2 -&gt; add edge T1 -&gt; T2
+2. T2 later waits on a lock held by T1 -&gt; add edge T2 -&gt; T1
+3. Cycle found -&gt; choose victim
+4. Abort victim, release its locks, wake surviving transaction
+</code></pre></div>
+
+<p>Victim selection is where engineering policy enters. Many systems prefer the younger transaction, the one with the fewest updates, or the one with the lowest estimated rollback cost. That choice matters operationally. Aborting a short, fresh transaction usually wastes less work and releases resources faster. Aborting a large transaction with many dirty pages may free a critical lock, but it also creates more undo work and can amplify retry pressure upstream. A good deadlock report therefore includes both the cycle and the chosen victim so operators can see whether the heuristics match the workload.</p>
+<p>Timeout is different. A timeout policy says, in effect, "this wait lasted longer than we are willing to tolerate, so abort someone even if we cannot prove a cycle." That is useful as a safety boundary, especially when the engine cannot observe the full dependency graph, as in some distributed locking or multi-node transaction paths. It is also cheaper than running cycle detection aggressively on every wait. But timeout is blunt. A transaction can legitimately wait behind one long-running holder without any deadlock at all. If Harbor Point sets lock wait timeout too low, it will abort healthy work during market spikes. If it sets the timeout too high, true deadlocks will linger and inflate p99 latency before anyone is released.</p>
+<p>The practical lesson is to treat detector and timeout as complementary, not equivalent. Detection is the right tool when one lock manager can see the cycle. Timeout is the outer guardrail that limits damage when visibility is incomplete or blocking is simply too long to accept. Using timeout as the only deadlock strategy inside a single-node lock manager is usually a sign that the team is paying user-visible latency to avoid implementing or tuning the more precise mechanism.</p>
+<h3>Concept 3: Avoidance removes cycles by constraining how waits are allowed to form</h3>
+<p>The cheapest avoidance technique is usually design discipline. Harbor Point can remove the deadlock above by making every workflow acquire the issuer summary row before touching individual reservation rows. If both the trader amendment path and the risk-tightening path lock <code>issuer_exposure['MUNI-77']</code> first, then one of them will queue immediately and the cycle cannot form. A total order on lock acquisition does not eliminate waiting, but it turns circular waits into straight lines.</p>
+<p>That principle extends beyond application code. Lock upgrades are dangerous because they introduce "I already hold a weaker lock and now want a stronger one" edges late in the transaction. If Harbor Point knows a path will definitely update a reservation, it is often safer to request the stronger mode up front instead of taking a shared lock and upgrading later. Shorter critical sections help for the same reason: the less application work done while holding the first hot lock, the fewer opportunities there are for another transaction to interleave and create the opposite half of a cycle.</p>
+<p>Database engines also implement algorithmic avoidance policies. In <code>wait-die</code>, an older transaction is allowed to wait for a younger one, but a younger transaction that wants a lock held by an older one is aborted immediately. In <code>wound-wait</code>, the older transaction preempts the younger holder instead of waiting. Both schemes use transaction age to impose a monotonic direction on waits, which prevents cycles from forming. The cost is more aborts, especially for younger transactions during bursts of contention. To avoid starvation, restarted transactions usually keep their original timestamp so they do not remain "young forever."</p>
+<p>There is an even stronger form, sometimes called conservative 2PL, where a transaction must acquire all the locks it will need before doing any work. That prevents deadlocks because the transaction never waits mid-flight after partially claiming resources. In practice, Harbor Point cannot use this broadly: the exact set of reservation rows may only become known after reading current state. Conservative schemes are strongest when the access set is predictable and small; otherwise they trade away too much concurrency and flexibility.</p>
+<p>This is where the bridge to <a href="05.html">05.md</a> matters. MVCC removes many read-side waits by letting readers consult visibility metadata rather than queue behind writers. That shrinks the space where deadlocks can arise, but it does not erase it. Writers can still deadlock on hot rows, indexes, and metadata. Avoidance is therefore not a relic of lock-only systems. It remains part of the production toolbox even in versioned engines.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: deadlock handling in lock-based systems works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: Harbor Point sees lock timeout errors, but deadlock logs are empty.</p>
+<p><strong>Why it happens / is confusing</strong>: A timeout only proves the wait exceeded a budget. The blocker may be one long transaction on a hot issuer rather than a cycle, or the lock manager may not be running a detector for that path.</p>
+<p><strong>Clarification / Fix</strong>: Inspect blocked and blocking sessions first. If there is one root blocker, shorten its critical section or move non-essential work out of the transaction. If there is a genuine cycle that the engine cannot see directly, use timeout as the fallback and tighten application retry handling.</p>
+<p><strong>Issue</strong>: The same business action deadlocks only intermittently.</p>
+<p><strong>Why it happens / is confusing</strong>: Deadlocks depend on interleaving. Two code paths can be correct in isolation and still deadlock only when timing causes them to acquire the same resources in opposite orders.</p>
+<p><strong>Clarification / Fix</strong>: Compare the exact lock acquisition order across the conflicting statements. Standardize the order, avoid late lock upgrades, and make hot paths lock the shared summary row first.</p>
+<p><strong>Issue</strong>: Deadlock detection resolves the cycle quickly, but the service still melts down under load.</p>
+<p><strong>Why it happens / is confusing</strong>: Breaking the cycle is only half the story. If every aborted transaction retries immediately, the application can recreate contention faster than the database can drain it.</p>
+<p><strong>Clarification / Fix</strong>: Make deadlock retries idempotent, add bounded backoff with jitter, and cap the number of immediate retries on the same hot issuer.</p>
+<p><strong>Issue</strong>: Deadlock reports mention index or metadata locks that the application never requested explicitly.</p>
+<p><strong>Why it happens / is confusing</strong>: SQL statements often touch more than the obvious row. Index maintenance, foreign-key checks, and metadata access can add lock edges that are invisible at the ORM level.</p>
+<p><strong>Clarification / Fix</strong>: Read the engine's deadlock report as a physical execution trace, not only as a logical statement list. The missing edge often appears in the index path or constraint check, and that is where the ordering fix must be applied.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: deadlock handling in lock-based systems &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: deadlock handling in lock-based systems &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: Deadlock handling ↔ operating-system resource allocation</h3>
+<p>The same graph logic appears in operating systems when processes wait for multiple resources. Database lock managers simply make the graph more dynamic and more granular: row, page, index-key, and metadata locks are all resource nodes that can create wait edges. The key idea carries over cleanly: prevention constrains allowed waits, detection finds cycles after they form, and recovery chooses who to evict.</p>
+<h3>Connection 2: Deadlock handling ↔ MVCC visibility rules</h3>
+<p>Deadlock handling explains why many engines invested so heavily in MVCC. If readers can decide visibility from tuple-version metadata, they avoid joining the wait graph for many common cases. That does not eliminate writer deadlocks, but it changes where the system spends coordination cost. <a href="05.html">05.md</a> picks up exactly there by showing how snapshots replace some blocking decisions with version-selection rules.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS">PostgreSQL Documentation: Deadlocks</a><ul>
+<li>Focus: Review how PostgreSQL detects deadlocks, what the error reports look like, and why the server aborts one transaction to preserve progress.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlocks.html">MySQL 8.0 Reference Manual: Deadlocks in InnoDB</a><ul>
+<li>Focus: Study InnoDB's detector, lock wait timeout behavior, and concrete guidance on reducing deadlocks in row-level locking workloads.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-deadlocks-guide?view=sql-server-ver16">SQL Server Deadlocks Guide</a><ul>
+<li>Focus: Compare wait-for graphs, victim choice, and monitoring tooling in another major lock-based engine.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>A deadlock is a structural impossibility, not a long wait with bad luck</strong> - Once the wait-for graph contains a cycle, no amount of patience will let every transaction finish.</li>
+<li><strong>Detection and timeout solve different problems</strong> - Detection proves a cycle and aborts precisely, while timeout enforces an upper bound on waiting when proof is missing or too expensive.</li>
+<li><strong>The best avoidance technique is usually predictable lock behavior</strong> - Stable lock ordering, fewer upgrades, and shorter critical sections remove many deadlocks before detector heuristics ever matter.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model deadlock handling in lock-based systems as explicit state transitions and invariants?</strong></p>
+<p><strong>Why does increasing Harbor Point's lock wait timeout not solve the <code>QR-1842</code> deadlock by itself?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because deadlocks are cycles in the wait graph, so waiting longer does not create a path to commit</li>
+<li>B) Because lock timeouts only apply to read-only transactions</li>
+<li>C) Because strict 2PL automatically breaks every deadlock without aborting anyone</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>What is the main advantage of explicit deadlock detection over timeout in a single lock manager?</strong></p>
 <ul>
-<li>A) Gaining guaranteed forward progress while paying wasted work from victim rollbacks.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) It guarantees there will never be any lock waits</li>
+<li>B) It can prove a cycle exists and abort a victim quickly instead of guessing from elapsed time</li>
+<li>C) It removes the need for application retries</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Which change most directly prevents Harbor Point's amendment path from deadlocking with the risk-tightening path?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Allow both transactions to release locks early before commit</li>
+<li>B) Standardize both paths to lock <code>issuer_exposure['MUNI-77']</code> before <code>quote_reservations[QR-1842]</code></li>
+<li>C) Increase the number of worker threads submitting transactions</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves guaranteed forward progress, but that benefit is purchased with wasted work from victim rollbacks.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. A</strong>: A timeout can bound how long users wait, but it does not break the logical cycle itself. One of the transactions still has to be aborted or prevented from waiting in that pattern.</p>
+<p><strong>2. B</strong>: Detection uses actual dependency information from the lock manager, so it can distinguish an impossible wait cycle from a long but valid queue behind one hot lock holder.</p>
+<p><strong>3. B</strong>: A consistent global lock order prevents the circular dependency from forming. Releasing locks early would weaken strictness, and adding worker threads usually makes contention worse.</p>
 
       
       <hr>
@@ -218,7 +166,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

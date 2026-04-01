@@ -22,183 +22,139 @@
     <main>
       <h1>Day 410: Composite Index Ordering and Selectivity</h1>
 <blockquote>
-<p><strong>Composite Index Ordering and Selectivity matters most when you can reason about failure modes, invariants, and trade-offs.</strong></p>
+<p><strong>The core idea</strong>: A composite index is one lexicographic order over several columns, so the leading columns determine which predicates can prune the search space early and whether the engine can stream rows in the order the query actually needs.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In composite index design, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How column order determines usable predicates and scan locality. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding composite index design lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="09.html">09.md</a>, Harbor Point learned that a covering index can remove expensive heap lookups for the market-open dashboard. That still leaves a harder question: if the desk query filters by <code>issuer</code>, <code>status</code>, and then wants the newest reservations first, what should the actual key order be? The index <code>(issuer, status, submitted_at DESC)</code> and the index <code>(submitted_at DESC, issuer, status)</code> contain the same columns, but they are not minor variants of the same structure. They are different physical orderings of the leaf pages.</p>
+<p>That physical order is the whole lesson. A B-tree does not "understand" that all three columns matter equally. It compares the first column first, then the second only when the first ties, then the third only when the first two tie. If Harbor Point puts <code>submitted_at</code> first, the newest rows for every issuer are interleaved together. If it puts <code>issuer</code> first, every reservation for <code>MUNI-77</code> sits in one contiguous slice, and the engine can jump directly into that slice before it starts reading timestamps.</p>
+<p>The misleading heuristic to drop is "always put the most selective column first." Selectivity matters, but only in the context of actual predicates and ordering requirements. For Harbor Point's dashboard query, both <code>issuer</code> and <code>status</code> are equality predicates, so either can participate in the search prefix. The costly mistake is usually placing the range or sort column too early, or choosing a leading prefix that does not match the real workload the index is meant to serve.</p>
+<p>Once that clicks, composite-index design stops looking like folklore and starts looking like a contract between the query shape and the storage layout. The next lesson, <a href="11.html">11.md</a>, will show how the planner tries to cost those competing contracts.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How column order determines usable predicates and scan locality.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point has three recurring read paths during the first ten minutes of trading. The desk dashboard asks for "open reservations for one issuer, newest first, limit 50." The issuer drill-down asks for "all recent reservations for one issuer" regardless of status. Operations also has a cross-issuer screen that asks for "all open reservations, newest first." All three queries touch the same columns, but they do not need the same prefix.</p>
+<p>If the team picks the wrong composite order, the symptoms are subtle. The plan still says "using index," but the engine may scan a much larger slice than expected, perform an extra sort, or abandon the index entirely once the working set no longer fits comfortably in memory. A benchmark over yesterday's warm cache can make the design look fine, while the live market-open workload later exposes long scans across low-cardinality prefixes such as <code>status = 'open'</code>.</p>
+<p>That is why index ordering is a production decision rather than a syntactic detail. It determines which queries get a narrow seek, which queries inherit scan debt, and whether one generalized index is good enough or separate specialized indexes are justified. It also sets up the planner behavior discussed next: once multiple candidate orders exist, the optimizer has to estimate which one is cheapest for a given query.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind composite index design</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain how composite key order becomes physical search order</strong> - Describe the leftmost-prefix rule and why trailing columns only help after leading columns have narrowed the scan.</li>
+<li><strong>Analyze selectivity in the context of real predicates</strong> - Distinguish between equality, range, and ordering requirements instead of applying "most selective first" as a universal rule.</li>
+<li><strong>Choose a defensible column order for a workload</strong> - Evaluate when one composite index can serve several queries and when a second specialized index is the cleaner production choice.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for composite index design</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to composite index design.</p>
-<p><strong>Intuition</strong>: composite index design exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain higher index usefulness across critical queries, but you pay with reduced flexibility for unplanned predicate patterns.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of composite index design</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full composite index design pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Estimate prefix selectivity from workload statistics</li>
-<li>Order keys to maximize common predicate pruning</li>
-<li>Support range scans on trailing dimensions when prefixes are fixed</li>
-<li>Validate plan changes with index-only and fallback scan costs</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: Composite indexes are lexicographic structures, not unordered bags of useful columns</h3>
+<p>Harbor Point's reservations table now has enough volume that it cannot afford to scan broadly at market open. The desk query is:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">issuer</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">quantity</span><span class="p">,</span><span class="w"> </span><span class="n">limit_price</span><span class="p">,</span><span class="w"> </span><span class="n">submitted_at</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">reservations</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">issuer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;MUNI-77&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">submitted_at</span><span class="w"> </span><span class="k">DESC</span>
+<span class="k">LIMIT</span><span class="w"> </span><span class="mi">50</span><span class="p">;</span>
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for composite index design; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for composite index design.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain higher index usefulness across critical queries, but operationally absorb reduced flexibility for unplanned predicate patterns.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>If the index key is <code>(issuer, status, submitted_at DESC)</code>, the B-tree leaf entries are grouped first by <code>issuer</code>, then by <code>status</code>, then by time. Conceptually, a small slice of the tree looks like this:</p>
+<div class="codehilite"><pre><span></span><code>(&quot;ALPHA-01&quot;, &quot;open&quot;,   09:58) -&gt; row
+(&quot;ALPHA-01&quot;, &quot;settled&quot;,09:41) -&gt; row
+(&quot;MUNI-77&quot;, &quot;open&quot;,   10:05) -&gt; row
+(&quot;MUNI-77&quot;, &quot;open&quot;,   10:04) -&gt; row
+(&quot;MUNI-77&quot;, &quot;routed&quot;, 10:03) -&gt; row
+(&quot;ZETA-88&quot;, &quot;open&quot;,   10:02) -&gt; row
+</code></pre></div>
+
+<p>That layout gives the engine a narrow entry point. It can seek directly to the first <code>("MUNI-77", "open", ...)</code> tuple and then walk downward in timestamp order until it has fifty rows. The search stays inside one contiguous band of leaf pages because the leading columns already partitioned the tree into the relevant issuer and status slice.</p>
+<p>The leftmost-prefix rule falls straight out of that layout. The same index can also support queries on <code>(issuer)</code> alone, or <code>(issuer, status)</code>, because those predicates still identify a contiguous prefix range. It is much less useful for <code>WHERE status = 'open'</code> without <code>issuer</code>, because <code>status</code> is not the left edge of the ordering. The tree is not grouped by status first, so the engine cannot jump to one compact "all open rows" region.</p>
+<p>This is the first production trade-off: the leading prefix is a scarce design choice. Whatever you put first becomes the cheapest way to enter the tree. Columns placed later may still help, but only after the earlier columns have already shaped the search region.</p>
+<h3>Concept 2: Selectivity is only meaningful when you account for equality, range, and ordering together</h3>
+<p>Harbor Point's team initially argues that <code>issuer</code> should lead because it is far more selective than <code>status</code>: there are thousands of issuers but only a handful of statuses. That instinct is often directionally right, but on its own it is too crude. The query above has equality predicates on both <code>issuer</code> and <code>status</code>, then an ordering requirement on <code>submitted_at</code>. For that query shape, the most important structural decision is to keep the equality columns before the timestamp so the engine can land on one narrow prefix and then read rows in the requested order.</p>
+<p>Compare three candidate indexes:</p>
+<div class="codehilite"><pre><span></span><code>1. (issuer, status, submitted_at DESC)
+2. (status, issuer, submitted_at DESC)
+3. (submitted_at DESC, issuer, status)
+</code></pre></div>
+
+<p>Indexes <code>1</code> and <code>2</code> can both serve the dashboard query reasonably well because both equality columns are fixed before the ordered timestamp scan begins. Index <code>3</code> is the troublemaker. With time first, the tree is organized around "newest rows overall," not "rows for one issuer and status." The engine may still use the index, but it now has to inspect recent entries across many issuers until it accumulates fifty matches for <code>MUNI-77</code>. The order looks attractive for <code>ORDER BY submitted_at DESC</code>, yet it destroys the pruning power of the equality predicates.</p>
+<p>The more interesting distinction is between <code>1</code> and <code>2</code>, because that is where workload selectivity actually matters. If Harbor Point frequently runs <code>WHERE issuer = ? ORDER BY submitted_at DESC LIMIT 50</code>, then <code>(issuer, status, submitted_at DESC)</code> preserves a useful prefix for those issuer-only lookups. If operations mostly runs <code>WHERE status = 'open' ORDER BY submitted_at DESC LIMIT 50</code>, then <code>(status, issuer, submitted_at DESC)</code> gives that screen the better entry point. The correct order depends on which prefixes recur across the workload, not on a slogan about selectivity divorced from query shape.</p>
+<h3>Concept 3: Column order is a workload contract, so one composite index rarely serves every query equally well</h3>
+<p>Suppose Harbor Point keeps the covering strategy from <a href="09.html">09.md</a> and chooses:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_reservations_issuer_status_time</span>
+<span class="k">ON</span><span class="w"> </span><span class="n">reservations</span><span class="w"> </span><span class="p">(</span><span class="n">issuer</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">submitted_at</span><span class="w"> </span><span class="k">DESC</span><span class="p">)</span>
+<span class="n">INCLUDE</span><span class="w"> </span><span class="p">(</span><span class="n">quantity</span><span class="p">,</span><span class="w"> </span><span class="n">limit_price</span><span class="p">);</span>
+</code></pre></div>
+
+<p>This is an excellent fit for the desk dashboard and a decent fit for issuer drill-downs. It is a poor fit for the cross-issuer operations screen because <code>status</code> is buried behind <code>issuer</code>. The team now has three options: accept that the operations query is second-class, reorder the index to favor operations instead, or add a second specialized index such as <code>(status, submitted_at DESC)</code>.</p>
+<p>There is no abstract "best" answer because each option spends resources differently. A second index improves plan quality for another slice of the workload, but it adds write amplification, WAL volume, cache pressure, and vacuum or purge work. Reordering the first index helps one audience while degrading another. Leaving one query under-served might be fine if that query is rare and non-interactive. Composite-index design is therefore a workload contract: decide which access paths deserve to be cheap, then make that decision explicit in the physical order of the tree.</p>
+<p>This is also where data skew starts to matter. If <code>status = 'open'</code> matches ninety-five percent of the table during market open, then a status-led index can look plausible on paper and still scan a huge fraction of the hot tree in production. The planner will eventually try to account for that with statistics and cost models, but the structural limitation comes first. A low-cardinality leading column cannot create a narrow prefix if most rows share the same value.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: composite index design works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: The query uses a composite index but still performs an expensive sort or reads far more rows than expected.</p>
+<p><strong>Why it happens / is confusing</strong>: Teams often notice that the right columns are "in the index" and assume the physical order must therefore be correct. The problem is usually that the ordered or range column appears too early, so the engine cannot exploit the equality predicates to prune first and stream rows second.</p>
+<p><strong>Clarification / Fix</strong>: Compare the query's equality predicates, range predicates, and <code>ORDER BY</code> against the index prefix from left to right. For top-N queries like Harbor Point's dashboard, place the equality columns before the ordered timestamp so the scan can start inside one narrow slice.</p>
+<p><strong>Issue</strong>: Engineers keep debating whether <code>issuer</code> or <code>status</code> should come first, and both sides have benchmarks showing small wins.</p>
+<p><strong>Why it happens / is confusing</strong>: For one equality-equality query, both orders may perform similarly enough to hide the real question. The difference usually shows up in the additional queries that can reuse the prefix, not in the headline query alone.</p>
+<p><strong>Clarification / Fix</strong>: Inventory the real workload. If issuer-only lookups are common, favor an issuer-led prefix. If status-led screens are latency-critical and frequent, either lead with status or create a separate status-focused index instead of forcing one compromise tree to serve both audiences poorly.</p>
+<p><strong>Issue</strong>: An index that looked sensible six months ago now scans too much data at market open.</p>
+<p><strong>Why it happens / is confusing</strong>: Selectivity is not static. Data growth and workload changes can turn a once-useful prefix into a low-pruning one, especially when the leading column has few distinct values or heavy skew.</p>
+<p><strong>Clarification / Fix</strong>: Re-evaluate the actual cardinalities and query mix. If the leading prefix no longer narrows the search effectively, redesign the composite order or split the workload into separate indexes before blaming the planner alone.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: composite index design &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: composite index design &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: <a href="09.html">09.md</a> separates "which leaf range is cheap to reach" from "whether the leaf range already contains enough data"</h3>
+<p>Composite ordering decides how the engine enters and walks the tree. Covering decides whether the engine can answer the query from those leaf pages alone or still has to bounce back to the base rows. You need both decisions to match the same workload, not just one of them.</p>
+<h3>Connection 2: <a href="11.html">11.md</a> explains why a structurally good index can still be ignored</h3>
+<p>Once Harbor Point has multiple plausible orders, the optimizer has to estimate cardinality, sort cost, and page reads. Good structure narrows the candidate plans; the cost model determines which of those candidates the engine believes is cheapest for one specific query instance.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/indexes-multicolumn.html">PostgreSQL Documentation: Multicolumn Indexes</a><ul>
+<li>Focus: How the leftmost-prefix rule affects filtering and why multicolumn order changes which predicates are usable.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/multiple-column-indexes.html">MySQL 8.4 Reference Manual: Multiple-Column Indexes</a><ul>
+<li>Focus: How InnoDB uses composite keys, including the interaction between index order and matching predicates.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://www.sqlite.org/queryplanner.html#multicolumn_indices">SQLite Query Planner: Multi-Column Indices</a><ul>
+<li>Focus: A compact visual explanation of prefix narrowing and why index order also affects sorting work.</li>
+</ul>
+</li>
+<li>[GUIDE] <a href="https://use-the-index-luke.com/sql/where-clause/the-equals-operator/concatenated-keys">Use The Index, Luke!: Concatenated Keys</a><ul>
+<li>Focus: Query-pattern-driven advice for ordering equality, range, and sort columns in practice.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Column order is physical order</strong> - A composite index groups rows by its leading columns first, so those columns determine where the engine can seek cheaply.</li>
+<li><strong>Selectivity is conditional, not absolute</strong> - Equality predicates, range predicates, and ordering requirements matter together; "most selective first" is only a heuristic, not a law.</li>
+<li><strong>Every composite index chooses winners</strong> - One order makes some prefixes cheap and leaves others expensive, which is why workload analysis matters more than generic indexing folklore.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model composite index design as explicit state transitions and invariants?</strong></p>
+<p><strong>Why is <code>(submitted_at DESC, issuer, status)</code> usually a poor index order for Harbor Point's dashboard query?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because descending timestamps cannot appear in composite indexes</li>
+<li>B) Because leading with time groups rows by recency before issuer and status, forcing the engine to inspect many recent rows across other issuers</li>
+<li>C) Because the planner can only use one column from a composite index</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>When can <code>(issuer, status, submitted_at DESC)</code> and <code>(status, issuer, submitted_at DESC)</code> both work reasonably well for the same query?</strong></p>
 <ul>
-<li>A) Gaining higher index usefulness across critical queries while paying reduced flexibility for unplanned predicate patterns.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) When the query has equality predicates on both <code>issuer</code> and <code>status</code> before scanning by timestamp</li>
+<li>B) Only when the table is small enough to fit entirely in memory</li>
+<li>C) Never; one of the two must always be unusable</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>What is the real production question when choosing whether <code>issuer</code> or <code>status</code> should lead the index?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Which column name is shorter and cheaper to compare</li>
+<li>B) Which prefix is reused by the broader workload and deserves the cheapest entry point into the tree</li>
+<li>C) Which column was added to the schema first</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves higher index usefulness across critical queries, but that benefit is purchased with reduced flexibility for unplanned predicate patterns.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: With time first, the index is organized around recent rows overall. Harbor Point then has to search through many unrelated issuers before it finds enough <code>MUNI-77</code> rows, which defeats the main pruning benefit of the equality predicates.</p>
+<p><strong>2. A</strong>: If both leading columns are equality predicates for the query, either order can often narrow the scan sufficiently for that one query. The meaningful difference usually appears in which additional queries can reuse the leftmost prefix.</p>
+<p><strong>3. B</strong>: Leading columns are scarce. The one placed first becomes the cheapest way to enter the tree, so the right choice depends on the workload prefixes that matter most in production.</p>
 
       
       <hr>
@@ -218,7 +174,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

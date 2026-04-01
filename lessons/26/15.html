@@ -22,183 +22,148 @@
     <main>
       <h1>Day 415: Online Schema Migrations and DDL Safety</h1>
 <blockquote>
-<p><strong>Online Schema Migrations and DDL Safety is valuable when integrated into end-to-end system decisions under production constraints.</strong></p>
+<p><strong>The core idea</strong>: A schema migration is safe only when old code, new code, replicas, and recovery can all operate correctly throughout the overlap period; "online" DDL is therefore a compatibility protocol, not just a faster <code>ALTER TABLE</code>.</p>
 </blockquote>
 <hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In online schema migration internals, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How to evolve table structure without long blocking locks. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding online schema migration internals lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
+<p>In <a href="14.html">14.md</a>, Harbor Point moved older reservation partitions to colder storage so the trading path could keep its real working set on the fast tier. That helped market-open latency, but it created a new constraint. Compliance now wants a <code>risk_bucket</code> column and a new index on active reservations, yet the <code>reservations</code> table spans hot NVMe-backed partitions and colder immutable partitions kept for years. Harbor Point cannot freeze order intake, rewrite every partition in one shot, or assume a failover will happen only after the migration completes.</p>
+<p>The tempting mental model is "run one <code>ALTER TABLE</code>, wait, and the schema is updated." Production databases rarely behave that cleanly. Some changes are metadata-only. Some build new indexes in the background but still need metadata locks at the beginning and end. Some rewrite the whole table or create a shadow copy, which turns one DDL statement into a long-running data movement job. Even when the SQL syntax looks simple, the engine may be copying rows, generating WAL or binlog traffic, invalidating caches, and pushing replicas behind.</p>
+<p>The useful shift is to stop asking whether the DDL statement is "online" and start asking whether the whole migration window is compatible. During that window, old application binaries may still write the old shape, new binaries may expect the new column, replicas may replay migration traffic later than the primary, and cold historical partitions may lag behind hot partitions in backfill progress. If every actor can still read and write safely, the migration is online in the only sense that matters. If not, the label on the DDL algorithm does not save you.</p>
 <hr />
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How to evolve table structure without long blocking locks.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
+<p>Harbor Point's migration is not just a developer convenience change. The new <code>risk_bucket</code> field feeds surveillance queries and lets the database avoid expensive ad hoc computation during incident analysis. But the table being changed sits directly on the critical path for order routing and post-trade reconciliation. A naive rewrite could queue behind one long transaction, take a metadata lock that blocks fresh writes, and then create a wall of replica lag just when the team needs the database to stay failover-ready.</p>
+<p>This is why safe online DDL belongs in storage-engine reasoning, not in release-checklist folklore. Before the team understands migration mechanics, schema evolution feels like a binary choice between "ship the change" and "schedule downtime." Afterward, the team can separate the change into compatibility-safe stages: introduce a structure the old code can ignore, backfill at a controlled rate, validate that both representations agree, switch reads only when all paths are ready, and retire the old form last.</p>
+<p>That matters even more because of the tiering work from <a href="14.html">14.md</a>. Historical partitions may not deserve an eager rewrite, but they still have to remain readable during the transition. Online migration safety therefore means preserving service availability, replica health, and data compatibility across multiple storage tiers at once. It is the bridge from last lesson's working-set control to <a href="16.html">16.md</a>, where you will combine engine, index, and isolation choices into one coherent architecture decision.</p>
 <hr />
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind online schema migration internals</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Classify a schema change by its physical consequences</strong> - Distinguish metadata-only DDL, background rebuilds, and full rewrites before choosing a rollout strategy.</li>
+<li><strong>Trace a safe online migration sequence</strong> - Explain how expand, backfill, validation, cutover, and cleanup preserve compatibility under live traffic.</li>
+<li><strong>Evaluate DDL safety in production terms</strong> - Reason about metadata locks, replica lag, backfill pressure, and rollback options instead of treating schema changes as isolated SQL statements.</li>
 </ol>
 <hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for online schema migration internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to online schema migration internals.</p>
-<p><strong>Intuition</strong>: online schema migration internals exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain continuous availability during schema evolution, but you pay with temporary complexity and extra write overhead.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of online schema migration internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full online schema migration internals pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Phase migration into metadata, backfill, and cutover steps</li>
-<li>Dual-write old and new representations during transition</li>
-<li>Validate parity before switching read path</li>
-<li>Retire legacy columns once lagging writers are drained</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: The first safety question is "what physical work does this DDL really trigger?"</h3>
+<p>Harbor Point's request sounds simple: add <code>risk_bucket</code>, populate it for all reservations, and support a new index for analysts filtering by trading day and risk class. The dangerous assumption is that one piece of SQL always implies one kind of work. In practice, the same <code>ALTER TABLE</code> family spans several very different engine behaviors. One change may touch only metadata. Another may scan the table in the background to build an index. A third may rewrite every row into a new physical layout or maintain a shadow table until cutover.</p>
+<p>That classification is the first production decision because it tells you where the risk actually lives. If the change is metadata-only, the main danger may be a brief metadata lock and application-version skew. If the engine needs a background rebuild, the risk shifts toward I/O amplification, replica lag, and cancellation semantics. If the change forces a table rewrite, you are no longer talking about a small control-plane action; you are running a data-movement job under the name of DDL.</p>
+<p>For Harbor Point, the decision tree looks like this:</p>
+<div class="codehilite"><pre><span></span><code>requested change
+  -&gt; add nullable column?          often metadata-only or very light
+  -&gt; build secondary index?        background scan + validation + final lock
+  -&gt; change type / drop old form?  may force rewrite or shadow-copy flow
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
+<p>The exact rules depend on the engine. PostgreSQL distinguishes ordinary index builds from <code>CREATE INDEX CONCURRENTLY</code>, and some <code>ALTER TABLE</code> forms still rewrite the heap while others do not. MySQL/InnoDB distinguishes <code>ALGORITHM=INSTANT</code>, <code>INPLACE</code>, and <code>COPY</code>, which sound reassuring until you remember that "in place" can still consume significant background resources and acquire metadata locks. The mechanism differs by engine, but the operational reading is the same: always determine whether the change rewrites data, what lock it takes, and how replication replays it before running it on a production primary.</p>
+<p>The trade-off is straightforward. Treating DDL as a physical operation adds planning overhead, but skipping that classification is how teams discover too late that a "quick" schema change is really a table copy competing with user traffic.</p>
+<h3>Concept 2: Safe migrations preserve compatibility first, then move data</h3>
+<p>Harbor Point should not introduce <code>risk_bucket</code> by immediately making it mandatory everywhere. The safe pattern is expand, backfill, cut over, then contract. That sequence looks conservative because it is designed around overlapping versions of the system, not around the convenience of one final schema state.</p>
+<p>The expansion step introduces structures that old code can tolerate. Harbor Point adds the nullable column and the new index path without making either one required yet:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">reservations</span>
+<span class="w">  </span><span class="k">ADD</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">risk_bucket</span><span class="w"> </span><span class="nb">smallint</span><span class="p">;</span>
+
+<span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">CONCURRENTLY</span><span class="w"> </span><span class="n">idx_reservations_day_bucket</span>
+<span class="w">  </span><span class="k">ON</span><span class="w"> </span><span class="n">reservations</span><span class="w"> </span><span class="p">(</span><span class="n">trading_day</span><span class="p">,</span><span class="w"> </span><span class="n">risk_bucket</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Application code then enters a compatibility window. New writers compute <code>risk_bucket</code> for fresh rows and updates, but readers still work if the column is null because older rows have not been backfilled yet. If Harbor Point were replacing an old representation rather than adding a new one, this is where dual-write or dual-read logic would live. The invariant is simple and strict: every row must remain readable by both the old and the new application version until the team deliberately ends that overlap.</p>
+<p>Backfill comes next, and it is not a clerical step. It is a write workload with real consequences. Updating billions of historical rows generates WAL or binlog traffic, touches indexes, and can pull cold partitions back into active I/O if the team is careless. Because of the tiering decisions from <a href="14.html">14.md</a>, Harbor Point may choose to backfill recent hot partitions immediately while handling very old immutable partitions through a slower offline batch or through compatibility logic that computes the field on demand until they are rewritten. That is still one migration; it just respects the physical reality of the storage layout.</p>
+<p>Only after parity checks pass does cutover become safe. Harbor Point validates that newly written rows always have <code>risk_bucket</code>, that backfilled rows match the expected derivation, that the new index serves the intended query plan, and that replicas have applied the same history. Then reads switch to depend on the new column. Constraints such as <code>NOT NULL</code>, old-column removal, or trigger retirement happen last because they intentionally end compatibility. Until that final step, rollback remains possible: the application can fall back to the old read path while the expanded schema still accepts both versions.</p>
+<p>The trade-off is more code and a longer migration window. In exchange, the team can survive partial rollout, failover, paused backfills, and rollback without turning schema evolution into downtime.</p>
+<h3>Concept 3: "Online" still fails when lock budgets, lag budgets, or rollback rules are missing</h3>
+<p>Many incidents blamed on "bad migrations" are really failures of operational control around an otherwise reasonable plan. Harbor Point could choose a safe expand-and-backfill design and still cause an outage if the initial <code>ALTER TABLE</code> waits behind a long transaction, because metadata lock acquisition often queues and then blocks new work behind it. A DDL statement that would have held the lock for milliseconds can create a traffic jam lasting minutes if it enters the lock queue at the wrong time.</p>
+<p>Replica behavior is the next budget to protect. Backfills and index builds create a second workload that replicas must replay, so a migration can silently reduce failover safety long before user queries fail. If Harbor Point promotes a lagging replica during the migration window, the new application may suddenly talk to a node that has the old schema or an incomplete backfill. That is why robust migrations gate every stage on replica state and schema version, not just on primary success.</p>
+<p>Operationally, safe online DDL needs concrete guardrails:</p>
 <ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
+<li>a short lock timeout so DDL aborts instead of camping in the metadata-lock queue</li>
+<li>migration jobs that can pause and resume without breaking invariants</li>
+<li>throttling tied to replica lag, I/O pressure, and cache pollution on hot partitions</li>
+<li>validation queries or checksums that prove parity before read cutover</li>
+<li>a rollback plan that keeps the old read or write path viable until cleanup is complete</li>
 </ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for online schema migration internals; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for online schema migration internals.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain continuous availability during schema evolution, but operationally absorb temporary complexity and extra write overhead.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
+<p>These controls make migrations slower and more procedural. That is the right price. Online DDL is valuable because it turns schema change into a managed background activity rather than a stop-the-world event, but that only works when the migration is treated like any other production workload with SLOs, budgets, and abort conditions.</p>
 <hr />
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: online schema migration internals works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
+<p><strong>Issue</strong>: The migration was advertised as online, but application writes still froze when the DDL started.</p>
+<p><strong>Why it happens / is confusing</strong>: The DDL itself may need only a brief metadata lock, but if it waits behind a long transaction, it can block later queries in the same lock queue. The outage comes from waiting for the lock, not from holding it for a long time once acquired.</p>
+<p><strong>Clarification / Fix</strong>: Run with aggressive lock timeouts, inspect long-lived transactions before the migration, and schedule the start when lock queues are short. "Online" never means "ignore metadata locks."</p>
+<p><strong>Issue</strong>: Backfill looks healthy on the primary, but replicas fall behind and failover confidence drops.</p>
+<p><strong>Why it happens / is confusing</strong>: Every row rewrite or index build generates replication work. A migration can meet primary-side latency goals while quietly turning replicas into stale recovery targets.</p>
+<p><strong>Clarification / Fix</strong>: Throttle by replica apply lag, not just by primary CPU. Pause backfill when lag exceeds budget, and do not cut over reads until failover targets have fully replayed the migration.</p>
+<p><strong>Issue</strong>: The new application version starts reading <code>risk_bucket</code>, but some rows still contain nulls.</p>
+<p><strong>Why it happens / is confusing</strong>: The schema change succeeded, so it is easy to assume the data is ready too. In reality, DDL completion and backfill completion are different milestones.</p>
+<p><strong>Clarification / Fix</strong>: Keep reads backward-compatible until parity checks pass. Enforce <code>NOT NULL</code> or remove fallback logic only after validation proves that the overlap window is finished.</p>
 <hr />
 <h2>Advanced Connections</h2>
-<h3>Connection 1: online schema migration internals &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: online schema migration internals &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
+<h3>Connection 1: <a href="14.html">14.md</a> and this lesson are both about controlling background work so it does not poison the fast path</h3>
+<p>Tiering taught Harbor Point to protect the hot working set from cold reads. Online schema migrations apply the same discipline to change traffic. A backfill that rewrites old partitions too aggressively can pollute caches, consume bandwidth, and undo the latency gains from tiering. Safe migrations therefore need placement policy and throttling policy, not just correct SQL.</p>
+<h3>Connection 2: <a href="16.html">16.md</a> turns migration mechanics into an architecture-choice question</h3>
+<p>The monthly capstone asks you to pick an engine, index strategy, and isolation model for a workload. This lesson provides one of the selection criteria: how safely that stack supports schema evolution under live traffic. An engine that looks fast on day one but makes every future DDL change a blocking rewrite may be the wrong fit for Harbor Point's operational reality.</p>
 <hr />
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/sql-altertable.html">PostgreSQL Documentation: <code>ALTER TABLE</code></a><ul>
+<li>Focus: Which table changes are metadata updates, which require rewrites, and what lock semantics still apply.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/sql-createindex.html">PostgreSQL Documentation: <code>CREATE INDEX</code></a><ul>
+<li>Focus: How concurrent index builds work, including the extra scans and delayed validation that make them safer but slower.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html">MySQL 8.4 Reference Manual: InnoDB Online DDL Operations</a><ul>
+<li>Focus: The difference between <code>INSTANT</code>, <code>INPLACE</code>, and <code>COPY</code>, and why those algorithm labels matter operationally.</li>
+</ul>
+</li>
+<li>[TOOL DOC] <a href="https://github.com/github/gh-ost">gh-ost</a><ul>
+<li>Focus: A practical shadow-table migration tool for MySQL, useful for understanding cutover, throttling, and rollback control.</li>
+</ul>
+</li>
+<li>[TOOL DOC] <a href="https://docs.percona.com/percona-toolkit/pt-online-schema-change.html">Percona Toolkit: <code>pt-online-schema-change</code></a><ul>
+<li>Focus: Another mature online migration workflow that makes the shadow-copy and trigger-based compatibility model explicit.</li>
 </ul>
 </li>
 </ul>
 <hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Online DDL safety is a compatibility property</strong> - The migration is safe only if mixed schema versions can coexist across applications, replicas, and recovery during the overlap window.</li>
+<li><strong>DDL syntax hides very different physical behaviors</strong> - Metadata-only changes, background rebuilds, and full rewrites need different rollout plans because they stress the system in different ways.</li>
+<li><strong>Backfill and cutover are production workloads</strong> - They need lock budgets, lag budgets, validation, and rollback rules just like any other high-risk operational change.</li>
 </ol>
 <hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model online schema migration internals as explicit state transitions and invariants?</strong></p>
+<p><strong>Why is it dangerous to treat every <code>ALTER TABLE</code> as the same kind of production change?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because the SQL parser can randomly choose a different schema</li>
+<li>B) Because different DDL operations can map to metadata updates, background rebuilds, or full rewrites with very different lock and I/O behavior</li>
+<li>C) Because databases apply DDL only on replicas and never on primaries</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>What makes the expand-and-backfill pattern safer than switching reads to the new schema immediately after adding a column?</strong></p>
 <ul>
-<li>A) Gaining continuous availability during schema evolution while paying temporary complexity and extra write overhead.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) It keeps old and new application versions compatible while data is being populated and validated</li>
+<li>B) It guarantees that no metadata locks will be taken</li>
+<li>C) It removes the need to monitor replicas during the migration</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Harbor Point's primary handles the migration well, but replica lag spikes during backfill. What is the best operational response?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Ignore the lag because the primary is still fast</li>
+<li>B) Increase backfill speed so replicas finish the problem sooner</li>
+<li>C) Throttle or pause the backfill based on replica apply lag before continuing toward cutover</li>
 </ul>
 </li>
 </ol>
 <hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves continuous availability during schema evolution, but that benefit is purchased with temporary complexity and extra write overhead.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: DDL is a family of physical operations, not a single risk profile. Knowing whether a change rewrites data, builds an index in the background, or only updates metadata determines the safe rollout plan.</p>
+<p><strong>2. A</strong>: The safer pattern preserves a compatibility window. Reads and writes keep working while the new field is populated, validated, and rolled out across mixed application versions and replicas.</p>
+<p><strong>3. C</strong>: Replica lag is part of migration safety, not a secondary metric. If failover targets are falling behind, the migration needs to slow down before it can safely proceed.</p>
 
       
       <hr>
@@ -218,7 +183,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

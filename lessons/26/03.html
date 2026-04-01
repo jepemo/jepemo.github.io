@@ -22,183 +22,165 @@
     <main>
       <h1>Day 403: Strict 2PL and Lock Manager Internals</h1>
 <blockquote>
-<p><strong>Strict 2PL and Lock Manager Internals starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: Strict two-phase locking turns serializability from an after-the-fact proof into an online scheduling rule, and the lock manager is the subsystem that enforces that rule one lock request at a time.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In strict two-phase locking internals, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How lock tables, modes, and queues enforce conflict ordering. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding strict two-phase locking internals lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="02.html">02.md</a>, Harbor Point proved that two issuer-limit approvals for <code>MUNI-77</code> could form a dependency cycle: each trader saw room for one more reservation, both inserted, and the desk ended up beyond its exposure cap. A serialization graph told us the history was impossible to explain as one-at-a-time execution. Strict 2PL answers a different question: how do you stop that impossible history before it commits?</p>
+<p>The answer is not "add locks" in the vague sense. The answer is that the engine chooses a conflict point, records lock ownership in a central table, and makes later transactions wait instead of proceeding on assumptions that are no longer safe. Harbor Point's engineers materialize per-issuer headroom in one <code>issuer_exposure</code> row, so every approval for <code>MUNI-77</code> must coordinate on the same lockable object. Trader A gets the lock, updates the row, and holds that write lock until commit. Trader B does not get a stale read and a future apology; Trader B gets a queue position.</p>
+<p>That is the mental shift for this lesson. A lock manager is not just bookkeeping around mutexes. It is the database's concurrency scheduler. It decides which transactions are allowed to keep building a history and which ones must stop because the next edge would violate recoverability or serial order. Once you see it that way, wait time, deadlocks, lock escalation, and hot-row incidents stop looking like separate bugs. They are all side effects of the same mechanism.</p>
+<p>This also sets up <a href="04.html">04.md</a>. If waiting is how the engine preserves order, then waits can form cycles too. Deadlock detection is not an optional extra layered on top of locking; it is the operational consequence of using locks to protect correctness.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How lock tables, modes, and queues enforce conflict ordering.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's market-open path cannot afford an exposure bug that appears only when multiple traders reserve against the same issuer at once. After the anomaly analysis in <a href="02.html">02.md</a>, the team decides that every approval must update the shared <code>issuer_exposure</code> row inside one transaction before the reservation is acknowledged. That design only works if concurrent transactions really serialize on that row rather than racing past each other on cached assumptions.</p>
+<p>Strict 2PL is how the engine makes that promise believable. It acquires locks while a transaction is still discovering what it needs to touch, and it does not let a writer release its claim early and continue with new lock acquisitions later. The result is simpler reasoning: if a transaction read or wrote something protected by a lock, later conflicting work either waited or happened after commit. That simplicity matters in production because recovery, auditing, and incident response all depend on being able to say which transaction had the right to act first.</p>
+<p>The cost is equally real. Hot issuers now create visible queues. Long transactions hold locks longer than the business logic usually realizes. Table scans can take intention locks across large parts of the lock tree. A system that looks quiet in CPU and I/O metrics can still have terrible p99 latency because it is saturated on one lockable resource. Understanding the internals is what lets you distinguish "the database is slow" from "the lock scheduler is doing exactly what we asked it to do."</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind strict two-phase locking internals</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain what strict 2PL guarantees beyond basic transactional syntax</strong> - Show how Harbor Point's approval path is serialized by waiting on a shared lockable object.</li>
+<li><strong>Trace how a lock manager grants, queues, and releases locks internally</strong> - Follow resource lookup, compatibility checks, wait queues, and wakeups.</li>
+<li><strong>Evaluate the production trade-offs of strict locking</strong> - Reason about hotspots, lock escalation, deadlocks, and when schema design can reduce lock contention.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for strict two-phase locking internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to strict two-phase locking internals.</p>
-<p><strong>Intuition</strong>: strict two-phase locking internals exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain serializable schedules with simple reasoning, but you pay with blocking and deadlock risk.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of strict two-phase locking internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full strict two-phase locking internals pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Map resources to lock table entries</li>
-<li>Grant shared/exclusive locks via compatibility matrix</li>
-<li>Queue blocked transactions with fairness policy</li>
-<li>Release all write locks only at commit/abort</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: Strict 2PL prevents bad histories by forcing a safe order before commit</h3>
+<p>Two-phase locking means a transaction has a growing phase, where it may acquire new locks, and a shrinking phase, where it releases locks and may not acquire new ones afterward. The "strict" part adds a stronger rule: write locks stay held until commit or abort. Many engines use an even stronger practical variant that keeps most transaction locks until the end because it simplifies implementation and recovery. The important production consequence is that nobody gets to read or overwrite a value produced by an uncommitted writer.</p>
+<p>Harbor Point uses that rule on the <code>issuer_exposure</code> row for <code>MUNI-77</code>. The approval transaction first locks the row that represents current exposure, then checks whether the new reservation fits, then updates the total and inserts the reservation record:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">BEGIN</span><span class="p">;</span>
+
+<span class="k">SELECT</span><span class="w"> </span><span class="n">used_intraday</span><span class="p">,</span><span class="w"> </span><span class="n">exposure_limit</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">issuer_exposure</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">issuer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;MUNI-77&#39;</span>
+<span class="k">FOR</span><span class="w"> </span><span class="k">UPDATE</span><span class="p">;</span>
+
+<span class="k">UPDATE</span><span class="w"> </span><span class="n">issuer_exposure</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">used_intraday</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">used_intraday</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">300000</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">issuer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;MUNI-77&#39;</span><span class="p">;</span>
+
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">quote_reservations</span><span class="w"> </span><span class="p">(</span><span class="n">issuer_id</span><span class="p">,</span><span class="w"> </span><span class="n">trader_id</span><span class="p">,</span><span class="w"> </span><span class="n">amount</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;MUNI-77&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;trader-a&#39;</span><span class="p">,</span><span class="w"> </span><span class="mi">300000</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;open&#39;</span><span class="p">);</span>
+
+<span class="k">COMMIT</span><span class="p">;</span>
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
+<p>If Trader B arrives while Trader A still owns the conflicting lock, the engine does not let Trader B read the old <code>used_intraday</code> and "sort it out later." It blocks Trader B at lock acquisition time:</p>
+<div class="codehilite"><pre><span></span><code>T1: X-lock issuer_exposure[MUNI-77] granted
+T1: read 9.6M, update to 9.9M
+T2: X-lock issuer_exposure[MUNI-77] requested -&gt; queued
+T1: commit
+T1: unlock
+T2: lock granted
+T2: read 9.9M, decide whether another 300k still fits
+</code></pre></div>
+
+<p>That is how the lock protocol destroys the cycle from <a href="02.html">02.md</a>: the second transaction can no longer make its decision from a snapshot that predates the first committed change on the same contention point. The serial order is enforced by waiting, not by postmortem analysis.</p>
+<p>This also exposes an important design limit. Strict 2PL only coordinates on objects the lock manager knows about. If Harbor Point kept the rule as "sum all open reservations for this issuer" without a materialized <code>issuer_exposure</code> row, then row locks on existing reservation records would not be enough. The engine would need gap, next-key, or predicate locking to protect the set of rows that could satisfy the query in the future. Locking is powerful, but only when the conflict surface matches the invariant you need to protect.</p>
+<h3>Concept 2: A lock manager is a hash table of resources, modes, and wait queues</h3>
+<p>Inside the engine, a lock request is usually identified by a resource tag such as "table <code>issuer_exposure</code>" or "row <code>issuer_exposure</code>, key <code>MUNI-77</code>." The lock manager hashes that tag to a lock-table entry, protects the entry with a short-lived latch, and checks whether the requested mode is compatible with the locks already granted there. The transaction lock may live for milliseconds or seconds; the internal latch usually lives only long enough to inspect and update the lock table. Mixing those up is a common source of confusion.</p>
+<p>Harbor Point's hot row might look like this inside the lock manager:</p>
+<div class="codehilite"><pre><span></span><code>resource: (table=issuer_exposure, key=&#39;MUNI-77&#39;)
+granted:  [T9817 X]
+waiting:  [T9821 X, T9824 S]
+</code></pre></div>
+
+<p>The compatibility matrix is the rulebook behind that queue. In the simple case, <code>S</code> can coexist with <code>S</code>, while <code>X</code> conflicts with everything else. Real engines also use intention modes such as <code>IS</code>, <code>IX</code>, and <code>SIX</code> so they can lock a hierarchy safely. If Harbor Point takes an exclusive row lock, it will often first take an <code>IX</code> lock on the table to announce "this transaction intends to take stronger locks below this level." That is how the engine allows many row-level writers to coexist without forcing a table-level exclusive lock each time.</p>
+<p>The grant path is mechanical:</p>
+<div class="codehilite"><pre><span></span><code>1. Hash the resource tag to a lock-table bucket.
+2. Latch the bucket so the lock-table entry can be inspected safely.
+3. Compare the requested mode with granted locks and with queue policy.
+4. If compatible, grant immediately and attach the lock to the transaction.
+5. If incompatible, enqueue the request and put the transaction to sleep.
+6. On unlock or commit, wake the next compatible waiter(s).
+</code></pre></div>
+
+<p>Queue policy matters. If Trader B is already waiting for <code>X</code>, should a later <code>S</code> request from a reporting query be allowed to jump ahead because it is compatible with the currently granted state once Trader A finishes? Some engines preserve near-FIFO order to avoid starving writers. Others allow more aggressive reordering to maximize throughput. The same logical correctness guarantee can therefore produce very different latency behavior under contention.</p>
+<p>Lock upgrade is another internal detail with real consequences. A transaction might start with <code>S</code> on a row, decide it now needs to write, and request an upgrade to <code>X</code>. If multiple transactions do that on the same resource, they can deadlock even though they all began as readers. That is one reason careful schema and statement design matter: not just which rows you touch, but the order and mode in which you touch them.</p>
+<h3>Concept 3: Strictness simplifies recovery, but it pushes pain into waits, deadlocks, and hotspots</h3>
+<p>Holding write locks until commit is expensive, but it buys a cleaner recovery model. If Harbor Point aborts Trader A's approval after the transaction updated <code>issuer_exposure</code> but before commit, no committed transaction should have been allowed to read that uncommitted version and build further state on top of it. Strictness prevents those dirty reads and therefore avoids cascading aborts. Recovery can undo Trader A locally instead of chasing a chain of dependent transactions that already acted on bad data.</p>
+<p>That same strictness is also why locking incidents are so visible in production. A transaction that spends 50 milliseconds in application logic after taking a hot <code>X</code> lock can stall every later approval for that issuer, even if the actual row update takes microseconds. A batch job that accumulates thousands of row locks may trigger lock escalation to a page or table lock, collapsing concurrency far beyond the rows it originally intended to touch. A dashboard query that scans the same hot range under shared locks can suddenly start fighting with writers in a way nobody expected from "just a read."</p>
+<p>Harbor Point should therefore monitor lock behavior as a first-class system:</p>
 <ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
+<li>lock wait duration and timeout counts</li>
+<li>queue length on the hottest resources</li>
+<li>deadlock victim frequency</li>
+<li>number of locks held by the oldest transactions</li>
+<li>escalation events from row to coarser lock levels</li>
 </ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for strict two-phase locking internals; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for strict two-phase locking internals.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain serializable schedules with simple reasoning, but operationally absorb blocking and deadlock risk.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>This is also the right place to compare strict 2PL with MVCC-style concurrency control. Strict 2PL usually blocks earlier and makes order explicit in wait queues. MVCC often lets readers continue and pays later through validation, conflict tracking, or serialization retries. Neither model is universally better. For a hotspot like <code>issuer_exposure[MUNI-77]</code>, strict locking gives Harbor Point a very legible correctness story. For broad read-heavy workloads, the same blocking behavior can become the system's main scalability limit.</p>
+<p>The next lesson on <a href="04.html">04.md</a> follows directly from this trade-off. Once waiting is the enforcement mechanism, the engine must detect or break wait cycles. Deadlock handling is not separate from strict 2PL. It is part of making strict 2PL survivable.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: strict two-phase locking internals works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: "We enabled row locking, but the issuer-limit anomaly still happened."</p>
+<p><strong>Why it happens / is confusing</strong>: Row locks only protect the rows actually locked. If the invariant depends on a range or on the absence of future rows, the lock manager needs predicate or next-key coverage, or the schema needs a shared summary row like Harbor Point's <code>issuer_exposure</code>.</p>
+<p><strong>Clarification / Fix</strong>: Identify the real conflict surface. If the business rule is predicate-shaped, either materialize the invariant onto one key or use an isolation mode that takes the necessary range or predicate locks.</p>
+<p><strong>Issue</strong>: "Database CPU is low, but approvals are timing out."</p>
+<p><strong>Why it happens / is confusing</strong>: Lock contention is a waiting problem, not necessarily a compute problem. One long holder on <code>issuer_exposure[MUNI-77]</code> can create a deep queue while the server appears otherwise underutilized.</p>
+<p><strong>Clarification / Fix</strong>: Inspect lock waits, blocked sessions, and transaction age. Shorten the critical section after the hot lock is acquired, and move unrelated work out of the transaction.</p>
+<p><strong>Issue</strong>: "Why did a read-only reporting query get involved in a locking incident?"</p>
+<p><strong>Why it happens / is confusing</strong>: Depending on the engine and isolation level, reads may still take shared, next-key, or predicate locks. They also interact with queue policy; a waiting writer can cause later readers to queue behind it.</p>
+<p><strong>Clarification / Fix</strong>: Check the query's isolation level and lock mode, then decide whether it should run from a snapshot, on a replica, or against a different access path that avoids the hot resource.</p>
+<p><strong>Issue</strong>: "We see deadlocks after adding <code>SELECT ... FOR UPDATE</code>."</p>
+<p><strong>Why it happens / is confusing</strong>: Locking preserves correctness by introducing waits. If two transactions acquire resources in opposite orders or both try to upgrade from <code>S</code> to <code>X</code>, the wait graph can cycle.</p>
+<p><strong>Clarification / Fix</strong>: Standardize lock acquisition order, keep transactions short, and instrument deadlock reports. <a href="04.html">04.md</a> is the next lesson because strict 2PL almost always creates this operational follow-up.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: strict two-phase locking internals &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: strict two-phase locking internals &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: Strict 2PL ↔ serialization graphs</h3>
+<p>The serialization graph from <a href="02.html">02.md</a> is the proof language; strict 2PL is one enforcement strategy. Every incompatible lock request is the engine refusing to let a transaction create a dependency edge "too early." The graph says why a history would be invalid, and the lock manager is the runtime mechanism that keeps the invalid history from ever finishing.</p>
+<h3>Connection 2: Strict 2PL ↔ recovery and ARIES-style logging</h3>
+<p>Strictness is not only about concurrency. By ensuring uncommitted writes stay isolated until commit or abort, it prevents cascading aborts and keeps recovery local to the failed transaction. That is why classic recovery designs pair WAL with strict locking: logging tells the engine how to redo or undo, while strictness limits how far uncommitted effects can leak before that recovery logic runs.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/explicit-locking.html">PostgreSQL Documentation: Explicit Locking</a><ul>
+<li>Focus: Review concrete lock modes, conflicts, and the operational behavior of waiting and deadlocks in a production database.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html">MySQL 8.0 Reference Manual: InnoDB Locking</a><ul>
+<li>Focus: Study record, gap, and next-key locks to see how lock managers protect both rows and index ranges.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[PAPER] <a href="https://www.microsoft.com/en-us/research/publication/a-critique-of-ansi-sql-isolation-levels/">A Critique of ANSI SQL Isolation Levels</a><ul>
+<li>Focus: Connect anomalies, predicate conflicts, and lock-based prevention strategies to the formal isolation vocabulary.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging">ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging</a><ul>
+<li>Focus: See why fine-grained locking and WAL were designed together in a recoverable transaction engine.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Strict 2PL is a scheduling rule, not a generic "use locks" slogan</strong> - It prevents unsafe histories by making conflicting transactions wait before they can build the wrong state.</li>
+<li><strong>The lock manager is a real subsystem with its own data structures and policies</strong> - Resource tags, compatibility checks, latches, wait queues, and upgrades directly shape latency behavior.</li>
+<li><strong>Strictness makes correctness and recovery easier to reason about, but it externalizes the cost as contention</strong> - Hotspots, lock escalation, and deadlocks are the operational price of that simpler correctness story.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model strict two-phase locking internals as explicit state transitions and invariants?</strong></p>
+<p><strong>What makes strict 2PL stricter than ordinary two-phase locking?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) It forces every transaction to take a table lock before doing any work</li>
+<li>B) It requires write locks to be held until commit or abort, preventing other transactions from observing uncommitted writes</li>
+<li>C) It allows transactions to release locks early as long as they reacquire them later</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Why does Harbor Point's lock manager keep a wait queue for <code>issuer_exposure[MUNI-77]</code> instead of letting both approvals proceed and fixing conflicts at commit time?</strong></p>
 <ul>
-<li>A) Gaining serializable schedules with simple reasoning while paying blocking and deadlock risk.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Because strict 2PL enforces order online by delaying conflicting work at lock acquisition time</li>
+<li>B) Because lock queues are only useful for performance monitoring and do not affect correctness</li>
+<li>C) Because SQL requires every transaction to run in arrival order</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Why might row-level strict 2PL still fail to protect a predicate like "sum all open reservations for one issuer" if there is no shared summary row?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Because strict 2PL only works for writes, never for reads</li>
+<li>B) Because the lock manager cannot protect conflicts that are expressed as future matching rows unless it also locks the relevant gaps, ranges, or predicate</li>
+<li>C) Because lock managers do not track resources by key</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves serializable schedules with simple reasoning, but that benefit is purchased with blocking and deadlock risk.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: Two-phase locking forbids new acquisitions after the shrinking phase starts. Strict 2PL adds the stronger recoverability rule that write locks remain held until the transaction finishes.</p>
+<p><strong>2. A</strong>: The queue is the enforcement mechanism. By blocking the second approval before it can read or write through the same contention point, the engine prevents the unsafe history instead of explaining it after the fact.</p>
+<p><strong>3. B</strong>: A predicate depends on a set of possible rows, including ones that do not exist yet. Protecting that invariant requires locking the corresponding range or redesigning the schema so all conflicting transactions meet on one lockable key.</p>
 
       
       <hr>
@@ -218,7 +200,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

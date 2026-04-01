@@ -22,183 +22,141 @@
     <main>
       <h1>Day 402: Isolation Anomalies and Serialization Graphs</h1>
 <blockquote>
-<p><strong>Isolation Anomalies and Serialization Graphs starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: A concurrent history is safe only if its dependency graph can be arranged into one serial order; anomalies are the cases where the graph closes into a cycle and no such order exists.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In isolation anomalies and serializability, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How write skew, phantom reads, and lost updates emerge from interleavings. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding isolation anomalies and serializability lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="01.html">01.md</a>, Harbor Point's upgraded <code>quotevault</code> engine learned how to treat a multi-statement correction as one atomic unit. That solved the question "did this transaction commit or not?" It did not solve the harder question that appears as soon as two traders act at once: "can these committed transactions both be correct together?"</p>
+<p>At 09:30, Harbor Point has <code>9.6M</code> of open municipal-bond exposure against issuer <code>MUNI-77</code>, with a hard intraday limit of <code>10.0M</code>. Trader A wants to reserve <code>300k</code> of headroom for a client quote. Trader B, on another session, wants to do the same thing at the same moment. Each transaction reads the current open reservations, sees <code>400k</code> of room left, inserts its own reservation row, and commits. Nothing is half-written. WAL is fine. Recovery is fine. The problem is that the final state says <code>10.2M</code> is reserved, even though each transaction individually checked the rule before writing.</p>
+<p>That is the mental shift for this lesson. Isolation anomalies are not mysterious "race conditions" floating above the database. They are specific histories with specific dependency edges. A serialization graph gives you a compact proof: if the graph has a cycle, the database allowed a story that could not have happened in any one-at-a-time execution. Write skew, phantoms, and lost updates are different surfaces of that same failure.</p>
+<p>The next lesson on <a href="03.html">03.md</a> turns that theory into machinery by looking at strict two-phase locking and lock-manager internals. This lesson stays one layer earlier: how to name the bad histories precisely, how to draw them, and why production systems either block, validate, or abort transactions to keep those cycles from becoming durable facts.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How write skew, phantom reads, and lost updates emerge from interleavings.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's exposure guard looked safe in code review because every approval ran inside a transaction and every transaction re-checked the issuer limit before inserting a reservation. Under light load, the invariant held. During the market-open burst, it failed intermittently. The desk did not see torn rows or crashed processes; it saw a much worse kind of bug, one that looked legitimate in every local log line and still broke a portfolio-level rule.</p>
+<p>This is the practical value of anomaly analysis. Without it, the team argues in vague terms: "maybe MVCC is stale," "maybe the replica lagged," "maybe we need more locks." With it, the bug becomes concrete. Two transactions each read a predicate over open reservations, each inserted a row that should have changed the other's decision, and the committed history formed a cycle. That tells you exactly what kind of protection is missing: predicate locking, serializable validation, or a schema change that collapses the invariant onto one contention point.</p>
+<p>In production, that precision matters because isolation choices affect more than correctness. They change wait behavior, abort rates, deadlock exposure, retry logic, and how you explain a postmortem. Once the team can say "this was a write-skew cycle on an issuer-limit predicate," the fix stops being folklore and becomes engineering.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind isolation anomalies and serializability</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain why an anomaly is really a failed serial-order proof</strong> - Show why Harbor Point's exposure approvals can be individually sensible and jointly wrong.</li>
+<li><strong>Build and read a serialization graph</strong> - Map reads and writes to dependency edges and decide whether a committed history is serializable.</li>
+<li><strong>Compare prevention strategies in production terms</strong> - Reason about when to block conflicts up front, when to validate and retry, and when to redesign the invariant.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for isolation anomalies and serializability</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to isolation anomalies and serializability.</p>
-<p><strong>Intuition</strong>: isolation anomalies and serializability exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain predictable correctness under concurrency, but you pay with reduced parallelism at stricter levels.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of isolation anomalies and serializability</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full isolation anomalies and serializability pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Model conflicting operations as dependency edges</li>
-<li>Build serialization graph from read-write and write-write conflicts</li>
-<li>Detect cycles that violate serial equivalence</li>
-<li>Select isolation level that blocks target anomaly classes</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: An isolation anomaly is a committed history with no valid serial explanation</h3>
+<p>Return to Harbor Point's issuer-limit rule. The desk stores each tentative quote approval as a row in <code>quote_reservations</code>, and the rule is "the sum of all <code>status = 'open'</code> reservations for one issuer must stay at or below the configured limit." The approval transaction therefore reads a predicate, not just one row:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">BEGIN</span><span class="p">;</span>
+
+<span class="k">SELECT</span><span class="w"> </span><span class="k">COALESCE</span><span class="p">(</span><span class="k">SUM</span><span class="p">(</span><span class="n">amount</span><span class="p">),</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">reserved</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">quote_reservations</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">issuer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;MUNI-77&#39;</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span><span class="p">;</span>
+
+<span class="c1">-- if reserved + 300000 &lt;= 10000000, then:</span>
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">quote_reservations</span><span class="w"> </span><span class="p">(</span><span class="n">issuer_id</span><span class="p">,</span><span class="w"> </span><span class="n">trader_id</span><span class="p">,</span><span class="w"> </span><span class="n">amount</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;MUNI-77&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;trader-a&#39;</span><span class="p">,</span><span class="w"> </span><span class="mi">300000</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;open&#39;</span><span class="p">);</span>
+
+<span class="k">COMMIT</span><span class="p">;</span>
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
+<p>If Trader A and Trader B both run that logic against the same snapshot-like view, both can read <code>9.6M</code>, both can conclude that <code>300k</code> fits, and both can insert. The anomaly is not that one transaction saw corrupted data. Each one saw a self-consistent database state. The anomaly is that after both commits, no serial order explains the outcome. If A had really run before B, then B's read should have seen <code>9.9M</code> and declined. If B had really run before A, then A should have declined. Because both committed approvals exist, the history cannot be equivalent to either serial order.</p>
+<p>That is why serializability is the reference contract. It does not promise that transactions literally run one at a time. It promises that the committed result can be explained as if they had. As soon as Harbor Point loses that property, the desk is no longer reasoning about one clean sequence of approvals. It is reasoning about interleavings whose combined effect may violate a portfolio invariant even though no single statement looks suspicious.</p>
+<p>Write skew is the name usually given to this pattern when two transactions read overlapping facts and then write different rows whose combination breaks a rule. Phantoms are the same problem viewed through a predicate: a new matching row appears in a range or filter that a transaction used for its decision. Lost updates are a tighter version in which both transactions read the same item and one silently overwrites the other's derived write. Different names help with diagnosis, but the common test is still the same: can you tell one serial story that matches the final outcome?</p>
+<h3>Concept 2: A serialization graph turns concurrency into something you can prove</h3>
+<p>A serialization graph has one node per committed transaction. An edge means "these two transactions must appear in this order if the history is to make sense." Three edge families matter most in database isolation work:</p>
 <ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
+<li><code>wr</code>: T1 wrote a version that T2 later read, so T1 must come before T2.</li>
+<li><code>ww</code>: T1 and T2 both wrote the same logical item or key range, and T2's write is later, so T1 must come before T2.</li>
+<li><code>rw</code> anti-dependency: T1 read a version or predicate result that T2 later changed, so for T1's read to remain valid, T1 must come before T2.</li>
 </ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for isolation anomalies and serializability; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for isolation anomalies and serializability.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain predictable correctness under concurrency, but operationally absorb reduced parallelism at stricter levels.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>Harbor Point's issuer-limit bug is a pure <code>rw</code> cycle:</p>
+<div class="codehilite"><pre><span></span><code>T1: read SUM(open reservations for MUNI-77) = 9.6M
+T2: read SUM(open reservations for MUNI-77) = 9.6M
+T1: insert reservation R1 for 300k
+T2: insert reservation R2 for 300k
+
+Edges:
+T1 --rw--&gt; T2   because T2 inserted a row that should have changed T1&#39;s predicate result
+T2 --rw--&gt; T1   because T1 inserted a row that should have changed T2&#39;s predicate result
+</code></pre></div>
+
+<p>Once the graph contains <code>T1 -&gt; T2 -&gt; T1</code>, the proof is over. A cycle means there is no topological order, which means there is no serial schedule that could have produced the same reads and writes. That is the formal reason the history is non-serializable. The value of the graph is that it separates "something concurrent happened" from "this specific concurrency pattern violated the serial contract."</p>
+<p>This also explains why phantoms are not just a user-interface oddity where a query returns a different count the second time. In serialization terms, a phantom is a predicate-shaped <code>rw</code> edge. Harbor Point's transaction did not read reservation row <code>R2</code> because <code>R2</code> did not exist yet, but it absolutely depended on the absence of any such row when it approved the quote. Predicate reads therefore create dependencies on gaps and ranges, not only on the row identifiers that currently exist.</p>
+<p>If Harbor Point had instead materialized the current issuer total in one <code>issuer_exposure</code> row and both transactions performed a read-modify-write on that row, the anomaly surface would change. The engine could often detect or block the conflict with a simpler row-level <code>ww</code> interaction. That does not mean serialization graphs become irrelevant. It means schema design can move an invariant from a broad predicate conflict to a narrow key conflict that the engine handles more directly.</p>
+<h3>Concept 3: Real engines prevent cycles either by blocking edges or by aborting dangerous histories</h3>
+<p>Once you think in graphs, isolation levels stop looking like vague labels and start looking like edge-management policies. A strict two-phase locking engine tries to stop dangerous edges from forming in the first place. If Harbor Point's approval transaction reads the relevant rows or ranges under locks that are held until commit, another transaction may have to wait before it can insert a conflicting reservation. The benefit is straightforward reasoning: by the time a transaction commits, its ordering constraints were already enforced. The cost is blocking, lock memory, and the possibility of deadlocks when transactions wait on one another in a loop.</p>
+<p>MVCC changes the shape of the problem rather than removing it. Snapshot reads let Harbor Point's readers proceed without blocking writers for many workloads, which is excellent for throughput and latency. But a stable snapshot does not by itself eliminate <code>rw</code> cycles. In fact, snapshot isolation is exactly where write skew often survives: each transaction reads a coherent past, writes a disjoint row, and only later does the system discover that the combination had no serial explanation. Serializable MVCC implementations solve this by tracking dangerous structures and aborting one participant before the cycle becomes a committed fact.</p>
+<p>That design choice is visible to operators. Blocking-first systems tend to surface lock waits, deadlocks, and queue buildup. Validation-first systems surface serialization failures and application retries. Neither is "free." Harbor Point has to decide whether the issuer-limit path is better served by waiting, by retrying, or by changing the schema so the invariant becomes one atomic counter update instead of a predicate over many reservation rows. The right answer depends on hotspot intensity, tail-latency budget, and how much retry complexity the application can tolerate.</p>
+<p>This is the bridge into <a href="03.html">03.md</a>. Strict 2PL is one concrete way to enforce a serial order before commit, and a lock manager is the subsystem that makes that enforcement operational. The graph perspective from this lesson tells you what that machinery is really buying: not "more locking" in the abstract, but the prevention of specific cycles that would otherwise let Harbor Point acknowledge an impossible history.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: isolation anomalies and serializability works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: "We run at <code>REPEATABLE READ</code>, but the issuer limit still breaks occasionally."</p>
+<p><strong>Why it happens / is confusing</strong>: A stable snapshot prevents many read anomalies, but it may still allow a write-skew cycle when two transactions read the same predicate and then write different rows.</p>
+<p><strong>Clarification / Fix</strong>: Confirm whether the invariant depends on the absence or sum of multiple rows. If it does, move the path to true serializable isolation, add explicit locking for the predicate, or redesign the invariant around one row that every transaction must update.</p>
+<p><strong>Issue</strong>: "No row was overwritten, so why are we calling this a concurrency bug?"</p>
+<p><strong>Why it happens / is confusing</strong>: Teams often equate concurrency bugs with lost updates on one row. Harbor Point's failure is subtler: both inserts are individually valid, but together they invalidate the predicate that justified each insert.</p>
+<p><strong>Clarification / Fix</strong>: Inspect the history at the predicate level, not just the row level. Ask which rows or gaps each transaction assumed were absent or below threshold when it made its decision.</p>
+<p><strong>Issue</strong>: "After enabling serializable isolation, commits started failing with retryable errors."</p>
+<p><strong>Why it happens / is confusing</strong>: The database is no longer permitting dangerous cycles to commit. One transaction is being aborted so the committed history still has a valid serial order.</p>
+<p><strong>Clarification / Fix</strong>: Treat serialization failures as a normal control path. Keep transactions short, add supporting indexes so predicate checks are narrow, and retry from an idempotent application boundary rather than halfway through side effects.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: isolation anomalies and serializability &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: isolation anomalies and serializability &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: Serialization graphs ↔ lock manager internals</h3>
+<p>A lock manager is the operational counterpart to the graph model. Row locks, gap locks, next-key locks, and predicate locks are all ways of forbidding certain edges from appearing concurrently. Harbor Point's issuer-limit rule is a good example of why row locks alone are not always enough: the dangerous dependency comes from a range predicate over "all open reservations for <code>MUNI-77</code>," not from one known row identifier. That is exactly why <a href="03.html">03.md</a> needs both strict 2PL and lock-manager internals in the same lesson.</p>
+<h3>Connection 2: Serialization graphs ↔ history-based correctness testing</h3>
+<p>The same reasoning appears outside one database engine. Jepsen-style analyses and formal consistency checkers take an observed history, build constraints between operations, and ask whether any legal order satisfies them. The contract is different for linearizability than for serializability, but the habit of mind is the same: correctness is a statement about which histories can be explained by a permitted order, not about whether the logs "look normal" at first glance.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Documentation: Transaction Isolation</a><ul>
+<li>Focus: Compare the guarantees of <code>READ COMMITTED</code>, <code>REPEATABLE READ</code>, and <code>SERIALIZABLE</code> in a production MVCC engine.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-next-key-locking.html">MySQL 8.0 Reference Manual: InnoDB Next-Key Locking</a><ul>
+<li>Focus: See how range and gap locking are used to prevent phantom-style predicate conflicts.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[PAPER] <a href="https://www.microsoft.com/en-us/research/publication/a-critique-of-ansi-sql-isolation-levels/">A Critique of ANSI SQL Isolation Levels</a><ul>
+<li>Focus: Ground the anomaly vocabulary in a classic paper that explains why isolation names alone are insufficient.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://drkp.net/papers/ssi-vldb12.pdf">Serializable Snapshot Isolation in PostgreSQL</a><ul>
+<li>Focus: Study how an MVCC system can detect dangerous <code>rw</code> structures and abort one transaction before a non-serializable cycle commits.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>An anomaly is a failed serialization proof</strong> - The question is not whether each transaction looked reasonable alone, but whether the committed history still admits any serial order.</li>
+<li><strong>Predicate reads create real dependencies</strong> - Harbor Point's limit check depends on the absence of matching rows, so phantoms and write skew live in the gaps, not only in overwritten tuples.</li>
+<li><strong>Isolation strategy is edge management</strong> - Engines either block dangerous edges early, validate and abort them later, or rely on schema design to collapse broad predicates into simpler conflicts.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model isolation anomalies and serializability as explicit state transitions and invariants?</strong></p>
+<p><strong>Why is Harbor Point's double-approval bug non-serializable even though both transactions committed successfully?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Because WAL flushes happened in the wrong order</li>
+<li>B) Because both transactions participated in a dependency cycle, so no one-at-a-time execution can explain the final state</li>
+<li>C) Because inserts are never safe inside a transaction</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Which edge best captures the fact that T1 read the set of open reservations before T2 inserted a new matching reservation?</strong></p>
 <ul>
-<li>A) Gaining predictable correctness under concurrency while paying reduced parallelism at stricter levels.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) <code>rw</code> anti-dependency</li>
+<li>B) <code>ww</code> dependency</li>
+<li>C) <code>wr</code> dependency</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>Why can moving the invariant onto one materialized <code>issuer_exposure</code> row make enforcement simpler?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Because it removes the need for durability</li>
+<li>B) Because it turns a broad predicate conflict into a narrower key conflict that row-level coordination can often detect directly</li>
+<li>C) Because it guarantees deadlocks cannot happen</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves predictable correctness under concurrency, but that benefit is purchased with reduced parallelism at stricter levels.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: The committed approvals imply both T1 before T2 and T2 before T1. That cycle means the history cannot match any serial execution, even though each transaction was atomic and durable on its own.</p>
+<p><strong>2. A</strong>: T1 read a predicate result that T2 later invalidated by inserting a matching row. That is the defining shape of an <code>rw</code> anti-dependency and the reason phantoms matter.</p>
+<p><strong>3. B</strong>: Materializing the invariant does not remove concurrency problems, but it often narrows them to one shared row or key. That gives the engine a simpler conflict surface than "all rows matching this predicate."</p>
 
       
       <hr>
@@ -218,7 +176,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 05:23 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>
