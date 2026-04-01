@@ -22,183 +22,129 @@
     <main>
       <h1>Day 419: Raft for Database Replication</h1>
 <blockquote>
-<p><strong>Raft for Database Replication starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: In a Raft-backed database, a write is not considered committed because one primary decided it was durable. It is committed because a majority of the replicas for that data range have accepted the same log entry in the same position, which makes that history survive leader failure.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In raft replication internals, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How leader election and log matching provide safe consensus. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding raft replication internals lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="02.html">02.md</a>, Harbor Point had a familiar primary-standby question: when reservation <code>R-88421</code> is approved, should the database return success after local WAL flush, after one standby flushes, or after some stricter remote milestone? Raft changes that question. The reservation range for issuer <code>MUNI-77</code> is no longer "one primary plus followers." It is a three-replica Raft group, and commit means the group has chosen an ordered log entry by majority.</p>
+<p>That sounds like a small wording change, but it changes the whole failure story. In leader-follower replication, teams often debate which standby acknowledgment should be required before success. In Raft, the log itself is the contract: the leader proposes an entry, followers accept it only if their existing log prefix matches, and the leader acknowledges the client only after a majority has that entry durably recorded. If the leader dies after that point, any future leader must carry that committed history forward. If the leader dies before that point, the entry may disappear and the client must retry.</p>
+<p>The useful mental shift is this: Raft is not "synchronous replication with fancier elections." It turns replication into the mechanism that defines authority. Harbor Point adopts it because losing a committed reservation after failover is worse than paying an extra quorum round trip, but that safety comes with real database costs: every hot shard has a leader, every write waits for quorum I/O, and every read path has to be explicit about whether it needs fresh linearizable data or is allowed to trail behind.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How leader election and log matching provide safe consensus.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's reservation platform now has a harder requirement than the earlier primary-standby deployment could comfortably explain. The <code>issuer_exposure</code> record for <code>MUNI-77</code> cannot be overbooked, and a reservation approval cannot vanish just because the current leader host failed before a replica promotion finished. A simple asynchronous primary is too weak for that contract. A synchronous primary is better, but the rule still sounds like an implementation setting: "wait for remote flush on one standby." Operations wants something stronger and easier to reason about during failover.</p>
+<p>Raft gives Harbor Point that stronger contract for the data range itself. The leader for the <code>MUNI-77</code> range may change, but the committed log history for that range cannot fork as long as a majority of replicas remain available. That makes post-failover reasoning cleaner: either the reservation reached quorum and will survive, or it did not and the client must retry. There is no third state where an old primary believed the write was committed but the new leader is free to forget it.</p>
+<p>This matters operationally because it pushes coordination directly into the database write path. Approval latency now depends on quorum network and disk behavior, not only the old leader's local flush. Hot keys concentrate on the current leader for their Raft group. Lagging replicas may need snapshots instead of ordinary log catch-up. The next lesson, <a href="04.html">04.md</a>, generalizes that quorum idea and asks how read and write quorums behave when the system exposes them as tunable policy rather than fixing them inside Raft's majority rule.</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind raft replication internals</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain how Raft changes database commit semantics</strong> - Trace why a write becomes durable when a majority agrees on one log position, not when one primary decides to acknowledge it.</li>
+<li><strong>Analyze failover outcomes for committed and uncommitted entries</strong> - Predict which reservation updates survive leader loss and why some timed-out writes must be retried.</li>
+<li><strong>Evaluate when Raft is worth the cost in a database system</strong> - Connect quorum commit, read freshness, replica catch-up, and hot-range leadership to real production trade-offs.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for raft replication internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to raft replication internals.</p>
-<p><strong>Intuition</strong>: raft replication internals exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain clear safety model under node failures, but you pay with write availability depends on majority health.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of raft replication internals</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full raft replication internals pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Elect leader via term-based majority voting</li>
-<li>Replicate entries with previous-index/term consistency checks</li>
-<li>Advance commit index once majority stores entry</li>
-<li>Apply committed entries in strict log order</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: A database write becomes a Raft log entry before it becomes visible state</h3>
+<p>Harbor Point stores the <code>MUNI-77</code> reservation range on three replicas: <code>db-a</code>, <code>db-b</code>, and <code>db-c</code>. At 09:30:00.120, the API asks to reserve another <code>500000</code> notional, which means incrementing <code>issuer_exposure.reserved_notional</code> and inserting reservation <code>R-88421</code>. In a Raft-backed database, the leader for that range does not apply those changes to its local state machine first and then "ship" them as an afterthought. It first turns the write into a log entry, such as "apply reservation delta for <code>MUNI-77</code>," with a term and an index.</p>
+<p>The leader appends that entry to its local Raft log and sends <code>AppendEntries</code> RPCs to followers. Each follower checks the prefix information attached to the request: "Do I already have the same previous log index and term as the leader?" If the answer is yes, it appends the new entry durably to its own log. If the answer is no, the follower rejects the append and the leader backs up until the logs share a matching prefix again. That is the log-matching rule that prevents replicas from quietly drifting into different histories.</p>
+<p>Only after the leader sees that a majority has stored the entry may it advance <code>commitIndex</code> for that log position. At that point the entry is committed by protocol. The database can then apply the command to the replicated state machine: update the exposure total, create the reservation row, and make the result visible to subsequent reads. Followers also wait for the leader's commit information before applying the entry locally. A follower may have the bytes for an entry in its log without yet exposing that entry to queries.</p>
+<p>For Harbor Point's range, the write path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>client
+  -&gt; range router
+  -&gt; leader db-b (term 48)
+       append log[1051] = reserve R-88421 for MUNI-77
+       fsync local Raft log
+       send AppendEntries(prev=1050/48, entry=1051) to db-a, db-c
+  -&gt; db-a fsyncs log[1051]
+  -&gt; majority reached: db-b + db-a
+  -&gt; leader sets commitIndex = 1051
+  -&gt; leader applies entry to storage engine state
+  -&gt; leader replies success to client
+  -&gt; followers apply once they learn commitIndex &gt;= 1051
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for raft replication internals; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for raft replication internals.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain clear safety model under node failures, but operationally absorb write availability depends on majority health.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>This is the first big difference from the previous lesson. In <a href="02.html">02.md</a>, synchronous replication meant "the primary waits for a standby milestone." Here, majority acknowledgment is not an optional durability enhancement layered on top of the write. It is what makes the write committed at all. The trade-off is straightforward: Harbor Point gets a failover-safe history for that range, but every write now pays for quorum coordination and cannot outrun the health of the majority.</p>
+<h3>Concept 2: Leader changes are safe because committed and uncommitted entries are treated differently</h3>
+<p>The hardest production confusion in Raft-backed databases is assuming that "replicated somewhere" means "safe forever." Harbor Point needs the sharper distinction. Suppose leader <code>db-b</code> appends reservation <code>R-88421</code> locally and sends it to followers, but crashes before anything else happens. If no follower durably stored the entry, the write never reached quorum. <code>db-a</code> and <code>db-c</code> can elect a new leader whose log does not include <code>R-88421</code>, and the old entry disappears. That is not data loss according to the protocol, because the system never promised that entry was committed.</p>
+<p>Now change the scenario slightly. <code>db-b</code> appends <code>R-88421</code>, <code>db-a</code> durably appends it too, quorum is reached, and <code>db-b</code> crashes before the client sees the response. Harbor Point now has a different problem: the client may time out and be unsure whether the reservation succeeded, but the cluster itself is not unsure. Because a majority stored the entry, any future leader must contain it. <code>db-c</code> cannot win leadership with an older log if <code>db-a</code> is available, and if only <code>db-c</code> survives the cluster will stop making progress rather than elect a leader that could forget a committed command.</p>
+<p>This is where Raft's election restriction matters to database behavior. Candidates include their last log index and term when requesting votes. Replicas refuse to vote for a candidate whose log is less up to date than their own. That rule ensures the new leader contains every committed entry. The database can therefore expose a clean invariant to Harbor Point: once a reservation update is committed, failover may delay availability, but it must not rewrite history.</p>
+<p>The client-side implication is equally important. A timeout after leader failure is not enough to tell Harbor Point whether <code>R-88421</code> exists. The right question is not "Did the old leader start the write?" but "Did the write reach quorum before the old leader disappeared?" Production systems handle that ambiguity with idempotent request identifiers, deduplication on retry, and observability around proposal success versus application success. Raft protects the history once the cluster commits an entry; it does not magically remove the need for careful client retry semantics.</p>
+<h3>Concept 3: Raft makes databases easier to reason about, but not cheaper to operate</h3>
+<p>Raft is especially attractive in databases because it gives each shard or key range its own small consensus group. Harbor Point does not need one monolithic cluster-wide log for every table. It can split the keyspace so <code>MUNI-77</code>, <code>ENERGY-12</code>, and other issuer ranges each live in separate Raft groups. That spreads write throughput across many leaders and makes rebalancing possible as the dataset grows. Systems such as CockroachDB and TiKV build their storage layer around exactly this idea: ranges or regions are the unit of replication, leadership, and repair.</p>
+<p>The cost is that every range now has consensus behavior that must be operated deliberately. A hot issuer creates a hot Raft leader, because writes for that range must flow through one replica at a time. A slow follower may not block every write if the other two replicas still form a majority, but it can increase snapshot traffic and recovery work. If a follower falls too far behind, catching up from the log may be slower than shipping a snapshot of the current state and then replaying the remaining entries. Rebalancing a range to another node is therefore not just copying bytes; it is copying state while preserving the log's authoritative order.</p>
+<p>Read behavior also stops being trivial. Harbor Point's approval API needs linearizable answers when it asks "what is the current reserved notional for <code>MUNI-77</code>?" Many Raft-backed databases serve those reads from the leader or leaseholder, because that node already has the freshest committed prefix. Replica reads can be cheaper or geographically closer, but then the system must either prove freshness through a mechanism such as <code>ReadIndex</code> or accept staleness. That is the bridge to <a href="04.html">04.md</a>: once the database is defined by quorum commit, read semantics become a first-class design choice rather than a side effect.</p>
+<p>So the trade-off is not "Raft is safer, therefore use it everywhere." The real trade-off is narrower. Use Raft when a shard's state must survive leader loss without ambiguity and when paying quorum cost is acceptable. Do not use it casually for workloads that mostly need local durability, loose replica freshness, or extreme write fan-out across wide geographies. Harbor Point accepts the cost for exposure control because a duplicated or missing reservation is more expensive than a few extra milliseconds of coordinated commit latency.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: raft replication internals works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: Reservation writes slowed down after one replica moved onto a busier node, even though the leader's own disk metrics still look healthy.</p>
+<p><strong>Why it happens / is confusing</strong>: The leader is not waiting only on itself. Commit needs a majority of replicas for that range, so follower fsync time and network delay are part of write latency as soon as the local node stops being the only bottleneck.</p>
+<p><strong>Clarification / Fix</strong>: Measure proposal latency, follower append latency, and quorum commit latency separately. If one follower is consistently slow, Harbor Point may need to move that replica, rebalance the range, or temporarily accept reduced fault tolerance while repair work finishes.</p>
+<p><strong>Issue</strong>: After a leader crash, the client retried <code>R-88421</code> because the original request timed out, and support is unsure whether one or two reservations were created.</p>
+<p><strong>Why it happens / is confusing</strong>: A client timeout does not reveal whether the old leader failed before or after quorum commit. The cluster knows the answer; the client often does not.</p>
+<p><strong>Clarification / Fix</strong>: Make reservation requests idempotent with a stable request ID stored in the replicated state machine. On retry, the new leader can answer whether <code>R-88421</code> already committed instead of applying it twice.</p>
+<p><strong>Issue</strong>: A follower appears almost caught up, but the database still sends some reads to the leader instead of serving them locally.</p>
+<p><strong>Why it happens / is confusing</strong>: Having most log entries is not the same as proving a linearizable read. The follower may still lack the latest committed prefix or may not have a freshness proof tied to the current leader term.</p>
+<p><strong>Clarification / Fix</strong>: Distinguish follower-read mode from leader/leaseholder reads in dashboards and runbooks. If the request needs current exposure values, route it through the linearizable path rather than trusting approximate replica lag.</p>
+<p><strong>Issue</strong>: A recovering replica starts consuming large amounts of bandwidth and disk I/O instead of quietly replaying the Raft log.</p>
+<p><strong>Why it happens / is confusing</strong>: Once a replica falls too far behind, the retained log prefix may be too long or too expensive to replay incrementally. The database will ship a snapshot and then catch up from a later log position.</p>
+<p><strong>Clarification / Fix</strong>: Watch snapshot send/receive metrics, tune log retention relative to repair time, and keep replica placement stable enough that brief outages do not force repeated full-range snapshots.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: raft replication internals &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: raft replication internals &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: <a href="02.html">02.md</a> asked which remote milestone to wait for; Raft makes quorum acceptance the milestone</h3>
+<p>The previous lesson treated replica acknowledgment as a policy choice on top of leader-follower replication. Raft collapses that debate into the protocol itself for a shard: a write is committed when a majority has accepted the log entry and the leader advances commit index. The operator still chooses replication factor and placement, but not an ad hoc definition of commit for each write.</p>
+<h3>Connection 2: <a href="04.html">04.md</a> and <a href="05.html">05.md</a> widen the scope from one Raft group to many replicated partitions</h3>
+<p><a href="04.html">04.md</a> will compare Raft's fixed majority semantics with systems that expose tunable read and write quorums directly. <a href="05.html">05.md</a> then asks how the keyspace should be partitioned so those quorum costs land on sensible shards. In practice, databases scale Raft by running many small consensus groups, so sharding strategy determines where leadership, quorum latency, and hot spots show up.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Extended Version)</a><ul>
+<li>Focus: The original Raft paper's treatment of leader election, log replication, commitment, and why committed entries survive leadership change.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/architecture/replication-layer">CockroachDB Architecture: Replication Layer</a><ul>
+<li>Focus: A production database implementation of per-range Raft groups, leaseholders, snapshots, and quorum writes.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[DOC] <a href="https://tikv.org/docs/7.1/reference/architecture/storage/">TiKV Architecture: Storage</a><ul>
+<li>Focus: How a real distributed KV store turns each region into a Raft group and combines replicated logs with range-based sharding.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.4/learning/api_guarantees/">etcd API Guarantees</a><ul>
+<li>Focus: How a Raft-backed system explains completed operations, linearizable reads, and the trade-off between fresh and stale read modes.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Raft commit is a quorum fact, not a primary's opinion</strong> - A database write becomes durable for the cluster only when a majority has accepted the same log entry in the same position.</li>
+<li><strong>Leader failure does not make all in-flight writes equal</strong> - Committed entries must survive leadership change, while uncommitted entries may disappear and require client retry.</li>
+<li><strong>Raft simplifies failover reasoning by charging coordination upfront</strong> - The price of cleaner safety semantics is quorum latency, leader hot spots, explicit read freshness rules, and replica repair work.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model raft replication internals as explicit state transitions and invariants?</strong></p>
+<p><strong>Harbor Point's leader for range <code>MUNI-77</code> appends reservation <code>R-88421</code> locally and crashes before any follower durably stores it. What should the cluster do next?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Treat the reservation as committed because the old leader accepted it first</li>
+<li>B) Elect a new leader from the remaining replicas and allow the uncommitted entry to disappear if it never reached quorum</li>
+<li>C) Force every replica to apply the old leader's last local log entry before voting</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Why can Harbor Point trust a committed reservation to survive leader failover in a Raft-backed database?</strong></p>
 <ul>
-<li>A) Gaining clear safety model under node failures while paying write availability depends on majority health.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Because followers are allowed to invent missing entries during recovery</li>
+<li>B) Because a new leader may be elected even if its log is older than the previous leader's</li>
+<li>C) Because vote rules require the new leader to have a log at least as up to date as other voting replicas, which preserves committed history</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>What is the clearest operational downside of putting a hot issuer range on a three-node Raft group?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Every write for that range now depends on one leader and a majority path, so quorum latency and leader hot spots become visible in application performance</li>
+<li>B) Followers no longer need persistent storage because the leader already has the truth</li>
+<li>C) Snapshot and repair traffic disappear because Raft automatically keeps all replicas perfectly aligned at all times</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves clear safety model under node failures, but that benefit is purchased with write availability depends on majority health.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: Without quorum, the old leader's entry was never committed. The remaining replicas should elect a leader from the surviving majority and continue from the committed prefix they share. Option A confuses local append with commit, and option C would risk applying history the cluster never actually chose.</p>
+<p><strong>2. C</strong>: Raft's election and log-matching rules ensure that a leader with an older log cannot replace a leader whose committed entries are still represented in the voting majority. Option A is false because followers do not fabricate history. Option B describes the kind of unsafe election Raft is designed to prevent.</p>
+<p><strong>3. A</strong>: Raft buys failover safety by making the write path coordinate through the current leader and quorum. Option B is impossible because replicas must persist their log state, and option C is false because lagging replicas may still need snapshots or repair traffic.</p>
 
       
       <hr>
@@ -218,7 +164,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 08:16 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

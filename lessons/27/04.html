@@ -22,183 +22,132 @@
     <main>
       <h1>Day 420: Quorum Reads/Writes and Tunable Consistency</h1>
 <blockquote>
-<p><strong>Quorum Reads/Writes and Tunable Consistency starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: In a replicated database with tunable consistency, freshness is not a property of the engine alone. It is a property of how many replicas a write must reach and how many replicas a read must consult before the caller gets an answer.</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In quorum consistency mechanics, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How R/W quorum sizing impacts stale-read probability and latency. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding quorum consistency mechanics lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="03.html">03.md</a>, Harbor Point used Raft to make "committed" mean "a majority of the replicas for this range accepted the same log entry." That majority rule was fixed by the protocol. This lesson looks at a different family of replicated databases, where the client chooses the consistency level per operation. For Harbor Point's <code>issuer_limits</code> record for <code>MUNI-77</code>, the database still stores three replicas, but the caller can ask for <code>ONE</code>, <code>QUORUM</code>, or <code>ALL</code> depending on how much latency, availability, and freshness it is willing to trade.</p>
+<p>That sounds like a configuration detail until you trace one real update. At 09:30, risk raises the <code>MUNI-77</code> intraday limit from <code>50,000,000</code> to <code>60,000,000</code>. If the write waits for two replicas and the next read also consults two replicas, at least one replica must have seen the new value, so the coordinator has a chance to return it. If the next read only asks one replica, it may hit the lagging node and still see <code>50,000,000</code>. The same database can therefore behave "strong" for one call and "stale" for the next because the application asked different questions.</p>
+<p>The important mental shift is that quorum settings are not generic speed knobs. They define which failure stories are allowed. Harbor Point can keep trader dashboards fast with cheaper reads, but reservation approval cannot pretend a stale exposure check is harmless. Tunable consistency is useful precisely because it lets the system spend coordination where the business meaning of the operation demands it.</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How R/W quorum sizing impacts stale-read probability and latency.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point does not use the same durability rule for every workload. The reservation path for <code>MUNI-77</code> must reject trades once the issuer is near its cap, and a stale read there can create a regulatory problem. The market-overview dashboard, however, can tolerate a short delay if the limit was just changed and one replica has not caught up yet. If the team sets everything to <code>ALL</code>, the product pays unnecessary latency and loses availability whenever one replica is slow. If it sets everything to <code>ONE</code>, it quietly accepts stale answers on operations that were supposed to be safety checks.</p>
+<p>This is why tunable consistency belongs in application design, not only database administration. The question is not "Is this database eventually consistent or strongly consistent?" The useful question is "For this operation, how many replicas must participate before we trust the result?" Once Harbor Point states that clearly, latency budgets, failover behavior, and stale-read risk become visible trade-offs instead of surprises discovered in incident review.</p>
+<p>The transition from the previous lesson is deliberate. Raft fixed the write quorum inside the storage protocol. Tunable consistency exposes that choice to the caller. The next lesson, <a href="05.html">05.md</a>, asks a different but related question: once quorum costs apply to a replica set, how should the data be partitioned so the right keys share the same replica set in the first place?</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind quorum consistency mechanics</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain how read and write quorums create or fail to create freshness guarantees</strong> - Use <code>N</code>, <code>R</code>, and <code>W</code> to reason about when reads must overlap recent writes.</li>
+<li><strong>Trace a tunable-consistency read and write end to end</strong> - Follow how coordinators, replicas, version metadata, and repair mechanisms produce a result for one key.</li>
+<li><strong>Choose consistency levels for distinct production operations</strong> - Match reservation checks, dashboards, and degraded-mode behavior to explicit latency and correctness trade-offs.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for quorum consistency mechanics</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to quorum consistency mechanics.</p>
-<p><strong>Intuition</strong>: quorum consistency mechanics exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain flexible consistency-per-request behavior, but you pay with complex client semantics and conflict handling.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of quorum consistency mechanics</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full quorum consistency mechanics pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Pick replication factor N and quorum sizes R/W</li>
-<li>Ensure overlap condition R + W &gt; N when needed</li>
-<li>Resolve divergent versions with vector/timestamp metadata</li>
-<li>Expose consistency mode per operation</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: Quorum arithmetic is about overlap, not about sounding "strict"</h3>
+<p>Harbor Point stores the <code>issuer_limits</code> row for <code>MUNI-77</code> on three replicas: <code>iad</code>, <code>ord</code>, and <code>dub</code>. That replication factor is <code>N = 3</code>. A write consistency level chooses <code>W</code>, the number of replicas that must acknowledge the update before the database returns success. A read consistency level chooses <code>R</code>, the number of replicas that must answer before the database returns a value.</p>
+<p>The useful rule is simple: if <code>R + W &gt; N</code>, every successful read quorum must overlap every successful write quorum for that key. With <code>N = 3</code>, a write at <code>QUORUM</code> usually means <code>W = 2</code>, and a read at <code>QUORUM</code> means <code>R = 2</code>. Because <code>2 + 2 &gt; 3</code>, at least one replica is shared between the read and the most recent successful write. That shared replica is the reason the coordinator can discover the newer version.</p>
+<p>For Harbor Point, the arithmetic looks like this:</p>
+<div class="codehilite"><pre><span></span><code>Replicas for key MUNI-77:  iad   ord   dub
+
+Write QUORUM (W=2):        ACK   ACK   timeout
+Read QUORUM (R=2):         ask   ask   skip
+
+Overlap replica:           iad
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
-</ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for quorum consistency mechanics; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for quorum consistency mechanics.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain flexible consistency-per-request behavior, but operationally absorb complex client semantics and conflict handling.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>Change the policy and the guarantee changes immediately. If Harbor Point writes at <code>QUORUM</code> but reads at <code>ONE</code>, the next read may land on <code>dub</code>, which never acknowledged the limit increase. The write was still successful, but the read did not ask enough replicas to guarantee seeing it. If Harbor Point writes at <code>ALL</code>, it gets the freshest possible baseline for later reads, but one slow or unavailable replica now blocks the write entirely.</p>
+<p>That is why "use quorum" is not a complete recommendation. You have to name the actual <code>N</code>, <code>R</code>, and <code>W</code>, and you have to say which operation is being protected. Reservation approval might deserve <code>QUORUM</code> for both reads and writes. A dashboard refresh probably does not. The lesson is not that one level is morally correct. The lesson is that overlap is the mechanism, and without overlap you are accepting stale-read risk by design.</p>
+<h3>Concept 2: Tunable consistency works because replicas carry version information, not just values</h3>
+<p>At 09:30:00.120, Harbor Point raises the <code>MUNI-77</code> limit from <code>50,000,000</code> to <code>60,000,000</code>. The request goes to a coordinator node, which sends the mutation to all three natural replicas. Each replica stores both the value and the metadata used to decide which version is newer. In many Dynamo-style systems that metadata is a timestamp; in others it may include logical clocks or version vectors. The point is the same: a read needs something more than raw bytes if it is going to reconcile answers from multiple replicas.</p>
+<p>Suppose <code>iad</code> and <code>ord</code> persist version <code>v184 = 60,000,000</code>, while <code>dub</code> is briefly overloaded and still has <code>v183 = 50,000,000</code>. Because the write asked for <code>W = 2</code>, the coordinator can return success once <code>iad</code> and <code>ord</code> acknowledge. The write path does not wait forever for <code>dub</code>, but it also does not forget about it. The lagging replica may catch up through ordinary replication, hinted handoff, or anti-entropy repair depending on the database.</p>
+<p>Now the reservation service performs an exposure check with <code>R = 2</code>:</p>
+<div class="codehilite"><pre><span></span><code>client -&gt; coordinator
+coordinator -&gt; ord: value=60,000,000 version=v184
+coordinator -&gt; dub: value=50,000,000 version=v183
+coordinator compares versions
+coordinator returns 60,000,000
+coordinator may trigger read repair for dub
+</code></pre></div>
+
+<p>This is the part many teams miss. A quorum read does not simply pick whichever replica answered first. It compares answers from multiple replicas and chooses the newest version according to the database's conflict-resolution rule. If one replica is stale, the read may also repair it by sending back the newer value. That is how overlap turns into a usable result rather than a mathematical slogan.</p>
+<p>The downside is that this mechanism is only as trustworthy as the version rule. If Harbor Point relies on wall-clock timestamps and one node's clock jumps ahead, an older business update can appear "newer" than a later one. If the application allows concurrent writes at weak consistency, the system may surface siblings or resolve conflicts in a way that is legal for the database but awkward for the product. Tunable consistency therefore moves some correctness burden up the stack: the database provides overlap and reconciliation tools, but the application still has to understand what "newest" means.</p>
+<h3>Concept 3: Tunable consistency is valuable because different operations deserve different failure stories</h3>
+<p>Harbor Point should not treat every call on <code>MUNI-77</code> the same. When the reservation service decides whether another order may consume issuer capacity, it should use a read level that overlaps the write level used for limit changes and reservation state. <code>QUORUM</code> or <code>LOCAL_QUORUM</code> is often the right choice because it makes a fresh answer likely enough to support a business invariant without requiring every replica worldwide to respond. For the trader dashboard, <code>ONE</code> may be acceptable because a few seconds of staleness changes the user experience, not the compliance posture.</p>
+<p>That flexibility is the entire reason tunable consistency exists. A fixed quorum system such as the Raft-backed database from <a href="03.html">03.md</a> gives Harbor Point a cleaner safety contract, but it charges coordination for every write whether the operation is critical or not. A tunable system lets Harbor Point reserve the higher coordination cost for the operations that actually need it. In practice that means the application has to carry more intent: "this read is for admission control," "this write is for background analytics," and so on.</p>
+<p>The catch is that quorum math is scoped to one replica set for one key or partition. It does not automatically solve every distributed-data problem. If Harbor Point later shards issuer data across many partitions, the quorum guarantee applies inside each shard, not across a multi-key workflow. If the system uses region-local quorums, it may preserve low latency inside one region while allowing another region to trail until repair catches up. If the workload truly needs linearizable uniqueness or cross-partition atomicity, tunable quorums alone are not enough; the design may need consensus or transaction coordination on top.</p>
+<p>So the trade-off is precise. Tunable consistency is powerful when the application can name which operations tolerate stale data and which cannot. It is dangerous when teams label an entire database "eventually consistent" or "quorum based" and stop there. Harbor Point gets the best results only when every important operation carries an explicit consistency decision that matches its business consequence.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: quorum consistency mechanics works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: Harbor Point writes the new <code>MUNI-77</code> limit at <code>QUORUM</code>, but a trader dashboard still shows the old value a moment later.</p>
+<p><strong>Why it happens / is confusing</strong>: The write guarantee says two replicas stored the new version before success. It does not say every later read will consult one of those replicas. A <code>ONE</code> read can still hit the lagging node.</p>
+<p><strong>Clarification / Fix</strong>: Use <code>QUORUM</code> or <code>LOCAL_QUORUM</code> for paths that need recent data, and reserve <code>ONE</code> for views where short staleness is acceptable.</p>
+<p><strong>Issue</strong>: <code>QUORUM</code> reads are slower than expected even though no replica is down.</p>
+<p><strong>Why it happens / is confusing</strong>: The coordinator is waiting for multiple replicas, and the second-fastest response now matters. If one of the participating replicas is cross-region or under compaction pressure, tail latency becomes visible.</p>
+<p><strong>Clarification / Fix</strong>: Check replica placement, compaction load, and whether the operation could use a local quorum. Quorum cost is often dominated by the slowest replica that still counts toward <code>R</code>.</p>
+<p><strong>Issue</strong>: Two services both updated <code>MUNI-77</code>, and the final value looks wrong even though both writes succeeded.</p>
+<p><strong>Why it happens / is confusing</strong>: Tunable consistency does not by itself prevent conflicting concurrent writes. The database still needs a rule for choosing the surviving version, and timestamp-based rules can surprise you when clocks skew or updates race.</p>
+<p><strong>Clarification / Fix</strong>: For critical invariants, raise write consistency, use compare-and-set or lightweight transaction features when available, and avoid relying on wall-clock order alone to express business precedence.</p>
+<p><strong>Issue</strong>: A regional partition caused one region to keep serving requests, but later repair changed some answers.</p>
+<p><strong>Why it happens / is confusing</strong>: Availability-focused configurations may accept local progress and reconcile later. That is useful for uptime, but it means some reads or writes were valid only within a weaker immediate-consistency envelope.</p>
+<p><strong>Clarification / Fix</strong>: Decide explicitly whether the operation prefers regional availability or globally fresher answers. Then choose <code>LOCAL_QUORUM</code>, global <code>QUORUM</code>, or a stronger coordination mechanism to match that requirement.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: quorum consistency mechanics &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: quorum consistency mechanics &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: <a href="03.html">03.md</a> fixes quorum in the protocol; this lesson makes quorum a caller-visible policy</h3>
+<p>Raft-backed replication says "a majority must commit the log entry" whether the application asked for that coordination or not. Tunable-consistency systems expose a broader menu: <code>ONE</code>, <code>QUORUM</code>, <code>ALL</code>, and often region-aware variants. The overlap idea is related, but the operational burden shifts upward because the caller must choose well for each operation.</p>
+<h3>Connection 2: <a href="05.html">05.md</a> decides which keys share a replica set, and quorums happen inside that boundary</h3>
+<p>All the guarantees in this lesson assume one key or partition already has a known replica set. The next lesson asks how Harbor Point should split the keyspace so hot issuers, cold issuers, and range-oriented queries land on sensible shards. Once sharding enters the picture, quorum cost and freshness are paid per shard, not per database as an abstract whole.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
+<li>Focus: The original explanation of <code>N</code>, <code>R</code>, <code>W</code>, version reconciliation, and the availability-first design that made tunable consistency practical.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://cassandra.apache.org/doc/stable/cassandra/architecture/dynamo.html#tunable-consistency">Apache Cassandra Documentation: Tunable Consistency</a><ul>
+<li>Focus: How a widely used production database defines consistency levels such as <code>ONE</code>, <code>QUORUM</code>, and <code>ALL</code>, plus the operational consequences of each.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: The broader trade-offs between leaderless replication, quorums, read repair, and the limits of overlap-based guarantees.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://jepsen.io/analyses/cassandra-3.11.4">Jepsen: Cassandra 3.11.4</a><ul>
+<li>Focus: Why real-world consistency behavior depends on failure mode, repair strategy, and exact guarantees rather than marketing labels alone.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Quorums work by overlap</strong> - Fresh reads come from choosing <code>R</code> and <code>W</code> so successful read and write sets must share at least one replica for the same key.</li>
+<li><strong>A quorum read needs version metadata, not only multiple answers</strong> - The coordinator has to identify the newest value and often repair stale replicas for overlap to become a correct result.</li>
+<li><strong>Tunable consistency is an application contract</strong> - Different operations can spend different amounts of coordination, but only if the team deliberately matches consistency level to business consequence.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model quorum consistency mechanics as explicit state transitions and invariants?</strong></p>
+<p><strong>Harbor Point stores <code>MUNI-77</code> on three replicas with <code>N = 3</code>. Which setting best supports a reservation check that must overlap a recent limit change written at <code>QUORUM</code>?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Read at <code>ONE</code>, because the write already waited for two replicas</li>
+<li>B) Read at <code>QUORUM</code>, because <code>R = 2</code> overlaps <code>W = 2</code></li>
+<li>C) Read at <code>ANY</code>, because overlap is guaranteed as long as one node answers</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Why can a <code>QUORUM</code> read return the correct <code>60,000,000</code> limit even when one replica still holds <code>50,000,000</code>?</strong></p>
 <ul>
-<li>A) Gaining flexible consistency-per-request behavior while paying complex client semantics and conflict handling.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Because the coordinator compares version metadata from multiple replicas and chooses the newer value</li>
+<li>B) Because the slowest replica is ignored permanently once a write succeeds</li>
+<li>C) Because quorum reads only contact replicas that are already fully synchronized</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>What is the clearest reason Harbor Point should not use the same consistency level for reservation approval and for the trader dashboard?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) Because all applications must either use <code>ONE</code> everywhere or <code>ALL</code> everywhere</li>
+<li>B) Because the business consequence of staleness is different for admission control than for human-facing monitoring</li>
+<li>C) Because tunable consistency only works for analytics queries, not transactional checks</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves flexible consistency-per-request behavior, but that benefit is purchased with complex client semantics and conflict handling.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: With <code>N = 3</code>, a <code>QUORUM</code> write means <code>W = 2</code> and a <code>QUORUM</code> read means <code>R = 2</code>, so <code>R + W &gt; N</code> and the read must overlap the recent write on at least one replica. Option A can miss the fresh replica set, and option C does not create the same overlap guarantee.</p>
+<p><strong>2. A</strong>: The coordinator asks multiple replicas, inspects their version metadata, and returns the newest answer according to the database's conflict-resolution rule. Option B is false because the lagging replica still matters for repair and future reads. Option C is false because quorum reads often detect synchronization gaps precisely by comparing mismatched replicas.</p>
+<p><strong>3. B</strong>: Reservation approval is enforcing a safety boundary, while the dashboard is mainly informing a person. Those operations deserve different latency and freshness trade-offs. Option A invents a false all-or-nothing rule, and option C is wrong because tunable consistency is often used exactly for operational checks that need stronger reads than dashboards do.</p>
 
       
       <hr>
@@ -218,7 +167,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 08:16 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>

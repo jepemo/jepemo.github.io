@@ -22,183 +22,119 @@
     <main>
       <h1>Day 418: Synchronous vs Asynchronous Replication</h1>
 <blockquote>
-<p><strong>Synchronous vs Asynchronous Replication starts with intuition, then moves to the mechanics that actually enforce correctness.</strong></p>
+<p><strong>The core idea</strong>: The real difference between synchronous and asynchronous replication is the commit acknowledgment boundary: which replica milestone must happen before the primary is allowed to tell the client "your write is durable."</p>
 </blockquote>
-<hr />
 <h2>Today's "Aha!" Moment</h2>
-<p><strong>The insight</strong>: In sync vs async replication semantics, performance is secondary to invariants. If ordering, visibility, or durability invariants are wrong, speed only makes failures happen faster.</p>
-<p><strong>Why this matters</strong>: How acknowledgment policy changes durability and latency. This is the layer where many production incidents originate because teams tune symptoms before they model internals.</p>
-<p><strong>The universal pattern</strong>: choose invariant -&gt; encode invariant in data structures/protocol -&gt; verify under failure.</p>
-<p><strong>Concrete anchor</strong>: A production team sees latency regressions and occasional data anomalies after scaling. Understanding sync vs async replication semantics lets them separate harmless slowdown from correctness risk.</p>
-<p><strong>How to recognize when this applies</strong>:</p>
-<ul>
-<li>You can optimize throughput but still cannot explain correctness boundaries.</li>
-<li>Operational incidents mention lag, replay, lock contention, or stale reads.</li>
-<li>Design reviews discuss architecture but skip failure-path mechanics.</li>
-</ul>
-<p><strong>Common misconceptions</strong>:</p>
-<ul>
-<li>[INCORRECT] "If benchmarks look good, internals are fine."</li>
-<li>[INCORRECT] "Correctness can be patched later with retries."</li>
-<li>[CORRECT] <strong>The truth</strong>: In database internals, correctness contracts must be designed before optimization.</li>
-</ul>
-<p><strong>Real-world examples</strong>:</p>
-<ol>
-<li><strong>Engine tuning</strong>: Teams that track internal invariants avoid destructive optimizations.</li>
-<li><strong>Incident response</strong>: Mechanism-level observability shortens root-cause analysis.</li>
-</ol>
-<hr />
+<p>In <a href="01.html">01.md</a>, Harbor Point separated three standby milestones: receiving WAL, flushing it durably, and replaying it into query-visible state. This lesson adds the question that turns those milestones into a production policy: when trader <code>R-88421</code> is approved, which of those milestones must happen before the API returns <code>201 Created</code>?</p>
+<p>An asynchronous primary answers that question narrowly. It fsyncs its own WAL, acknowledges the client, and lets replicas catch up afterward. That keeps the reservation path fast, but it leaves a window in which the client has been told the approval committed even though no standby has durably stored it yet. If the primary dies inside that window and the standby is promoted, the acknowledged reservation can disappear.</p>
+<p>A synchronous primary moves at least one remote milestone into the commit path. The client does not get success until some standby has reached the configured point, usually remote flush and sometimes remote apply. That shrinks the data-loss window across failover, but the write is now paying for network latency, remote disk latency, and standby availability. The key design question is not "Do we prefer sync or async in theory?" It is "What failure are we willing to expose to the caller, and what latency or availability cost are we willing to pay to avoid it?"</p>
 <h2>Why This Matters</h2>
-<p><strong>The problem</strong>: How acknowledgment policy changes durability and latency.</p>
-<p><strong>Before</strong>:</p>
-<ul>
-<li>Decisions are made with black-box assumptions.</li>
-<li>Trade-offs are discovered only after production incidents.</li>
-<li>Performance fixes sometimes violate hidden correctness constraints.</li>
-</ul>
-<p><strong>After</strong>:</p>
-<ul>
-<li>Invariants are explicit and testable.</li>
-<li>Teams can predict failure behavior before rollout.</li>
-<li>Tuning decisions are tied to measurable mechanisms.</li>
-</ul>
-<p><strong>Real-world impact</strong>: Better durability guarantees, lower incident frequency, and more predictable scaling behavior.</p>
-<hr />
+<p>Harbor Point's compliance team treats a reservation approval as a legally meaningful event. If support tells a trader that reservation <code>R-88421</code> was accepted, the database cannot quietly lose it just because the primary crashed two milliseconds later. At the same time, the desk will not accept an approval path that stalls every time a remote replica has a brief I/O hiccup. The replication mode is therefore not a storage footnote. It is part of the product's contract.</p>
+<p>Without an explicit acknowledgment rule, teams talk past each other. Application engineers say "the write committed" because the primary returned success. Database operators say "the standby was almost caught up" because replay lag looked small. Incident commanders later discover that both statements were true and the data was still lost on failover, because "committed" only meant local durability. Once the team names the commit boundary precisely, latency, RPO, failover behavior, and read freshness stop being vague aspirations and become measurable properties.</p>
+<p>This lesson connects directly to <a href="01.html">01.md</a>: log shipping gave Harbor Point a way to reproduce history on a standby, but it did not decide when a history prefix becomes part of the durability promise made to clients. The next lesson, <a href="03.html">03.md</a>, shows what happens when that durability promise is no longer "one primary plus replicas" but "a quorum commits a log entry together."</p>
 <h2>Learning Objectives</h2>
 <p>By the end of this session, you will be able to:</p>
 <ol>
-<li><strong>Explain the core pressure behind sync vs async replication semantics</strong> - Identify what breaks if this subsystem is mis-designed.</li>
-<li><strong>Trace internal mechanics step by step</strong> - Follow state changes, ordering rules, and persistence boundaries.</li>
-<li><strong>Apply trade-off reasoning</strong> - Decide when the design is worth its operational cost.</li>
+<li><strong>Explain the commit boundary in synchronous and asynchronous replication</strong> - Identify which local and remote milestones a database waits for before acknowledging a write.</li>
+<li><strong>Analyze failover outcomes from the acknowledgment policy</strong> - Predict when an acknowledged write can still be lost after primary failure.</li>
+<li><strong>Choose a replication mode for a concrete workload</strong> - Match reservation-critical writes, standby-read needs, and latency budgets to the right durability policy.</li>
 </ol>
-<hr />
 <h2>Core Concepts Explained</h2>
-<h3>Concept 1: Problem Model for sync vs async replication semantics</h3>
-<p><strong>Concrete example / mini-scenario</strong>: During load spikes, the system maintains average latency but starts violating consistency expectations for edge requests tied to sync vs async replication semantics.</p>
-<p><strong>Intuition</strong>: sync vs async replication semantics exists because general-purpose abstractions hide a bottleneck or correctness boundary that becomes dominant at scale.</p>
-<p><strong>Technical structure (how it works)</strong>: Model the subsystem as state + transitions + invariant checks. Every transition must preserve ordering and visibility rules even during crash or concurrency pressure.</p>
-<p><strong>Practical implications</strong>: Architecture choices should be evaluated against invariant-preservation, not just median latency.</p>
-<p><strong>Fundamental trade-off</strong>: You gain explicit durability/latency control, but you pay with either higher commit latency or potential data loss window.</p>
-<p><strong>Mental model</strong>: A transaction ledger for internal state transitions; every step must be auditable.</p>
-<p><strong>Connection to other fields</strong>: Similar to distributed systems protocols and filesystem journaling.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Systems where correctness under failure is non-negotiable.</li>
-<li>[Anti-pattern] Blindly copying patterns without mapping workload and invariant needs.</li>
-</ul>
-<h3>Concept 2: Internal Mechanics of sync vs async replication semantics</h3>
-<p><strong>Concrete example / mini-scenario</strong>: A single write request traverses the full sync vs async replication semantics pipeline while one node/process fails mid-flight.</p>
-<p><strong>Intuition</strong>: If you can narrate the internal sequence, you can predict both normal-path and failure-path outcomes.</p>
-<p><strong>Technical structure (how it works)</strong>:</p>
-<ol>
-<li>Define quorum rule for commit acknowledgment</li>
-<li>Block or release client commit based on replica acks</li>
-<li>Track replica freshness watermark continuously</li>
-<li>Route reads according to staleness tolerance policy</li>
-</ol>
-<p><strong>Practical implications</strong>: These steps define where to instrument latency, correctness, and backlog metrics.</p>
-<p><strong>Fundamental trade-off</strong>: Mechanism transparency improves diagnosis, but it requires disciplined observability and schema/protocol hygiene.</p>
-<p><strong>Mental model</strong>: Pipeline with invariants at each boundary; a breach at one boundary propagates system-wide.</p>
-<p><strong>Connection to other fields</strong>: Comparable to compiler passes where intermediate representations enforce correctness contracts.</p>
-<p><strong>Code Example (If applicable)</strong>:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_write</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">validate_preconditions</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="n">state</span> <span class="o">=</span> <span class="n">apply_internal_transition</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="n">persist_or_replicate</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">acknowledge_commit</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+<h3>Concept 1: The commit path changes when replica acknowledgment enters the critical path</h3>
+<p>Harbor Point's approval service already writes to WAL on the primary before reporting success. The difference between asynchronous and synchronous replication is what happens after that local WAL flush. In asynchronous mode, the primary treats local durability as sufficient for the client contract and pushes the new WAL to standbys in the background. In synchronous mode, local durability is necessary but not sufficient: the primary must also wait for one or more standby milestones before it may return success.</p>
+<p>That makes the commit path materially different:</p>
+<div class="codehilite"><pre><span></span><code>Asynchronous commit
+client -&gt; primary WAL flush -&gt; ACK to client -&gt; ship WAL -&gt; standby flush -&gt; standby replay
+
+Synchronous commit (remote flush)
+client -&gt; primary WAL flush -&gt; ship WAL -&gt; standby flush -&gt; ACK to primary -&gt; ACK to client -&gt; standby replay
 </code></pre></div>
 
-<p><strong>When to use it</strong>:</p>
+<p>The important detail is that "synchronous" is not one universal milestone. Some systems wait until a standby confirms the WAL bytes were received. Others wait for the standby to flush them durably. A stricter variant waits until the standby has replayed the change so standby reads can observe it immediately after commit. Harbor Point usually cares most about remote flush, because the regulatory requirement is "do not lose approved reservations on failover," not "make every standby query instantly current."</p>
+<p>This is why synchronous replication is a semantics choice before it is a performance choice. The setting answers a precise question: when the API says "committed," does that mean "durable on one machine" or "durable on more than one machine"? Only after that answer is clear does it make sense to measure the latency cost.</p>
+<h3>Concept 2: Failover risk is the real difference, not just average write latency</h3>
+<p>Suppose Harbor Point receives approval for reservation <code>R-88421</code> at 09:30:00.120. The primary writes the commit record locally at <code>09:30:00.123</code> and returns success at <code>09:30:00.124</code>. In asynchronous mode, that success may still outrun replication. If the primary host fails at <code>09:30:00.125</code> and the standby had not yet flushed the WAL for <code>R-88421</code>, promotion will recover to an older history prefix. Support now sees a contradiction: the client was told the reservation succeeded, but the new primary has no trace of it.</p>
+<p>In synchronous mode with remote flush, the same crash produces a different result. The primary would not have acknowledged <code>R-88421</code> until a standby confirmed that the commit record was durably stored. Promotion can then continue recovery from that durable prefix even if replay was slightly behind. The standby may need a brief moment to finish applying the WAL before queries show the reservation, but the event is not lost.</p>
+<p>That distinction also corrects a common misconception. Synchronous replication does not automatically mean "no stale standby reads." If Harbor Point waits for remote flush but not remote apply, an acknowledged reservation is failover-safe without necessarily being visible on a hot standby query at the same instant. Read freshness and failover durability are related, but they are not the same guarantee. The difference matters when teams build trader dashboards on standbys and assume that a synchronous commit setting solved every read-after-write problem.</p>
+<p>The same mechanism explains why asynchronous replication is still a rational choice for some data. If Harbor Point emits a derived analytics event or refreshes a low-value search projection, accepting a tiny failover loss window may be cheaper than putting another network round-trip into the user's critical path. The mode should follow the consequence of loss, not a blanket preference for "faster" or "safer."</p>
+<h3>Concept 3: Production systems usually implement a policy spectrum, not a pure binary</h3>
+<p>Real deployments rarely stay at the textbook endpoints. Harbor Point might require one nearby standby to flush every reservation approval before acknowledging the trader, while allowing additional reporting replicas to lag asynchronously. Another team might configure quorum-based synchronous replication so any one of two local standbys can satisfy the commit rule. Yet another might run "semi-sync," where the primary waits for a receipt or flush from one standby but falls back to asynchronous mode after a timeout. All of those are really policies about what durability guarantee survives degraded conditions.</p>
+<p>Those policy choices create explicit trade-offs:</p>
 <ul>
-<li>[Ideal situation] Designing or debugging critical storage/replication paths.</li>
-<li>[Anti-pattern] Treating operational symptoms without tracing state transitions.</li>
+<li>Strict synchronous replication reduces the chance of acknowledged-write loss during failover, but it ties write availability to replica health and network quality.</li>
+<li>Asynchronous replication preserves write throughput and keeps the primary available when replicas are unhealthy, but it accepts a non-zero RPO window for acknowledged writes.</li>
+<li>Intermediate policies such as quorum sync or semi-sync reduce some risk without paying the full cost of waiting for every replica, but they also make the guarantee more conditional and therefore harder to explain operationally.</li>
 </ul>
-<h3>Concept 3: Operational Implications and Trade-offs</h3>
-<p><strong>Concrete example / mini-scenario</strong>: Two designs satisfy functional requirements for sync vs async replication semantics; one prioritizes throughput, the other prioritizes stricter correctness and recoverability.</p>
-<p><strong>Intuition</strong>: Real systems choose explicit risk profiles, not perfect solutions.</p>
-<p><strong>Technical structure (how it works)</strong>: Compare options on write/read amplification, contention behavior, recovery guarantees, and observability burden for sync vs async replication semantics.</p>
-<p><strong>Practical implications</strong>: The best choice changes with workload mix, failure model, and team operational maturity.</p>
-<p><strong>Fundamental trade-off</strong>: You gain explicit durability/latency control, but operationally absorb either higher commit latency or potential data loss window.</p>
-<p><strong>Mental model</strong>: Engineering budget allocation across latency, correctness, and operational complexity.</p>
-<p><strong>Connection to other fields</strong>: Similar to reliability engineering where tighter guarantees require stronger coordination and testing.</p>
-<p><strong>When to use it</strong>:</p>
-<ul>
-<li>[Ideal situation] Capacity planning, incident postmortems, architecture review gates.</li>
-<li>[Anti-pattern] Locking into one strategy without periodic workload revalidation.</li>
-</ul>
-<hr />
+<p>Harbor Point should therefore document the acknowledgment rule in product language, not only database language. "Reservation approvals survive loss of the primary because one standby must flush the WAL before commit returns" is an operationally useful promise. So is "search suggestions may roll back a few seconds after failover because they replicate asynchronously." If the team cannot state the rule that clearly, it probably has not chosen the mode deliberately enough.</p>
+<p>This lesson also prepares the ground for <a href="03.html">03.md</a>. Synchronous leader-follower replication adds a remote acknowledgment to a primary's commit path. Raft goes further by making quorum acknowledgment the definition of commit itself. The same design pressure appears in both: durability improves when multiple nodes must confirm ordered history, but latency and failure handling become part of the write path.</p>
 <h2>Troubleshooting</h2>
-<p><strong>Issue</strong>: sync vs async replication semantics works in staging but fails under production concurrency or failure patterns.</p>
-<p><strong>Why it happens / is confusing</strong>: Test environments underrepresent skew, contention, and crash timing windows.</p>
-<p><strong>Clarification / Fix</strong>: Reproduce with production-like concurrency, inject failures deliberately, and verify invariants after replay/recovery.</p>
-<p><strong>Issue</strong>: Optimization changes improve benchmark throughput but worsen tail behavior.</p>
-<p><strong>Why it happens / is confusing</strong>: Median-focused tuning can hide queue growth, lock debt, or lag accumulation.</p>
-<p><strong>Clarification / Fix</strong>: Track p95/p99, backlog depth, and correctness counters alongside throughput.</p>
-<hr />
+<p><strong>Issue</strong>: Enabling synchronous replication caused approval latency spikes even though the primary's own disk is healthy.</p>
+<p><strong>Why it happens / is confusing</strong>: The extra delay is no longer coming only from local WAL flush. The commit path now includes network transport, standby disk flush, and any queuing on the designated synchronous replica.</p>
+<p><strong>Clarification / Fix</strong>: Measure each hop separately. Verify whether Harbor Point is waiting for remote receive, remote flush, or remote apply, and whether the synchronous standby is in the same region and provisioned for peak WAL volume.</p>
+<p><strong>Issue</strong>: A failover lost a reservation that the API had already confirmed, even though replication lag dashboards looked small.</p>
+<p><strong>Why it happens / is confusing</strong>: Small replay lag does not prove that the acknowledged transaction had already been flushed on a standby when the primary died. If the system was running asynchronously, the acknowledgment only guaranteed local durability.</p>
+<p><strong>Clarification / Fix</strong>: Compare the configured commit policy with the business RPO. If acknowledged approvals must survive failover, require at least one standby flush before success or move that workload onto a quorum-commit design.</p>
+<p><strong>Issue</strong>: The primary stopped accepting writes when a replica link flapped for a few seconds.</p>
+<p><strong>Why it happens / is confusing</strong>: In strict synchronous mode, the primary is not allowed to complete commits without the configured replica acknowledgment. What looks like a "replica problem" has become a write-availability problem by design.</p>
+<p><strong>Clarification / Fix</strong>: Decide whether the business prefers blocking writes, failing over quickly, or temporarily degrading to asynchronous behavior. Then encode that policy explicitly instead of relying on an implicit timeout or an undocumented operator decision.</p>
 <h2>Advanced Connections</h2>
-<h3>Connection 1: sync vs async replication semantics &lt;-&gt; Distributed Systems Safety</h3>
-<p><strong>The parallel</strong>: Both depend on ordering, quorum/visibility, and replay correctness under partial failure.</p>
-<p><strong>Real-world case</strong>: WAL + replication pipelines mirror durable event logs in distributed data platforms.</p>
-<h3>Connection 2: sync vs async replication semantics &lt;-&gt; Performance Engineering</h3>
-<p><strong>The parallel</strong>: Throughput tuning is constrained by coordination and persistence invariants.</p>
-<p><strong>Real-world case</strong>: Group commit, compaction throttling, and lock scheduling all trade tail latency for stability.</p>
-<hr />
+<h3>Connection 1: <a href="01.html">01.md</a> supplies the replica milestones that synchronous commit can wait for</h3>
+<p>The previous lesson separated receive, flush, and replay positions on a standby. This lesson turns those positions into a client-facing contract. "Async" means the commit boundary stops at local durability. "Sync" means the boundary extends to one of those remote positions.</p>
+<h3>Connection 2: <a href="03.html">03.md</a> replaces single-primary acknowledgment with quorum commit</h3>
+<p>Primary-standby systems ask, "Should this leader wait for a follower before acknowledging?" Raft-based systems ask, "Has this log entry reached a majority, making it committed by protocol definition?" The machinery changes, but the core trade-off is the same: stronger failover guarantees come from waiting for more nodes to confirm ordered history.</p>
 <h2>Resources</h2>
 <h3>Optional Deepening Resources</h3>
 <ul>
-<li>[BOOK] <em>Database Internals</em> (Alex Petrov)<ul>
-<li>Focus: Engine architecture patterns and design trade-offs.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION">PostgreSQL Documentation: Synchronous Replication</a><ul>
+<li>Focus: The exact standby milestones PostgreSQL can wait for and how those choices affect latency and failover durability.</li>
 </ul>
 </li>
-<li>[BOOK] <em>Designing Data-Intensive Applications</em> (Kleppmann)<ul>
-<li>Focus: Replication, consistency, and distributed data system principles.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html">MySQL Reference Manual: Semisynchronous Replication</a><ul>
+<li>Focus: A production example of a middle ground between fully asynchronous replication and stricter synchronous policies.</li>
 </ul>
 </li>
-<li>[DOC] PostgreSQL and RocksDB internals documentation<ul>
-<li>Focus: Concrete production-grade implementations of the mechanisms discussed.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Leader-based replication, failover data loss windows, and why acknowledgment policy is the real semantic boundary.</li>
 </ul>
 </li>
 </ul>
-<hr />
 <h2>Key Insights</h2>
 <ol>
-<li><strong>Invariants first</strong> - Mechanisms exist to preserve correctness under stress, not just to improve speed.</li>
-<li><strong>Mechanics are debuggable</strong> - Clear internal flow turns opaque incidents into tractable engineering work.</li>
-<li><strong>Trade-offs are explicit contracts</strong> - Every durability/consistency gain has measurable operational cost.</li>
+<li><strong>Replication mode is a commit-contract choice</strong> - The important question is which remote milestone must happen before a client can be told the write is durable.</li>
+<li><strong>Async is fast because it accepts a failover loss window</strong> - An acknowledged write can still disappear if the primary dies before any standby has durably stored it.</li>
+<li><strong>Sync improves failover safety by adding coordination to the write path</strong> - The benefit is real, but so are the latency and availability costs of waiting for replicas.</li>
 </ol>
-<hr />
-<h2>Knowledge Check (Test Questions)</h2>
+<h2>Knowledge Check</h2>
 <ol>
 <li>
-<p><strong>What is the primary reason to model sync vs async replication semantics as explicit state transitions and invariants?</strong></p>
+<p><strong>Harbor Point wants approved reservations to survive loss of the primary after the API returns success. Which acknowledgment rule best matches that goal in a leader-follower system?</strong></p>
 <ul>
-<li>A) To reduce the need for observability.</li>
-<li>B) To reason about correctness under concurrency and failure.</li>
-<li>C) To maximize benchmark throughput automatically.</li>
+<li>A) Return success after the primary flushes WAL locally and let replicas catch up later</li>
+<li>B) Return success only after at least one standby durably flushes the reservation's WAL</li>
+<li>C) Return success as soon as the standby receives the bytes in memory, even if it has not persisted them</li>
 </ul>
 </li>
 <li>
-<p><strong>In this lesson, which trade-off is central?</strong></p>
+<p><strong>Why can a hot standby still show stale data even when the database is using synchronous replication?</strong></p>
 <ul>
-<li>A) Gaining explicit durability/latency control while paying either higher commit latency or potential data loss window.</li>
-<li>B) Eliminating all coordination overhead with no downside.</li>
-<li>C) Avoiding durability/consistency constraints entirely.</li>
+<li>A) Because synchronous replication always disables standby reads</li>
+<li>B) Because the system may wait for remote flush, not remote apply, before acknowledging the write</li>
+<li>C) Because acknowledged writes are never shipped to replicas until after failover</li>
 </ul>
 </li>
 <li>
-<p><strong>When should this design be revisited?</strong></p>
+<p><strong>What is the clearest reason a strict synchronous primary may stop accepting writes when its replica link becomes unstable?</strong></p>
 <ul>
-<li>A) Never, once it passes initial tests.</li>
-<li>B) Only after a major rewrite.</li>
-<li>C) When workload shape, failure model, or SLOs change.</li>
+<li>A) The primary forgot how to flush WAL locally</li>
+<li>B) The commit rule now depends on replica acknowledgment, so replica health is part of write availability</li>
+<li>C) Synchronous replication automatically converts every write into a distributed transaction across all tables</li>
 </ul>
 </li>
 </ol>
-<hr />
 <h2>Answers</h2>
-<p><strong>1. B</strong>: Explicit transition and invariant modeling is what allows predictable reasoning under failure and concurrency.</p>
-<p><strong>2. A</strong>: The design is valuable because it improves explicit durability/latency control, but that benefit is purchased with either higher commit latency or potential data loss window.</p>
-<p><strong>3. C</strong>: Architecture choices are conditional on assumptions; when assumptions shift, re-evaluation is mandatory.</p>
+<p><strong>1. B</strong>: Waiting for a standby to flush the WAL means the reservation exists durably on more than one machine before the client is told it committed. Option A is asynchronous and leaves an acknowledged-write loss window. Option C is weaker than durable remote flush because in-memory receipt can still vanish on standby crash.</p>
+<p><strong>2. B</strong>: Synchronous replication can protect failover durability without guaranteeing immediate query visibility on standbys. If the policy waits for remote flush but replay is still behind, standby reads can remain stale for a short period. Options A and C describe behaviors that are not generally true.</p>
+<p><strong>3. B</strong>: Once the configured guarantee requires replica acknowledgment, a replica outage or network problem can block commits by design. Option A is unrelated to the mode change, and option C overstates what ordinary synchronous leader-follower replication does.</p>
 
       
       <hr>
@@ -218,7 +154,7 @@
 
     <hr>
     <footer>
-        <p>Generated on 2026-03-05 14:53 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
+        <p>Generated on 2026-04-01 08:16 UTC | @jepemo | Built with <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a></p>
     </footer>
   </body>
 </html>
