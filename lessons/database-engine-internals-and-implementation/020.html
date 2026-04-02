@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Checkpointing and Dirty Page Control - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Checkpointing and Dirty Page Control</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 020 | Lesson ID: 397
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 397: Checkpointing and Dirty Page Control</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A checkpoint is not "write everything now." It is a moving recovery boundary, and dirty-page control is the pacing system that keeps that boundary from drifting so far behind the log that restart time, eviction, and tail latency all become unstable.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="019.html">12.md</a>, Harbor Point compressed historical quote pages so each flush wrote fewer bytes to disk. That helped space usage, but it also made one hidden cost sharper: some pages now took more CPU to rebuild and compress before they could be written back. During the market-open burst, the quote ingester dirtied heap pages and B-tree leaves faster than the background writer could clean them, so every few minutes the engine hit a checkpoint cliff. WAL volume surged, the buffer pool ran short of cheap clean victims, and p99 latency jumped even though the SQL workload had not changed.</p>
+<p>The misconception is that a checkpoint means the database pauses, flushes every dirty page, and reaches a perfectly synchronized state on disk. Production engines usually do something more subtle. They take a fuzzy checkpoint: while transactions keep running, the engine records enough metadata to say, "if we crash after this point, recovery can begin from here and consult this dirty-page picture." The checkpoint is therefore a recovery promise, not a claim that the data files are already fully caught up.</p>
+<p>Dirty-page control is the companion mechanism that makes that promise operationally believable. The engine tracks which pages became dirty, how old the oldest unflushed change is, and how much clean space remains in the buffer pool. Background writers then flush pages gradually so restart work stays bounded and foreground threads do not end up doing emergency cleaning. That is the conceptual bridge into <a href="021.html">14.md</a>: before you can walk through analysis, redo, and undo, you need to know what checkpoint metadata says about the dirty state left behind by the crash.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's trading desk cares about two different clocks. The first is live latency: traders want the newest municipal-bond quote visible immediately. The second is restart time: if the primary crashes at 09:47, operations wants the engine back with a predictable recovery window, not a surprise hour-long WAL replay. Checkpointing and dirty-page control are where those clocks get negotiated.</p>
+<p>If the engine lets dirty pages accumulate without discipline, several bad things happen at once. Recovery must replay farther back in the log because the oldest dirty page still reflects an old <code>page_lsn</code>. Foreground misses start stalling because eviction candidates are dirty and expensive to flush. When a checkpoint finally forces the issue, the system can produce exactly the burst of random writes and compression work that hurts trading-hour latency the most.</p>
+<p>Once the mechanism is explicit, the tuning questions become concrete. You stop asking, "Should we checkpoint more often?" in the abstract and start asking, "What is our oldest dirty <code>recLSN</code>, how fast are background cleaners advancing it, and which pages are making restart distance sticky?" That is a production-grade way to reason about checkpoint policy.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what a checkpoint actually records</strong> - Describe why fuzzy checkpoints bound crash recovery without forcing a stop-the-world flush.</li>
+<li><strong>Trace how dirty pages are tracked and written back</strong> - Follow <code>page_lsn</code>, dirty-page-table entries, WAL ordering, and background flushing through the page lifecycle.</li>
+<li><strong>Evaluate checkpoint policy as an operational trade-off</strong> - Connect dirty-page age, writeback pacing, recovery time, and foreground latency in a real engine.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A checkpoint is a recovery map, not a declaration that every page is clean</h3>
+<p>Suppose Harbor Point loses power at 09:47 in the middle of the market-open burst. The engine does not want crash recovery to scan WAL from the beginning of the database's life; it wants a recent place to start. That is the purpose of checkpointing. The checkpoint tells recovery, "here is a recent summary of active transactions and dirty pages; begin your reasoning from this boundary instead of replaying history blindly."</p>
+<p>In a page-oriented WAL engine, the useful checkpoint state is not "all dirty pages are flushed." The useful state is "we know which pages were dirty, and for each such page we know the earliest log record whose effects might still be missing from disk." In ARIES terminology that page-level start point is the <code>recLSN</code> stored in the dirty page table. Recovery can therefore begin redo from the smallest <code>recLSN</code> among the pages listed by the checkpoint, because anything earlier must already be reflected in durable page images.</p>
+<p>That is why most production checkpoints are fuzzy. Transactions continue to update pages while the checkpoint is being taken. The engine writes checkpoint records into WAL and snapshots the current dirty page table and active transaction table without freezing the system long enough to flush every changed page immediately. A simplified timeline looks like this:</p>
+<div class="codehilite"><pre><span></span><code>... WAL records ...
+BEGIN_CHECKPOINT
+   writers keep dirtying pages
+   background writer keeps flushing some older pages
+END_CHECKPOINT {
+  active_txns = {...}
+  dirty_pages = {
+    page 8124 -&gt; recLSN 4F/19A0C110,
+    page 9120 -&gt; recLSN 4F/19A1D2A8
+  }
+}
+... more WAL records ...
+</code></pre></div>
+
+<p>The trade-off is subtle but important. A fuzzy checkpoint avoids long pauses, which is exactly what Harbor Point needs during active trading, but it does not guarantee that the on-disk database is fully current at the checkpoint moment. Recovery still has work to do after a crash. What the checkpoint buys is a bounded, explicit starting point for that work.</p>
+<h3>Concept 2: Dirty-page control is about bounding the oldest unflushed change, not just counting dirty buffers</h3>
+<p>After a page is modified in memory, the engine marks it dirty and updates its <code>page_lsn</code> to the LSN of the newest WAL record that changed it. The first time that page becomes dirty after being clean, the dirty page table records its <code>recLSN</code>, which means "recovery may need to start at least this far back if this page is still dirty at crash time." That makes dirty-page control fundamentally a question about age, not just volume.</p>
+<p>Harbor Point can have 10,000 dirty pages and still be healthy if most of them were dirtied recently and background flushing is steadily advancing the oldest <code>recLSN</code>. It can also have far fewer dirty pages and still be in trouble if a small set of old hot index leaves never gets flushed, because those few pages pin recovery to an old redo start point. Counting dirty pages matters for buffer-pool pressure, but the oldest dirty page often matters more for restart behavior.</p>
+<p>The engine therefore runs a steady writeback loop. Background writers choose dirty pages, usually favoring older or checkpoint-relevant pages, and flush them only when the write-ahead rule is satisfied:</p>
+<div class="codehilite"><pre><span></span><code>durable_wal_lsn &gt;= page_lsn
+</code></pre></div>
+
+<p>If that inequality does not hold, the page is not yet safe to write back because the log needed to reconstruct it after a crash would still be missing from durable storage. When the write does complete, the page may leave the dirty page table entirely if no newer in-memory modifications happened in the meantime. If it was dirtied again during flush, it stays dirty with a newer <code>page_lsn</code>, and the cycle continues.</p>
+<p>This is why checkpoint tuning and cleaner tuning cannot be separated cleanly. A checkpoint needs older dirty pages to be flushed so the redo start point can advance. The buffer pool needs enough clean frames to satisfy future misses cheaply. Both goals depend on the same background writeback machinery. The trade-off is that more aggressive cleaning reduces restart distance and eviction pain, but increases steady random I/O, page recompression work, and the chance of writing a page that will be dirtied again soon.</p>
+<h3>Concept 3: Checkpoint spikes happen when writeback pacing loses the race against the workload</h3>
+<p>Harbor Point's morning incident is a classic pacing failure. The engine can absorb bursts for a while because WAL makes commits cheap up front, but the debt does not disappear. Dirty heap pages, B-tree leaves, and compressed historical pages all represent future writeback work. If the background writer is too conservative, or if page flushes have become more expensive because compressed page images must be rebuilt, the dirty backlog ages faster than it is drained.</p>
+<p>When that happens, the checkpoint process stops feeling like lightweight bookkeeping and starts behaving like emergency cleanup. It asks foreground threads to help flush pages, it competes with reads for I/O bandwidth and CPU, and it still may fail to advance the oldest <code>recLSN</code> quickly because the truly old dirty pages are exactly the ones being touched repeatedly. The visible symptom is often "checkpoint completed" messages paired with disappointing restart distance, because multiple checkpoints can pass while the same stubborn pages keep recovery anchored to old WAL.</p>
+<p>This is where operational metrics need to be mechanism-aware. Harbor Point should watch at least four things together: oldest dirty <code>recLSN</code> age, dirty-page percentage in the buffer pool, checkpoint duration versus target duration, and WAL generation rate. Looking at checkpoint frequency alone can be misleading. A frequent checkpoint that never advances the redo start point is mostly paperwork.</p>
+<p>The production trade-off is not between "checkpoint" and "no checkpoint." It is between different ways of paying for durability debt. Gentle continuous writeback costs some I/O and CPU all the time, but protects latency and restart predictability. Delayed writeback keeps the foreground path cheaper temporarily, but risks flush storms, clean-victim shortages, and longer crash recovery. The next lesson on <a href="021.html">14.md</a> turns that checkpoint metadata into an actual crash-recovery walkthrough, and <a href="022.html">15.md</a> will zoom in further on the durable-latency side of the equation with <code>fsync</code> and group commit.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Checkpoints are running on schedule, but crash recovery still has to replay far more WAL than the team expects.</p>
+<p><strong>Why it happens / is confusing</strong>: A fuzzy checkpoint does not guarantee that all pre-checkpoint dirty pages were flushed. If the same old pages remain dirty across multiple checkpoints, the redo start point can stay stubbornly old even though checkpoint records keep appearing.</p>
+<p><strong>Clarification / Fix</strong>: Track the oldest dirty <code>recLSN</code> directly, not just checkpoint timestamps. If restart distance is sticky, prioritize flushing the oldest dirty pages and verify that cleaner throughput can actually retire them.</p>
+<p><strong>Issue</strong>: p99 latency spikes during checkpoints even though storage bandwidth graphs do not show a full device saturation event.</p>
+<p><strong>Why it happens / is confusing</strong>: The expensive part may be CPU and contention in page preparation rather than raw write bandwidth. Harbor Point's compressed pages, checksums, latch waits, and foreground-assisted cleaning can all make checkpoints painful before the disk looks maxed out.</p>
+<p><strong>Clarification / Fix</strong>: Separate checkpoint write time from checkpoint sync time, and measure page flush CPU, latch waits, and the number of foreground writes performed on behalf of the checkpointer. Smoother pacing usually helps more than simply shortening the checkpoint interval.</p>
+<p><strong>Issue</strong>: The buffer pool reports too many dirty pages, and user queries begin stalling on eviction.</p>
+<p><strong>Why it happens / is confusing</strong>: The engine may not have enough immediately flushable victims. Some pages are dirty but blocked by WAL durability lag, while others are dirty again almost as soon as they are cleaned because the workload keeps touching the same hot set.</p>
+<p><strong>Clarification / Fix</strong>: Compare <code>durable_wal_lsn</code> to the <code>page_lsn</code> of would-be victims, and look for a small set of pages that keep cycling back to dirty. The fix may involve faster WAL flush progress, more background cleaner capacity, or a policy that favors advancing the oldest dirty pages before the checkpoint becomes urgent.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Database checkpoints ↔ distributed snapshots</h3>
+<p>Apache Flink checkpoints and Chandy-Lamport-style distributed snapshots solve a related problem at a different scale: capture enough in-flight state to restart or recover without stopping the whole system. A fuzzy database checkpoint does the same thing inside one engine. It does not serialize every page immediately; it records a consistent enough picture that later recovery can resume from a bounded point.</p>
+<h3>Connection 2: Dirty-page control ↔ operating-system writeback throttling</h3>
+<p>Linux page-cache writeback uses thresholds such as <code>dirty_background_ratio</code> and <code>dirty_ratio</code> for the same reason a database uses background cleaners and dirty-page limits: waiting too long creates bursty stalls, but writing too eagerly wastes I/O and cache residency. The database version is stricter because it must also obey WAL ordering and recovery semantics that the kernel's generic page cache does not know about.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-configuration.html">PostgreSQL Documentation: WAL Configuration</a><ul>
+<li>Focus: See how checkpoint cadence, <code>max_wal_size</code>, and <code>checkpoint_completion_target</code> shape steady writeback versus bursty checkpoint behavior.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html">MySQL 8.0 Reference Manual: InnoDB Redo Log</a><ul>
+<li>Focus: Connect checkpoint age, dirty-page flushing, and redo-log growth in a production engine with a different storage implementation.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging">ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging</a><ul>
+<li>Focus: Read the original description of fuzzy checkpoints, dirty page tables, and the recovery model that the next lesson builds on.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html">Linux Kernel Documentation: <code>sysctl/vm</code></a><ul>
+<li>Focus: Compare database dirty-page pacing to kernel dirty-page throttling to sharpen the intuition for why burst control matters.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A checkpoint bounds recovery; it does not prove the data files are fully caught up</strong> - Fuzzy checkpoints record dirty state and transaction state so recovery knows where to start.</li>
+<li><strong>Dirty-page age matters as much as dirty-page count</strong> - The oldest surviving <code>recLSN</code> often determines restart distance and whether checkpoints are actually making progress.</li>
+<li><strong>Checkpoint policy is really writeback policy under recovery constraints</strong> - The engine is balancing clean-victim supply, WAL ordering, restart time, and foreground latency with the same background flush machinery.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can a checkpoint finish even though many dirty pages are still not written to their final locations on disk?</strong></p>
+<ul>
+<li>A) Because a checkpoint only needs to record a usable recovery boundary and dirty-page state, not force every page clean immediately</li>
+<li>B) Because dirty pages are automatically durable once they enter the buffer pool</li>
+<li>C) Because checkpoints affect only replicas, not the primary engine</li>
+</ul>
+</li>
+<li>
+<p><strong>Which page is most important for bounding crash-recovery redo distance?</strong></p>
+<ul>
+<li>A) The most recently dirtied page, because it has the largest <code>page_lsn</code></li>
+<li>B) The page with the oldest <code>recLSN</code> that is still dirty at crash time</li>
+<li>C) Any clean page chosen by the replacement policy</li>
+</ul>
+</li>
+<li>
+<p><strong>Why might Harbor Point see checkpoint-induced latency spikes after enabling heavier page compression?</strong></p>
+<ul>
+<li>A) Because checkpoints disable WAL and force direct page writes only</li>
+<li>B) Because the number of SQL statements increased even if the workload stayed the same</li>
+<li>C) Because each flush may now require more CPU to rebuild and compress dirty pages, so the background writer falls behind and cleanup becomes bursty</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: A fuzzy checkpoint's job is to log enough metadata for bounded recovery. Dirty pages may still be outstanding after the checkpoint completes, as long as recovery can identify and replay the necessary WAL.</p>
+<p><strong>2. B</strong>: Redo must start from the earliest log record whose effects might still be missing from disk. That is exactly what the oldest dirty page's <code>recLSN</code> represents.</p>
+<p><strong>3. C</strong>: Compression can reduce bytes written while increasing the CPU cost of preparing each page for flush. If cleaner throughput drops, dirty-page age grows and checkpoint work becomes spikier.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="019.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Compression and Encoding in Storage Engines</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="021.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Crash Recovery Walkthrough: Analysis, Redo, Undo</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

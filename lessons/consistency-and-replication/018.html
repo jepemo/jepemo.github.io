@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Replication Primitives: Log Shipping and Apply - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Replication Primitives: Log Shipping and Apply</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 018 | Lesson ID: 417
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 417: Replication Primitives: Log Shipping and Apply</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A replica becomes trustworthy when it replays the same durable log the primary would use for crash recovery, in the same order, while keeping separate track of what has been received, flushed, and applied.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="../database-engine-internals-and-implementation/039.html">../26/16.md</a>, Harbor Point chose a page-oriented MVCC database because its reservation workflow depended on ordered WAL, predictable B-tree access, and bounded recovery. The next step is obvious from an operations perspective: move trader dashboards and disaster-recovery failover onto a standby so the primary is not the only copy of the truth. The tempting mental model is "the primary sends changed rows to the replica." That sounds intuitive, but it is not how reliable database replication begins.</p>
+<p>What the primary actually knows how to produce durably is its write-ahead log. When a reservation is approved, the engine does not only think "one row changed." It emits a sequence of WAL records that describe index updates, heap changes, visibility metadata, and finally the commit record that makes the transaction durable. Log shipping works because the replica can consume that exact ordered history and reconstruct the same state transition the primary would reconstruct during crash recovery. Replication is therefore an extension of recovery, not a separate magic copy mechanism.</p>
+<p>That shift matters because "copied" is not one state. A WAL record may have left the primary, arrived on the standby, been written to disk on the standby, or already been replayed into visible pages. Those are different milestones with different operational meanings. Harbor Point can have almost no network lag and still show stale dashboards if apply is behind. It can also have WAL safely stored on the standby before those changes are query-visible there. This lesson is about those primitives: the log, the shipping path, the apply path, and the watermarks that describe where the replica really is.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's production problem is concrete. During the 09:30 market open, the primary handles short approval transactions that update <code>issuer_exposure</code>, insert an <code>open</code> reservation, and write index entries for the trader dashboard. Product wants that dashboard to read from a standby. Operations also wants to promote the standby quickly if the primary host dies. Both requests sound simple until someone asks the question that matters: what exactly does "caught up" mean?</p>
+<p>If the team answers that question loosely, incidents follow. A standby may have received the newest WAL bytes but not replayed them, so the dashboard misses reservations that definitely committed on the primary. A disconnected standby may fall so far behind that the primary has already discarded the WAL segments it needs. A failover runbook may assume that a replica with low transport lag is promotion-ready when the actual replay position is still behind the business events support is about to inspect.</p>
+<p>Once the team thinks in terms of log shipping and apply, the system becomes easier to reason about. The WAL defines the only valid order of state transitions. Shipping tells you how much of that history has reached the standby. Apply tells you how much of that history has become part of the standby's visible state. The next lesson, <a href="019.html">02.md</a>, will ask when a client commit should wait for a replica acknowledgment. That question only makes sense after the mechanics of shipping and apply are clear.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why log shipping starts from the recovery log instead of table diffs</strong> - Show how WAL preserves commit order and engine-specific state transitions.</li>
+<li><strong>Distinguish receipt, durability, and replay on a replica</strong> - Use the right watermark when reasoning about stale reads, failover readiness, and lag.</li>
+<li><strong>Analyze the operational trade-offs of log shipping</strong> - Identify where backlog, WAL retention, and apply conflicts turn a healthy replica into an unreliable one.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Replication is remote crash recovery driven by WAL order</h3>
+<p>Harbor Point's approval path already gave the primary a durable source of truth before replication existed. When a trader opens a reservation for issuer <code>MUNI-77</code>, the engine writes WAL records for the summary-row update in <code>issuer_exposure</code>, the new row in <code>reservations</code>, and the affected B-tree entries, then emits a commit record. That WAL is what lets the primary recover after a crash. Replication reuses the same mechanism rather than inventing a second description of the transaction.</p>
+<p>That design solves a hard correctness problem. The database state is not just "rows." It includes page images, visibility information, index maintenance, and a very specific commit order. If Harbor Point tried to ship only logical row deltas at this layer, the standby would need a second mechanism to preserve every storage-engine invariant the primary already encoded in WAL. By shipping the durable log, the standby gets the exact prefix of history the primary trusted locally.</p>
+<p>For one Harbor Point approval, the WAL prefix might look conceptually like this:</p>
+<div class="codehilite"><pre><span></span><code>LSN 8A/10  UPDATE issuer_exposure SET reserved_notional = reserved_notional + 500000
+LSN 8A/28  INSERT reservations(id=&#39;R-88421&#39;, issuer=&#39;MUNI-77&#39;, status=&#39;open&#39;, ...)
+LSN 8A/40  INSERT idx_reservations_open_issuer_time(...)
+LSN 8A/58  COMMIT tx=88421
+</code></pre></div>
+
+<p>The replica cannot safely expose the reservation after replaying only the row insert if the index change or commit record is missing. It must replay the WAL in order and stop at the last complete durable prefix. That is why log shipping is attractive operationally: the primary and standby share one notion of history. It is also why physical log shipping is tightly coupled to one engine family and storage layout. You gain exactness and predictable recovery semantics, but the replica is no longer a loosely interpreted consumer of events. It is another copy of the same database system reconstructing the same state.</p>
+<p>An ASCII view of the normal path makes the coupling clearer:</p>
+<div class="codehilite"><pre><span></span><code>client tx
+   |
+   v
+primary generates WAL ----&gt; local fsync ----&gt; commit visible on primary
+   |
+   +---- WAL sender ----&gt; standby stores WAL ----&gt; standby replays WAL ----&gt; query visible on standby
+</code></pre></div>
+
+<p>The arrow from "local fsync" to "standby stores WAL" is intentionally separate from the arrow to "standby replays WAL." Shipping and apply are different phases. That distinction is the core primitive for the rest of the month.</p>
+<h3>Concept 2: A replica has multiple positions, not one "caught up" flag</h3>
+<p>Harbor Point's operations dashboard should never display a single boolean called <code>replica_healthy</code>. A useful standby exposes at least three meaningful positions. One position tells you how much WAL the standby has received over the network. Another tells you how much of that WAL is durable on the standby's own disk. A third tells you how much has been replayed into data pages so hot-standby queries can see it.</p>
+<p>Those positions diverge in ordinary production conditions. Suppose the primary commits reservation <code>R-88421</code> at LSN <code>8A/58</code>. The standby might receive that record almost immediately because the network is fast, but replay could still lag because the standby is saturating I/O or because a long-running read query is delaying page changes. In that moment Harbor Point has very low transport lag and very real read staleness.</p>
+<p>The operational meaning of each watermark is different:</p>
+<ul>
+<li><code>receive_lsn</code>: the standby has the bytes in memory or on its ingress path, but not necessarily durably.</li>
+<li><code>flush_lsn</code>: the standby has fsynced that WAL locally, so it can continue recovery from that prefix even after its own crash.</li>
+<li><code>replay_lsn</code>: the standby has applied that prefix, so queries on the standby can observe the effects.</li>
+</ul>
+<p>That separation explains a common confusion around failover. A standby can be safer than its visible query state suggests. If it has flushed WAL beyond its current replay position, promotion can continue recovery from the durable local prefix before opening for writes. By contrast, read scaling depends on replay, not merely receipt or flush, because trader dashboards and support queries only see changes that have actually been applied.</p>
+<p>Harbor Point therefore needs metrics and alerts keyed to the right question. "How stale are standby reads?" is a replay question. "How much WAL would the standby lose if it crashed right now?" is a flush question. "Is the network path to the standby keeping up?" is a receive question. Treating those as one number hides the real failure mode.</p>
+<h3>Concept 3: Log shipping stays healthy only if retention, apply speed, and conflicts are managed</h3>
+<p>Once Harbor Point starts relying on a standby, the dangerous failures are usually not mysterious consensus bugs. They are ordinary backlog problems at the replication primitives layer. If the standby disconnects for long enough, the primary may recycle old WAL segments before the standby consumes them. At that point the standby cannot resume from its last position and needs a new base backup or another seeding path. The database did not "partially replicate." It lost the continuous log prefix required to continue recovery.</p>
+<p>Apply lag is the second class of problem. Harbor Point wants to run trader dashboards on the standby, but read traffic is only safe when it does not prevent the standby from applying new WAL promptly. Depending on engine behavior, long-running reads can delay cleanup or conflict with replayed changes. Even without query conflicts, replay can fall behind simply because one standby is under-provisioned for the rate at which the primary generates WAL during market open. The result looks like an application bug because dashboards are stale, yet the root cause is replay throughput.</p>
+<p>The third pressure is observability. Log shipping gives strong ordering guarantees precisely because it insists on a contiguous prefix of WAL. That means small gaps matter. If Harbor Point sees <code>receive_lsn</code> moving but <code>replay_lsn</code> stuck, the team should ask whether replay is blocked, not whether the application "forgot to refresh." If none of the positions move, the issue is earlier: WAL sender, network path, standby receiver, or retention. The lesson is not that replication is fragile. The lesson is that the right primitive-level signals make it diagnosable.</p>
+<p>This is the trade-off of physical log shipping. It is operationally efficient, preserves exact engine semantics, and makes failover conceptually straightforward because every standby is reconstructing the same storage history. In exchange, replicas are tightly bound to the primary's engine version and physical layout, and every standby must keep up with a single ordered WAL stream instead of independently interpreting business events. That is acceptable for Harbor Point because the requirement is "another trustworthy copy of the same OLTP database," not "a differently shaped downstream system."</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The standby reports that it is connected, but the trader dashboard still misses reservations that committed seconds ago.</p>
+<p><strong>Why it happens / is confusing</strong>: Connection health only proves that the shipping path exists. The standby may be receiving WAL while replay is behind due to I/O saturation, replay conflicts, or a long-running query.</p>
+<p><strong>Clarification / Fix</strong>: Compare receive, flush, and replay positions separately. If replay alone is lagging, reduce conflicting standby reads, provision more I/O, or move the dashboard to a replica tier that can keep up with market-open WAL volume.</p>
+<p><strong>Issue</strong>: A standby comes back after an outage and cannot catch up from its old position.</p>
+<p><strong>Why it happens / is confusing</strong>: The primary kept moving and eventually removed WAL segments older than the standby's restart point. Log shipping requires a continuous WAL prefix; missing segments are not reconstructible from the later log alone.</p>
+<p><strong>Clarification / Fix</strong>: Increase WAL retention, use replication slots or an equivalent retention mechanism carefully, and alert on lag before the standby falls off the retained history window.</p>
+<p><strong>Issue</strong>: Operations promotes a standby and discovers that some recently committed work is not yet visible to support queries.</p>
+<p><strong>Why it happens / is confusing</strong>: The standby may have durably stored WAL beyond its replay point. Promotion can continue recovery from that durable prefix, but hot-standby reads before promotion were only seeing the replayed prefix.</p>
+<p><strong>Clarification / Fix</strong>: Distinguish read freshness from failover safety in runbooks and dashboards. For user-facing reads, watch replay lag. For promotion analysis, also inspect what WAL has been durably flushed locally.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="../database-engine-internals-and-implementation/039.html">../26/16.md</a> chose an engine whose WAL could support replication without redefining correctness</h3>
+<p>The month 26 capstone argued that Harbor Point needed a page-oriented MVCC engine because ordered WAL, B-tree maintenance, and bounded recovery matched the reservation workload. This lesson extends that same decision over the network. If the local engine's commit order were not trustworthy, remote replicas would only reproduce the confusion on more machines.</p>
+<h3>Connection 2: <a href="019.html">02.md</a> and <a href="020.html">03.md</a> build on these watermarks in different ways</h3>
+<p><a href="019.html">02.md</a> asks which replica milestone a client commit should wait for: local durability only, remote flush, or something stricter. <a href="020.html">03.md</a> revisits the same idea through Raft, where the replicated log is logical and quorum-committed rather than a physical WAL stream. The common thread is that ordering comes first; the difference is what exactly is being ordered and what acknowledgment rule makes it durable.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby.html">PostgreSQL Documentation: Log-Shipping Standby Servers</a><ul>
+<li>Focus: The end-to-end mechanics of WAL shipping, standby recovery, and how streaming replication extends the same recovery machinery used after a crash.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION">PostgreSQL Documentation: <code>pg_stat_replication</code> and Replication Monitoring</a><ul>
+<li>Focus: How real systems expose sent, write, flush, and replay positions so operators can separate transport lag from apply lag.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/replication-threads.html">MySQL Reference Manual: Replication Threads</a><ul>
+<li>Focus: The same primitive split in another engine family, where an I/O thread fetches changes and an applier thread replays them from a relay log.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: The broader conceptual frame for replication logs, follower catch-up, and why a replica is really a state machine consuming an ordered history.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Log shipping works because replication reuses recovery</strong> - The replica consumes the same ordered durable history the primary would use after its own crash.</li>
+<li><strong>Replica freshness has multiple milestones</strong> - Received WAL, flushed WAL, and replayed WAL answer different production questions and should never be collapsed into one status flag.</li>
+<li><strong>Healthy replication depends on continuous history and timely apply</strong> - Retention gaps, under-provisioned standby I/O, and replay conflicts are the ordinary ways a replica stops being trustworthy.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point ship WAL to the standby instead of trying to replicate changed rows directly at this layer?</strong></p>
+<ul>
+<li>A) Because WAL preserves the engine's exact ordered state transitions, including commit order and index maintenance</li>
+<li>B) Because row-level replication is impossible in any database system</li>
+<li>C) Because WAL shipping automatically makes every standby query current with the primary</li>
+</ul>
+</li>
+<li>
+<p><strong>A standby has already flushed a commit record locally but has not replayed it yet. What is true?</strong></p>
+<ul>
+<li>A) Standby queries can already see the transaction because the bytes are durable</li>
+<li>B) The standby may be able to continue recovery from that WAL after promotion, but hot-standby reads still cannot observe the transaction yet</li>
+<li>C) The standby must discard that WAL because replay has not happened immediately</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the most likely explanation when <code>receive_lsn</code> keeps advancing but <code>replay_lsn</code> stays flat during market open?</strong></p>
+<ul>
+<li>A) The network path is down entirely</li>
+<li>B) The primary has stopped generating WAL</li>
+<li>C) The standby is receiving history, but apply is blocked or under-provisioned</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: WAL carries the engine's real recovery history: page changes, index maintenance, visibility metadata, and commit order. Option B is too absolute because some systems do support logical replication layers. Option C is false because shipping bytes to the standby does not imply they have already been replayed.</p>
+<p><strong>2. B</strong>: Durably flushed WAL means the standby has stored the history prefix locally, which matters for crash recovery and promotion. It does not mean standby queries can already see the transaction; that requires replay. Option C misunderstands the whole point of separating flush from replay.</p>
+<p><strong>3. C</strong>: The log is arriving, so transport is not the main issue. The problem is later in the pipeline: replay conflicts, slow standby I/O, or insufficient apply throughput. Options A and B would usually stop <code>receive_lsn</code> from advancing in the first place.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="017.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Monthly Capstone: Design a Globally Distributed Data Layer</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="019.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Synchronous vs Asynchronous Replication</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

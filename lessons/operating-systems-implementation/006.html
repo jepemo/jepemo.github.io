@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Async IO Fundamentals - Concurrency While Waiting - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Async IO Fundamentals - Concurrency While Waiting</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a>
+        </p>
+        <p>
+          Sequence: 006 | Lesson ID: 237
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 237: Async IO Fundamentals - Concurrency While Waiting</h1>
+<blockquote>
+<p><strong>Threads are one way to get concurrency, but they are not the only way. Async I/O becomes attractive when the real bottleneck is not CPU work, but how much time the program spends waiting for sockets, files, or timers to become ready.</strong></p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>After processes, threads, locks, lock-free structures, and memory ordering, it is easy to assume that concurrency always means:</p>
+<ul>
+<li>more execution paths</li>
+<li>more scheduling</li>
+<li>more synchronization between them</li>
+</ul>
+<p>Async I/O changes the center of gravity.</p>
+<p>It starts from a different observation:</p>
+<ul>
+<li>many servers spend large amounts of time not computing, but waiting</li>
+</ul>
+<p>Waiting for:</p>
+<ul>
+<li>the next bytes on a socket</li>
+<li>the kernel to finish a read</li>
+<li>a timeout to expire</li>
+<li>a remote peer to respond</li>
+</ul>
+<p>The aha is:</p>
+<ul>
+<li><strong>async I/O does not make waiting disappear</strong></li>
+<li><strong>it makes waiting non-blocking, so one execution context can keep making progress on other work while the kernel watches the slow thing</strong></li>
+</ul>
+<p>That is why an event loop can handle many in-flight operations without needing one blocked thread per connection.</p>
+<p>So async I/O is best understood as:</p>
+<ul>
+<li>concurrency for I/O-bound workloads by multiplexing waiting, not by multiplying blocked threads</li>
+</ul>
+<h2>Why This Matters</h2>
+<p>Imagine a chat server handling tens of thousands of mostly idle connections.</p>
+<p>At any given moment, most clients are doing almost nothing:</p>
+<ul>
+<li>waiting for a message</li>
+<li>waiting for a heartbeat</li>
+<li>waiting for the next small burst of traffic</li>
+</ul>
+<p>If we use one blocked thread per connection, the system spends a huge amount of overhead on:</p>
+<ul>
+<li>thread stacks</li>
+<li>scheduler bookkeeping</li>
+<li>context switches</li>
+<li>synchronization around shared resources</li>
+</ul>
+<p>Yet most of those threads are simply sleeping in <code>read()</code> or <code>recv()</code>.</p>
+<p>Async I/O changes the model:</p>
+<ul>
+<li>register interest in events</li>
+<li>let the kernel tell us which sockets are ready</li>
+<li>run a small piece of handler logic for the ready ones</li>
+<li>go back to the event loop</li>
+</ul>
+<p>Now the program is not saying:</p>
+<ul>
+<li>"one waiting thread per connection"</li>
+</ul>
+<p>It is saying:</p>
+<ul>
+<li>"one loop that reacts to whichever connections are ready right now"</li>
+</ul>
+<p>This matters because it changes the cost structure dramatically for I/O-heavy systems.</p>
+<p>The point is not that async is "modern" or always better.
+The point is that blocking threads are often a bad fit when waiting dominates and per-connection work is tiny.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why async I/O exists</strong> - Describe the difference between CPU-bound concurrency and I/O-bound waiting, and why the latter motivates an event-driven model.</li>
+<li><strong>Trace the event loop model</strong> - Show how readiness notification and callback/coroutine resumption let one runtime manage many in-flight operations.</li>
+<li><strong>Evaluate the trade-off</strong> - Recognize when async I/O reduces thread overhead and when it instead complicates control flow or fails to help with CPU-bound work.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Blocking I/O Ties Up an Execution Context While Nothing Useful Happens</h3>
+<p>Suppose a thread handles a client connection like this:</p>
+<div class="codehilite"><pre><span></span><code>read request
+wait for bytes
+parse
+call database
+wait for response
+format output
+write response
+wait for socket buffer
+</code></pre></div>
+
+<p>Large parts of that lifecycle are waiting, not computing.</p>
+<p>With blocking I/O, the thread cannot do other useful work while stuck in those waits.</p>
+<p>That is acceptable if:</p>
+<ul>
+<li>concurrency is low</li>
+<li>the number of connections is small</li>
+<li>the simplicity of one-thread-per-task is worth the cost</li>
+</ul>
+<p>But it becomes expensive when thousands of tasks are mostly sleeping.</p>
+<p>So the key insight is:</p>
+<ul>
+<li>blocking I/O wastes execution contexts on waiting</li>
+</ul>
+<p>That waste is exactly what async I/O tries to remove.</p>
+<h3>Concept 2: Async I/O Uses Readiness or Completion Notification to Reuse the Same Execution Context</h3>
+<p>The event-driven model usually looks like this:</p>
+<ol>
+<li>tell the kernel which sockets or file descriptors we care about</li>
+<li>wait for the kernel to report readiness or completion</li>
+<li>run the handler for whichever operation is now ready</li>
+<li>suspend again when that handler reaches another wait point</li>
+</ol>
+<p>ASCII sketch:</p>
+<div class="codehilite"><pre><span></span><code>event loop
+   |
+   +--&gt; register interest in fd1, fd2, fd3, ...
+   |
+   +--&gt; kernel says: fd2 ready, timer expired, fd9 writable
+   |
+   +--&gt; run tiny units of work for ready events
+   |
+   +--&gt; go back to waiting for the next set
+</code></pre></div>
+
+<p>This is the reason async can scale well for many mostly idle connections.</p>
+<p>Instead of:</p>
+<ul>
+<li>many blocked threads each waiting separately</li>
+</ul>
+<p>we have:</p>
+<ul>
+<li>one or a few loops resuming only the work that is actually unblocked</li>
+</ul>
+<p>Modern async syntax with <code>await</code> makes this easier to read, but the underlying idea is the same:</p>
+<ul>
+<li>suspend when progress depends on external I/O</li>
+<li>resume when the awaited event is ready</li>
+</ul>
+<h3>Concept 3: Async I/O Is Great for I/O-Bound Workloads, but It Does Not Magically Fix CPU-Bound Work</h3>
+<p>Async often gets overgeneralized.</p>
+<p>It is excellent when:</p>
+<ul>
+<li>there are many concurrent waits</li>
+<li>each ready event does a relatively small amount of CPU work</li>
+<li>thread-per-connection overhead would dominate</li>
+</ul>
+<p>It does <strong>not</strong> make CPU-heavy handlers faster.</p>
+<p>If a handler spends a long time compressing data, parsing a giant document, or running expensive business logic, then the event loop itself can become blocked.</p>
+<p>That leads to the core trade-off:</p>
+<ul>
+<li>async I/O reduces blocked-thread overhead</li>
+<li>but it demands that handlers stay short, cooperative, and aware of where they may yield</li>
+</ul>
+<p>This is why async systems often need:</p>
+<ul>
+<li>worker pools for CPU-bound tasks</li>
+<li>explicit backpressure</li>
+<li>careful avoidance of accidental blocking calls inside the event loop</li>
+</ul>
+<p>So async I/O is not a universal concurrency upgrade.
+It is a very good fit for one specific shape of workload:</p>
+<ul>
+<li>high concurrency</li>
+<li>lots of waiting</li>
+<li>small bursts of actual work between waits</li>
+</ul>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: "Async means the program runs everything in parallel."</p>
+<p><strong>Why it happens / is confusing</strong>: The word "concurrent" is often mentally collapsed into "parallel."</p>
+<p><strong>Clarification / Fix</strong>: Async mainly helps one runtime manage many in-flight waits. It is about efficient multiplexing of blocked I/O, not automatic CPU parallelism.</p>
+<p><strong>Issue</strong>: "If we move to async, all scalability problems go away."</p>
+<p><strong>Why it happens / is confusing</strong>: Thread overhead is visible, so removing it feels like the whole problem.</p>
+<p><strong>Clarification / Fix</strong>: Async reduces one class of cost. It does not remove slow handlers, overloaded databases, bad backpressure, or CPU-heavy application code.</p>
+<p><strong>Issue</strong>: "If the code uses <code>await</code>, it cannot block the event loop."</p>
+<p><strong>Why it happens / is confusing</strong>: Developers equate async syntax with non-blocking behavior.</p>
+<p><strong>Clarification / Fix</strong>: A function can still call blocking APIs or do too much CPU work before yielding. Async correctness depends on what the code actually does, not on the presence of <code>async</code> keywords.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Async IO Fundamentals &lt;-&gt; Threads &amp; Scheduling</h3>
+<p><strong>The parallel</strong>: Threads create concurrency by giving the scheduler many execution paths. Async I/O creates concurrency by letting a smaller number of execution contexts manage many waits cooperatively.</p>
+<h3>Connection 2: Async IO Fundamentals &lt;-&gt; io_uring</h3>
+<p><strong>The parallel</strong>: This lesson introduces the event-driven model at a high level. <code>io_uring</code> is one modern Linux mechanism that implements an efficient completion-based path for that style of I/O.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://man7.org/linux/man-pages/man7/epoll.7.html">epoll(7)</a></li>
+<li>[DOC] <a href="https://man7.org/linux/man-pages/man2/select.2.html">select(2)</a></li>
+<li>[DOC] <a href="https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick">The Node.js Event Loop</a></li>
+<li>[BOOK] <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">Operating Systems: Three Easy Pieces</a></li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Async I/O is about concurrency while waiting</strong> - It helps when many operations are blocked on external I/O, not when the core problem is CPU saturation.</li>
+<li><strong>The event loop reuses execution context across many in-flight operations</strong> - The kernel reports readiness or completion, and the runtime resumes only the work that can move forward.</li>
+<li><strong>Async changes the cost model, not the laws of performance</strong> - It reduces blocked-thread overhead but still requires short handlers, backpressure, and care around accidental blocking work.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>What problem is async I/O primarily trying to solve?</strong></p>
+<ul>
+<li>A) Faster arithmetic on CPU-bound workloads</li>
+<li>B) Efficient handling of many concurrent waits without one blocked thread per operation</li>
+<li>C) Removal of all kernel scheduling</li>
+</ul>
+</li>
+<li>
+<p><strong>What does an event loop fundamentally do?</strong></p>
+<ul>
+<li>A) It runs every handler continuously whether or not I/O is ready</li>
+<li>B) It waits for readiness/completion events and resumes the work that can now make progress</li>
+<li>C) It converts network traffic into disk sectors</li>
+</ul>
+</li>
+<li>
+<p><strong>When is async I/O a poor fit by itself?</strong></p>
+<ul>
+<li>A) When handlers spend long periods on CPU-heavy work without yielding</li>
+<li>B) When the application uses sockets</li>
+<li>C) When the kernel supports readiness notification</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Async I/O is primarily about handling many concurrent waits efficiently instead of dedicating one blocked thread to each one.</p>
+<p><strong>2. B</strong>: The event loop waits for the kernel to report which operations are ready and resumes only those paths.</p>
+<p><strong>3. A</strong>: Async I/O does not solve CPU saturation; CPU-heavy work can still block the loop and needs another strategy.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="005.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Memory Models & Ordering - When Program Order Is Not Enough</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="007.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>io_uring - Shared Rings for Modern Linux Async IO</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/operating-systems-implementation.html">← Back to Operating Systems Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

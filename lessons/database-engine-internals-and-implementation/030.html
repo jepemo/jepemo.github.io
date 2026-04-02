@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WAL Internals: LSN, pageLSN, and Flush Ordering - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>WAL Internals: LSN, pageLSN, and Flush Ordering</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 030 | Lesson ID: 407
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 407: WAL Internals: LSN, pageLSN, and Flush Ordering</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Once <a href="029.html">06.md</a> decides which transaction is allowed to commit, write-ahead logging makes that decision crash-safe by giving every log record an LSN, stamping dirty pages with a <code>pageLSN</code>, and refusing to flush data pages ahead of the WAL that explains them.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>At Harbor Point, the risk engine has already solved the logical conflict from <a href="029.html">06.md</a>: trader <code>R1</code> won validation for a <code>0.5M</code> <code>MUNI-77</code> reservation, and trader <code>R2</code> was forced to retry. That tells the database which history is legal. It does not yet tell the database what happens if the machine loses power three milliseconds later.</p>
+<p>That is the job of WAL internals. The update to <code>MUNI-77</code> is first described as a log record with a monotonically increasing log sequence number, or LSN. When the buffer manager applies that change to an in-memory page, it stamps the page with the same value as <code>pageLSN</code>, meaning "this page now reflects all log records up through here." From then on, the storage engine has an uncompromising rule: the page is not allowed to reach disk until the WAL is durable at least through that <code>pageLSN</code>.</p>
+<p>The key realization is that the data file is not the primary source of truth at commit time. The WAL is. Harbor Point can acknowledge <code>R1</code> before the modified page itself is written to the table file, because the durable promise is "the log contains enough information to redo this change after a crash," not "every touched page has already been flushed."</p>
+<p>That is why LSNs and flush ordering matter in production. If the ordering is wrong, recovery may find a page whose contents have no durable explanation, or it may lose a committed trade that the application was told was safe. The next lesson, <a href="031.html">08.md</a>, depends on this contract: redo can only be idempotent if the engine knows exactly which log records a page has already absorbed.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's market-open burst is the worst time to discover that "commit succeeded" and "page reached disk" are not the same event. During the burst, hundreds of reservations dirty pages faster than the data files can be written. If the database required every modified page to flush before acknowledging a commit, commit latency would be dominated by random data-page I/O and the desk would stall under load.</p>
+<p>Real engines therefore use a <code>steal/no-force</code> design. "No-force" means a commit does not force every dirty page to disk. "Steal" means the buffer manager is still allowed to flush a dirty page before its transaction commits, which helps memory pressure but creates a recovery obligation. WAL is the mechanism that makes both choices safe. The log must become durable before a dirty page hits disk, and a transaction's commit record must become durable before the client hears "committed."</p>
+<p>The production relevance is immediate. If the WAL device falls behind, Harbor Point may see rising commit latency even while the data device looks underutilized, because the checkpoint and page writers are blocked by the log-first rule. If the engine mis-orders those writes, the failure mode is worse than slowness: crash recovery may reconstruct an impossible state. Understanding LSNs and <code>pageLSN</code> is how you separate healthy buffering from correctness debt.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what LSN and <code>pageLSN</code> each represent</strong> - Describe how the engine maps an in-memory page version back to the WAL timeline.</li>
+<li><strong>Trace the flush-ordering path for a committing write</strong> - Follow Harbor Point's reservation from log record creation to commit acknowledgment and later page flush.</li>
+<li><strong>Reason about production trade-offs</strong> - Explain why databases usually fsync WAL before acknowledging commit instead of forcing data pages, and what operational bottlenecks that creates.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: LSN is the durable timeline, and <code>pageLSN</code> says how far a page has caught up</h3>
+<p>When <code>R1</code> inserts the <code>0.5M</code> reservation for <code>MUNI-77</code>, the engine does not begin by overwriting the table file. It first appends an update record to the WAL buffer. That record is assigned an LSN, often a byte position or logical address in the WAL stream. The exact encoding varies by engine, but the contract is the same: higher LSN means later in the durable history.</p>
+<p>Now the buffer manager modifies the in-memory page that stores the reservation row. The important side effect is not just the new tuple; it is the page header update to <code>pageLSN = update_lsn</code>. <code>pageLSN</code> is a compact statement about page state: "this page already includes every logged change up through this LSN." Without that stamp, recovery would have no reliable way to compare page contents with redo records.</p>
+<p>For Harbor Point, that relationship looks like this:</p>
+<div class="codehilite"><pre><span></span><code>WAL stream:
+  ... -&gt; LSN 9810240: insert reservation R1 for MUNI-77
+      -&gt; LSN 9810312: commit transaction R1
+
+Buffer page 842:
+  rows: [..., reservation R1]
+  pageLSN: 9810240
+</code></pre></div>
+
+<p>This explains why <code>pageLSN</code> belongs on the page, not just in a transaction table. Recovery works page by page. When the engine later scans redo, it can ask a local question for page 842: "Is this log record newer than the page image already on disk?" If the page on disk has <code>pageLSN &gt;= redo_lsn</code>, the change is already reflected and redo can skip it safely. That is the bridge to <a href="031.html">08.md</a>.</p>
+<p>The trade-off is tighter coupling between components that would otherwise look separate. The log manager assigns LSNs, the buffer manager mutates pages, and the recovery subsystem trusts <code>pageLSN</code> to tell the truth. Once those contracts drift apart, no amount of throughput tuning can restore correctness.</p>
+<h3>Concept 2: Flush ordering is what lets the engine acknowledge commit before the data page is written</h3>
+<p>The phrase "write-ahead logging" is easy to misread. It does not mean "flush the log before touching memory." Harbor Point's page is updated in memory immediately after the update record is generated. The actual rule is narrower and more useful: before a dirty page is written to persistent storage, the WAL must be durable through that page's <code>pageLSN</code>. And before a transaction is acknowledged as committed, the WAL must be durable through the commit record's LSN.</p>
+<p>For <code>R1</code>, the normal path is:</p>
+<ol>
+<li>The engine appends an update log record for the reservation and gets <code>LSN = 9810240</code>.</li>
+<li>It inserts the row on buffer page 842 and sets <code>pageLSN = 9810240</code>.</li>
+<li>At commit, it appends a commit record, say <code>LSN = 9810312</code>.</li>
+<li>The WAL writer flushes the log to durable storage through <code>9810312</code>.</li>
+<li>Only after that flush succeeds does Harbor Point return success to the trader.</li>
+<li>The modified table page may still remain dirty in memory and reach disk later.</li>
+</ol>
+<p>That last step is the non-obvious one. The database is free to acknowledge <code>R1</code> before page 842 is flushed because redo can recreate the page from WAL after a crash. The durable contract is attached to the log, not to immediate data-file persistence. This is why commit latency in many engines tracks WAL fsync latency much more closely than data-file write latency.</p>
+<p>The same ordering rule also permits <code>steal</code>. Suppose memory pressure forces page 842 out of the buffer pool before <code>R1</code> commits. The engine may flush that dirty page early, but only if the WAL is already durable through <code>pageLSN = 9810240</code>. If the process crashes after the flush but before the commit record is durable, recovery can still undo or ignore the uncommitted effects because the page never outran the log that explains how it got there.</p>
+<p>The performance trade-off is deliberate. Sequential WAL writes and group commit are usually cheaper than forcing many scattered data pages on every commit. In exchange, the engine accepts a more sophisticated recovery path and stronger coupling between dirty-page management and WAL flush progress.</p>
+<h3>Concept 3: Production bottlenecks often show up as an LSN gap, not as obvious disk saturation</h3>
+<p>At 09:32, Harbor Point's dashboards show a confusing picture: the data volume is only half busy, but commit latency jumps from <code>4 ms</code> to <code>35 ms</code>, dirty pages accumulate, and checkpoints take longer to finish. The missing variable is WAL flush progress. If the current end of log advances much faster than the durable flushed LSN, the system starts to accumulate dirty pages whose <code>pageLSN</code> cannot legally reach disk yet.</p>
+<p>That creates a chain reaction. Page cleaners cannot evict some dirty buffers because their explaining WAL is not durable. Checkpoints drag on because too many pages remain pinned behind the WAL frontier. Backpressure reaches transactions as longer commit waits, not because every commit flushes its own data pages, but because commit still needs the log device to certify the durable order. In other words, WAL can become the critical path even when the table-space device looks fine.</p>
+<p>This is why production observability has to include LSN-centric signals: current insert LSN, flushed LSN, checkpoint redo LSN, dirty-page backlog, and recovery distance implied by the outstanding WAL. Without them, Harbor Point might misdiagnose the problem as a generic storage slowdown and spend days tuning page flushers when the real bottleneck is a saturated log device or an fsync configuration change.</p>
+<p>The design trade-off is worth it because the alternative is much worse. If Harbor Point forced every data page at commit, the desk would pay higher steady-state latency. If it relaxed flush ordering instead, the database could expose pages whose contents have no durable explanation. WAL chooses a middle path: log first, data later, with exact ordering rules. The next lesson uses that same path to explain why redo can be repeated safely after multiple crashes.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Commit latency rises sharply, but the table-space disks are not saturated.</p>
+<p><strong>Why it happens / is confusing</strong>: Commit acknowledgment waits on WAL durability, not on every data page flush. A slow log device or more expensive fsync path can dominate latency while the main data volume still looks comfortable.</p>
+<p><strong>Clarification / Fix</strong>: Check WAL flush time, group-commit behavior, and the gap between inserted and flushed LSN. Treat the log device as a first-class performance bottleneck.</p>
+<p><strong>Issue</strong>: Dirty pages pile up and checkpoints stall even though the buffer pool is large.</p>
+<p><strong>Why it happens / is confusing</strong>: Buffer size helps only until dirty pages need eviction. A page with <code>pageLSN</code> greater than the durable WAL frontier cannot legally be written, so page cleaners stall behind WAL progress.</p>
+<p><strong>Clarification / Fix</strong>: Inspect checkpoint metrics together with WAL throughput. If the LSN gap is widening, reducing checkpoint aggressiveness alone will not solve the root cause.</p>
+<p><strong>Issue</strong>: Engineers assume a committed transaction must already exist in the data file on disk.</p>
+<p><strong>Why it happens / is confusing</strong>: "Committed" sounds like "fully materialized everywhere," but in a <code>no-force</code> system it really means the commit record is durable in WAL and the engine can redo the change later.</p>
+<p><strong>Clarification / Fix</strong>: Separate durability of intent from persistence of page images. The log makes the transaction durable first; data pages catch up afterward.</p>
+<p><strong>Issue</strong>: After enabling asynchronous commit, a small number of acknowledged writes disappear after crash tests.</p>
+<p><strong>Why it happens / is confusing</strong>: Async commit weakens the usual rule by allowing the client acknowledgment before the commit record is guaranteed durable. That can be an acceptable trade for some workloads, but it changes the durability contract.</p>
+<p><strong>Clarification / Fix</strong>: Use sync commit for truly durable operations, and make the weaker guarantee explicit in API semantics and operational docs.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Optimistic commit logic in <a href="029.html">06.md</a> needs WAL to make the winner durable</h3>
+<p>The previous lesson decided whether Harbor Point was allowed to commit <code>R1</code> and reject <code>R2</code>. WAL picks up immediately after that decision. Validation answers "which history is legal?"; LSN assignment and flush ordering answer "which legal history survives power loss?" Production systems need both layers, because a transaction that is serializable but not durably ordered is still not safe.</p>
+<h3>Connection 2: <code>pageLSN</code> is the hook recovery uses in <a href="031.html">08.md</a> for idempotent redo</h3>
+<p>ARIES-style recovery and engines influenced by it replay log records by comparing each redo record's LSN with the page's stored <code>pageLSN</code>. That local comparison is what makes redo repeatable after repeated crashes: if the page already includes the change, skip it; if not, apply it. Today's flush-ordering rules are therefore the prerequisite for tomorrow's recovery correctness story.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging">ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging</a><ul>
+<li>Focus: The original recovery design that formalized WAL, page-oriented redo, and the role of LSNs in crash recovery.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-intro.html">PostgreSQL Documentation: Write-Ahead Logging (WAL)</a><ul>
+<li>Focus: A production-oriented explanation of why PostgreSQL writes WAL before table pages and how that improves both performance and crash safety.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PostgreSQL Documentation: Database Page Layout</a><ul>
+<li>Focus: The page-header fields, including the page LSN, that let recovery reason about what a page image already contains.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-redo-log.html">MySQL Reference Manual: InnoDB Redo Log</a><ul>
+<li>Focus: Another widely used engine's WAL design, useful for comparing the common log-first contract across implementations.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>LSN is the storage engine's durable ordering primitive</strong> - It gives updates, commits, and later recovery work a single comparable timeline.</li>
+<li><strong><code>pageLSN</code> turns a page image into a statement about WAL history</strong> - Recovery can decide whether redo is needed only because each page says how far into the log it already reflects.</li>
+<li><strong>Flush ordering makes <code>steal/no-force</code> practical</strong> - Commit durability comes from WAL fsync, while delayed page flushes preserve throughput and shift complexity into recovery.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>What does <code>pageLSN</code> tell the recovery system about a data page?</strong></p>
+<ul>
+<li>A) Which transaction created the page originally</li>
+<li>B) The newest WAL record whose effects are already reflected on that page</li>
+<li>C) How many times the page has been flushed since startup</li>
+</ul>
+</li>
+<li>
+<p><strong>Which condition must hold before Harbor Point can flush a dirty page containing <code>R1</code>'s reservation to disk?</strong></p>
+<ul>
+<li>A) The transaction must already be committed and all touched pages must flush together</li>
+<li>B) The WAL must be durable at least through the page's <code>pageLSN</code></li>
+<li>C) The checkpoint must have completed for the whole database</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can Harbor Point acknowledge <code>R1</code> before the modified table page reaches disk?</strong></p>
+<ul>
+<li>A) Because the commit record in durable WAL is enough for redo to recreate the page after crash</li>
+<li>B) Because committed transactions never need recovery</li>
+<li>C) Because the data file is updated synchronously by the WAL writer</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: <code>pageLSN</code> is the page's statement of the latest WAL change it already includes. Recovery compares redo LSNs to that value to decide whether reapplying the record is necessary.</p>
+<p><strong>2. B</strong>: The dirty page may flush before commit, but only if the explaining WAL is already durable through the page's <code>pageLSN</code>. That is the write-ahead rule.</p>
+<p><strong>3. A</strong>: In a <code>no-force</code> design, commit durability comes from the flushed commit record in WAL. The page itself can reach disk later because redo can reconstruct it if the system crashes first.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="029.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Timestamp Ordering and Optimistic Concurrency</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="031.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Recovery Correctness and Idempotent Redo</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

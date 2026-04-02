@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPU-Accelerated Cellular Automata - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>GPU-Accelerated Cellular Automata</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/networks-cellular-automata-and-emergence.html">Networks, Cellular Automata, and Emergence</a>
+        </p>
+        <p>
+          Sequence: 004 | Lesson ID: 356
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 356: GPU-Accelerated Cellular Automata</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A cellular automaton maps well to a GPU because each cell in one generation can be updated independently from the previous grid, but real speedups only appear when the implementation preserves synchronous semantics and respects the GPU's memory hierarchy.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="003.html">03.md</a>, the important lesson from Wolfram's elementary automata was that a tiny local rule can be applied everywhere at once. GPU acceleration starts from that same structural fact. The Harbor City emergency lab already has a correct cellular automaton that predicts how wind-driven embers jump across an industrial district. The model is useful, but only barely: one <code>8192 x 8192</code> run takes long enough on CPU that planners cannot explore hundreds of wind scenarios before the forecast changes.</p>
+<p>The tempting story is "move the loop to the GPU and everything becomes fast." That is not quite right. A GPU cannot parallelize the future of one cell across many time steps, because generation <code>t + 1</code> still depends on generation <code>t</code>. What it can do is evaluate millions of cells from the same generation at once. That matches the automaton's own semantics. Every cell reads its neighbors from the old grid, computes one new state, and writes into a separate next grid. The GPU helps because the work is spatially parallel, not because time dependencies disappeared.</p>
+<p>The deeper insight is that most cellular automata on GPUs are limited less by arithmetic than by data movement. A binary or four-state rule often does only a small amount of math per cell, but it must read neighboring state for every update. So the difference between a disappointing port and a useful accelerator is usually memory layout, halo loading, and how long the grid stays resident on the device. Once that clicks, GPU-accelerated cellular automata stop looking like a vague "HPC optimization" topic and become a concrete exercise in preserving model semantics while feeding the hardware efficiently.</p>
+<h2>Why This Matters</h2>
+<p>Harbor City uses the ember-spread model during severe wind events to answer operational questions: which warehouse corridors are likely to ignite next, which roads will still be open for crews, and which containment lines fail if the wind rotates fifteen degrees. Those decisions are only useful if the simulator can run enough scenarios before the next weather update arrives. A slow but correct model is still a bottleneck when the job is ensemble forecasting rather than one beautiful demo run.</p>
+<p>This is where teams often make two expensive mistakes. One is to assume that GPUs automatically solve performance and then discover that copying every generation back to the CPU erased the gain. The other is to chase speed so aggressively that the GPU version no longer matches the CPU reference because boundaries, update timing, or neighborhood reads changed. In production, both failures hurt: the first wastes hardware budget, and the second quietly damages trust in the model.</p>
+<p>Understanding GPU-accelerated cellular automata helps you avoid both traps. You learn why dense local-update grids are naturally parallel, why these kernels are usually memory-bandwidth-sensitive, and why validation against a trusted CPU implementation must stay in the workflow. Those lessons apply not just to fire spread, but to occupancy grids, lattice simulations, image-like stencil updates, and the reaction-diffusion pattern engines that follow in <a href="005.html">05.md</a>.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why cellular automata are a strong GPU workload</strong> - Identify which parts of the update are parallel across space and which parts remain sequential in time.</li>
+<li><strong>Trace a correct GPU execution path</strong> - Describe how threads, buffers, neighborhood reads, and synchronization preserve the automaton's semantics.</li>
+<li><strong>Evaluate whether a GPU design is worth it in practice</strong> - Compare large dense grids, sparse activity, transfer overhead, and profiling evidence when choosing CPU, GPU, or hybrid execution.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: One generation of a cellular automaton is a bulk-parallel GPU job</h3>
+<p>Harbor City's ember model divides the district into cells that are <code>empty</code>, <code>fuel</code>, <code>burning</code>, or <code>burned</code>. On each tick, every cell inspects a fixed neighborhood, combines that with wind direction and a few local thresholds, and decides its next state. That update pattern is exactly what a GPU likes: the same rule applied to a very large number of independent work items.</p>
+<p>The clean mapping is one thread per cell for one generation. A kernel launch covers the whole board, each thread computes its global <code>(x, y)</code> coordinate, reads the old state of that cell and its neighbors, then writes one result into the next buffer. The whole generation is therefore a bulk-synchronous step: massively parallel inside the step, strictly ordered across steps.</p>
+<div class="codehilite"><pre><span></span><code>one generation on the GPU
+
+grid of thread blocks
+    -&gt; one thread owns one cell
+    -&gt; all threads read from current
+    -&gt; all threads write to next
+    -&gt; kernel ends
+swap current and next
+</code></pre></div>
+
+<p>That last line matters. Time itself is still sequential. You cannot compute generation 200 before generation 199 exists, so GPU acceleration does not remove causality. It compresses the cost of each generation by exploiting the fact that the cell updates inside that generation do not depend on one another once the old grid is fixed.</p>
+<p>The production trade-off is that this approach shines for dense regular boards and uniform rules. If only a tiny frontier of cells is active, millions of idle threads may do no useful work. In that case the automaton may still be correct on GPU, but the hardware fit is weaker than it first appears.</p>
+<h3>Concept 2: Correctness and speed both depend on memory discipline</h3>
+<p>The Harbor City team's first CUDA prototype is wrong for a subtle reason: it lets threads overwrite the same grid they are still reading. That breaks the cellular automaton model immediately, because later threads in the generation are now influenced by partially updated neighbors. The fix is the same one used on CPU, but it matters even more on GPU: keep separate <code>current</code> and <code>next</code> buffers and swap them only after the kernel completes.</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@cuda</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">step</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">next_grid</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">wind</span><span class="p">):</span>
+    <span class="n">x</span><span class="p">,</span> <span class="n">y</span> <span class="o">=</span> <span class="n">cuda</span><span class="o">.</span><span class="n">grid</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">x</span> <span class="o">&gt;=</span> <span class="n">width</span> <span class="ow">or</span> <span class="n">y</span> <span class="o">&gt;=</span> <span class="n">height</span><span class="p">:</span>
+        <span class="k">return</span>
+
+    <span class="c1"># Each thread reads old state only.</span>
+    <span class="n">state</span> <span class="o">=</span> <span class="n">current</span><span class="p">[</span><span class="n">y</span><span class="p">,</span> <span class="n">x</span><span class="p">]</span>
+    <span class="n">next_grid</span><span class="p">[</span><span class="n">y</span><span class="p">,</span> <span class="n">x</span><span class="p">]</span> <span class="o">=</span> <span class="n">transition</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">wind</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Once the semantics are correct, memory layout becomes the main performance question. A naive kernel makes each thread fetch its own neighborhood from global memory, which means adjacent threads repeatedly read overlapping data. A faster version groups threads into blocks, loads a tile of the grid plus a one-cell halo into shared memory, then reuses that tile for all neighbor lookups inside the block.</p>
+<div class="codehilite"><pre><span></span><code>shared-memory tile for a Moore neighborhood
+
+halo  halo  halo  halo
+halo [block of cells] halo
+halo [block of cells] halo
+halo  halo  halo  halo
+</code></pre></div>
+
+<p>This is also why row-major layout and coalesced accesses matter. If neighboring threads read neighboring cells, the GPU can combine those requests efficiently. If the data layout is strided, padded badly, or split across multiple arrays with mismatched access patterns, the automaton becomes memory-bound for avoidable reasons. The trade-off is practical rather than ideological: a byte per cell is simple and often good enough, while bit-packing can reduce bandwidth pressure but makes neighbor decoding, branching, and debugging harder.</p>
+<h3>Concept 3: The real accelerator is the whole execution pipeline, not just the kernel</h3>
+<p>Suppose Harbor City copies the board to the GPU, runs one generation, copies the full board back so the CPU can render it, then repeats. That version may benchmark worse than a multithreaded CPU implementation even if the kernel itself is fine. The reason is that the pipeline keeps paying host-device transfer cost for work that could have stayed on the device.</p>
+<p>The better production design keeps many generations on the GPU before copying anything back. If the planners only need ignition counts, perimeter coordinates, or a final heatmap every 50 steps, the device can compute those summaries in place and transfer far less data. The same idea extends to ensembles: if 128 wind scenarios use the same rule shape, several boards can be staged on the GPU together so launch overhead and data motion are amortized across many runs.</p>
+<p>Profiling is what separates guesswork from engineering here. If Nsight Compute shows high memory throughput and low arithmetic utilization, the kernel is probably bandwidth-bound, so more math optimization will not help much. If branch divergence spikes because different cell states take wildly different rule paths, simplifying the rule representation may matter more than changing block size. If occupancy looks low because shared-memory tiles are too large, a smaller tile can outperform a theoretically "smarter" one.</p>
+<p>That is the durable lesson. A GPU is the right tool when the automaton is large, dense, repeatedly evaluated, and able to stay on-device long enough to amortize transfers. It is the wrong tool when the board is tiny, the workflow requires full-grid CPU inspection every tick, or the active region is so sparse and irregular that the GPU mostly schedules empty work. These same execution questions will carry directly into <a href="005.html">05.md</a>, where Turing-pattern simulations replace discrete cell states with floating-point concentration fields but keep the same local-neighborhood, double-buffered stencil structure.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The GPU simulation diverges from the trusted CPU output after a few generations.</p>
+<p><strong>Why it happens / is confusing</strong>: The kernel is usually reading and writing the same buffer, mishandling boundary cells, or loading an incorrect halo into shared memory. The result still looks plausible, so the bug can hide for a long time.</p>
+<p><strong>Clarification / Fix</strong>: Keep explicit <code>current</code> and <code>next</code> buffers, test with deterministic seeds, and compare the GPU board against a CPU golden implementation after fixed step counts.</p>
+<p><strong>Issue</strong>: GPU utilization looks busy, but wall-clock speed barely improves.</p>
+<p><strong>Why it happens / is confusing</strong>: Cellular automata often do little arithmetic per byte moved, so the bottleneck is memory traffic rather than raw compute. High "activity" can coexist with poor throughput.</p>
+<p><strong>Clarification / Fix</strong>: Check for coalesced reads, reduce redundant neighbor fetches with shared-memory tiling, and measure achieved bandwidth before spending time on algebraic micro-optimizations.</p>
+<p><strong>Issue</strong>: The GPU version is slower than the CPU on small experiments.</p>
+<p><strong>Why it happens / is confusing</strong>: Kernel launch overhead and host-device copies dominate when the board is small or when the program moves the full grid on and off the device every step.</p>
+<p><strong>Clarification / Fix</strong>: Keep state resident on the GPU for many generations, transfer summaries instead of full boards when possible, and stay on CPU for small or highly interactive workloads where transfer latency overwhelms parallelism.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: GPU-Accelerated Cellular Automata ↔ Stencil Computation</h3>
+<p>A cellular automaton step is a stencil kernel in discrete clothing: read a local neighborhood, compute one output value, write it into a second buffer. The same structure appears in image filters, finite-difference PDE solvers, and lattice-Boltzmann methods. That connection is useful because optimization ideas such as tiling, halo exchange, coalesced access, and double buffering transfer almost unchanged across these domains.</p>
+<h3>Connection 2: GPU-Accelerated Cellular Automata ↔ Turing Pattern Simulation</h3>
+<p>The bridge to <a href="005.html">05.md</a> is especially direct. Turing patterns are usually expressed as reaction-diffusion updates on continuous fields rather than discrete cell states, but they still rely on repeated local neighborhood computation over a grid. Once you understand why Harbor City's ember model benefits from on-device residency and tiled stencil reads, you already understand much of what makes GPU reaction-diffusion engines fast.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] CUDA C++ Programming Guide<ul>
+<li>Link: <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/">https://docs.nvidia.com/cuda/cuda-programming-guide/</a></li>
+<li>Focus: The execution model behind threads, blocks, grids, and device memory, which is the foundation for mapping one cell update per thread.</li>
+</ul>
+</li>
+<li>[DOC] CUDA C++ Best Practices Guide<ul>
+<li>Link: <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/">https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/</a></li>
+<li>Focus: Coalesced access, shared memory, and bandwidth-oriented optimization strategies that matter for neighborhood-heavy kernels.</li>
+</ul>
+</li>
+<li>[DOC] Nsight Compute User Guide<ul>
+<li>Link: <a href="https://docs.nvidia.com/nsight-compute/NsightCompute/">https://docs.nvidia.com/nsight-compute/NsightCompute/</a></li>
+<li>Focus: Profiling GPU kernels to see whether your automaton is limited by memory throughput, occupancy, or branch divergence.</li>
+</ul>
+</li>
+<li>[PAPER] Efficient simulation execution of cellular automata on GPU<ul>
+<li>Link: <a href="https://doi.org/10.1016/j.simpat.2022.102519">https://doi.org/10.1016/j.simpat.2022.102519</a></li>
+<li>Focus: A detailed study of why many cellular automata are memory-bound on modern GPUs and which implementation techniques improve throughput.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>GPU acceleration exploits spatial independence, not temporal independence</strong> - All cells in one generation can be updated together, but the generations themselves still form a strict causal chain.</li>
+<li><strong>Memory behavior usually decides performance</strong> - For many automata, coalesced loads, shared-memory reuse, and on-device residency matter more than adding clever arithmetic.</li>
+<li><strong>A fast kernel is not enough by itself</strong> - Production value comes from the full pipeline: correct buffering, measured profiling data, and transfer patterns that do not erase the gain.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>What part of a cellular automaton maps most naturally to GPU parallelism?</strong></p>
+<ul>
+<li>A) Computing many future generations of one cell simultaneously.</li>
+<li>B) Computing all cells of one generation from the same previous grid.</li>
+<li>C) Computing only the boundary cells while the CPU handles the interior.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can a naive GPU port of a cellular automaton still be disappointing?</strong></p>
+<ul>
+<li>A) Because GPUs are unsuitable for grid-based models.</li>
+<li>B) Because host-device transfers and redundant memory reads can dominate runtime even when the rule itself is simple.</li>
+<li>C) Because synchronous update is impossible on GPUs.</li>
+</ul>
+</li>
+<li>
+<p><strong>When is a GPU usually the strongest fit for a cellular automaton workload?</strong></p>
+<ul>
+<li>A) When the board is large and dense, multiple runs can stay on-device, and the same local rule is applied repeatedly.</li>
+<li>B) When the board is tiny and the application needs the full grid copied back to the CPU after every step.</li>
+<li>C) When only a handful of irregularly scattered cells are active and most threads would be idle.</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: A GPU is best used to evaluate one full generation in parallel from a fixed previous grid. Time steps remain sequential because later generations depend on earlier ones.</p>
+<p><strong>2. B</strong>: Cellular automata often move more data than they compute. If every step pays transfer overhead and each thread performs redundant neighbor loads, the GPU can stay busy without delivering much wall-clock benefit.</p>
+<p><strong>3. A</strong>: Large dense boards and repeated runs give the GPU enough regular work to amortize launch and transfer costs. Tiny or highly sparse workloads often fit CPU or hybrid execution better.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="003.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Wolfram's Elementary Cellular Automata</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="005.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Turing Patterns - How Leopards Get Their Spots</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/networks-cellular-automata-and-emergence.html">← Back to Networks, Cellular Automata, and Emergence</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

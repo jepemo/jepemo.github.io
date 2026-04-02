@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>B-Tree Node Structure and Search Path - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>B-Tree Node Structure and Search Path</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 014 | Lesson ID: 391
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 391: B-Tree Node Structure and Search Path</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A B-tree stays fast on disk because each page is a sorted routing table, so one root-to-leaf walk narrows a huge key space to one small leaf page.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="013.html">06.md</a>, Harbor Point's municipal-bond system ran into the main weakness of a fully sorted file: preserving global order under steady quote updates becomes expensive. The table still needs order for lookups and range scans, but it does not need the entire data file to be one giant sorted array. A B-tree solves that by storing order hierarchically. Instead of one sorted run, Harbor Point builds an index on <code>(cusip, quote_ts DESC)</code> where each page covers only a slice of the key space.</p>
+<p>The important realization is that a B-tree root page does not point to rows. It points to ranges. An internal page might say, in effect, "keys up to <code>13040...</code> are in this child; keys up to <code>13080...</code> are in that child." Each descent step removes most of the search space at page granularity. If an 8 KB internal page can hold a few hundred separators and child pointers, the tree becomes shallow enough that tens of millions of index entries are often reachable in three or four levels.</p>
+<p>That is why the usual explanation, "B-trees are <code>O(log n)</code>," is too weak for production reasoning. What matters operationally is page fanout. Upper levels stay hot in cache, leaves hold almost all of the data, and a lookup is usually one binary search per page plus one pointer chase to the next page. The structure of the node determines how many cache lines, buffer hits, and storage reads the engine spends to answer a query.</p>
+<p>This also explains why the next lesson on <a href="015.html">08.md</a> has to exist. Search is cheap only if every parent separator still describes the correct child range after inserts and deletes. Today we focus on what the nodes mean and how a read finds its path. Next comes the maintenance work that keeps that path valid.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point serves two high-value queries from the same <code>municipal_quotes</code> table. Trader dashboards repeatedly ask for the newest quote for one <code>cusip</code>. Compliance analysts replay quote movement over a narrow time window for one issuer. A heap file alone makes both queries scan too much, while a fully sorted file makes every incoming quote pay too much maintenance.</p>
+<p>A B-tree index is the compromise that makes the workload tractable. It gives the dashboard a short root-to-leaf path to the newest entries for one bond, and it gives compliance a way to start at the first relevant leaf and then continue in key order. Once you understand node structure, you can explain why those two access patterns can share one index and why the latency story depends more on page layout than on abstract algorithm names.</p>
+<p>This is production-relevant for another reason: many storage problems that look like "query planning" are really "index geometry." Wide keys reduce fanout and deepen the tree. Non-covering leaves still force heap lookups after the index search finishes. Poor key ordering groups the wrong entries together. If you cannot picture the search path, you cannot diagnose those problems accurately.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what lives in a B-tree node</strong> - Distinguish root, internal, and leaf pages and describe what each page stores.</li>
+<li><strong>Trace a root-to-leaf lookup</strong> - Follow how separator keys, child pointers, and leaf links answer point and range queries.</li>
+<li><strong>Reason about production trade-offs</strong> - Connect key width, fanout, cache residency, and heap lookups to real latency behavior.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A B-tree node is a page-sized routing structure, not a single key/value pair</h3>
+<p>Harbor Point's index on <code>(cusip, quote_ts DESC)</code> is not a binary tree where each node holds one comparison key. It is a page-sized node designed for block storage. Most production systems calling something a "B-tree" are really using a B+ tree variant: internal pages store routing information, while leaf pages store the full searchable keys and either row pointers or the rows themselves if the index is clustered.</p>
+<p>At a high level, the tree looks like this:</p>
+<div class="codehilite"><pre><span></span><code>root
+[13020 | 13080 | 13140]
+   |        |        |
+   v        v        v
+internal  internal  internal
+   |                    |
+   v                    v
+leaf &lt;-&gt; leaf &lt;-&gt; leaf &lt;-&gt; leaf
+</code></pre></div>
+
+<p>Inside each page, entries are kept in sorted key order. Internal pages hold separator keys plus child page identifiers. Leaf pages hold the actual index entries for Harbor Point's quotes, such as <code>(cusip, quote_ts DESC) -&gt; row locator</code>. Many engines also keep sibling links between neighboring leaves so once a range scan reaches its first leaf, it can continue without climbing back to the root for every next key.</p>
+<p>The page-sized design is what makes B-trees flat. Suppose Harbor Point uses 8 KB index pages and, after headers and free space, an internal entry averages about 32 bytes. One internal page can then route to roughly 200 or more children. With that fanout, a four-level tree can cover an enormous key space while touching only one page per level. The exact numbers vary by engine and key width, but the principle does not: fewer, wider levels mean fewer storage reads.</p>
+<p>That benefit is purchased with overhead. The index needs extra pages, internal separators, and free space management that a heap file would not need. But compared with the fully sorted-file idea from <a href="013.html">06.md</a>, the B-tree localizes order maintenance. The engine preserves sorted order inside leaves and routing order above them instead of rewriting a long contiguous run of the base file every time a new quote arrives out of order.</p>
+<h3>Concept 2: The search path is a sequence of interval decisions from root to leaf</h3>
+<p>Consider Harbor Point's dashboard query:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">price</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">municipal_quotes</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">cusip</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;13042AB7&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">quote_ts</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="s1">&#39;2026-03-31 09:37:00&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">quote_ts</span><span class="w"> </span><span class="k">DESC</span>
+<span class="k">LIMIT</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</code></pre></div>
+
+<p>With an index on <code>(cusip, quote_ts DESC)</code>, the engine starts at the root. It binary-searches the root's separator keys to find which child covers the interval containing <code>13042AB7</code>. That child page is read next. The same process repeats on the internal page: binary search among separators, choose one child pointer, descend again. Eventually the search reaches a leaf page whose key range includes the target <code>cusip</code> and timestamp boundary.</p>
+<p>At the leaf, the engine is no longer routing. It is matching. It searches the sorted leaf entries, finds the first visible entry satisfying the predicate, and either returns the value immediately if the index is covering or follows the row locator into the heap table if the index is secondary. The path therefore has two phases: narrow by intervals in internal pages, then resolve an actual tuple in a leaf.</p>
+<p>Range scans use the same descent. Harbor Point's compliance job might ask for all quotes for one <code>cusip</code> between 09:30 and 09:45. The B-tree first finds the starting leaf exactly as a point lookup would. After that, the engine walks leaf-to-leaf in key order until the range ends. This is the detail that makes B-trees much better than hash organization for ordered access: the search path finds the first page, and the leaf chain preserves the continuation order.</p>
+<p>Two production details matter here. First, upper levels are tiny relative to leaves, so the buffer pool often keeps the root and maybe the next level resident almost all the time. A cold lookup may therefore pay for one leaf read and one heap read, not a disk hit at every tree level. Second, the parent/child boundary is a correctness contract. If a separator says a child covers keys below <code>13080</code>, the child really must satisfy that interval. The next lesson on <a href="015.html">08.md</a> is about the splits and parent updates that preserve that contract during writes.</p>
+<h3>Concept 3: Node structure turns index design choices into latency and maintenance behavior</h3>
+<p>Once you see the B-tree as a stack of page-sized routing tables, several design decisions become easier to reason about. The most obvious is key width. If Harbor Point stores a compact <code>cusip</code> plus timestamp in the key, internal pages keep high fanout. If it adds wide text fields or many extra columns, each page holds fewer entries, the tree gets taller, and each lookup has more work to do. "Same index, different columns" can therefore change latency even when the query predicate looks similar.</p>
+<p>Key order is equally structural. Harbor Point's dashboard and compliance workloads both begin with <code>cusip</code>, so placing <code>cusip</code> first groups all entries for one bond into a tight part of the leaf space. If the index instead began with <code>trading_desk_id</code>, the same <code>cusip</code> values would be scattered across many desk prefixes and the search path would no longer isolate the dashboard's hot access pattern cleanly. The node structure is not neutral about column order; it physically arranges which keys become neighbors.</p>
+<p>Leaf density creates another trade-off. A covering index can answer more queries without touching the heap because the leaf already stores every needed column. That often improves read latency. The cost is fatter leaves, lower fanout at the bottom of the tree, and more page splits or write amplification as updates arrive. Conversely, a narrow secondary index keeps the tree compact but forces a second hop to the heap after the leaf search completes. That is why "add coverage" is never a free optimization.</p>
+<p>Finally, node structure explains why B-tree correctness work is local but not trivial. Search is cheap because the engine only touches one root-to-leaf path, not the whole ordered dataset. But that means every node on the path must maintain clean key boundaries and enough space discipline for future inserts. Fill factor, page compaction, sibling links, and parent separators are not housekeeping details; they are the reason the tree stays shallow and searchable under live traffic.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: An index lookup touches more pages than expected even though the table size has not exploded.</p>
+<p><strong>Why it happens / is confusing</strong>: Tree height is affected by key width and page occupancy, not just row count. A wider composite key or aggressive covering index can silently reduce fanout and add another level.</p>
+<p><strong>Clarification / Fix</strong>: Inspect the indexed columns and page density before blaming the query planner. Narrower keys, better prefix choice, or avoiding unnecessary included columns often recover the expected search depth.</p>
+<p><strong>Issue</strong>: The index scan is ordered, but the query still behaves like random I/O.</p>
+<p><strong>Why it happens / is confusing</strong>: The B-tree ordered the index entries, not necessarily the heap table. If the leaf stores row locators, each qualifying entry may trigger a separate heap fetch.</p>
+<p><strong>Clarification / Fix</strong>: Distinguish "ordered index traversal" from "ordered table access." For hot point lookups, a covering index may be worth the extra leaf size. For broader scans, clustering or a different storage layout may matter more.</p>
+<p><strong>Issue</strong>: Write bursts against one hot <code>cusip</code> create latch pressure near the top of the tree.</p>
+<p><strong>Why it happens / is confusing</strong>: Reads usually treat upper levels as nearly free because they stay cached, but concentrated writes can force repeated structural changes along the same root-to-leaf path.</p>
+<p><strong>Clarification / Fix</strong>: Look at page split frequency, fill factor, and hot-key concentration rather than only read metrics. The maintenance mechanics in <a href="015.html">08.md</a> are the next place to investigate.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: B-tree search path ↔ Buffer pool economics</h3>
+<p>The reason B-tree lookups often feel cheaper than their tree height suggests is that upper levels form a tiny, extremely hot working set. In PostgreSQL and similar engines, a small number of root and internal pages can stay resident while leaves take most of the churn. That is why fanout and key width directly affect cache behavior, not just asymptotic complexity.</p>
+<h3>Connection 2: B-tree node structure ↔ Split and merge maintenance</h3>
+<p>The B-tree gives Harbor Point ordered access without keeping the whole table globally sorted, but it only works because page-local changes can update the routing structure safely. A leaf split introduces a new sibling and a new separator in the parent; a merge or deletion path has to preserve the same search boundaries in reverse. That is the exact bridge into <a href="015.html">08.md</a>.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/btree.html">PostgreSQL Documentation: B-Tree Indexes</a><ul>
+<li>Focus: Read the implementation notes on B-tree structure, leaf pages, and cascading page splits to connect the lesson's abstractions to a production engine.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.sqlite.org/fileformat.html">SQLite Database File Format: B-tree Pages</a><ul>
+<li>Focus: Inspect the page header, cell pointer array, and right-most child pointer to see how a real engine serializes internal and leaf nodes on disk.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://queue.acm.org/detail.cfm?id=3220266">Algorithms Behind Modern Storage Systems</a><ul>
+<li>Focus: Compare the B-tree fanout story with LSM-tree trade-offs so the search path stays grounded in engine-level design choices.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A B-tree node is a page of routing information</strong> - The storage win comes from comparing many ordered keys per page, not from binary-tree-style single-node comparisons.</li>
+<li><strong>The search path is an interval walk</strong> - Internal pages narrow the key space, and leaves resolve the actual tuple or row pointer.</li>
+<li><strong>Index geometry is an operational concern</strong> - Key width, column order, and leaf payload change fanout, cache residency, and write cost in measurable ways.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does a B-tree stay shallow enough for fast disk-based lookup?</strong></p>
+<ul>
+<li>A) Because each page stores many ordered separators and child pointers, giving the tree high fanout</li>
+<li>B) Because internal pages keep full copies of every matching row</li>
+<li>C) Because the engine scans all leaves in parallel and picks the earliest answer</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main job of an internal B-tree page during Harbor Point's quote lookup?</strong></p>
+<ul>
+<li>A) Store the final row payload so the heap is never needed</li>
+<li>B) Decide which child page covers the target key interval</li>
+<li>C) Re-sort the leaf entries before every read</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can Harbor Point's compliance query continue scanning after it finds the first matching leaf?</strong></p>
+<ul>
+<li>A) Because B-tree leaves are linked in key order, so the scan can continue to neighboring leaves</li>
+<li>B) Because the root page already contains every key in the index</li>
+<li>C) Because hash buckets are ordered by timestamp once the first match is found</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: High fanout is the central reason. Each internal page routes across many child ranges, so the tree height grows slowly even as the entry count grows very large.</p>
+<p><strong>2. B</strong>: Internal pages are routing tables. They store separator information that tells the engine which child subtree contains the desired key range.</p>
+<p><strong>3. A</strong>: Once the search path reaches the first relevant leaf, range scans can continue through neighboring leaves in key order. That ordered continuation is one of the major reasons B-trees are useful for both point and range queries.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="013.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>File Organization: Heap, Sorted, and Hash</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="015.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>B-Tree Insert, Split, and Merge Maintenance</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

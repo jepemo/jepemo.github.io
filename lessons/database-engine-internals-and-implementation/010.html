@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Record Formats and Variable-Length Columns - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Record Formats and Variable-Length Columns</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 010 | Lesson ID: 387
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 387: Record Formats and Variable-Length Columns</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A row format turns one tuple body into a decoding contract: which columns are present, where fixed-width values live, how variable-length values are located, and when long data must move out of line.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="009.html">02.md</a>, the page learned how to keep a stable record identity even while tuple bytes move around. That still leaves a harder question: once slot 7 points at a tuple body, how does the engine know what those bytes mean? Harbor Point's <code>municipal_quotes</code> table makes that question concrete. Every row has fixed-width fields such as <code>quote_id</code>, <code>cusip</code>, <code>bid_cents</code>, <code>ask_cents</code>, and <code>quote_ts</code>. Some rows also carry an optional <code>desk_note</code>, and a smaller subset carries a much larger <code>vendor_payload_json</code> blob from the market-data feed.</p>
+<p>If the engine reserved the maximum possible space for every row, page density would collapse. If it stored raw bytes back to back with no header, it would not know whether a missing <code>desk_note</code> is <code>NULL</code>, an empty string, or a corrupted record tail. The row format exists to solve exactly that problem. It tells the executor and recovery code where the fixed fields begin, which nullable columns are actually present, how to find each variable-length value, and whether a long attribute is stored inline or behind an overflow pointer.</p>
+<p>That means record format is not an afterthought after page layout. It is the page's inner contract. A slotted page tells the system which tuple it is looking at. The tuple format tells the system how to interpret the bytes inside that tuple without ambiguity.</p>
+<p>The production consequence shows up quickly. When Harbor Point's feed handler starts attaching longer desk notes during a storm-driven selloff, the change is not just "strings got bigger." Row width changes page occupancy, buffer-pool pressure, WAL volume, and update behavior. That is why this lesson naturally bridges <a href="009.html">02.md</a> and <a href="011.html">04.md</a>: the shape of one row determines how efficiently whole pages move through memory.</p>
+<h2>Why This Matters</h2>
+<p>Suppose Harbor Point spends most mornings doing two things at once: traders append fresh quotes, and analysts scan the latest page range for widening spreads. On Monday the average <code>desk_note</code> is absent and pages stay dense. On Tuesday a volatile market causes many rows to include 150-byte notes plus vendor metadata. The logical schema did not change, but the physical workload did. The same "fetch the latest 10,000 quotes" query may now touch far more pages because each page holds fewer rows.</p>
+<p>There is also a correctness angle that does not show up in a schema diagram. Risk logic may treat <code>desk_note IS NULL</code> as "no human override," while <code>desk_note = ''</code> means "override present but blank." Recovery code must know exactly how many bytes belong to each field after a crash. Replication and checksum validation depend on deterministic decoding. If the row format is vague, the engine can produce silent semantic errors long before anyone notices a corrupted page.</p>
+<p>Once you understand record layout, storage behavior stops feeling mysterious. You can explain why adding one nullable text column barely changes some rows but makes others spill to overflow storage, why a "small" text update rewrites much more than expected, and why the next lesson's buffer-pool policies care deeply about tuple width rather than just page count.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what a row format must encode</strong> - Describe how headers, null metadata, fixed-width fields, and variable-length metadata let the engine decode a tuple correctly.</li>
+<li><strong>Trace how a variable-length row is read and updated</strong> - Follow the path from slot entry to tuple header to inline bytes or overflow pointers.</li>
+<li><strong>Evaluate storage-engine trade-offs around wide attributes</strong> - Connect row layout choices to page density, update cost, and memory pressure in production.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A record format is the tuple-level contract inside a slotted page</h3>
+<p>Return to Harbor Point's quote page from <a href="009.html">02.md</a>. The slot directory can tell the engine that slot 7 currently points to byte offset 8016 with a tuple length of 96 bytes. That is enough to find the tuple body, but not enough to interpret it. The engine still needs to answer a series of questions: which columns are <code>NULL</code>, where is <code>quote_ts</code>, how long is <code>desk_note</code>, and does <code>vendor_payload_json</code> live inside this tuple or somewhere else?</p>
+<p>That is why most row stores begin each tuple with a small header. The exact fields differ by engine, but the header usually carries some combination of tuple length, status bits, visibility metadata, and a header-size marker that tells the decoder where the fixed-width area begins. Immediately after that, many engines place a null bitmap: one bit per nullable column. A bitmap sounds minor until you consider semantics. <code>NULL</code> is not the same as an empty string, zero, or an absent delimiter. The storage layer must preserve that distinction because SQL semantics, indexes, and recovery rules all depend on it.</p>
+<p>After the header and bitmap comes a fixed-width region for columns whose size is known in advance, followed by metadata or bytes for variable-length attributes. One common design stores fixed-width columns at predictable offsets and appends variable-length payloads at the end. Another stores small length prefixes beside each variable field. Both approaches are trying to preserve the same decoding invariant: given the tuple bytes and schema metadata, there must be exactly one correct interpretation.</p>
+<div class="codehilite"><pre><span></span><code>slot 7 tuple body
++---------------------------------------------------+
+| header | null bitmap | padding                    |
+| quote_id | cusip | bid_cents | ask_cents | ts     |
+| note offset/len | payload offset/len or pointer   |
+| &quot;storm widening after 10:32 auction&quot;              |
+| {&quot;venue&quot;:&quot;MUNI-X&quot;,&quot;confidence&quot;:0.71}              |
++---------------------------------------------------+
+</code></pre></div>
+
+<p>Padding belongs in that picture too. Engines often align 4-byte and 8-byte values so the CPU can load them efficiently and so the decoder can compute offsets predictably. Padding wastes a few bytes per row, but it keeps hot fields cheap to read. As soon as you care about scanning millions of records, that trade-off becomes rational rather than cosmetic.</p>
+<h3>Concept 2: Variable-length columns turn one tuple into a miniature layout problem</h3>
+<p>Variable-length columns are where row formats stop being obvious. <code>desk_note</code> might be 18 bytes in one row and 240 bytes in the next. <code>vendor_payload_json</code> may be absent most of the time and then suddenly expand to kilobytes when the feed provider includes diagnostic metadata. The engine therefore needs a mechanism that lets it find each value without pretending every row is equally wide.</p>
+<p>In a typical row-store read path, decoding a tuple works like this:</p>
+<ol>
+<li>Read the tuple header to determine header length and status bits.</li>
+<li>Consult the null bitmap before touching any nullable attribute.</li>
+<li>Read fixed-width columns from stable offsets.</li>
+<li>Use a length prefix, offset table, or varlena header to find each inline variable-length value.</li>
+<li>If the field is stored out of line, follow an overflow pointer to a separate storage area.</li>
+</ol>
+<p>The update path reveals why these choices matter. Suppose Harbor Point revises a quote and the new <code>desk_note</code> grows from 24 bytes to 180 bytes. If there is enough contiguous free space on the page, the engine may rewrite the tuple locally and update the slot entry if the payload moved. If there is not enough space, the engine may move part of the value off-page, create a redirect-like structure, or force the update into another page depending on the engine design. What looked like "just a text edit" becomes a page-management decision because the record format and page layout are coupled.</p>
+<p>Inline storage and overflow storage are the main trade-off. Keeping variable-length values inline improves locality for point reads and range scans that actually need the value. Moving large values out of line keeps the base tuple compact, which can preserve page density and reduce movement on updates. The cost is extra pointer chasing, more I/O for rows that need the large value, and more complicated maintenance when overflow pages are vacuumed or reclaimed.</p>
+<p>This is also where many row formats add thresholds and compression rules. PostgreSQL's TOAST mechanism and InnoDB's long-column handling are concrete examples: small values stay inline because locality matters, while large values are compressed or spilled because a giant inline tuple would damage the rest of the system.</p>
+<h3>Concept 3: Row width is a storage-engine performance policy, not just a schema detail</h3>
+<p>Once you look at Harbor Point's rows physically, page density becomes a direct consequence of tuple format. Imagine an 8 KB page that can hold about 70 recent quotes when <code>desk_note</code> is usually <code>NULL</code>. If market stress pushes the average inline row size high enough that the same page now holds only 20 quotes, the executor needs roughly three times as many page reads to scan the same logical window. Nothing about SQL changed. The physical row format changed the cost model underneath it.</p>
+<p>That cost propagates into the next layer. Fewer rows per page means a buffer pool must cache more pages to cover the same hot working set. Wider rows increase WAL traffic during updates because more bytes move or more overflow metadata changes. Fragmentation becomes harder to avoid because variable-length growth leaves awkward holes inside pages, exactly the problem <a href="009.html">02.md</a> described. Record format is therefore one of the earliest places where "storage" and "memory behavior" stop being separable topics.</p>
+<p>This is why production schema advice has to be mechanism-driven. If analysts constantly filter on <code>cusip</code>, <code>bid_cents</code>, <code>ask_cents</code>, and <code>quote_ts</code> but only occasionally inspect <code>vendor_payload_json</code>, keeping the hot fields in a compact fixed-width prefix and pushing cold, wide data out of the base tuple can materially improve scans. If the application reads the note on every request, aggressively externalizing it may save pages while making the dominant query slower. The correct layout depends on access patterns, update frequency, and how expensive an extra page fetch is in the current engine.</p>
+<p>That trade-off sets up <a href="011.html">04.md</a>. Replacement policy is not just about "which page is old." It is about whether each cached page holds enough useful rows to justify the memory it consumes. Record format decides that before the buffer manager ever sees the page.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: <code>desk_note IS NULL</code> and <code>desk_note = ''</code> behave differently, but an internal export or debugging tool treats them as the same thing.</p>
+<p><strong>Why it happens / is confusing</strong>: The tool is likely reading decoded values without preserving the null bitmap semantics. A zero-length varlen field still occupies logical space in the tuple format; <code>NULL</code> is represented separately.</p>
+<p><strong>Clarification / Fix</strong>: Inspect how the engine encodes nullability. When debugging storage, always distinguish null bitmap state from value length or delimiter presence.</p>
+<p><strong>Issue</strong>: A table suddenly fits far fewer rows per page after a vendor rollout, even though only one optional JSON column changed.</p>
+<p><strong>Why it happens / is confusing</strong>: Variable-length columns can cross an inline-storage threshold. Once enough rows start carrying larger inline payloads, tuple width expands and page density drops sharply.</p>
+<p><strong>Clarification / Fix</strong>: Measure average inline row width before and after the change. Check whether the engine compressed or externalized large values, and consider whether the wide attribute belongs in the base row at all.</p>
+<p><strong>Issue</strong>: Small text edits create larger-than-expected WAL or page churn.</p>
+<p><strong>Why it happens / is confusing</strong>: Growing a variable-length field often relocates tuple bytes or changes overflow metadata. The update dirties more of the page than the logical column change suggests.</p>
+<p><strong>Clarification / Fix</strong>: Look for tuple relocation, overflow-page writes, and page fragmentation. Fillfactor, overflow thresholds, and column placement can matter as much as the application update itself.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Record formats &lt;-&gt; WAL and crash recovery</h3>
+<p>Recovery systems replay byte-level or field-level changes against pages that must still decode into valid tuples. PostgreSQL's heap tuple header, null bitmap, and TOAST pointers are a good example: redo is only safe because the storage engine knows exactly how tuple headers and variable-length attributes are structured on disk.</p>
+<h3>Connection 2: Record formats &lt;-&gt; buffer pools and CPU cache behavior</h3>
+<p>Tuple width determines how many logical rows each cached page can serve. InnoDB's compact and dynamic row formats, for example, are not just disk-layout choices; they change how much useful data fits into memory and how often a query must chase overflow storage. That is why <a href="011.html">04.md</a> follows naturally from this lesson.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>
+<p>[DOC] <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PostgreSQL Database Page Layout</a></p>
+<ul>
+<li>Focus: See how heap tuple headers, <code>t_hoff</code>, null bitmaps, and alignment rules map onto the generic row-format model from this lesson.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html">InnoDB Row Formats</a></p>
+<ul>
+<li>Focus: Compare <code>COMPACT</code> and <code>DYNAMIC</code> row formats and pay attention to how long columns move off-page.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://www.sqlite.org/fileformat.html">SQLite Database File Format</a></p>
+<ul>
+<li>Focus: Inspect record headers, serial types, and variable-length integer encoding inside SQLite cells.</li>
+</ul>
+</li>
+<li>
+<p>[PAPER] <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">Architecture of a Database System</a></p>
+<ul>
+<li>Focus: Place record layout inside the broader contracts among storage, buffer management, and recovery.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A slot is not enough; the tuple also needs a decoding contract</strong> - Page layout finds the record, but record format explains the bytes inside it.</li>
+<li><strong>Variable-length columns force explicit locality decisions</strong> - Inline values make common reads cheap, while overflow storage protects page density and update stability.</li>
+<li><strong>Row width shapes the rest of the engine</strong> - Page occupancy, WAL volume, fragmentation, and buffer-pool efficiency all start with the tuple format.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does a row format need a null bitmap instead of treating a zero-length value as "missing"?</strong></p>
+<ul>
+<li>A) Because <code>NULL</code> and an empty value have different semantics and must be decoded differently</li>
+<li>B) Because variable-length columns can never be empty</li>
+<li>C) Because the slot directory already stores nullability for each column</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main trade-off when a storage engine moves a large column out of line?</strong></p>
+<ul>
+<li>A) It removes the need for page headers</li>
+<li>B) It keeps the base tuple smaller but may require an extra fetch when the value is read</li>
+<li>C) It guarantees that updates never rewrite any page bytes</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does record format matter to the next lesson on buffer pools?</strong></p>
+<ul>
+<li>A) Because tuple width changes how many useful rows fit on each cached page</li>
+<li>B) Because buffer pools only work with fixed-length rows</li>
+<li>C) Because variable-length columns are decoded entirely by the query planner</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The engine must distinguish <code>NULL</code> from empty strings, zeros, and other present values. The null bitmap preserves that semantic information independently of the payload bytes.</p>
+<p><strong>2. B</strong>: Out-of-line storage protects base-row size and can reduce page churn, but it adds pointer chasing and potentially another page read when the large value is actually needed.</p>
+<p><strong>3. A</strong>: Buffer-pool effectiveness depends on how much useful data each cached page contains. Wider tuples mean fewer rows per page and a larger in-memory footprint for the same logical workload.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="009.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Page Layouts and Slotted Pages</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="011.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Buffer Pool Internals and Replacement Policies</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cross-Region Commit Protocols - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Cross-Region Commit Protocols</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+        </p>
+        <p>
+          Sequence: 004 | Lesson ID: 452
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 452: Cross-Region Commit Protocols</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A cross-region transaction is safe only when every participant durably records "I can commit" before any shard exposes final effects, and the final commit or abort decision is itself replicated so recovery can finish after crashes.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="003.html">Global Ordering with Hybrid Logical Clocks</a>, <code>PayLedger</code> gained a timestamp language that <code>eu-west</code> payroll and <code>us-east</code> treasury could both compare. That solved the question "which event should sort first?" It did not solve the harder question: "when may the system claim that both writes happened as one atomic business action?"</p>
+<p>Use the payroll-close path as the concrete anchor. A payroll manager approves run <code>apr-2026</code> for tenant <code>globex-eu</code>. The transaction must mark the run as <code>approved</code> on the payroll shard in Europe and reserve settlement cash on the treasury shard in the US. If Europe commits locally and the coordinator dies before the treasury reservation becomes durable, the business does not experience "one slow transaction." It experiences a broken invariant: payroll appears approved without the money hold that was supposed to make that approval safe.</p>
+<p>Cross-region commit protocols exist to prevent exactly that half-finished state. They split the operation into a durable prepare phase and a durable decision phase. Participants first promise they can finish later without losing the transaction, then a replicated transaction record says whether the answer is <code>COMMITTED</code> or <code>ABORTED</code>. Only after that decision is durable do shards make the final result visible. The useful mental shift is that the commit point is not "the coordinator sent two RPCs." The commit point is "the system wrote down a recoverable global decision."</p>
+<p>That changes how you reason about latency and failures in production. WAN round trips, quorum placement, lock duration, and recovery queues are not incidental overhead around the protocol. They are the protocol. The next lesson on <a href="005.html">Disaster Recovery Drills and PITR Validation</a> picks up from there, because a commit protocol is only real if you can prove its records and intents survive failover and restore events.</p>
+<h2>Why This Matters</h2>
+<p>Cross-region commit protocols show up when a system has a small set of invariants that are more expensive to violate than to coordinate. <code>PayLedger</code> is a good example because a payroll approval is not just another row update. Once the status flips to <code>approved</code>, downstream systems may generate accounting entries, notify finance, or release settlement workflows. If that approval becomes visible without the treasury reservation that was meant to guard it, the platform creates manual reconciliation work during the exact window when operators can least afford ambiguity.</p>
+<p>Teams often discover this boundary the hard way. A design works fine while one service owns the whole write. Then the product grows into region-local compliance storage plus centralized liquidity management, and someone says "we'll just write both places and retry on failure." That sounds reasonable until retries run into ambiguous outcomes, duplicate external side effects, or long-lived locks after a regional failover. At that point the incident is no longer about code style. It is about whether the data platform can explain which transaction won, which one aborted, and how any participant can prove the answer after a crash.</p>
+<p>The production trade-off is sharp. Cross-region atomic commit gives stronger business invariants, but every extra participant stretches commit latency, conflict windows, and operational complexity. That is why mature systems reserve this machinery for narrow, high-value state changes and push secondary work, like search indexing or notification fan-out, onto asynchronous paths with idempotent recovery.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why comparable timestamps are not enough for atomicity</strong> - Distinguish global ordering from the separate problem of making a multi-region write become visible all at once.</li>
+<li><strong>Trace the prepare, decide, and recovery path of a cross-region transaction</strong> - Follow how participants record intents, how the transaction record becomes the commit point, and how failures are resolved later.</li>
+<li><strong>Evaluate when cross-region atomic commit is worth its cost</strong> - Decide which writes belong inside the participant set and which ones should move to asynchronous, idempotent workflows instead.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Prepare turns a risky multi-region write into a durable promise</h3>
+<p>Keep the <code>PayLedger</code> transaction concrete. One user action, "approve payroll run <code>apr-2026</code>," needs to touch at least two replica groups:</p>
+<ul>
+<li><code>eu-west/payroll</code>: set <code>run_status = approved</code></li>
+<li><code>us-east/treasury</code>: reserve <code>4.8M EUR</code> worth of settlement liquidity</li>
+</ul>
+<p>If each region were allowed to commit independently, the failure modes would be unacceptable. Europe could durably mark the run approved while the US reservation times out. A retry might then reserve cash twice. An audit feed could read one effect without the other and produce a timeline that looks internally contradictory. The core problem is not that the transaction is distributed. The problem is that the system has no durable intermediate state between "nothing happened" and "everything happened."</p>
+<p>The prepare phase creates that intermediate state. Each participant validates the transaction against its local read and write rules, acquires the necessary locks or write intents, and replicates a prepare record to its local quorum before voting <code>yes</code>. At that moment the participant is saying, "I have enough durable information to either commit or abort later, even if the coordinator disappears." The prepared writes are not yet visible as committed versions, but they are no longer ephemeral in-flight RPC state either.</p>
+<p>You can sketch the flow like this:</p>
+<div class="codehilite"><pre><span></span><code>client
+  -&gt; coordinator
+       -&gt; eu-west/payroll   write intent + lock   -&gt; quorum replicated -&gt; vote YES
+       -&gt; us-east/treasury  write intent + lock   -&gt; quorum replicated -&gt; vote YES
+</code></pre></div>
+
+<p>This is the first major trade-off. Prepared state protects atomicity, but it also holds resources. The longer the transaction stays prepared, the longer other writers may wait behind locks, and the more likely a hot row or hot tenant becomes a p99 problem. That is why participant count matters so much in production. A transaction that spans two carefully chosen shards is one thing; a transaction that drags analytics, search, notifications, and billing into the same atomic set is usually a design mistake.</p>
+<h3>Concept 2: The transaction record is the real commit point</h3>
+<p>Once every participant has voted <code>yes</code>, the system still does not have a committed transaction. It has a collection of durable promises. The actual commit point is the global decision record that says <code>COMMITTED</code> or <code>ABORTED</code> and is itself replicated strongly enough that recovery can discover it later. In many modern systems this record lives in a transaction metadata range or coordinator-owned keyspace backed by consensus. That detail matters because classic two-phase commit blocks if the coordinator's only memory of the decision dies with one process.</p>
+<p>For <code>PayLedger</code>, the coordinator typically chooses a commit timestamp that is greater than any timestamp already observed in the transaction, often using the global time mechanism from the previous lesson. It then writes something conceptually like:</p>
+<div class="codehilite"><pre><span></span><code>txn_id = tx-88421
+participants = [eu-west/payroll, us-east/treasury]
+decision = COMMITTED
+commit_ts = (2026-04-02T10:00:05.120, 3)
+</code></pre></div>
+
+<p>Only after that transaction record is durable does the system have an answer it can defend. Participants can then resolve their intents into committed versions, either inline on the happy path or asynchronously if the client disconnects. Readers that encounter a prepared intent do not have to guess whether the transaction succeeded. They can consult the transaction record, see the durable decision, and either wait, push resolution, or read around the aborted intent depending on the engine's rules.</p>
+<p>This is why production implementations are usually better described as "two-phase commit layered on replicated participants" than as bare 2PC. Consensus on each participant protects local durability. Consensus on the transaction record protects the global decision. The cost is extra write amplification and extra WAN-sensitive round trips, but the benefit is that coordinator failure turns into a recovery lookup problem instead of an unbounded blocking mystery.</p>
+<h3>Concept 3: Recovery behavior and participant scope determine whether the protocol is worth it</h3>
+<p>The protocol earns its keep on failure paths, so that is where you should evaluate it. If one participant cannot prepare, the coordinator aborts and asks any prepared participants to roll back. If every participant prepared but the coordinator crashes before the client hears the answer, the transaction is "in doubt" from the client's perspective, not from the database's perspective. Recovery workers or later readers can inspect the durable transaction record, learn whether the answer was commit or abort, and finish intent resolution.</p>
+<p>That recovery model drives operational decisions. You want the transaction record placed so it survives the region failures you claim to tolerate. You want metrics for the age of the oldest unresolved intent, the size of the transaction recovery queue, and the number of reads that had to push someone else's transaction to completion. You also want transaction shapes that are intentionally small. For <code>PayLedger</code>, the payroll status row and treasury reservation belong inside the atomic set because the invariant spans them directly. Search indexing, email notifications, and audit exports do not; they should consume a transactional outbox after commit with idempotent handling.</p>
+<p>The business lesson is blunt: cross-region atomic commit is a scarce resource. Use it where partial visibility would violate money movement, inventory depletion, entitlement assignment, or another narrow invariant that the business cannot repair cheaply. Do not use it to make every side effect synchronous. That discipline is what makes the protocol survivable in production, and it leads directly into <a href="005.html">Disaster Recovery Drills and PITR Validation</a>, where the question becomes whether your commit logs, snapshots, and recovery playbooks actually uphold these promises during a bad day.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Commit latency spikes during payroll close, even though each shard is healthy on its own.</p>
+<p><strong>Why it happens / is confusing</strong>: Cross-region commit latency is determined by the slowest prepare and decision round trip, not by the median latency of one shard in isolation. Teams often look at region-local database dashboards and miss that the participant set grew wider or crossed a slower WAN path.</p>
+<p><strong>Clarification / Fix</strong>: Track participant count per transaction, coordinator locality, and p95/p99 prepare time by region pair. Move non-critical side effects out of the atomic participant set, and keep the coordinator near the shard that owns the transaction record to reduce one WAN hop.</p>
+<p><strong>Issue</strong>: Failover leaves old intents behind, and some reads stall while "pushing" unresolved transactions.</p>
+<p><strong>Why it happens / is confusing</strong>: The transaction itself may be decided already, but intent resolution is lagging behind after coordinator loss or replica recovery. Without visibility into the transaction record and recovery queues, it looks like the database forgot whether the transaction committed.</p>
+<p><strong>Clarification / Fix</strong>: Expose metrics for unresolved-intent age, recovery queue depth, and transaction record lookup failures. Make sure recovery workers can run from surviving regions and that operators know how to verify the decision record before manually clearing locks.</p>
+<p><strong>Issue</strong>: A retry after an ambiguous timeout does not duplicate database rows, but it still sends duplicate downstream notifications.</p>
+<p><strong>Why it happens / is confusing</strong>: The commit protocol protects atomic database state, not arbitrary external side effects. If email or webhook delivery happens outside the transaction without idempotency, the client can safely retry the database write and still trigger duplicate external work.</p>
+<p><strong>Clarification / Fix</strong>: Keep external side effects behind a transactional outbox or another idempotent post-commit mechanism keyed by transaction ID. Let the database transaction establish the source of truth, then let downstream consumers deduplicate against that durable record.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Cross-region commit protocols ↔ hybrid logical clocks</h3>
+<p>The previous lesson's HLC timestamps give the system a comparable time domain for commit timestamps, safe reads, and transaction ordering. They do not say when a cross-region write is final. The commit protocol still has to decide when every participant is prepared and when the global decision is durable enough to expose. Ordering metadata and commit atomicity work together, but they are different layers of the design.</p>
+<h3>Connection 2: Cross-region commit protocols ↔ disaster recovery drills</h3>
+<p>An atomic commit protocol is only as strong as its recovery artifacts. If you cannot restore transaction records, replay prepared intents correctly, or prove quorum placement still works after a region loss, then the protocol's guarantees collapse during the exact incidents it was supposed to survive. That is the bridge to <a href="005.html">Disaster Recovery Drills and PITR Validation</a>.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <em>Spanner: Google's Globally Distributed Database</em> - James C. Corbett et al.<ul>
+<li>Link: <a href="https://research.google/pubs/pub39966/">https://research.google/pubs/pub39966/</a></li>
+<li>Focus: Read the sections on Paxos-backed participant groups, two-phase commit, and commit-wait to see how global timestamps and atomic commit interact in a real system.</li>
+</ul>
+</li>
+<li>[DOC] CockroachDB architecture: transaction layer<ul>
+<li>Link: <a href="https://www.cockroachlabs.com/docs/stable/architecture/transaction-layer">https://www.cockroachlabs.com/docs/stable/architecture/transaction-layer</a></li>
+<li>Focus: Study transaction records, intents, and the recovery path after coordinator failure. The terminology differs, but the prepare/decide/recover shape is the same one discussed here.</li>
+</ul>
+</li>
+<li>[DOC] Cloud Spanner: TrueTime and external consistency<ul>
+<li>Link: <a href="https://docs.cloud.google.com/spanner/docs/true-time-external-consistency">https://docs.cloud.google.com/spanner/docs/true-time-external-consistency</a></li>
+<li>Focus: Contrast external-consistency commit timing with the more general lesson here: even with strong time APIs, the system still needs a durable commit decision that all participants can recover.</li>
+</ul>
+</li>
+<li>[BOOK] <em>Designing Data-Intensive Applications</em> - Martin Kleppmann<ul>
+<li>Link: <a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/">https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/</a></li>
+<li>Focus: Revisit the chapters on transactions and fault tolerance, then map the abstract ideas to the concrete <code>PayLedger</code> prepare/commit flow from this lesson.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Atomicity starts before commit</strong> - The prepare phase matters because it turns each participant's "maybe" into a durable promise that recovery can finish later.</li>
+<li><strong>The decision record is the commit point</strong> - A transaction becomes safely committable only when the global <code>COMMITTED</code> or <code>ABORTED</code> outcome is itself replicated and discoverable after crashes.</li>
+<li><strong>Cross-region commit should stay narrow</strong> - Reserve this machinery for invariants that truly require all-or-nothing behavior, and push secondary work onto asynchronous, idempotent paths.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>In the <code>PayLedger</code> example, which event marks the defensible commit point of the cross-region transaction?</strong></p>
+<ul>
+<li>A) The moment the client receives a <code>200 OK</code> from the coordinator.</li>
+<li>B) The moment the replicated transaction record durably stores <code>COMMITTED</code> with the participant set and commit timestamp.</li>
+<li>C) The moment the first participant appends its local write intent.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why do participants keep prepared writes as intents or locked state instead of exposing them immediately as committed rows?</strong></p>
+<ul>
+<li>A) Because the protocol needs a state that can be completed or rolled back later without letting one region become visible ahead of the global decision.</li>
+<li>B) Because HLC timestamps cannot be assigned until after a read request arrives.</li>
+<li>C) Because exposing committed rows early would make WAN latency disappear from dashboards.</li>
+</ul>
+</li>
+<li>
+<p><strong>Which change most improves commit latency without weakening the core payroll invariant?</strong></p>
+<ul>
+<li>A) Let the treasury reservation happen asynchronously after the payroll row commits.</li>
+<li>B) Remove the search-index update and finance notification from the transaction's participant set and drive them from a transactional outbox after commit.</li>
+<li>C) Allow one participant to skip quorum replication during prepare if that region is under load.</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The client response and local prepare records are not enough on their own. The durable transaction record is what lets every participant and every recovery worker agree on the outcome after failures.</p>
+<p><strong>2. A</strong>: Prepared state is the protocol's safe middle ground. It preserves the ability to finish or roll back later while preventing one shard from exposing final effects before the system has a durable global answer.</p>
+<p><strong>3. B</strong>: The payroll status and treasury reservation are the invariant-bearing writes, so they stay in the atomic set. Search and notification work can happen after commit through an idempotent outbox, which shortens the transaction without weakening correctness.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="003.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Global Ordering with Hybrid Logical Clocks</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="005.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Disaster Recovery Drills and PITR Validation</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

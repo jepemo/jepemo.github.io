@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Backup, Snapshots, and Point-in-Time Recovery - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Backup, Snapshots, and Point-in-Time Recovery</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 030 | Lesson ID: 429
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 429: Backup, Snapshots, and Point-in-Time Recovery</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A production-grade recovery system is a time machine built from two parts: a base image that is known to be restorable, and an unbroken log history that can replay the database forward to the exact moment you choose.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="029.html">12.md</a>, Harbor Point learned that a global secondary index is not decorative metadata. It is maintained state with its own write path, lag surface, and repair story. That becomes much more serious the day recovery enters the picture. At 09:41, an operator runs the wrong maintenance job against <code>bond_reservations</code>, and thousands of <code>open</code> reservations for issuer <code>CA-MUNI</code> are flipped to <code>released</code>. The corresponding rows in <code>gsi_open_by_issuer</code> are deleted just as faithfully. The cluster is behaving correctly. The business result is disastrous.</p>
+<p>The obvious reaction, "restore last night's backup," is not a real answer. Harbor Point would get the lost reservations back, but it would also erase every legitimate trade placed since the backup finished. A dump taken at 02:00 is a copy of history at 02:00, not a mechanism for reconstructing 09:40:59. On the other side, WAL archives without a base image are not enough either, because replay needs a known starting set of pages, indexes, and metadata.</p>
+<p>Point-in-time recovery works because it combines those two ingredients into one contract. The base backup says, "starting from this exact on-disk state, all later changes can be reconstructed from log position X onward." The archived WAL says, "here is every durable change after that point, in the order the engine committed it." Recovery is therefore not "copy files and hope." It is controlled re-execution of database history until the last safe boundary before the bad event.</p>
+<p>That framing also fixes a common misconception. Teams often talk about backups as if the only question is whether a copy exists. In production, the harder question is whether the copy, the archived log stream, and the stop point all line up tightly enough to produce the state the business actually needs. Harbor Point does not need "a backup." It needs a restore path that can land just before the erroneous release job and can prove that the restored state is internally consistent.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation service is busiest during the market open, which is also the worst time to discover that "restore" was never modeled beyond an S3 retention policy. The database contains the authoritative reservation rows, exposure summaries, and the index structures that make trader and compliance workflows fast enough to use. If a bad migration, operator mistake, storage fault, or software bug corrupts those structures at 09:41, the team has two business constraints at once: recover the right state, and do it fast enough that trading does not stay frozen for hours.</p>
+<p>Without a real PITR design, the team is trapped between two bad options. Restoring an old full backup loses too much legitimate work. Keeping only logical exports gives a readable copy of some tables, but not the engine state required to bring the whole cluster back consistently. Relying on "the replicas probably have the old data" is worse, because a faithfully replicated mistake spreads the corruption to every healthy standby.</p>
+<p>Once the recovery path is designed around snapshots plus WAL, the problem becomes precise. Harbor Point can choose a base backup from 02:00, restore it onto new hosts, replay WAL until just before the destructive maintenance transaction, and then decide what to do about derived systems that live outside the core cluster. The next lesson, <a href="031.html">14.md</a>, naturally follows from that workflow: once recovery is decomposed into snapshot age, archived-log completeness, replay speed, and validation, those stages become observable production commitments rather than folklore.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why a physical base backup must be anchored to log positions</strong> - Distinguish a restorable snapshot from a generic filesystem copy or logical export.</li>
+<li><strong>Trace how point-in-time recovery reconstructs the database to a chosen boundary</strong> - Follow base restore, WAL replay, recovery target selection, and timeline creation in Harbor Point's cluster.</li>
+<li><strong>Evaluate recovery trade-offs for real production systems</strong> - Decide what must be restored exactly, what can be rebuilt, and how those choices shape RPO, RTO, and operational complexity.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A restorable base backup is a crash-consistent starting point, not just a copy of files</h3>
+<p>Harbor Point takes nightly physical backups of the reservation cluster while trading is still possible in some regions. That means a backup can capture data files while the database is actively mutating pages, splitting B-tree nodes, and advancing transaction visibility metadata. If the team simply copied the data directory with no coordination, the result could contain page <code>P1</code> from before transaction <code>T88421</code> and index page <code>I7</code> from after <code>T88421</code>, which is not a state the database ever considered valid.</p>
+<p>That is why practical base backups are tied to the engine's recovery model. The database exposes a safe backup window, or a backup tool such as <code>pg_basebackup</code> coordinates the process, records the WAL position where the backup starts, and guarantees that recovery can use WAL to bridge the fuzzy parts of the snapshot. The copied files do not need to represent one perfectly frozen instant by themselves. They need to represent an on-disk state that becomes consistent once replay begins from the recorded log boundary.</p>
+<p>For Harbor Point, the mental model looks like this:</p>
+<div class="codehilite"><pre><span></span><code>base backup files
+    +
+backup start/end WAL positions
+    +
+all WAL generated after the backup began
+    =
+restorable foundation
+</code></pre></div>
+
+<p>This is why a logical dump solves a different problem. A dump can re-create table contents, often portably, but it does not preserve page layout, visibility maps, free space maps, or the exact index structure the engine needs for fast recovery. PITR is about recovering the database as a storage system, not merely as a collection of rows.</p>
+<p>The trade-off is operational: physical base backups are larger, engine-specific, and require disciplined handling of backup manifests and WAL retention. The payoff is that Harbor Point gets a starting image the engine itself knows how to trust during crash recovery and replay.</p>
+<h3>Concept 2: Point-in-time recovery is ordered log replay that stops at a business-safe boundary</h3>
+<p>Suppose Harbor Point restores the 02:00 base backup after the bad 09:41 maintenance job. The cluster does not become useful the moment the files are copied back. The real work is replaying every committed change between the backup and the chosen recovery target. WAL is what makes that possible because it records the same low-level state transitions the primary relied on for durability in the first place.</p>
+<p>The recovery flow is conceptually simple:</p>
+<div class="codehilite"><pre><span></span><code>02:00 base backup at timeline T1
+        |
+        v
+restore files onto new hosts
+        |
+        v
+fetch WAL segments from archive
+        |
+        v
+replay records in commit order
+        |
+        v
+stop at target_time / target_lsn / restore point
+        |
+        v
+promote restored cluster onto new timeline T2
+</code></pre></div>
+
+<p>In Harbor Point's incident, the operator knows the destructive job committed at 09:41:23 UTC. Recovery can therefore be configured to stop just before that commit:</p>
+<div class="codehilite"><pre><span></span><code>restore_command = &#39;cp /wal-archive/%f %p&#39;
+recovery_target_time = &#39;2026-04-01 09:41:23+00&#39;
+recovery_target_inclusive = false
+</code></pre></div>
+
+<p>The details matter. Recovery targets are evaluated at commit boundaries, not at the moment a transaction first started doing work. If a long-running transaction began before 09:41:23 but committed after it, the restored cluster will exclude its effects when <code>recovery_target_inclusive = false</code>. The team also has to respect the backup window itself: a base backup cannot recover to a time before that backup completed, because the files on disk were still being copied then.</p>
+<p>This makes PITR precise, but not effortless. The archive must contain every WAL segment from the base backup forward, in the correct timeline, without corruption or accidental garbage collection. Harbor Point is trading storage cost and archive-management discipline for the ability to land on a very narrow safe point instead of choosing between "yesterday" and "now."</p>
+<h3>Concept 3: Recovery design is really about scope, authority, and rehearsal</h3>
+<p>The hardest production question is rarely "can the database replay WAL?" The harder question is "what exactly must be correct when the restored system goes live?" Harbor Point's base tables are authoritative. The <code>gsi_open_by_issuer</code> structure from <a href="029.html">12.md</a> is also inside the database, so a physical backup and WAL replay restore it automatically if its mutations were committed transactionally with the base rows. That is the easy case.</p>
+<p>Now imagine Harbor Point also feeds an external search index and a risk dashboard cache from change data capture. A PITR restore of the core database does not automatically rewind those external systems to the same cutover point. The team must decide whether they are authoritative enough to require their own aligned restore, or derived enough to be rebuilt after the database comes back. That design decision changes restore steps, downtime, and the amount of post-recovery validation required.</p>
+<p>This is where RPO and RTO become concrete engineering knobs instead of executive slogans. A shorter base-backup interval can reduce replay volume, but costs more I/O and storage. Longer WAL retention improves recovery flexibility, but raises archive spend and operational surface area. Rebuilding derived structures after restore can shrink backup size, but extends the time before the platform is truly healthy. Harbor Point needs these choices documented before the incident, not improvised during it.</p>
+<p>That is also why restore drills matter more than backup success logs. A successful upload proves only that bytes were copied somewhere. A successful drill proves that the snapshot, WAL archive, target-selection procedure, application cutover steps, and data validation checks actually compose into a usable recovery path. The observability lesson in <a href="031.html">14.md</a> starts from exactly this point: once recovery is treated as a staged mechanism, each stage needs metrics, alerts, and an SLO of its own.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The restored cluster starts, but several legitimate reservations from just before the incident are missing.</p>
+<p><strong>Why it happens / is confusing</strong>: The team targeted the wrong stop point. Time-based recovery may have used the wrong timezone, the target may have landed before the commit record actually arrived, or <code>recovery_target_inclusive</code> may have excluded a transaction the operators meant to keep.</p>
+<p><strong>Clarification / Fix</strong>: Prefer named restore points or exact LSN targets when the workflow allows it, record incident times in UTC, and verify the commit boundary of the destructive transaction before promoting the restored cluster.</p>
+<p><strong>Issue</strong>: Recovery fails midway with an error about a missing WAL segment or timeline history file.</p>
+<p><strong>Why it happens / is confusing</strong>: The base backup itself may be valid, but PITR requires an unbroken archive chain from the backup's recorded start point through the target. Aggressive WAL cleanup, broken archive commands, or partial object-store uploads can leave a gap that only appears during restore.</p>
+<p><strong>Clarification / Fix</strong>: Treat WAL archival as a durability pipeline, not a background convenience. Validate archive completeness continuously, keep retention aligned with the maximum recovery window, and test restores from the actual archive rather than from local happy-path files.</p>
+<p><strong>Issue</strong>: The database is transactionally consistent after PITR, but downstream search or analytics results disagree with the restored state.</p>
+<p><strong>Why it happens / is confusing</strong>: PITR repaired the authoritative database, but asynchronous derived systems were neither restored to the same point nor rebuilt from the restored source of truth.</p>
+<p><strong>Clarification / Fix</strong>: Classify every dependent system ahead of time as authoritative or rebuildable. After recovery, either restore the authoritative dependents to the same cutover point or replay/rebuild the derived ones before declaring the platform healthy.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="029.html">12.md</a> made global indexes a correctness problem; PITR turns them into a recovery-scope problem</h3>
+<p>Once Harbor Point models <code>gsi_open_by_issuer</code> as maintained state, disaster recovery has to answer whether that state is restored in lockstep with the base table or regenerated after the fact. The correctness story from the write path becomes a scope decision in the recovery path.</p>
+<h3>Connection 2: <a href="031.html">14.md</a> turns recovery stages into observable promises</h3>
+<p>Backup age, WAL archive lag, replay throughput, restore duration, and post-restore validation success are all measurable. Observability is not an add-on after PITR is designed; it is the way Harbor Point proves the recovery design is still intact before the next incident forces the issue.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/continuous-archiving.html">Continuous Archiving and Point-in-Time Recovery (PITR)</a><ul>
+<li>Focus: Read the canonical description of how a file-system-level base backup and archived WAL combine into exact recovery targets and timelines.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/app-pgbasebackup.html">pg_basebackup</a><ul>
+<li>Focus: See how a production tool captures a live physical backup while recording the metadata needed for replay.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/pgwaldump.html">pg_waldump</a><ul>
+<li>Focus: Use WAL inspection to connect abstract replay talk to actual log records and LSN ranges.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.percona.com/percona-xtrabackup/8.4/point-in-time-recovery.html">Point-in-time recovery - Percona XtraBackup</a><ul>
+<li>Focus: Compare the same base-backup-plus-log-replay pattern in a MySQL ecosystem built around binary logs instead of PostgreSQL WAL naming.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A backup becomes useful only when it is paired with the log boundary that makes it restorable</strong> - Physical copies without replay metadata are just incomplete raw material.</li>
+<li><strong>PITR is replay of committed history, not selective row repair</strong> - The engine rebuilds a valid state by following log order and stopping at an explicit target.</li>
+<li><strong>Recovery scope is an architectural decision</strong> - Teams must decide in advance which structures are authoritative, which are rebuildable, and how that choice changes restore time and validation.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is Harbor Point's 02:00 physical base backup not enough by itself after the 09:41 destructive maintenance job?</strong></p>
+<ul>
+<li>A) Because physical backups cannot be restored while the database is online</li>
+<li>B) Because it represents only the cluster state around 02:00 and needs the subsequent WAL history to reconstruct the valid changes up to the safe recovery point</li>
+<li>C) Because base backups contain table rows but never contain indexes</li>
+</ul>
+</li>
+<li>
+<p><strong>What does <code>recovery_target_inclusive = false</code> mean in Harbor Point's PITR workflow?</strong></p>
+<ul>
+<li>A) Replay stops just before the target commit boundary, excluding transactions that committed exactly at that target</li>
+<li>B) Replay skips every transaction that started before the target time</li>
+<li>C) Recovery ignores WAL records until the next checkpoint after the target</li>
+</ul>
+</li>
+<li>
+<p><strong>Why must Harbor Point classify downstream systems such as search indexes or caches before an incident happens?</strong></p>
+<ul>
+<li>A) Because PITR automatically rewinds every dependent system unless it is explicitly disabled</li>
+<li>B) Because the team must know which systems need aligned restoration and which can be rebuilt from the restored database before service is declared healthy</li>
+<li>C) Because derived systems never affect recovery time</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The base backup provides the starting image, but it knows nothing about the legitimate 02:00-09:41 transactions Harbor Point wants to keep. WAL replay is what reconstructs that later history. Option A is false, and option C is wrong because physical backups absolutely contain index files.</p>
+<p><strong>2. A</strong>: Inclusive <code>false</code> means "stop before the target event is included," which is exactly what Harbor Point wants when the target identifies the destructive commit. Option B confuses transaction start with commit visibility, and option C invents a checkpoint rule that PITR does not use.</p>
+<p><strong>3. B</strong>: Recovery is complete only when the systems the business relies on are back in a coherent state. Some can be rebuilt from the restored source of truth, while others must be restored in lockstep. Options A and C both ignore the operational scope decision that PITR forces.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="029.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Global Secondary Indexes Across Shards</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="031.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Storage Engine Observability and SLOs</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Storage Engine Observability and SLOs - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Storage Engine Observability and SLOs</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 031 | Lesson ID: 430
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 430: Storage Engine Observability and SLOs</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A storage engine SLO is credible only when it is expressed in engine-native state such as WAL durability, replay position, checkpoint debt, and restore readiness, not just in API latency.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="030.html">13.md</a>, Harbor Point designed a real point-in-time recovery path for the <code>bond_reservations</code> cluster: nightly physical backups, continuous WAL archiving, and a restore procedure that can stop just before a destructive commit. That design looks solid on paper. The uncomfortable question the next morning is simpler: how would the team know, at 09:37 on a busy trading day, that the recovery promise is still intact?</p>
+<p>Suppose the API dashboard is green. Median write latency is normal, the load balancer sees no errors, and traders keep placing reservations. Meanwhile, the WAL archive command has been failing for twelve minutes because the object-store credentials expired, the replica used for compliance reads is 1.8 GB behind on replay, and the next checkpoint is forcing a burst of dirty-page writes that will soon stretch commit latency. From the application's point of view, the service is still "up." From the storage engine's point of view, Harbor Point is already outside its recovery and freshness promises.</p>
+<p>That is the key shift for this lesson. Storage engine observability is not a larger pile of metrics. It is a map from business promises to internal state transitions. "A committed reservation is durable within one second" is not a sentiment. It means Harbor Point can observe WAL generation, fsync completion, archive success, and replay progress closely enough to prove that the promise is still true. Once the team thinks that way, SLOs stop being generic uptime slogans and become concrete claims about the engine's hidden machinery.</p>
+<p>This also corrects a common misconception. Teams often assume the database is healthy when query latency stays below threshold. That is sometimes true for the request path and false for the storage path. A system can serve traffic smoothly while its backup window is already broken, its replay backlog is growing, or its maintenance debt is quietly setting up the next incident.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation service is the system of record for open positions during the market session. If the cluster accepts writes at 09:40 but cannot restore to 09:39 because WAL archival has been broken since 09:28, the business does not really have the durability posture it thinks it bought. The incident will not start when the first HTTP 500 appears. It will start when an operator asks for a recovery point the engine can no longer provide.</p>
+<p>Black-box monitoring does not catch that kind of degradation early enough. CPU, query throughput, and endpoint latency tell the team whether the database is currently serving work. They do not tell the team whether the write-ahead log is safely off-host, whether replicas are converging, whether checkpoints are accumulating dangerous flush debt, or whether a restore drill still finishes inside the promised recovery window.</p>
+<p>Once Harbor Point instruments those internal boundaries directly, production decisions get sharper. On-call can distinguish "slow because the workload is heavy" from "slow because durability work is falling behind." Capacity planning can ask whether more write volume increases archive lag or replica replay delay. Leadership can set an RPO and RTO that correspond to measured engine behavior rather than optimistic policy text.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why storage observability must follow engine state transitions</strong> - Map commits, log durability, checkpoints, archival, and replay into concrete observability points.</li>
+<li><strong>Translate business promises into storage-engine SLIs and SLOs</strong> - Define measures for durability, freshness, and recovery readiness that a production team can actually verify.</li>
+<li><strong>Diagnose degradation using backlog and drill signals</strong> - Separate transient load from structural risk by reading archive lag, replay debt, checkpoint pressure, and restore-test outcomes together.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Observe the write path as a sequence of state transitions</h3>
+<p>Harbor Point's traders care about a simple sentence: "when I place a reservation, it is durable." The engine cannot satisfy that sentence all at once. It satisfies it in stages. A transaction appends records to WAL, the WAL is flushed to durable local media, dirty data pages remain in memory for a while, a checkpoint later writes those pages back, WAL segments are archived for disaster recovery, and replicas replay the same history on their own schedule.</p>
+<p>That means storage observability has to ask a specific question at each boundary: what has happened, and what has not happened yet? If Harbor Point only graphs end-to-end transaction latency, it collapses all of those stages into one blurry number. A commit can be acknowledged quickly while the archive is failing. A replica can answer reads while replay is behind the point that compliance assumes. The observability model has to preserve those distinctions.</p>
+<p>For this cluster, the engine flow looks like this:</p>
+<div class="codehilite"><pre><span></span><code>client commit
+    |
+    v
+WAL appended in memory
+    |
+    v
+WAL fsync completes  ---&gt; commit may now be acknowledged
+    |
+    v
+dirty pages accumulate in buffer cache
+    |
+    v
+checkpoint/background writer flushes pages
+    |
+    v
+WAL segment archived off-host
+    |
+    v
+replica receives and replays WAL
+</code></pre></div>
+
+<p>Each arrow suggests an observability boundary. WAL write and sync timing say whether the commit path is healthy. Checkpoint write volume and duration reveal whether page flush work is arriving smoothly or in bursts. Archive success timestamps tell Harbor Point whether a local durable commit is also durable against host loss. Replay position tells the team whether standbys are fresh enough for reads or failover.</p>
+<p>The trade-off is specificity. Engine-native metrics are less portable than generic host dashboards, and they require operators to understand terms like LSN, checkpoint, or replay lag. The payoff is that those metrics answer the actual production question: which promise is degrading, and at which internal boundary is it happening?</p>
+<h3>Concept 2: A storage SLO is a bundle of narrower promises, not one number</h3>
+<p>Harbor Point's executives may ask for "99.95% database availability," but the storage team cannot operate the engine from that phrase alone. The lesson from <a href="030.html">13.md</a> is that recovery and durability are staged mechanisms. The observability consequence is that the SLO must also be staged. Otherwise the team reports success while missing the exact failure mode that matters.</p>
+<p>For Harbor Point, a useful SLO bundle might look like this:</p>
+<div class="codehilite"><pre><span></span><code>Commit durability:
+  99% of writes acknowledged in &lt; 40 ms
+
+Recovery point objective:
+  archived WAL gap &lt; 60 s for 99.9% of minutes
+
+Replica freshness:
+  compliance replica replay lag &lt; 5 s during market hours
+
+Recovery time objective:
+  weekly restore drill completes to serving state in &lt; 15 min
+</code></pre></div>
+
+<p>Notice what changed. The promises are still business-facing, but each one has an engine-native measurement behind it. Commit durability might rely on WAL sync latency histograms and commit wait time. The recovery-point promise depends on successful WAL archival, not on query latency. Replica freshness should be measured with replay position or commit timestamp lag, not merely TCP connectivity to the standby. Recovery time is not inferred from backup success; it is measured through drills that execute the full restore path.</p>
+<p>Those measurements also force trade-offs into the open. If Harbor Point tightens the archive gap from sixty seconds to ten, it may need more archive bandwidth, faster object-store uploads, or a different WAL segment size. If it insists on a five-second replay lag during peak trading, it may need more network headroom or less read traffic on the replica. A better SLO is not free. It is a costed operating posture.</p>
+<p>The important design move is to reject proxies that do not prove the claim. "CPU below 70%" is not an SLI for durability. "Database port answered health checks" is not an SLI for PITR readiness. Storage SLOs should be built from signals that correspond to the engine step the promise depends on.</p>
+<h3>Concept 3: The most valuable signals are usually backlogs, gaps, and rehearsed outcomes</h3>
+<p>Storage engines rarely fail as a clean binary switch. More often, risk accumulates as debt. WAL is generated faster than it is archived. A replica receives WAL faster than it can replay. Dirty buffers grow until a checkpoint turns into a write storm. Vacuum or compaction falls behind until read amplification rises and bloat distorts latency. If Harbor Point alerts only on instantaneous thresholds, it notices the problem too late and has trouble telling cause from effect.</p>
+<p>That is why backlog-oriented observability is so effective. Instead of asking only "what is the lag right now?", Harbor Point asks "is the lag shrinking, stable, or growing under current load?" A replay gap of 400 MB may be harmless during a burst if the standby is closing it quickly. A replay gap of 80 MB can be dangerous if it has been growing steadily for twenty minutes while compliance is still reading from that node. The same logic applies to checkpoint pressure and archive delay.</p>
+<p>Restore drills belong in the same observability system. A weekly drill that restores the latest base backup, replays WAL to a target point, and runs a validation query is not separate from monitoring. It is the only way Harbor Point can measure the full recovery pipeline as it actually exists. Backup completion logs are component health. Drill duration and validation success are system health.</p>
+<p>This is where the lesson points toward <a href="032.html">15.md</a>. Observability can show Harbor Point that replay lag spikes during failover tests or that a partition causes WAL sender timeouts, but it cannot prove on its own that the engine preserves correctness claims under adversarial failures. Metrics tell the team where the boundaries are. Failure testing verifies whether those boundaries hold when the world is hostile.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The API dashboard is green, but Harbor Point is already missing its recovery point objective.</p>
+<p><strong>Why it happens / is confusing</strong>: Request-path metrics can stay healthy while WAL archival is broken. The cluster is still serving from local durable storage, so nothing looks wrong until a host loss or destructive transaction demands off-host recovery.</p>
+<p><strong>Clarification / Fix</strong>: Track the time since the last successfully archived WAL segment and alert on sustained gaps. Treat archival health as part of the durability SLO, not as a background maintenance metric.</p>
+<p><strong>Issue</strong>: Replica lag shown in seconds jumps around and does not explain whether the standby is actually catching up.</p>
+<p><strong>Why it happens / is confusing</strong>: Time lag alone hides the amount of outstanding WAL and whether replay throughput is improving or collapsing. A low-volume minute and a heavy burst can produce the same "seconds behind" headline with very different recovery risk.</p>
+<p><strong>Clarification / Fix</strong>: Pair time-based lag with an LSN or byte gap and observe the trend. Harbor Point should know both how far behind the replica is and whether the backlog is shrinking under current load.</p>
+<p><strong>Issue</strong>: Commit latency spikes every few minutes, and teams blame application lock contention.</p>
+<p><strong>Why it happens / is confusing</strong>: Checkpoints and background flush bursts can surface as commit slowdowns even when the SQL layer is unchanged. If the engine is forcing many dirty pages out at once, WAL and data-file I/O compete for the same device budget.</p>
+<p><strong>Clarification / Fix</strong>: Correlate commit latency with checkpoint start and end times, dirty-buffer counts, and WAL sync timing. If the spike aligns with flush debt, tune checkpoint cadence or write smoothing before rewriting application code.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="030.html">13.md</a> designed the PITR mechanism; this lesson turns it into a monitored promise</h3>
+<p>Base backups, WAL archives, and restore targets define how Harbor Point would recover. Observability decides whether that design is still true at 09:37 on a normal weekday, before an incident exposes silent drift in the recovery pipeline.</p>
+<h3>Connection 2: <a href="032.html">15.md</a> uses failure injection to test the invariants that observability exposes</h3>
+<p>Once Harbor Point knows which boundaries matter, such as replay progress, archive continuity, and commit durability, the next step is to break the system deliberately and verify that those signals still correspond to real consistency behavior under partitions, crashes, and failovers.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/monitoring-stats.html">PostgreSQL Monitoring Database Activity</a><ul>
+<li>Focus: See the built-in statistics views that expose WAL, checkpoint, background writer, and replication behavior.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/continuous-archiving.html">PostgreSQL Continuous Archiving and Point-in-Time Recovery</a><ul>
+<li>Focus: Connect the recovery design from <a href="030.html">13.md</a> to the operational signals that prove archival is healthy.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://sre.google/sre-book/service-level-objectives/">Service Level Objectives</a><ul>
+<li>Focus: Read how SLOs are defined as measurable promises, then translate that framing into storage-engine-native SLIs.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://sre.google/workbook/implementing-slos/">Implementing SLOs</a><ul>
+<li>Focus: Use the workbook's guidance to choose signals that reflect user-visible risk instead of vanity metrics.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Storage observability must mirror engine state transitions</strong> - If a metric does not tell you which durability or replay boundary has been crossed, it is a weak foundation for operating the database.</li>
+<li><strong>A storage SLO is really a set of narrower promises</strong> - Commit latency, archive continuity, replica freshness, and restore time are different commitments and should not be flattened into one health number.</li>
+<li><strong>Backlog growth and restore drills reveal risk earlier than generic uptime dashboards</strong> - The engine usually tells you it is accumulating debt long before the application tells you it is down.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why is Harbor Point's API latency dashboard not enough to prove the reservation cluster still meets its durability promises?</strong></p>
+<ul>
+<li>A) Because database latency is never relevant to durability</li>
+<li>B) Because the request path can stay healthy while WAL archival, replay, or checkpoint behavior is already violating recovery or freshness objectives</li>
+<li>C) Because storage SLOs should only use host-level CPU metrics</li>
+</ul>
+</li>
+<li>
+<p><strong>Which signal is the best direct SLI for Harbor Point's point-in-time recovery window?</strong></p>
+<ul>
+<li>A) Time since the last successfully archived WAL segment, measured against the target archive gap</li>
+<li>B) Number of SQL connections currently open to the primary</li>
+<li>C) Median HTTP response size for the reservation API</li>
+</ul>
+</li>
+<li>
+<p><strong>Why should Harbor Point track both replay time lag and LSN or byte lag on the compliance replica?</strong></p>
+<ul>
+<li>A) Because only one of them is valid during market hours</li>
+<li>B) Because together they show both how stale the replica is and whether the backlog is actually shrinking or growing under load</li>
+<li>C) Because PostgreSQL requires two lag metrics before failover is allowed</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Application latency can stay normal while storage-specific promises are already failing underneath it. WAL archival gaps, replay delay, or checkpoint debt can silently break recovery and freshness guarantees without immediately breaking request handling.</p>
+<p><strong>2. A</strong>: PITR depends on continuous off-host log history. Open connections and response sizes do not prove that Harbor Point can recover to the promised point in time.</p>
+<p><strong>3. B</strong>: Time lag gives a freshness headline, while LSN or byte lag shows backlog size and whether the replica is catching up. Harbor Point needs both to distinguish a harmless burst from sustained replay debt.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="030.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Backup, Snapshots, and Point-in-Time Recovery</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="032.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Failure Testing and Jepsen-Style Validation</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

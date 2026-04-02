@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leader Election Timelines and Failover Path - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Leader Election Timelines and Failover Path</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 035 | Lesson ID: 434
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 434: Leader Election Timelines and Failover Path</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Failover is not the instant a node wins an election; it is the whole timed path from the last trusted heartbeat to the first safe write acknowledged by the new leader.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="034.html">034.md</a>, Harbor Point's metadata service made failover look crisp: generation <code>42</code> exists, shard <code>184</code> now belongs to <code>md-db-2</code>, and stale components must stop acting like generation <code>41</code> is still current. That description is correct, but it hides the hardest part of the incident. Between the last append from <code>ny-db-3</code> and the moment <code>md-db-2</code> may safely publish itself as leader, the system is moving through a timed sequence of suspicion, voting, log verification, leader activation, and route propagation. Production availability is determined by that sequence, not by the word "election" alone.</p>
+<p>Harbor Point cares about this because shard <code>184</code> orders reservation writes for a group of municipal bond issuers. If New York drops out during market open, operators do not just want "a new leader eventually." They need to know why writes were unavailable for 2.3 seconds instead of 900 milliseconds, which step consumed the budget, and whether a shorter timeout would reduce downtime or merely create more false elections. The failover path is therefore an engineering timeline with safety gates, not a single state flip.</p>
+<p>The misconception to remove is that "leader elected" and "writes resumed" are the same timestamp. They are not. A candidate can collect enough votes to win term <code>42</code> before routers have learned the new generation, before a stale leader has been fenced, or before the new leader has confirmed the commit boundary it inherited. The whole lesson is about separating those timestamps so you can reason about outages and correctness at the same time.</p>
+<h2>Why This Matters</h2>
+<p>Suppose Harbor Point advertises that a regional leader loss should recover within three seconds. One Monday morning, <code>ny-db-3</code> stalls under a noisy-neighbor storage incident. Clients see write timeouts for almost five seconds, and the postmortem immediately fills with vague explanations: "the election was slow," "the network was weird," "the cache needed to refresh." Those are symptoms, not a model.</p>
+<p>Once you decompose failover into stages, the incident becomes legible. Maybe failure detection consumed 1.1 seconds because election timeouts were intentionally conservative. Maybe the first election split because two followers timed out together. Maybe <code>md-db-2</code> won quickly but routers did not receive the generation <code>42</code> watch event for another 600 milliseconds. Maybe clients kept retrying against stale connections after the cluster was already healthy. Each stage has a different fix, and some fixes trade availability against false-positive elections or stale-read risk.</p>
+<p>That is why production teams measure failover as a path: last confirmed leader activity, candidate timeout, quorum vote, leader activation barrier, metadata publication, and client-visible recovery. If you do not distinguish those points, you cannot tell whether the system is conservative in a safe way or simply inefficient.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain the parts of a failover timeline</strong> - Break leader loss into detection, election, activation, publication, and client recovery instead of treating it as one opaque event.</li>
+<li><strong>Trace a safe leader transition step by step</strong> - Follow how Harbor Point moves shard <code>184</code> from <code>ny-db-3</code> in term <code>41</code> to <code>md-db-2</code> in term <code>42</code> without creating two leaders that can both accept writes.</li>
+<li><strong>Evaluate failover tuning trade-offs</strong> - Judge when changing heartbeat and election settings reduces real downtime and when it only increases instability, false elections, or stale traffic.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Failure detection is the first and most visible part of the outage budget</h3>
+<p>Harbor Point runs shard <code>184</code> on three replicas: <code>ny-db-3</code> is leader in term <code>41</code>, and <code>md-db-2</code> plus <code>md-db-4</code> are followers. The leader sends AppendEntries heartbeats every 200 milliseconds. On a healthy morning that means both Madrid replicas keep refreshing the same belief: term <code>41</code> is current, <code>ny-db-3</code> is the writer, and the last committed reservation entry is index <code>812944</code>.</p>
+<p>At <code>09:17:00.000</code>, the last successful heartbeat arrives from New York. Then storage stalls hard enough that <code>ny-db-3</code> stops replicating. Nothing magical tells the followers "the leader crashed." They only observe silence. <code>md-db-2</code> and <code>md-db-4</code> each start counting from their last successful heartbeat and wait for their own randomized election timeout to expire.</p>
+<p>Harbor Point's timers for this shard look like this:</p>
+<div class="codehilite"><pre><span></span><code>heartbeat interval:     200 ms
+election timeout range: 800-1200 ms
+quorum size:            2 of 3 replicas
+</code></pre></div>
+
+<p>The timeline immediately matters:</p>
+<div class="codehilite"><pre><span></span><code>09:17:00.000  last heartbeat from ny-db-3, term 41, commit 812944
+09:17:00.200  next heartbeat would normally arrive
+09:17:00.980  md-db-2 election timeout expires after 980 ms of silence
+09:17:01.140  md-db-4 would have timed out later if no winner appeared
+</code></pre></div>
+
+<p>Randomization is not cosmetic. If both Madrid replicas timed out at the same moment, they could each become candidate, split the vote, and force another election round. The price of randomized timeouts is that some failovers take slightly longer than the minimum; the benefit is that the cluster usually produces one clear candidate instead of repeated collisions.</p>
+<p>This also shows why "reduce the timeout" is not a free optimization. If Harbor Point pushed the election range down to 250-350 milliseconds while cross-region RTT occasionally spikes to 180 milliseconds and JVM pauses hit 120 milliseconds, healthy leaders would start being declared dead during load spikes. False elections are expensive because they interrupt a functioning write path. A good failover configuration therefore reflects the latency distribution and pause behavior of the real system, not an aspirational minimum.</p>
+<h3>Concept 2: Winning the vote is only the middle of failover, not the end</h3>
+<p>When <code>md-db-2</code> times out, it becomes a candidate for term <code>42</code>, votes for itself, and sends <code>RequestVote</code> messages containing its last log term and last log index. That metadata is the safety filter. <code>md-db-4</code> should grant its vote only if it has not already voted in term <code>42</code> and <code>md-db-2</code>'s log is at least as up to date as its own. If the most recent committed reservation entries existed only on <code>ny-db-3</code>, then <code>md-db-2</code> would not be safe to lead and should lose the election.</p>
+<p>In Harbor Point's incident, <code>md-db-2</code> has replicated through index <code>812944</code>, while <code>md-db-4</code> is one entry behind at <code>812943</code>. That makes <code>md-db-2</code> the only viable immediate successor. The state transition looks like this:</p>
+<div class="codehilite"><pre><span></span><code>follower(term 41)
+  -&gt; timeout
+candidate(term 42, vote for self)
+  -&gt; quorum votes
+leader-elect(term 42)
+  -&gt; commit a leader barrier / no-op entry
+active leader(term 42)
+</code></pre></div>
+
+<p>The "leader-elect" state is where many simplified explanations stop too early. In Raft-style systems, a newly elected leader often appends a no-op entry in its own term and replicates it to a quorum. That barrier confirms two things at once: the node really can reach a majority as leader, and the cluster now has a committed entry in the new term that establishes the commit boundary inherited from the previous leader. Until that happens, the node may have won the vote but still not be ready to acknowledge ordinary client writes with the guarantees Harbor Point wants.</p>
+<p>For shard <code>184</code>, the sequence is:</p>
+<div class="codehilite"><pre><span></span><code>09:17:00.980  md-db-2 becomes candidate for term 42
+09:17:01.015  md-db-4 grants vote after comparing logs
+09:17:01.016  md-db-2 has quorum (self + md-db-4)
+09:17:01.050  md-db-2 appends no-op entry at term 42
+09:17:01.090  md-db-4 acknowledges the no-op
+09:17:01.091  md-db-2 may now act as active leader
+</code></pre></div>
+
+<p>That distinction is production-relevant. If the node starts serving writes immediately after the vote but before it has established the new term's commit barrier, crash recovery and read-after-write behavior become harder to reason about. The failover clock that operators care about should therefore record both "won election" and "became active leader." They are close in healthy cases, but they are not the same event.</p>
+<h3>Concept 3: The failover path finishes only after publication, fencing, and client recovery</h3>
+<p>Once <code>md-db-2</code> is an active leader, Harbor Point still has to make the rest of the platform agree. The metadata service from <a href="034.html">034.md</a> publishes generation <code>42</code> for shard <code>184</code>, naming <code>md-db-2</code> as owner and fencing <code>ny-db-3</code>. Routers watching that metadata stream update their shard map, and new requests begin carrying generation <code>42</code>. Any server that still believes it can serve generation <code>41</code> must reject those requests or fail its lease checks.</p>
+<p>That gives Harbor Point a full outage equation:</p>
+<div class="codehilite"><pre><span></span><code>write unavailability
+  = failure detection
+  + election rounds
+  + leader activation barrier
+  + metadata publication and route update
+  + client retry / reconnect time
+</code></pre></div>
+
+<p>In the running incident, the first four stages finish by roughly <code>09:17:01.300</code>, but some application servers keep one stale TCP connection open to <code>ny-db-3</code> and only retry after a 500-millisecond write timeout. Users experience the system as "recovered around 09:17:01.8xx," even though the quorum chose a leader earlier. That is why failover dashboards usually need both control-plane timestamps and client-observed timestamps.</p>
+<p>Fencing is the other non-optional piece. A partially isolated <code>ny-db-3</code> might still be alive enough to answer requests from stale gateways. Consensus already prevents it from committing new entries without a quorum, but Harbor Point cannot rely on clients to understand that nuance. The old leader must lose its lease, reject writes tagged with the new generation, or be removed from routing quickly enough that clients do not keep treating it as authoritative. Safe failover is therefore not just "new leader available"; it is "old leader no longer believable."</p>
+<p>This is the bridge to <a href="036.html">036.md</a>. Leader election says who won term <code>42</code>, but leases and clock uncertainty determine when the cluster may safely treat reads as current during and after that handoff. Election mechanics choose the writer; time assumptions shape the read side of failover.</p>
+<h2>Troubleshooting</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: The cluster reports election completion in about one second, but clients still see write errors for two or three seconds.</p>
+<ul>
+<li><strong>Why it happens</strong>: Routing caches, metadata watch lag, connection reuse, or client retry timers dominate the later stages of the failover path.</li>
+<li><strong>Clarification / Fix</strong>: Break the timeline into election completion, active-leader time, metadata publication time, and first successful client retry. Lowering election timeout will not help if route propagation is the real bottleneck.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Leaders keep changing during transient latency spikes even though no replica has actually failed.</p>
+<ul>
+<li><strong>Why it happens</strong>: Election timeouts are too close to normal RTT variance, GC pauses, or storage stalls, so healthy leaders are repeatedly suspected.</li>
+<li><strong>Clarification / Fix</strong>: Tune heartbeat and election ranges from real latency distributions, not ideal-path benchmarks. A slightly slower but stable failover is safer than frequent false elections.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: The old leader still accepts traffic after the new leader is elected.</p>
+<ul>
+<li><strong>Why it happens</strong>: Election succeeded inside the quorum, but metadata publication, lease expiry, or generation fencing did not finish quickly enough.</li>
+<li><strong>Clarification / Fix</strong>: Make the failover path explicitly include stale-leader fencing. Measure how long old routes remain usable and fail closed when generation numbers or leadership leases disagree.</li>
+</ul>
+</li>
+</ul>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="034.html">034.md</a> made leader changes durable facts; this lesson shows the timed sequence that produces those facts</h3>
+<p>The previous lesson focused on the metadata record that says "generation <code>42</code> is real." This lesson fills in the timeline underneath that record: followers wait, one candidate wins, the new term establishes a commit barrier, and only then may the metadata service publish the new owner.</p>
+<h3>Connection 2: <a href="036.html">036.md</a> will turn the failover path into a read-safety question</h3>
+<p>Election tells Harbor Point which replica may coordinate writes after <code>ny-db-3</code> fails. The next lesson asks a subtler question: when can a leader or follower safely serve reads during the handoff if clocks are imperfect and leadership is represented by time-bounded leases?</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Extended Version)</a><ul>
+<li>Focus: Sections 5.2 and 5.4 explain election timing, randomized timeouts, and why leadership is tied to log completeness rather than speed alone.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/op-guide/failures/">etcd failure modes</a><ul>
+<li>Focus: Compare Harbor Point's failover path with a production Raft system's behavior when a leader disappears, quorum is lost, or clients keep talking to stale members.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub33002/">Paxos Made Live: An Engineering Perspective</a><ul>
+<li>Focus: Read how a real production system turned abstract leader election into operational timelines, alarms, and safety checks.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Failover is a timeline, not a moment</strong> - Detection, voting, activation, route publication, and client retry each consume part of the outage budget.</li>
+<li><strong>Election victory does not automatically mean write safety</strong> - A new leader still needs to prove it can establish the new term's commit boundary and fence the old authority.</li>
+<li><strong>The right tuning depends on which stage is slow</strong> - Shorter timeouts help only when detection dominates; they do nothing for stale routes, slow retries, or missing fencing.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point randomize election timeouts for followers of shard <code>184</code> instead of giving every replica the same timeout</strong>?</p>
+<ul>
+<li>A) To make leader failover unpredictable to clients</li>
+<li>B) To reduce the chance that multiple followers become candidates simultaneously and split the vote</li>
+<li>C) To let lagging replicas win leadership more easily</li>
+</ul>
+</li>
+<li>
+<p><strong>Why is <code>md-db-2</code> not considered fully ready to serve writes immediately after it wins quorum votes for term <code>42</code></strong>?</p>
+<ul>
+<li>A) Because it still needs to establish a leader barrier, such as committing a no-op in the new term, before the cluster can treat it as an active leader</li>
+<li>B) Because quorum votes are only advisory and do not actually change leadership</li>
+<li>C) Because a new leader must wait until the old leader has been physically powered off</li>
+</ul>
+</li>
+<li>
+<p><strong>If client-visible downtime is longer than the election itself, which explanation best fits the lesson's failover model</strong>?</p>
+<ul>
+<li>A) The election result must have been incorrect</li>
+<li>B) Later stages such as metadata publication, route cache updates, or client retries are consuming additional time</li>
+<li>C) Consensus protocols cannot restore availability after a leader failure</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Randomized timeouts reduce collisions between candidates and make a decisive election more likely. Option A confuses internal coordination with client-facing behavior, and option C is the opposite of the safety rule because lagging replicas should not gain an advantage.</p>
+<p><strong>2. A</strong>: Winning votes identifies the candidate, but the system still needs an activation barrier that proves the new leader can safely carry the cluster's history forward. Option B is false because quorum votes do change leadership, and option C is unnecessary because safe fencing does not require destroying the old machine.</p>
+<p><strong>3. B</strong>: The lesson's central point is that failover continues after the vote. Metadata propagation, stale-route eviction, and retry behavior often dominate what users experience. Option A jumps to correctness failure without evidence, and option C is wrong because consensus can restore write availability once a new quorum leader is active.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="034.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Cluster Metadata Services and Control Plane State</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="036.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Clock Uncertainty, Leases, and Safe Reads</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

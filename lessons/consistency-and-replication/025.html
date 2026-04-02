@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sagas and Outbox for Cross-Service Consistency - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Sagas and Outbox for Cross-Service Consistency</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 025 | Lesson ID: 424
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 424: Sagas and Outbox for Cross-Service Consistency</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A saga keeps each service commit local, and the transactional outbox makes the resulting message part of that same local commit; together they replace one global atomic commit with a replayable workflow that can advance, compensate, and recover under failure.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="024.html">07.md</a>, Harbor Point used two-phase commit to keep one reservation atomic across two shards inside a tightly controlled data system. That worked because every participant could enter prepared state, hold locks, and wait for one durable global decision. The platform now has to solve a different problem. A reservation for <code>CA-MUNI-77</code> begins in the Inventory service, changes desk exposure in the Risk service, and eventually triggers downstream settlement preparation. Those systems do not share one storage engine, one lock table, or one recovery protocol.</p>
+<p>The naive implementation is the classic dual write. Inventory decrements available quantity in its own database and then publishes <code>InventoryReserved</code> to the broker. If the process crashes after the database commit but before the publish, Risk never hears about the reservation. If it publishes first and the database commit fails, Risk reacts to an event for a reservation that does not exist. That gap is small in time and huge in consequence. A few milliseconds of bad ordering is enough to create phantom risk, orphaned inventory holds, or settlement work for trades that were never truly accepted.</p>
+<p>The outbox pattern closes that first gap. Inventory writes its reservation row and an outbox row in the same local transaction, so "state changed" and "message must eventually be published" become one durable fact. A relay can publish later, retry later, or even fail over to another process, but it is replaying committed intent instead of guessing what the service meant to publish. The saga pattern then uses those durable events to move the workflow from one service to the next. If Risk rejects the desk because it would exceed its intraday limit, the workflow does not magically roll back the past. It issues a compensating action that releases the inventory hold through another local transaction.</p>
+<p>That is the mental shift. Sagas are not "distributed transactions, but easier." They are explicit workflow state machines for systems that cannot or should not hold one global prepared state. The next lesson, <a href="026.html">09.md</a>, follows directly from this point: once the outbox is the authoritative source of what must be published, change data capture from the write-ahead log becomes a stronger way to ship those rows than an ad hoc polling loop.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation flow is latency-sensitive, but its bigger constraint is cross-service correctness. At 09:31, desk <code>ALPHA</code> submits a <code>$2M</code> reservation for <code>CA-MUNI-77</code>. Inventory must hold the bonds immediately so another desk cannot oversell them. Risk must decide whether that extra exposure still fits the desk's limit. Settlement preparation must only start if the reservation is actually accepted. Those are separate responsibilities owned by separate services, and the product does not get to pretend they are one database transaction just because the API call looks singular from the trader's screen.</p>
+<p>This is exactly where many production systems fail in subtle ways. A broker publish that is "usually immediate" gets delayed. One consumer retries after a timeout and replays the same step twice. A service deploy lands during the handoff between local commit and message emission. The result is not a dramatic crash. It is a workflow that stalls in an ambiguous state: inventory held, risk unchanged, customer told "pending," operators grepping logs to reconstruct what should happen next.</p>
+<p>Sagas and outbox patterns matter because they make those states first-class instead of accidental. The workflow becomes inspectable. Each service owns one local transaction at a time. Every inter-service step becomes durable, replayable, and idempotent by design. The trade-off is equally real: Harbor Point gives up the simplicity of one atomic outcome in exchange for better fit across service boundaries and external side effects.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why the dual-write gap appears at service boundaries</strong> - Show why "commit the database, then publish the event" is not a safe cross-service protocol.</li>
+<li><strong>Trace a reservation saga end to end</strong> - Follow Harbor Point's inventory hold, risk approval or rejection, and compensation path through durable local steps.</li>
+<li><strong>Evaluate when saga plus outbox is the right tool</strong> - Distinguish workflows that need local commits plus compensation from cases that should stay inside one database or one stricter commit domain.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The transactional outbox turns "publish this event" into durable local state</h3>
+<p>Start with the first service in Harbor Point's reservation flow. Inventory receives <code>Reserve(CA-MUNI-77, desk=ALPHA, qty=2_000_000, saga_id=8841)</code>. It has exactly one local invariant it can enforce by itself: either the hold row exists and available quantity is reduced, or nothing changed. What it cannot safely do is promise "and the message definitely reached Kafka" as part of that same database transaction if the broker is outside the database's commit protocol.</p>
+<p>The outbox pattern fixes that by narrowing the atomic boundary. Inventory opens one local transaction, inserts or updates the domain rows for the hold, and also inserts an outbox row such as <code>event_id=evt-8841-1</code>, <code>topic=inventory.reserved</code>, <code>payload=...</code>, <code>aggregate_id=CA-MUNI-77</code>, <code>saga_id=8841</code>. When the transaction commits, Harbor Point knows two things are true together: the inventory hold exists, and there is durable evidence that this hold must be published. If the process crashes immediately afterward, another relay can still discover the outbox row and publish it later.</p>
+<div class="codehilite"><pre><span></span><code>Inventory request
+   |
+   v
++-----------------------------+
+| local DB transaction        |
+| 1. decrement available qty  |
+| 2. insert reservation hold  |
+| 3. insert outbox row        |
++-----------------------------+
+   |
+   v
+commit
+   |
+   v
+relay publishes inventory.reserved
+</code></pre></div>
+
+<p>One compact implementation looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">reserve_inventory</span><span class="p">(</span><span class="n">cmd</span><span class="p">):</span>
+    <span class="k">with</span> <span class="n">db</span><span class="o">.</span><span class="n">transaction</span><span class="p">()</span> <span class="k">as</span> <span class="n">tx</span><span class="p">:</span>
+        <span class="n">hold</span> <span class="o">=</span> <span class="n">tx</span><span class="o">.</span><span class="n">create_hold</span><span class="p">(</span><span class="n">cmd</span><span class="o">.</span><span class="n">instrument</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">qty</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">desk</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">saga_id</span><span class="p">)</span>
+        <span class="n">tx</span><span class="o">.</span><span class="n">insert_outbox</span><span class="p">(</span>
+            <span class="n">event_id</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">cmd</span><span class="o">.</span><span class="n">saga_id</span><span class="si">}</span><span class="s2">:inventory-reserved&quot;</span><span class="p">,</span>
+            <span class="n">topic</span><span class="o">=</span><span class="s2">&quot;inventory.reserved&quot;</span><span class="p">,</span>
+            <span class="n">aggregate_id</span><span class="o">=</span><span class="n">cmd</span><span class="o">.</span><span class="n">instrument</span><span class="p">,</span>
+            <span class="n">payload</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;hold_id&quot;</span><span class="p">:</span> <span class="n">hold</span><span class="o">.</span><span class="n">id</span><span class="p">,</span> <span class="s2">&quot;desk&quot;</span><span class="p">:</span> <span class="n">cmd</span><span class="o">.</span><span class="n">desk</span><span class="p">,</span> <span class="s2">&quot;qty&quot;</span><span class="p">:</span> <span class="n">cmd</span><span class="o">.</span><span class="n">qty</span><span class="p">},</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p>The mechanism is small, but the operational implications are large. The relay is now allowed to be at-least-once because the event record itself is durable and consumers can deduplicate on <code>event_id</code>. Harbor Point can also monitor outbox lag as a direct measure of "how long committed business intent waits before the rest of the platform sees it." The trade-off is that publication is no longer synchronous with the request path. The workflow gains durability and replayability, but it must tolerate a short window where the Inventory database is ahead of the rest of the system.</p>
+<p>Ordering matters here too. If multiple events for <code>CA-MUNI-77</code> are published out of order, Risk may process a release before the matching hold. Production systems therefore usually partition by aggregate or saga identifier and keep the outbox schema explicit about event ordering, deduplication keys, and publish status. The outbox solves the local database-plus-broker race. It does not remove the need to design consumer semantics carefully.</p>
+<h3>Concept 2: A saga coordinates cross-service progress through durable steps and compensations</h3>
+<p>Once Inventory publishes <code>inventory.reserved</code>, Harbor Point still does not have a confirmed reservation. It has one successful local step in a larger workflow. The saga is the mechanism that tracks that workflow across services. In Harbor Point's case, an orchestrated saga is the clearest design: a Reservation Workflow service records the current state for <code>saga_id=8841</code>, listens for step outcomes, and decides what command comes next.</p>
+<p>For one reservation, the path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>1. Inventory: hold bonds for CA-MUNI-77
+2. Workflow: wait for inventory.reserved
+3. Risk: apply provisional exposure for desk ALPHA
+4a. If accepted: emit reservation.confirmed and continue to settlement prep
+4b. If rejected: command Inventory to release the hold
+5. Inventory: publish inventory.released as compensation complete
+</code></pre></div>
+
+<p>The important point is that compensation is a new business action, not an undo button inside someone else's database. If Risk rejects the reservation because desk <code>ALPHA</code> would exceed its limit, Inventory runs a fresh local transaction that releases the hold and writes another outbox event. That means other systems may briefly observe <code>inventory.reserved</code> before they observe <code>inventory.released</code>. Harbor Point is not promising invisible rollback. It is promising that the workflow will converge through explicit next steps.</p>
+<p>That requirement changes the data model. Every participating service needs a stable idempotency key such as <code>saga_id + step_name</code>, plus a record of whether it has already applied that step. Risk cannot increment exposure twice just because <code>inventory.reserved</code> was redelivered after a consumer restart. The workflow service also needs timeouts and a durable saga state table. If the response from Risk never arrives, Harbor Point must know whether to retry the command, mark the workflow for operator review, or expire the reservation hold after a deadline.</p>
+<p>The gain is that each service keeps ownership of its own storage and invariants. Inventory knows inventory. Risk knows exposure. Settlement knows downstream handoff rules. No service has to hold a prepared lock while waiting on every other service. The cost is more explicit state. Harbor Point now carries statuses like <code>PENDING_RISK</code>, <code>REJECTED_COMPENSATING</code>, and <code>CONFIRMED</code>, and those states are part of the real production contract rather than temporary implementation detail.</p>
+<h3>Concept 3: The hard part is not starting a saga, but choosing safe boundaries for compensation and visibility</h3>
+<p>The biggest design mistake with sagas is to think every workflow can be "compensated later" without changing the business contract. That is false. Releasing an inventory hold is compensable because the original hold is still under Harbor Point's control. Sending an irreversible instruction to an external settlement network is different. Once the clearing rail accepts a message, Harbor Point may need a cancel message, a reversal, or a manual exception process. There may be no true rollback.</p>
+<p>That is why production saga design usually orders steps from easiest to compensate toward hardest to compensate. Harbor Point should reserve inventory first, because releasing it is straightforward. It should apply provisional risk next, because removing provisional exposure is still local and reversible. It should send the hardest-to-reverse external instruction only after the earlier business conditions are satisfied. In other words, sagas are as much about workflow sequencing as about messaging.</p>
+<p>This is also where the comparison with <a href="024.html">07.md</a> becomes sharp. Two-phase commit resolves uncertainty before state becomes visible by forcing everyone to wait on one commit decision. Saga plus outbox allows intermediate committed states, then resolves uncertainty by driving the workflow forward or by compensating after failure. One approach spends lock time and availability to buy atomicity. The other spends workflow complexity and observability to fit across service boundaries.</p>
+<p>The outbox relay choice is part of that trade-off. A simple polling process can work for moderate throughput, but as Harbor Point's volume rises the team will care about publish latency, ordering, and relay load on the primary database. That pressure leads directly to <a href="026.html">09.md</a>: change data capture from the write-ahead log is often the cleaner way to externalize committed outbox rows without building a brittle polling system around <code>published_at IS NULL</code>.</p>
+<p>The practical lesson is that "eventual consistency" is not a permission slip for vague behavior. Harbor Point still needs concrete guarantees: which states can be observed, how duplicates are handled, how long a reservation may sit in <code>PENDING_RISK</code>, and what operator path exists when compensation itself fails. A saga is production-ready only when those boundaries are explicit.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Risk exposure is incremented twice for the same reservation after a consumer restart.</p>
+<p><strong>Why it happens / is confusing</strong>: The outbox relay and broker are typically at-least-once, so a redelivered <code>inventory.reserved</code> event is normal. If Risk treats message delivery as uniqueness, a retry becomes a duplicate business action.</p>
+<p><strong>Clarification / Fix</strong>: Make the consumer idempotent on a stable business key such as <code>saga_id + step_name</code> or <code>event_id</code>. Store that deduplication decision in the same local transaction as the exposure update.</p>
+<p><strong>Issue</strong>: Inventory looks correct in its own database, but downstream services are minutes behind during peak traffic.</p>
+<p><strong>Why it happens / is confusing</strong>: The outbox closes correctness gaps, but it does not guarantee immediate publication. A slow poller, poor indexing, or relay outage turns the outbox into a growing backlog.</p>
+<p><strong>Clarification / Fix</strong>: Track outbox depth and oldest-unpublished age as first-class lag metrics. Index the unpublished rows well, archive sent rows aggressively, and decide whether a WAL-based CDC relay is warranted.</p>
+<p><strong>Issue</strong>: A reservation reaches the external settlement adapter, then Risk later rejects the workflow and compensation cannot fully undo the side effect.</p>
+<p><strong>Why it happens / is confusing</strong>: The workflow put a hard-to-reverse side effect too early in the saga, assuming all failures could be repaired with a simple compensating transaction.</p>
+<p><strong>Clarification / Fix</strong>: Move irreversible actions to the end of the saga, or model them as a separate workflow with explicit cancel or reversal semantics. If no safe compensation exists, do not treat the step as casually reversible.</p>
+<p><strong>Issue</strong>: Operators see many reservations stuck in <code>PENDING_RISK</code> after a deploy, but no service reports a hard error.</p>
+<p><strong>Why it happens / is confusing</strong>: A saga can stall quietly when a consumer group is paused, a topic partition is misrouted, or the workflow service missed a timeout transition.</p>
+<p><strong>Clarification / Fix</strong>: Give each saga state an age budget, alert on overdue transitions, and persist timeout deadlines in the workflow store so another worker can resume or compensate stalled reservations.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="024.html">07.md</a> and this lesson solve the same cross-boundary correctness problem with opposite failure strategies</h3>
+<p>Two-phase commit tries to prevent any partial outcome from becoming visible before one global decision is durable. Saga plus outbox accepts that partial local outcomes will exist, then makes the workflow durable enough to continue or compensate afterward. Harbor Point should prefer 2PC only where participants can actually support prepared state and the business invariant cannot tolerate visible intermediate commits.</p>
+<h3>Connection 2: <a href="026.html">09.md</a> is the transport refinement for the outbox side of this design</h3>
+<p>An outbox row is useful only if the platform can externalize it reliably and in order. Polling the application tables is the simplest relay, but WAL-based change data capture often becomes the better production mechanism because it follows the database's own commit stream and reduces custom publish logic.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[ARTICLE] <a href="https://microservices.io/patterns/data/saga.html">Pattern: Saga</a><ul>
+<li>Focus: Explains why sagas use a sequence of local transactions and compensating actions instead of one distributed commit.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://microservices.io/patterns/data/transactional-outbox.html">Pattern: Transactional Outbox</a><ul>
+<li>Focus: Shows the dual-write failure window and why the outbox record must be inserted in the same transaction as the domain change.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html">Debezium Outbox Event Router</a><ul>
+<li>Focus: A concrete CDC-based implementation for publishing committed outbox rows to a broker without writing a custom relay from scratch.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://ics.uci.edu/~cs223/papers/cidr07p15.pdf">Life Beyond Distributed Transactions: an Apostate's Opinion</a><ul>
+<li>Focus: A classic argument for designing around idempotent messages, tentative operations, and semantic recovery instead of relying on global distributed transactions everywhere.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>The outbox solves the local dual-write problem, not the whole workflow problem</strong> - It guarantees that a committed state change and the intent to publish travel together, but downstream consumers still need ordering and idempotency.</li>
+<li><strong>A saga is a durable state machine, not a hidden rollback layer</strong> - Failures are repaired by explicit compensating actions that create new committed facts.</li>
+<li><strong>Compensation safety depends on step ordering</strong> - Put the easiest-to-reverse local actions early and the hardest-to-reverse external effects late, then measure lag and stuck-state age as production signals.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point insert the outbox row in the same local transaction as the inventory hold?</strong></p>
+<ul>
+<li>A) To guarantee that the service can never publish duplicate events</li>
+<li>B) To make the inventory change and the obligation to publish its event durable as one committed fact</li>
+<li>C) To let the broker participate directly in the database's lock manager</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the most accurate description of a compensation step in Harbor Point's reservation saga?</strong></p>
+<ul>
+<li>A) It is a new local transaction that moves the workflow toward a safe business state after a prior step already committed</li>
+<li>B) It is a database rollback that erases every externally visible effect of the prior step</li>
+<li>C) It is a best-effort log message telling operators that the workflow probably failed</li>
+</ul>
+</li>
+<li>
+<p><strong>When is saga plus outbox usually a better fit than two-phase commit?</strong></p>
+<ul>
+<li>A) When the workflow spans independent services or external side effects that cannot hold one shared prepared state safely</li>
+<li>B) When the system requires every observer to see only one instantaneous atomic outcome</li>
+<li>C) When the team wants to avoid idempotency keys and workflow monitoring</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The local transaction makes "inventory changed" and "this event must be published" succeed or fail together. Option A is false because duplicates can still appear in at-least-once delivery, and option C is false because the broker is not joining the database's local lock protocol.</p>
+<p><strong>2. A</strong>: Compensation creates a new committed step, such as releasing the hold, after another step already became durable. Option B describes a rollback fantasy that does not match cross-service visibility, and option C ignores the fact that compensation is part of the business workflow itself.</p>
+<p><strong>3. A</strong>: Saga plus outbox fits when Harbor Point cannot depend on all participants sharing one strict commit protocol, especially once external systems enter the path. Option B describes the kind of invariant that points back toward 2PC or a single commit domain, and option C is the opposite of reality because sagas need more idempotency and monitoring, not less.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="024.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Distributed Transactions and Two-Phase Commit</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="026.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Change Data Capture from WAL Streams</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

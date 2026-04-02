@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Raft Log Replication and Commit Semantics - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Raft Log Replication and Commit Semantics</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consensus-and-coordination.html">Consensus and Coordination</a>
+        </p>
+        <p>
+          Sequence: 006 | Lesson ID: 214
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 214: Raft Log Replication and Commit Semantics</h1>
+<blockquote>
+<p><strong>In Raft, replicating an entry and committing an entry are not the same event. The whole safety story depends on that gap being handled carefully.</strong></p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>Once Raft makes the leader explicit, the next instinct is simple: the leader receives a command, sends it to followers, and once enough followers have it, the command is done.</p>
+<p>That intuition is close, but dangerously incomplete.</p>
+<p>The subtlety is that "an entry exists on several machines" does not automatically mean "this entry is now part of the durable committed history the cluster may safely apply." There is a gap between:</p>
+<ul>
+<li><strong>replicated</strong>: some set of nodes has the entry</li>
+<li><strong>committed</strong>: the protocol can now treat the entry as part of the authoritative log</li>
+</ul>
+<p>That gap is the aha for this lesson.</p>
+<p>Raft needs it because leadership can change. A leader may replicate an entry to some followers and then disappear before the cluster has enough evidence that this entry is safe to treat as committed. A later leader must not accidentally build a different history that makes an earlier unsafe assumption visible to users.</p>
+<p>So Raft log replication is not just "copy bytes to followers." It is:</p>
+<ul>
+<li>append entries under the current leader</li>
+<li>check log consistency on followers</li>
+<li>track replication progress carefully</li>
+<li>only advance commit when the protocol's safety conditions are satisfied</li>
+</ul>
+<p>That is what makes Raft a consensus protocol rather than just leader-led shipping of log records.</p>
+<h2>Why This Matters</h2>
+<p>Suppose a leader appends entry <code>42</code> and successfully sends it to one follower, but crashes before reaching a majority. The entry exists in multiple places. Is it safe for any node to apply it to the state machine?</p>
+<p>If the answer were "yes, because replication happened," the cluster could expose state that later disappears when a new leader overwrites or bypasses that entry. That would break the whole illusion of a single authoritative history.</p>
+<p>This is why Raft's commit semantics matter so much:</p>
+<ul>
+<li>they separate "seen by some replicas" from "chosen by the protocol"</li>
+<li>they define when it is safe to apply a command to the state machine</li>
+<li>they explain a huge amount of real operational behavior, including lag, catch-up, and failover outcomes</li>
+</ul>
+<p>In production, many confusing bugs or misunderstandings live exactly here:</p>
+<ul>
+<li>assuming append success means client-visible durability</li>
+<li>assuming follower logs must always match perfectly in real time</li>
+<li>assuming a leader can commit any old replicated entry simply because it appears on several nodes</li>
+</ul>
+<p>If the learner gets commit semantics right, later topics like membership change, snapshots, and production debugging become much easier.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Differentiate replication from commitment</strong> - Explain why an entry can be present on followers before it is safe to treat as committed.</li>
+<li><strong>Trace the Raft replication path</strong> - Understand how <code>AppendEntries</code>, log matching, and follower rollback/repair maintain a coherent log.</li>
+<li><strong>Reason about commit safely</strong> - Describe why the leader tracks replication progress and why commit semantics are tied to majority and term rules.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The Leader Replicates Entries, but Followers Must Prove Log Continuity Before Accepting Them</h3>
+<p><strong>Concrete example / mini-scenario</strong>: The leader wants to append entry <code>[(term 8, index 15, cmd=X)]</code> to a follower. That follower may already have a different suffix from an earlier leader.</p>
+<p>This is why Raft's replication RPC carries more than the new entry itself. The leader also sends:</p>
+<ul>
+<li>the index immediately before the new entries</li>
+<li>the term at that previous index</li>
+</ul>
+<p>That previous-entry check is the key to safe repair.</p>
+<p>If the follower agrees that:</p>
+<ul>
+<li>"yes, I do have that previous index and term"</li>
+</ul>
+<p>then the leader and follower share a common prefix, and the new entries can be appended after it.</p>
+<p>If the follower disagrees, it rejects the append and the leader backs up, trying an earlier prefix until it finds the point where their logs match.</p>
+<p>ASCII intuition:</p>
+<div class="codehilite"><pre><span></span><code>leader:   [1][2][3][4][5][6]
+follower: [1][2][3][X][Y]
+
+find matching prefix first
+then replace divergent suffix
+</code></pre></div>
+
+<p>This gives us the <strong>log matching property</strong> intuition:</p>
+<ul>
+<li>if two logs contain an entry with the same index and term, they share the same prefix up to that point</li>
+</ul>
+<p>That property is not free. It is maintained by this constant "prove the prefix, then append" discipline.</p>
+<p>So Raft replication is really:</p>
+<div class="codehilite"><pre><span></span><code>1. identify shared prefix
+2. repair divergence if needed
+3. append new entries after the known-good prefix
+</code></pre></div>
+
+<p>That is much more than blind shipping.</p>
+<h3>Concept 2: Replicated Does Not Mean Committed</h3>
+<p><strong>Concrete example / mini-scenario</strong>: The leader writes a new entry to itself and one follower in a five-node cluster. Three other followers have not acknowledged it yet.</p>
+<p>At this moment, the entry is clearly replicated somewhere. But it is not yet committed, because the protocol does not yet have enough evidence that this entry belongs to the history a future leader will be forced to preserve.</p>
+<p>The simplest intuition is:</p>
+<ul>
+<li><strong>replication</strong> is about placement</li>
+<li><strong>commit</strong> is about protocol authority</li>
+</ul>
+<p>Raft leaders therefore track follower progress, commonly via ideas like <code>matchIndex</code> and <code>nextIndex</code>:</p>
+<ul>
+<li><code>nextIndex</code>: where the leader should next try to append on that follower</li>
+<li><code>matchIndex</code>: the highest log index that follower is known to store</li>
+</ul>
+<p>The leader uses this information to ask:</p>
+<ul>
+<li>do a majority of replicas now store this entry?</li>
+</ul>
+<p>Only when the answer becomes strong enough does the leader advance the commit index.</p>
+<p>ASCII sketch:</p>
+<div class="codehilite"><pre><span></span><code>leader log:   40 41 42 43
+matchIndex:
+  leader   -&gt; 43
+  follower1-&gt; 43
+  follower2-&gt; 42
+  follower3-&gt; 39
+  follower4-&gt; 42
+
+majority has index 42
+=&gt; 42 may be eligible for commit
+</code></pre></div>
+
+<p>This is the heart of the lesson. The system can know that an entry exists before it knows that the cluster may now treat it as committed truth.</p>
+<p>That distinction is what prevents temporary replication from becoming premature externally visible state.</p>
+<h3>Concept 3: Commit Semantics Protect the State Machine from Unstable History</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A leader from term <code>8</code> replicates an entry widely but then fails. A leader from term <code>9</code> is elected. Which entries can now safely be treated as committed and applied?</p>
+<p>This is where Raft's commit rules become subtle and important.</p>
+<p>Leaders do not just wave entries into permanence because those entries appear in many places. They need to respect the conditions that guarantee a future leader cannot safely replace the history beneath them.</p>
+<p>The practical mental model is:</p>
+<div class="codehilite"><pre><span></span><code>apply to state machine only after commit
+commit only after the protocol has enough evidence that this log prefix is now authoritative
+</code></pre></div>
+
+<p>This is why Raft separates:</p>
+<ul>
+<li><strong>last log index stored</strong></li>
+<li><strong>commit index</strong></li>
+<li><strong>last applied</strong></li>
+</ul>
+<p>Those are different pieces of state:</p>
+<ul>
+<li>an entry may be present in the log</li>
+<li>later become committed</li>
+<li>only then be applied to the deterministic state machine</li>
+</ul>
+<p>That ordering is what keeps externally visible behavior aligned with consensus safety.</p>
+<p>It also explains why client semantics are subtle. If a leader accepts a command but crashes before commitment, the command may need retry or may appear not to have taken effect even though it existed temporarily in some logs.</p>
+<p>So the deeper point is:</p>
+<ul>
+<li>Raft is not only replicating logs</li>
+<li>it is managing when a log prefix becomes safe enough to expose as real system state</li>
+</ul>
+<p>That is what "commit semantics" actually means.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: "If an entry is on multiple nodes, why isn't it already committed?"</p>
+<p><strong>Why it happens / is confusing</strong>: Physical distribution feels like proof of permanence.</p>
+<p><strong>Clarification / Fix</strong>: Because leadership may still change and some replicated entries may not yet be forced into the future authoritative history. Commitment is a protocol guarantee, not just a storage count.</p>
+<p><strong>Issue</strong>: "Why do followers sometimes delete entries they already had?"</p>
+<p><strong>Why it happens / is confusing</strong>: Deleting a replicated entry can look like data loss.</p>
+<p><strong>Clarification / Fix</strong>: Those entries were part of a divergent, not-yet-authoritative suffix. Followers repair their logs to match the leader's confirmed prefix so the cluster can recover one consistent history.</p>
+<p><strong>Issue</strong>: "Why not apply entries as soon as the leader writes them locally?"</p>
+<p><strong>Why it happens / is confusing</strong>: It seems faster and simpler.</p>
+<p><strong>Clarification / Fix</strong>: Because the leader alone is not enough to define committed truth. Applying too early would expose state that could later be rolled back by leadership change.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Raft Log Replication &lt;-&gt; Strong Leadership</h3>
+<p><strong>The parallel</strong>: The previous lesson made the leader explicit. This lesson shows the operational consequence: the leader becomes the single normal writer of new entries and the coordinator of follower repair and commit advancement.</p>
+<p><strong>Real-world case</strong>: Many real Raft incidents are actually replication-health incidents: lagging followers, stuck commit index, or repeated prefix mismatch and catch-up.</p>
+<h3>Connection 2: Raft Log Replication &lt;-&gt; Membership Changes</h3>
+<p><strong>The parallel</strong>: Once we understand what commit means, we can safely talk about changing the voting set itself. Membership change is hard precisely because the meaning of "majority" is changing while the log continues to advance.</p>
+<p><strong>Real-world case</strong>: Joint consensus can be seen as a careful extension of commit semantics to a period where two configurations must overlap safely.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] In Search of an Understandable Consensus Algorithm (Raft)<ul>
+<li>Link: <a href="https://raft.github.io/raft.pdf">https://raft.github.io/raft.pdf</a></li>
+<li>Focus: Re-read the log replication and safety sections now that you are explicitly watching the distinction between append, commit, and apply.</li>
+</ul>
+</li>
+<li>[DOC] The Raft Consensus Algorithm<ul>
+<li>Link: <a href="https://raft.github.io/">https://raft.github.io/</a></li>
+<li>Focus: Useful for diagrams and supplementary references that make the replication flow more concrete.</li>
+</ul>
+</li>
+<li>[ARTICLE] The Secret Lives of Data: Raft<ul>
+<li>Link: <a href="https://thesecretlivesofdata.com/raft/">https://thesecretlivesofdata.com/raft/</a></li>
+<li>Focus: Helpful visualization for seeing leader append, follower catch-up, and commit progression.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Replication and commitment are different protocol states</strong> - An entry can exist on several nodes before it is safe to apply.</li>
+<li><strong>Prefix matching is the core repair mechanism</strong> - Leaders do not blindly append; they prove shared history, then repair divergence and extend the log.</li>
+<li><strong>Commit semantics protect the state machine</strong> - Only committed entries become externally visible authoritative history.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why does Raft include previous-index and previous-term information in append requests?</strong></p>
+<ul>
+<li>A) To prove that leader and follower share a common prefix before extending the log.</li>
+<li>B) To compress the packet.</li>
+<li>C) To avoid using quorums.</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the clearest difference between a replicated entry and a committed entry?</strong></p>
+<ul>
+<li>A) Replicated means it was written on disk somewhere; committed means the protocol now treats it as part of authoritative history.</li>
+<li>B) There is no real difference.</li>
+<li>C) Committed means every node has already applied it.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why should the state machine wait for commit before applying an entry?</strong></p>
+<ul>
+<li>A) Because leaders are always slow.</li>
+<li>B) Because an uncommitted replicated suffix may still be replaced after leadership changes.</li>
+<li>C) Because followers cannot store entries before commit.</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The previous-entry metadata is how the leader verifies shared prefix and safely repairs divergent follower logs.</p>
+<p><strong>2. A</strong>: Replication is a storage/distribution fact; commitment is a consensus fact about authoritative history.</p>
+<p><strong>3. B</strong>: Applying too early would expose state derived from a suffix that the cluster may not yet be forced to keep.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="005.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Raft Design Principles and Strong Leadership</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="007.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Raft Membership Changes and Joint Consensus</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consensus-and-coordination.html">← Back to Consensus and Coordination</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Global Secondary Indexes Across Shards - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Global Secondary Indexes Across Shards</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 029 | Lesson ID: 428
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 428: Global Secondary Indexes Across Shards</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Once a table is sharded by one key and queried by another, a global secondary index becomes its own distributed data structure, with separate shards, separate write amplification, and separate correctness hazards that must stay aligned with the base rows.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="028.html">11.md</a>, Harbor Point learned that a replica can answer quickly and still be too old for a session-sensitive read. Now the team has a different pressure. The <code>bond_reservations</code> table is sharded by <code>desk_id</code> so the 09:30 market burst no longer crushes a single primary, but compliance still needs a fast answer to: "show every open reservation for issuer <code>CA-MUNI</code> across all desks."</p>
+<p>The first instinct is usually wrong: "add an index on <code>issuer_id</code>." A local secondary index on each shard helps only after the router has already fanned out to every shard. The expensive part is still there. Harbor Point has not solved the lookup problem; it has only made each shard's local scan cheaper.</p>
+<p>The real design shift is to treat the index as another table with another partitioning rule. Harbor Point creates <code>gsi_open_by_issuer</code>, sharded by <code>issuer_id</code>, where each entry points to the base reservation's home shard and primary key. Now an issuer lookup can go straight to the relevant index shard, find the matching reservation IDs, and then fetch the base rows that are still needed.</p>
+<p>That is the important mental model: a global secondary index is not a schema decoration. It is a second distributed write path. When reservation <code>R-88421</code> changes from <code>open</code> to <code>released</code> on data shard <code>D5</code>, the system must also delete or invalidate the corresponding entry on index shard <code>I3</code>. If those state transitions drift apart, the query is wrong even when every shard is healthy in isolation. That is why this lesson sits naturally between <a href="028.html">11.md</a>, which focused on read freshness, and <a href="030.html">13.md</a>, which will ask how much of this derived state must survive restore and point-in-time recovery.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's sharding decision is sensible. Partitioning <code>bond_reservations</code> by <code>desk_id</code> spreads write traffic, keeps desk-local workflows fast, and avoids one giant write hotspot during trading hours. The problem is that production systems are rarely queried by exactly the same key they use for partitioning. Risk, compliance, and search workflows nearly always want alternate access paths.</p>
+<p>Without a global secondary index, the query <code>WHERE issuer_id = 'CA-MUNI' AND status = 'open'</code> becomes a scatter-gather operation over every desk shard. That may still work at small scale. It gets expensive once the system holds millions of reservations, each shard has its own backlog profile, and the endpoint has a real latency objective during the busiest minute of the day. Tail latency is now tied to the slowest shard in the fan-out.</p>
+<p>A global secondary index fixes the read shape by precomputing the alternate path. The endpoint can route by <code>issuer_id</code>, not by <code>desk_id</code>, and fetch only the reservations that actually match. The cost is that every relevant write now has at least two storage responsibilities: maintain the source row and maintain the index row. Harbor Point is trading read fan-out for write amplification and cross-shard consistency work.</p>
+<p>That trade is often worth it, but only if the team is honest about what the index is. It is not free performance. It is derived state with its own shards, failure modes, lag surface, and repair plan. If compliance treats the index answer as authoritative, operations must be able to say whether the index is current, how stale it can become, and how it is repaired after crashes, retries, or rebalancing.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why local indexes stop helping once a query crosses shard boundaries</strong> - Distinguish scatter-gather with per-shard indexes from a true global secondary index that is partitioned by the alternate lookup key.</li>
+<li><strong>Trace how a base-row write turns into index mutations on different shards</strong> - Follow inserts, updates, deletes, retries, and stale-entry cleanup for Harbor Point's issuer lookup path.</li>
+<li><strong>Evaluate the production trade-offs of global secondary indexes</strong> - Decide when the read-latency win justifies the extra write coordination, hotspot risk, and repair machinery.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A global secondary index is a separately sharded lookup structure</h3>
+<p>Harbor Point's base table is partitioned by <code>desk_id</code>, which is a good fit for the write path because most reservation updates originate from desk-local workflows. That layout says nothing about issuer-centric queries. If the router receives <code>GET /issuers/CA-MUNI/open-reservations</code>, it cannot infer which desk shards might contain matching rows, because <code>issuer_id</code> is not the partition key.</p>
+<p>This is where local and global indexes diverge. A local secondary index on each desk shard can speed up the search inside that shard, but the router still has to ask every shard whether it owns any <code>CA-MUNI</code> rows. The cluster has simply become "many efficient local lookups plus one expensive fan-out." A global secondary index changes the shape of the problem by materializing a second access path that is itself partitioned by the alternate key.</p>
+<p>Harbor Point's index entries might look like this:</p>
+<div class="codehilite"><pre><span></span><code>index key:   (issuer_id, status, reservation_id)
+payload:     home_shard, row_pk, row_version, desk_id, notional
+index shard: hash(issuer_id)
+</code></pre></div>
+
+<p>With that structure, every <code>CA-MUNI</code> lookup routes to the same index shard family. The read path becomes:</p>
+<div class="codehilite"><pre><span></span><code>issuer lookup for CA-MUNI
+        |
+        v
+index shard I3 for hash(&quot;CA-MUNI&quot;)
+        |
+        v
+reservation ids + home shards for matching open rows
+        |
+        v
+fetch base rows from D1, D5, D7 as needed
+</code></pre></div>
+
+<p>The payload choice matters. A pointer-style index stores only enough to find the base row, which keeps the index smaller and cheaper to update. A covering index duplicates read-mostly fields such as <code>desk_id</code>, <code>notional</code>, or <code>reservation_ts</code>, which can avoid the second hop for some endpoints. Harbor Point must decide whether the saved read latency is worth duplicating more bytes and widening every index update.</p>
+<p>The trade-off is now concrete. The system gains a targeted lookup path for non-shard-key queries, but it also creates a second partition map and a second place where skew can appear. If one issuer becomes disproportionately hot, the problem moves from "all desk shards are queried" to "one index shard is overloaded." Global indexes remove one form of fan-out while potentially concentrating another.</p>
+<h3>Concept 2: Correct index maintenance means transforming row changes into cross-shard mutations</h3>
+<p>Suppose desk <code>ALPHA</code> creates reservation <code>R-88421</code> for issuer <code>CA-MUNI</code>, and the base row lands on shard <code>D5</code> because <code>desk_id='ALPHA'</code>. Harbor Point also wants the row to appear in <code>gsi_open_by_issuer</code> on index shard <code>I3</code>. That means one logical user action produces at least two physical state changes:</p>
+<ol>
+<li>insert or update the base reservation on <code>D5</code></li>
+<li>insert or update the issuer index entry on <code>I3</code></li>
+</ol>
+<p>The same issue shows up on updates. If <code>R-88421</code> changes from <code>open</code> to <code>released</code>, the old row contributed to the index and the new row no longer should. If the issuer changes from <code>CA-MUNI</code> to <code>NY-MUNI</code>, Harbor Point must delete the old index key and insert a new one on a different index shard. If the row moves during resharding, the index payload's <code>home_shard</code> must change too. Global indexes are therefore maintained from <code>before</code> and <code>after</code> images, not from the SQL verb alone.</p>
+<p>Harbor Point's mutation builder can be reasoned about like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">issuer_index_mutations</span><span class="p">(</span><span class="n">before</span><span class="p">,</span> <span class="n">after</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">before</span> <span class="ow">and</span> <span class="n">before</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;open&quot;</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">Delete</span><span class="p">(</span>
+            <span class="n">key</span><span class="o">=</span><span class="p">(</span><span class="n">before</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">,</span> <span class="s2">&quot;open&quot;</span><span class="p">,</span> <span class="n">before</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">),</span>
+            <span class="n">row_version</span><span class="o">=</span><span class="n">before</span><span class="o">.</span><span class="n">row_version</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">after</span> <span class="ow">and</span> <span class="n">after</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;open&quot;</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">Put</span><span class="p">(</span>
+            <span class="n">key</span><span class="o">=</span><span class="p">(</span><span class="n">after</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">,</span> <span class="s2">&quot;open&quot;</span><span class="p">,</span> <span class="n">after</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">),</span>
+            <span class="n">home_shard</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">home_shard</span><span class="p">,</span>
+            <span class="n">row_pk</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">,</span>
+            <span class="n">row_version</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">row_version</span><span class="p">,</span>
+            <span class="n">desk_id</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">desk_id</span><span class="p">,</span>
+            <span class="n">notional</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">notional</span><span class="p">,</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p>The hard part is not producing those mutations. It is deciding how strongly they must line up with the base commit. A synchronous design updates the base row and the index entry in one distributed transaction. That gives Harbor Point the cleanest semantics: once the write commits, issuer queries see the new state immediately. The price is higher write latency, more coordination, and more distributed transaction failure handling.</p>
+<p>An asynchronous design commits the base row first, then derives index mutations from the ordered log or CDC stream. That usually scales writes better and isolates the index pipeline operationally, but it creates a visibility gap. The index may temporarily miss a new reservation or still expose a released one. If Harbor Point chooses that route, it needs explicit freshness metadata on the index path, the same way <a href="028.html">11.md</a> needed explicit replay positions on replica reads.</p>
+<p>Retries make the maintenance contract even stricter. If the system replays the same index mutation after a worker restart, the index must not silently duplicate entries. That is why practical designs keep stable row identifiers and versions in the index payload. A <code>Put</code> should overwrite the logical entry for <code>(issuer_id, status, reservation_id)</code> at a known version, and a <code>Delete</code> should be idempotent. Otherwise, normal retry behavior turns into correctness drift.</p>
+<h3>Concept 3: Operationally safe global indexes need hotspot control, observability, and repair paths</h3>
+<p>Once Harbor Point adds <code>gsi_open_by_issuer</code>, the index becomes part of the production surface, not just part of the schema. The team now needs index-specific metrics: write amplification per base mutation, lag between base commits and index application, query hit rate by index key, index-shard p99 latency, and mismatch counts from consistency checks. Without those signals, the team can see "issuer search is slow" but cannot tell whether the cause is a hot key, a lagging indexer, or stale payloads that trigger too many second-hop reads.</p>
+<p>Skew is the first operational hazard. If <code>CA-MUNI</code> is the busiest issuer on the platform, hashing only on <code>issuer_id</code> can make one index shard much hotter than the others. The fix depends on the query contract. Harbor Point can pre-split the issuer's index range, bucket the key with an extra dimension such as date window, or store multiple partitions for very hot issuers and accept a bounded fan-out across those buckets. None of these are free. They trade a single lookup for a slightly wider query in order to stop one shard from melting.</p>
+<p>The second hazard is divergence. The index can contain orphaned entries after failed deletes, stale <code>home_shard</code> pointers after row moves, or missing entries after log gaps. The only durable answer is repair tooling that treats the base table as the source of truth, scans a slice of reservations, regenerates the expected index entries, and compares them to what the index currently stores. In other words, Harbor Point must plan for index reconciliation before the first incident, not after one.</p>
+<p>This also explains why teams often classify a global secondary index as rebuildable derived state. If Harbor Point loses an index shard but still has the base rows plus a durable commit history, it can usually rebuild the index. The rebuild cost may be painful, but the data model remains recoverable. That classification matters because <a href="030.html">13.md</a> is next: backup and point-in-time recovery are much simpler when the system is clear about which structures are authoritative and which ones can be regenerated to a specific log position.</p>
+<p>Finally, the query semantics still matter after the index exists. A fast issuer lookup is not automatically a trustworthy one. If Harbor Point serves the result from an asynchronously maintained index and then from a lagging replica of that index shard, staleness compounds. The read contract must say whether issuer lookup is fully current, session-consistent, or merely bounded-stale. A global index makes the query cheaper. It does not eliminate the need to state what "correct enough right now" means.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A released reservation still appears in <code>GET /issuers/CA-MUNI/open-reservations</code> for several seconds after the base write commits.</p>
+<p><strong>Why it happens / is confusing</strong>: The base shard is current, but the global index is maintained asynchronously and has not yet applied the delete for the old <code>(issuer_id, status, reservation_id)</code> entry. If the read then goes to a replica of the index shard, the visibility gap is even larger.</p>
+<p><strong>Clarification / Fix</strong>: Expose an index freshness watermark, route session-sensitive issuer lookups through a path that can prove the required commit position, and fall back to the base shard or a stronger consistency mode when the index is behind.</p>
+<p><strong>Issue</strong>: One index shard shows far higher CPU and p99 latency than the rest, even though the base-table shards look balanced.</p>
+<p><strong>Why it happens / is confusing</strong>: The alternate lookup key is skewed. Sharding the base table by <code>desk_id</code> balanced writes, but the global index is partitioned by <code>issuer_id</code>, and a few issuers dominate query and update volume.</p>
+<p><strong>Clarification / Fix</strong>: Measure cardinality and request rate by index key, not just by shard. For hot issuers, pre-split or bucket the index key and let the router query a small bounded set of buckets instead of forcing one shard to absorb all traffic.</p>
+<p><strong>Issue</strong>: Index lookups return reservation IDs that no longer exist on the referenced data shard after a rebalance.</p>
+<p><strong>Why it happens / is confusing</strong>: The row moved, but the old index payload still points to the previous <code>home_shard</code>, or a retry reinserted an old pointer after the move had already completed.</p>
+<p><strong>Clarification / Fix</strong>: Store row version and shard epoch information with the index entry, make move operations update index payloads as first-class mutations, and run reconciliation jobs that compare current base locations with index pointers.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="028.html">11.md</a> taught that freshness needs proof; a global secondary index is another place where that proof can be lost</h3>
+<p>Replica lag showed Harbor Point that a fast answer can still be stale when the serving node has not replayed far enough. A global secondary index adds another replay surface. Even if the base row committed correctly, the query is wrong until the index entry representing that row is updated and visible on the chosen read path.</p>
+<h3>Connection 2: <a href="030.html">13.md</a> will turn global index design into a recovery question</h3>
+<p>Backups and point-in-time recovery force a decision: is the global index part of the authoritative snapshot, or is it derived state that should be rebuilt to the restored log position? That choice changes backup size, restore time, and the operational steps after a partial data loss event.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://cloud.google.com/spanner/docs/secondary-indexes">Secondary indexes in Cloud Spanner</a><ul>
+<li>Focus: See how a distributed SQL system exposes secondary indexes, backfill behavior, and the cost of maintaining alternate access paths.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html">Using Global Secondary Indexes in DynamoDB</a><ul>
+<li>Focus: Compare a production system where alternate-key lookups are explicit, eventually consistent by default, and paid for through extra write and storage cost.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://vitess.io/docs/20.0/reference/features/vindexes/#lookup-vindexes">Lookup Vindexes in Vitess</a><ul>
+<li>Focus: Study a concrete sharded-database mechanism where a separate lookup table maps alternate keys to the correct shard.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/indexes">Indexes | CockroachDB Docs</a><ul>
+<li>Focus: Review how covering indexes, stored columns, and distributed execution affect the read-versus-write trade-off.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A local index does not become global just because the table is sharded</strong> - The router still needs a separately partitioned access path if the query key differs from the data shard key.</li>
+<li><strong>Global secondary indexes are maintained state, not free metadata</strong> - Every base-row change can require cross-shard index mutations, idempotent retries, and explicit freshness handling.</li>
+<li><strong>The hardest part is operational, not syntactic</strong> - Hotspot control, divergence repair, and recovery strategy determine whether the index is safe to trust in production.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does adding a local <code>issuer_id</code> index on every <code>desk_id</code> shard fail to solve Harbor Point's issuer lookup problem by itself?</strong></p>
+<ul>
+<li>A) Because local indexes cannot store string keys</li>
+<li>B) Because the router still has to ask every shard whether it has matching rows, so the cross-shard fan-out remains</li>
+<li>C) Because local indexes work only for primary-key equality</li>
+</ul>
+</li>
+<li>
+<p><strong>What must happen when reservation <code>R-88421</code> changes from <code>open</code> to <code>released</code> in Harbor Point's asynchronously maintained global index design?</strong></p>
+<ul>
+<li>A) The base row changes on its data shard, and the old issuer index entry must later be deleted or invalidated on the relevant index shard</li>
+<li>B) Only the base row changes, because the index will infer status from the query at read time</li>
+<li>C) The system should rebuild the entire global index before acknowledging the write</li>
+</ul>
+</li>
+<li>
+<p><strong>Why is a global secondary index often treated as rebuildable derived state instead of the primary source of truth?</strong></p>
+<ul>
+<li>A) Because indexes are never used for production reads</li>
+<li>B) Because the authoritative business facts live in the base rows, while the index can be regenerated from those rows and durable commit history</li>
+<li>C) Because rebuilds are always cheaper than backups</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Per-shard indexes can speed up work inside each shard, but they do not tell the router which shard contains the matching rows. Harbor Point still pays the cost of cluster-wide scatter-gather. Options A and C are false limitations.</p>
+<p><strong>2. A</strong>: Releasing the reservation changes the base truth first and must eventually remove the old open-status entry from the issuer index. Option B would leave stale index rows behind, and option C is far more expensive than the maintenance pattern the index was supposed to avoid.</p>
+<p><strong>3. B</strong>: The base table records the actual reservation facts. The global index is a performance-oriented access path built from those facts, so it can usually be rebuilt if the source rows and ordered history survive. Option A is wrong because production reads may absolutely use the index, and option C is too strong because rebuild cost can be very high.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="028.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Read Replicas, Lag, and Read-Your-Writes</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="030.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Backup, Snapshots, and Point-in-Time Recovery</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

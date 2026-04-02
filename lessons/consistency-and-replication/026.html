@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Change Data Capture from WAL Streams - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Change Data Capture from WAL Streams</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 026 | Lesson ID: 425
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 425: Change Data Capture from WAL Streams</h1>
+<blockquote>
+<p><strong>The core idea</strong>: WAL-based CDC works because it reads the database's own commit log instead of re-querying tables, so downstream systems inherit commit order and transaction boundaries, but only if you manage offsets, retention, and decoding semantics carefully.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="025.html">08.md</a>, Harbor Point fixed the dual-write problem by inserting an outbox row in the same transaction that reserves inventory for bond <code>CA-MUNI-77</code>. That lesson solved the first correctness gap: Inventory can now say, truthfully, "the hold exists, and there is durable evidence that an event must be published." But the team still has to answer a hard operational question: how does that outbox row leave PostgreSQL and become a broker event without turning into another fragile polling script?</p>
+<p>The tempting answer is "query the outbox table every second." That works in demos and becomes awkward in production. The poller needs indexes that stay hot under heavy inserts, it must guess how to batch rows without reordering them, and it can only infer commit order indirectly from timestamps or surrogate IDs. Once Harbor Point starts reserving thousands of bonds per minute at market open, the gap between "row committed" and "row published" becomes both a latency problem and a correctness-observability problem.</p>
+<p>WAL-based CDC changes the perspective. Instead of asking tables what changed after the fact, the connector reads the database's own write-ahead log, the same durable stream used for crash recovery and replication. That stream already knows transaction boundaries, commit order, and log sequence numbers. When Inventory commits the reservation row and the outbox row for <code>saga_id=8841</code>, the CDC pipeline does not need to rediscover those facts from application tables. It can follow the commit stream the database itself trusts.</p>
+<p>That is why WAL-based CDC is more than a faster poller. It is a different contract. The database becomes the source of truth not only for stored rows but also for the exact sequence in which committed changes became durable. The rest of this lesson explains what the connector is really reading, where the guarantees stop, and why the next lesson, <a href="027.html">10.md</a>, naturally builds incremental materialized views on top of this same stream.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation workflow now spans Inventory, Risk, and downstream settlement preparation. Inventory stores the hold and an outbox event in PostgreSQL. A polling relay is good enough while traffic is light, but the desk's 09:30 opening burst exposes its limits. Some events wait several seconds because the poller scans too conservatively. Other batches grow so large that operators cannot tell whether rising lag comes from slow publishing, a blocked database query, or a broker partition that fell behind. Worse, if engineers try to parallelize the poller aggressively, they risk publishing events out of transaction order for the same reservation.</p>
+<p>WAL-based CDC matters because it moves the extraction point closer to the database's real commit path. The connector can observe committed inserts, updates, and deletes in log order, with transaction metadata attached, without constantly re-reading the tables that the application already uses for live traffic. For Harbor Point, that means the outbox row for <code>inventory.reserved</code> is emitted according to the same commit sequence that made the reservation durable in the first place.</p>
+<p>This does not make the pipeline magically "exactly once." If the connector crashes after publishing but before checkpointing its position, it may emit the same event again. If a replication slot falls too far behind, PostgreSQL may retain WAL segments until storage pressure becomes a production issue. If downstream consumers ignore schema evolution, a clean CDC feed can still break the read model. The value of WAL-based CDC is not perfection. It is that the failure modes are tied to concrete log positions, decoder rules, and replay semantics instead of hidden inside application polling logic.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why WAL-based CDC is structurally different from table polling</strong> - Show how reading the commit log preserves transaction order and visibility in a way polling must reconstruct imperfectly.</li>
+<li><strong>Trace Harbor Point's outbox event from commit to broker</strong> - Follow the reservation transaction, logical decoding, connector offsets, and downstream publication path.</li>
+<li><strong>Evaluate the operational trade-offs of WAL streaming</strong> - Reason about replication slots, lag, schema changes, large transactions, and idempotent consumers before choosing CDC in production.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The WAL is the database's authoritative story of committed change</h3>
+<p>When Inventory handles <code>Reserve(CA-MUNI-77, desk=ALPHA, qty=2_000_000, saga_id=8841)</code>, PostgreSQL does not update the outbox table first and worry about durability later. It writes log records describing the row changes into the write-ahead log, flushes the relevant WAL records durably, and only then reports commit success. The table pages may reach disk later. That is the entire point of write-ahead logging: recovery can replay the log because the log is the durable history.</p>
+<p>For CDC, that matters because the connector is reading the same durable history that recovery and replication trust. In a logical-decoding setup, PostgreSQL interprets WAL records into row-level changes that make sense outside the storage engine: "inserted an outbox row," "updated reservation status," "deleted a hold." Those decoded changes are still organized by transaction. A connector can therefore wait until it sees the commit record, then emit the full committed change set in order.</p>
+<p>That is the structural advantage over polling. A poller repeatedly asks, "which rows look new?" Usually it answers with a query like <code>WHERE published_at IS NULL</code> or <code>WHERE id &gt; last_seen_id</code>. That can be workable, but the query is reconstructing intent from table state. It must assume the chosen column reflects commit order, that long transactions do not surface late, and that concurrent updates will not create ambiguous visibility. WAL-based CDC starts from stronger evidence: the log sequence number, or LSN, that the database itself assigned as part of commit processing.</p>
+<p>For Harbor Point, this means the reservation hold and the matching outbox row stay tied together. If the transaction aborts, logical decoding does not emit the row as committed business intent. If the transaction commits after a long lock wait, the connector still sees the final commit order rather than the order in which the application started work. That distinction becomes crucial under concurrency. Production incidents often come from confusing "request arrival order" with "commit order."</p>
+<p>The trade-off is tight coupling to database internals. WAL formats, decoder plugins, and retention policies are not generic application concerns. Once Harbor Point leans on WAL-based CDC, the storage engine is no longer a black box. The team gets stronger ordering semantics, but it also inherits engine-specific operational responsibilities.</p>
+<h3>Concept 2: A CDC connector turns WAL positions into replayable downstream events</h3>
+<p>The end-to-end path for Harbor Point looks like this:</p>
+<div class="codehilite"><pre><span></span><code>Inventory service
+   |
+   | 1. local transaction
+   |    - insert reservation hold
+   |    - insert outbox row
+   v
+PostgreSQL commit
+   |
+   | 2. WAL records + commit record become durable
+   v
+Logical decoding / replication slot
+   |
+   | 3. connector reads committed changes in LSN order
+   | 4. connector stores its last processed position
+   v
+Kafka topic or event bus
+   |
+   | 5. consumers update risk view, notifications, or projections
+   v
+Downstream read models
+</code></pre></div>
+
+<p>Two pieces of state make this pipeline work: the database's replication position and the connector's checkpoint. PostgreSQL exposes a replication slot so the connector can ask, in effect, "continue streaming from the last LSN I have safely processed." The connector reads decoded changes, groups them by transaction, publishes the resulting events, and then records the latest durable offset on its own side. On restart, it resumes from that checkpoint instead of rescanning the outbox table.</p>
+<p>That design is why WAL-based CDC is usually at-least-once across the database-to-broker boundary. Suppose Harbor Point's connector publishes <code>inventory.reserved</code> to Kafka, then crashes before persisting the new checkpoint. After restart, it may reread the same committed transaction from the previous LSN and publish it again. The right response is not wishful thinking about exactly-once delivery. The right response is to keep the event identity stable, such as <code>event_id=8841:inventory-reserved</code>, and make downstream consumers idempotent.</p>
+<p>Initial snapshotting is another important mechanism. If Harbor Point enables CDC on a live system, the connector may need a starting picture of relevant tables before it can stream new WAL entries safely. Some tools take a consistent snapshot, note the corresponding log position, and then continue with WAL changes after that position. That snapshot boundary has to be chosen carefully; otherwise the system can miss rows inserted during initialization or replay them twice. The important mental model is "snapshot plus ordered tail," not "stream starts from nowhere."</p>
+<p>This is also the point where the lesson from <a href="025.html">08.md</a> becomes concrete. The outbox pattern gives Harbor Point a durable row that says an event must exist. WAL-based CDC gives the team a disciplined way to externalize that row without bolting more custom logic onto the application process. Once the connector is stable, the same commit stream can feed not only the broker topic but also the projection systems discussed in <a href="027.html">10.md</a>.</p>
+<h3>Concept 3: The hard production problems are lag, retention, and semantic drift</h3>
+<p>WAL-based CDC sounds elegant because it follows the database's own machinery, but the sharp edges show up quickly in production. The first is lag. If Harbor Point's connector falls behind, PostgreSQL cannot discard old WAL segments that the replication slot still needs. The result is not merely "CDC is slow." The result can be disk growth on the primary until operators notice that an analytics consumer's lag is now threatening the write path of the source database.</p>
+<p>Large transactions create another subtle problem. Imagine a bulk correction that updates fifty thousand reservation rows because a desk imported positions incorrectly. Logical decoding may hold that transaction until commit, then release a very large burst of change events at once. Downstream consumers see one giant wall of work, and any read model built on the stream experiences latency spikes even though the source database behaved correctly. Harbor Point therefore needs both application-level discipline around transaction size and operational metrics that distinguish steady lag from "one huge commit is decoding."</p>
+<p>Schema evolution is the third recurring failure mode. If the outbox payload adds <code>risk_bucket</code> and one consumer still expects the old schema, the WAL stream itself is not wrong. The connector decoded exactly what committed. Semantic drift happens above the log layer. Teams often misdiagnose this as a database or CDC bug when the real issue is contract management between producer and consumer. A WAL stream preserves order, not meaning.</p>
+<p>These trade-offs explain where WAL-based CDC fits. It is a strong choice when Harbor Point wants ordered, low-latency extraction of committed changes without repeatedly scanning hot tables. It is a weaker fit when the team cannot tolerate engine-specific operations, lacks idempotent consumers, or needs transformations so complex that a direct log tail becomes hard to reason about. The stream is powerful precisely because it is close to storage internals; that same closeness raises the operational bar.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: CDC lag grows steadily, and PostgreSQL disk usage starts climbing even though application traffic is normal.</p>
+<p><strong>Why it happens / is confusing</strong>: A replication slot tells PostgreSQL that old WAL segments are still needed. If the connector stops advancing its LSN, the database preserves log files for replay, so a connector problem turns into source-database storage pressure.</p>
+<p><strong>Clarification / Fix</strong>: Monitor slot lag, retained WAL bytes, and connector checkpoint age together. If Harbor Point uses CDC for operational workflows, treat slot lag as a production SLO, not a background admin metric.</p>
+<p><strong>Issue</strong>: Consumers process the same <code>inventory.reserved</code> event twice after a connector restart.</p>
+<p><strong>Why it happens / is confusing</strong>: The connector can crash after publish but before persisting its last processed LSN. On restart it legitimately rereads the already committed transaction from the earlier checkpoint.</p>
+<p><strong>Clarification / Fix</strong>: Keep stable event IDs in the outbox payload and make every downstream side effect idempotent on that business key. WAL-based CDC improves ordering, but it does not eliminate replay.</p>
+<p><strong>Issue</strong>: A new consumer misses historical rows even though the CDC stream is healthy from this morning onward.</p>
+<p><strong>Why it happens / is confusing</strong>: Streaming only future WAL records does not reconstruct the older table state automatically. Without a controlled snapshot, the consumer begins from "now" and has no baseline for existing reservations.</p>
+<p><strong>Clarification / Fix</strong>: Decide explicitly whether a new consumer needs an initial snapshot, a backfill job, or a separate bootstrap topic. "Start reading the WAL" is not a substitute for state initialization.</p>
+<p><strong>Issue</strong>: Downstream read models stall after a bulk correction even though the connector is still running.</p>
+<p><strong>Why it happens / is confusing</strong>: One very large transaction may decode and publish as a burst after commit, overwhelming consumers and making end-to-end freshness look erratic.</p>
+<p><strong>Clarification / Fix</strong>: Keep source transactions bounded when possible, monitor event burst size alongside lag, and design downstream projections to absorb bursts without assuming perfectly smooth input.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="025.html">08.md</a> defines what must be published; this lesson defines how the platform can publish it safely</h3>
+<p>The outbox pattern makes "inventory changed" and "an event must be emitted" one local fact. WAL-based CDC is the transport refinement that follows that fact through the database's own commit stream. Together they replace a fragile application-side relay with a pipeline grounded in storage semantics.</p>
+<h3>Connection 2: <a href="027.html">10.md</a> uses the same CDC stream to maintain derived state incrementally</h3>
+<p>Once Harbor Point can trust the ordered stream of committed changes, it can build read models and materialized views without re-reading the entire source tables every time. The next lesson extends this idea from "publish events correctly" to "maintain projections efficiently."</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/logicaldecoding-explanation.html">PostgreSQL Logical Decoding Concepts</a><ul>
+<li>Focus: How PostgreSQL turns WAL records into transaction-ordered logical changes and why replication slots matter.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://debezium.io/documentation/reference/stable/connectors/postgresql.html">Debezium PostgreSQL Connector</a><ul>
+<li>Focus: A production-grade example of snapshotting, LSN checkpoints, and streaming committed changes into Kafka.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html">Debezium Outbox Event Router</a><ul>
+<li>Focus: How WAL-based CDC and the transactional outbox pattern fit together when the source table stores application events.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/binary-log.html">MySQL Binary Log</a><ul>
+<li>Focus: A contrasting engine-specific implementation that reinforces the broader idea that log-based CDC depends on storage-engine semantics, even when the log is not literally called WAL.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>WAL-based CDC reads commit history, not table snapshots</strong> - That gives Harbor Point real transaction order and commit visibility instead of forcing a poller to reconstruct them from application rows.</li>
+<li><strong>Offsets are part of the correctness contract</strong> - The connector's checkpoint and the database's replication position determine replay behavior, so idempotent consumers remain mandatory.</li>
+<li><strong>The clean abstraction still has sharp operational edges</strong> - Slot lag, retained logs, large transactions, and schema drift are normal design concerns, not exceptional corner cases.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is WAL-based CDC usually a stronger fit than table polling for Harbor Point's outbox events?</strong></p>
+<ul>
+<li>A) Because the WAL already reflects commit order and transaction boundaries that polling has to infer indirectly</li>
+<li>B) Because the WAL guarantees consumers will never receive duplicate events</li>
+<li>C) Because reading the WAL removes the need for replication lag monitoring</li>
+</ul>
+</li>
+<li>
+<p><strong>What does a replication slot protect in Harbor Point's CDC pipeline?</strong></p>
+<ul>
+<li>A) It prevents any consumer from ever falling behind the broker</li>
+<li>B) It lets the connector resume from a known log position by keeping required WAL available until it is consumed</li>
+<li>C) It converts every downstream consumer into an exactly-once subscriber</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the correct response if the connector republishes <code>inventory.reserved</code> after a restart?</strong></p>
+<ul>
+<li>A) Assume the connector is broken, because WAL-based CDC should make duplicates impossible</li>
+<li>B) Remove checkpoints so the connector always starts from the latest WAL segment</li>
+<li>C) Deduplicate using a stable event identity and keep the consumer side effects idempotent</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: WAL-based CDC follows the database's own durable commit stream, so it inherits transaction order and visibility directly. Option B is false because replay can still happen after connector failures, and option C is false because lag management becomes more important, not less.</p>
+<p><strong>2. B</strong>: The slot preserves the WAL history the connector still needs so it can resume from a recorded LSN. Option A confuses source-log retention with broker-consumer lag, and option C promises a delivery guarantee that the slot does not provide.</p>
+<p><strong>3. C</strong>: Republishing after restart is a normal at-least-once failure mode when publish and checkpoint are not one atomic action. The robust fix is stable event identity plus idempotent consumers, not pretending the replay cannot occur.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="025.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Sagas and Outbox for Cross-Service Consistency</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="027.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Materialized Views and Incremental Maintenance</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

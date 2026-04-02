@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Schema Evolution and Compatibility Modes - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Schema Evolution and Compatibility Modes</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+        </p>
+        <p>
+          Sequence: 012 | Lesson ID: 460
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 460: Schema Evolution and Compatibility Modes</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Schema evolution is safe only when the change rules match deployment reality; compatibility modes are rollout contracts for old and new readers across time, not abstract labels for a schema registry.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="011.html">Serialization Formats and Binary Contracts</a>, <code>PayLedger</code> decided how to represent a <code>SettlementInstruction</code> on the wire. That solved the "what do these bytes mean today?" problem. Production systems immediately run into the harder follow-up question: what happens next week when the schema changes but the fleet does not upgrade at once?</p>
+<p><code>PayLedger</code> has exactly that problem. The settlement coordinator publishes instructions to Kafka, the bank adapter consumes them almost immediately, the reconciliation service may lag for hours during month-end traffic, and the audit replay job can reread fourteen days of old events at any time. Treasury now wants a new <code>settlement_purpose_code</code> field for cross-border payouts and wants fee breakdowns separated from the old <code>amount_minor</code> total. The system has to support new data, old binaries, and historical events simultaneously.</p>
+<p>That is what compatibility modes actually describe. They tell you which pairings must keep working: new readers on old data, old readers on new data, or both. Once you see that, "backward" and "forward" stop sounding like vocabulary from a registry UI and start sounding like deployment rules. The common mistake is to treat schema evolution as an additive field exercise. In production, the dangerous breaks are usually semantic: reusing a field number, changing a unit, or making an old replay impossible even though the new payload still parses.</p>
+<h2>Why This Matters</h2>
+<p>For <code>PayLedger</code>, a schema mistake does not stay inside the data team. If the coordinator starts emitting a new event shape that the lagging reconciliation service cannot read, settlement appears successful in one service and missing in another. If a replay job cannot decode yesterday's events after a deploy, the team loses the fastest path to rebuilding derived state during an incident. If a field keeps the same name but changes from "gross payout amount" to "net payout amount after fees," everything may deserialize cleanly while downstream ledgers become wrong.</p>
+<p>Schema evolution is therefore a time-travel problem as much as a data-format problem. Durable logs, rolling deploys, canaries, batch backfills, and multiple language runtimes guarantee that old and new versions will coexist. The question is not whether change will happen. The question is whether the platform defines what kinds of change are safe, how that safety is enforced, and in what deployment order producers and consumers move.</p>
+<p>When teams get this right, schema changes become boring in the best way. The registry or CI checks reject unsafe edits before deployment. Engineers know whether consumers must roll before producers or vice versa. Historical reprocessing stays viable. Most importantly, the system can evolve without turning every new field into a cross-team coordination incident.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why schema evolution is a deployment problem</strong> - Trace how rolling upgrades, retained events, and replay jobs force multiple schema versions to coexist.</li>
+<li><strong>Distinguish common compatibility modes precisely</strong> - Map backward, forward, full, and transitive compatibility to concrete reader-writer pairings and rollout order.</li>
+<li><strong>Evaluate whether a schema change is truly safe</strong> - Separate parse-level compatibility from semantic compatibility and choose safer migration patterns.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Schema evolution starts when old data and old binaries still matter</h3>
+<p><code>PayLedger</code>'s Kafka topic for settlement instructions retains events for fourteen days. That one operational detail changes everything. Even if the coordinator is upgraded in minutes, other components do not all move at the same speed. The bank adapter is close to real time, the reconciliation worker might be paused behind backlog, and the replay tooling might intentionally reread last week's events after a bug fix. The system is living with multiple versions whether the team plans for it or not.</p>
+<p>That means every schema change has to survive two different directions of time. A new reader may need to understand old events that were already written before the deploy. An old reader may need to survive events written by a newly deployed producer that got ahead of the rest of the fleet. Those are different guarantees. Treating them as the same is how teams end up with a schema that is "compatible" in one document and broken in one rollout.</p>
+<p>The simplest mental model is a four-cell matrix:</p>
+<div class="codehilite"><pre><span></span><code>                     Data written by
+                 old producer   new producer
+old reader          works?         works?
+new reader          works?         works
+</code></pre></div>
+
+<p>The bottom-right cell is trivial: new code reading data it wrote itself is the easy case. The other cells are the real contract. New reader plus old data is the replay and retained-history problem. Old reader plus new data is the rolling-upgrade and lagging-consumer problem. Once the team writes those cells down explicitly, compatibility stops being a vague promise and becomes a set of obligations that can be tested.</p>
+<p>This also explains why schema evolution is built on the previous lesson's wire-contract details. A Protobuf message can often tolerate added fields because unknown tags can be skipped. An Avro workflow can resolve differences between writer schema and reader schema if defaults and field names line up. A positional binary record with no self-description has almost no room to evolve safely because old readers cannot recover when the layout shifts. Evolution depends on how field identity, defaults, and unknown data are handled at the format level.</p>
+<h3>Concept 2: Compatibility modes encode rollout order and replay guarantees</h3>
+<p>The exact labels vary a bit by tool, but the standard vocabulary is consistent enough to be useful. In registry-based workflows, <strong>backward compatibility</strong> means the new schema can read data produced with the previous schema. Operationally, that supports "readers first, writers second" rollouts because updated consumers can still process the backlog that exists before producers switch. <strong>Forward compatibility</strong> means the old schema can read data produced with the new schema, which supports "writers first, readers second" rollouts because lagging consumers can survive data from the upgraded producer.</p>
+<p><strong>Full compatibility</strong> means both directions hold for the adjacent version pair. That gives deployment more flexibility because either side can move first without breaking the other, at least for the current version transition. <strong>Transitive</strong> variants widen the promise from "compatible with the immediately previous schema" to "compatible with all earlier schemas in scope." That distinction matters a lot in systems like <code>PayLedger</code> where replay jobs may reach back many versions, not just one deployment behind.</p>
+<p>You can summarize the operational meaning like this:</p>
+<div class="codehilite"><pre><span></span><code>backward          new readers can read old data        deploy consumers before producers
+forward           old readers can read new data        deploy producers before consumers
+full              both of the above for adjacent versions
+full transitive   both directions across all retained versions
+</code></pre></div>
+
+<p>For <code>PayLedger</code>, backward compatibility alone is not enough if the reconciliation service might lag behind while the coordinator starts writing newer events. Forward compatibility alone is not enough if the audit replay job must rebuild state from older events after a deploy. Because the system has both lagging consumers and historical replay, the safest platform rule is usually a transitive mode for durable event schemas, even if short-lived RPC contracts can tolerate a narrower adjacent-version guarantee.</p>
+<p>One important nuance is that a registry can validate only what the schema language expresses. It can often tell you that field <code>7</code> still exists or that a default value lets readers fill in missing data. It cannot reliably tell you whether <code>amount_minor</code> still means the same business quantity as before. Compatibility modes are necessary, but they are not the whole review. You still need human judgment for semantic changes.</p>
+<h3>Concept 3: Safe evolution depends on representation details and disciplined migration patterns</h3>
+<p>Suppose <code>PayLedger</code> starts with this Protobuf event:</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">message</span><span class="w"> </span><span class="nc">SettlementInstruction</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">run_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">employer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">amount_minor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">currency</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">settlement_deadline_unix_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Treasury now wants fee transparency, so the team is tempted to replace <code>amount_minor</code> with <code>net_amount_minor</code> and <code>fee_amount_minor</code>. Doing that as an in-place type or meaning change is the classic dangerous move. If field <code>3</code> used to mean gross settlement amount and now means net amount after fees, an old consumer may still parse the message perfectly and quietly compute the wrong ledger entries. Parse-level compatibility can coexist with semantic breakage.</p>
+<p>The safer migration is staged. First add new fields with new identifiers, keeping the old one:</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">message</span><span class="w"> </span><span class="nc">SettlementInstruction</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">run_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">employer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">amount_minor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span><span class="w">          </span><span class="c1">// deprecated, still populated during migration</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">currency</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">settlement_deadline_unix_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">settlement_purpose_code</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">net_amount_minor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">fee_amount_minor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Then update consumers to understand the new fields while still accepting the old one. Only after all critical readers have switched do producers stop depending on <code>amount_minor</code>. Eventually the team can deprecate the field and reserve its identifier so nobody reuses tag <code>3</code> for a different meaning later. The same general discipline applies outside Protobuf: in Avro, additive changes with sensible defaults are usually safer than removals; in JSON contracts, introducing a new field is often easier than silently changing the type or unit of an old field.</p>
+<p>The trade-off is obvious: disciplined evolution creates temporary redundancy. Dual-writing fields, carrying deprecated names, and preserving reserved identifiers all feel slower than a clean break. But that temporary mess buys production stability. The alternative is to save a week in schema cleanup and spend a month untangling corrupted derived data, failed replays, or consumers that only break under backlog conditions. In real platforms, schema hygiene is not about elegance. It is about keeping change survivable.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A replay job fails after a consumer deploy, even though live traffic still looks healthy.</p>
+<p><strong>Why it happens / is confusing</strong>: The new reader can handle events being produced now, but it cannot decode older retained events because a supposedly harmless change removed a field, changed a type, or relied on a default that old data never had. Live traffic hides the problem because it exercises only the newest writer-reader pairing.</p>
+<p><strong>Clarification / Fix</strong>: Test consumer changes against retained historical samples, not just newly produced fixtures. If replay is an operational requirement, adopt a transitive compatibility rule and reject schema changes that only work against the latest version.</p>
+<p><strong>Issue</strong>: The registry reports a compatible change, but downstream numbers become inconsistent.</p>
+<p><strong>Why it happens / is confusing</strong>: Compatibility checks reason about structure, not business meaning. A field can keep the same type and still change semantics from gross amount to net amount, from local time to UTC, or from one enum interpretation to another.</p>
+<p><strong>Clarification / Fix</strong>: Treat semantic changes as new fields or new schema versions with explicit migration notes. Keep the old field until consumers have switched, and review unit, timezone, and enum meaning changes as API breaks even when the registry stays green.</p>
+<p><strong>Issue</strong>: An old consumer starts misreading data after a field was removed months ago.</p>
+<p><strong>Why it happens / is confusing</strong>: Someone reused the old field number or field name for a different purpose. The payload still parses, but the old reader maps the familiar identifier to the wrong meaning.</p>
+<p><strong>Clarification / Fix</strong>: Reserve removed identifiers permanently where the schema system supports it, and document deprecations in the schema review process. "Unused" is not the same as "available for reuse."</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Wire-format design determines how much evolution room you have</h3>
+<p>This lesson is a direct continuation of <a href="011.html">Serialization Formats and Binary Contracts</a>. Tagged formats, explicit defaults, and clear field identity rules are what make backward and forward compatibility possible in the first place. Teams often blame schema governance for a problem that was actually created earlier by choosing a representation with weak evolution properties.</p>
+<h3>Connection 2: Durable event logs turn schema compatibility into platform policy</h3>
+<p>Compatibility choices become stricter when data outlives the process that wrote it. Kafka topics, CDC streams, and rebuildable projections all depend on the ability to decode history long after the original producer has changed. That is why event-platform teams often enforce transitive modes more aggressively than request-response APIs: retained data is an operational asset only if later code can still read it.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://protobuf.dev/programming-guides/proto3/#updating">Protocol Buffers: Updating A Message Type</a><ul>
+<li>Focus: Review which field edits are safe, why tag reuse is dangerous, and how unknown fields affect rolling upgrades.</li>
+</ul>
+</li>
+<li>[SPEC] <a href="https://avro.apache.org/docs/current/specification/">Apache Avro Specification</a><ul>
+<li>Focus: Read the schema resolution rules to see how writer and reader schemas cooperate during evolution.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html">Confluent Schema Evolution and Compatibility</a><ul>
+<li>Focus: Map backward, forward, full, and transitive modes to real deployment sequences and registry enforcement.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Compatibility modes are deployment contracts</strong> - They tell you which reader-writer pairings must survive while producers, consumers, and replay tools run different versions.</li>
+<li><strong>Structural compatibility is not semantic safety</strong> - A message can deserialize correctly and still carry the wrong business meaning after a field reinterpretation.</li>
+<li><strong>Safe evolution prefers additive, staged change</strong> - New fields, defaults, dual-read or dual-write windows, and reserved identifiers are slower upfront but far cheaper than repairing broken history.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is backward compatibility especially important for a consumer that replays historical Kafka events after a deploy?</strong></p>
+<ul>
+<li>A) Because it guarantees old consumers can read new events immediately</li>
+<li>B) Because it guarantees the new consumer can still read events written with the previous schema</li>
+<li>C) Because it eliminates the need for schema review</li>
+</ul>
+</li>
+<li>
+<p><strong>Which change is most likely to pass parse-level checks yet still be a semantic breaking change in <code>PayLedger</code>?</strong></p>
+<ul>
+<li>A) Adding <code>settlement_purpose_code</code> as a new optional field</li>
+<li>B) Changing the meaning of <code>amount_minor</code> from gross payout to net payout while keeping the same field identifier</li>
+<li>C) Reserving a removed field number so it cannot be reused</li>
+</ul>
+</li>
+<li>
+<p><strong>Why might <code>PayLedger</code> choose a transitive compatibility mode for its durable event stream instead of only checking against the immediately previous version?</strong></p>
+<ul>
+<li>A) Because Kafka refuses to store multiple schema versions in one topic</li>
+<li>B) Because replay jobs and long-retention consumers may need to read data written several schema versions ago</li>
+<li>C) Because transitive mode always makes every schema change free of operational trade-offs</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Backward compatibility protects the "new reader on old data" path, which is exactly what a replaying consumer needs after deployment. It says nothing by itself about lagging old consumers.</p>
+<p><strong>2. B</strong>: Reinterpreting an existing field keeps the wire shape familiar while changing the business meaning underneath it. That is often more dangerous than adding a brand-new field because the payload still looks valid.</p>
+<p><strong>3. B</strong>: Adjacent-version checks are too weak when consumers may replay far older data. Transitive compatibility raises the bar so retained history remains decodable across multiple schema generations.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="011.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Serialization Formats and Binary Contracts</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="013.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Polyglot Persistence and Data Integration</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

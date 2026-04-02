@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Storage Engines: Log-Structured vs Page-Oriented - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Storage Engines: Log-Structured vs Page-Oriented</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+        </p>
+        <p>
+          Sequence: 015 | Lesson ID: 463
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 463: Storage Engines: Log-Structured vs Page-Oriented</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Page-oriented engines keep durable state in mutable pages and use a log to make those page updates crash-safe, while log-structured engines treat append-only files as the durable state and push cleanup into background merge or compaction work.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="014.html">Systems of Record vs Derived Data</a>, <code>PayLedger</code> established PostgreSQL as the place where payout state becomes official and Elasticsearch as a derived search surface. That architectural split explains who is allowed to decide the truth. This lesson explains why those two systems behave so differently under the same payroll burst.</p>
+<p>At payroll cutoff, <code>PayLedger</code> writes thousands of small status transitions such as <code>approved -&gt; processing -&gt; settled</code> while support agents search for problem payouts in parallel. PostgreSQL starts showing checkpoint pressure and dirty-buffer churn. Elasticsearch keeps up with ingest at first, then query latency rises while merges catch up. Both systems are persisting the same business story, but they are paying the I/O bill in different places because their storage engines are built around different assumptions.</p>
+<p>The useful mental shift is that "log-structured" does not mean "has a log" and "page-oriented" does not mean "never appends." PostgreSQL also appends to a write-ahead log. LSM trees and Lucene segments also cache data in memory before flushing. The real question is which structure is treated as the durable truth after a crash: mutable pages that are repaired from a journal, or immutable append files that are periodically compacted into a cleaner shape.</p>
+<h2>Why This Matters</h2>
+<p>Teams often choose a database by feature checklist or benchmark headline, then discover the real trade-off only when production traffic settles into a pattern. A page-oriented engine may feel stable for mixed reads and point updates until random writes, page splits, and background cleanup collide with a burst window. A log-structured engine may absorb writes beautifully until compaction debt turns a cheap ingest path into expensive read amplification and disk churn.</p>
+<p><code>PayLedger</code> cannot afford to treat these effects as implementation trivia. The payout ledger has to keep small transactional reads and writes predictable because settlement workflows, operator tools, and audit checks all depend on it. The search index can tolerate seconds of lag, but it must survive heavy append traffic without turning every support query into a segment fan-out problem. Once the storage-engine model is explicit, symptoms such as checkpoint spikes, tombstone buildup, or compaction stalls stop looking mysterious and start looking like expected consequences of the chosen write path.</p>
+<p>That is the production value of this lesson: you stop asking "which database is faster?" and start asking "where does this engine place write amplification, read amplification, space amplification, and recovery work for my workload?"</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain the physical write path in each engine family</strong> - Trace how page-oriented and log-structured systems turn an application update into durable bytes.</li>
+<li><strong>Compare the operational trade-offs explicitly</strong> - Relate latency, amplification, and maintenance work to the underlying storage layout rather than treating them as isolated tuning issues.</li>
+<li><strong>Apply engine-family reasoning to architecture choices</strong> - Decide why an authoritative OLTP store, a search index, or an event-heavy projection may prefer different storage behavior.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Page-oriented engines optimize around mutable pages plus a write-ahead journal</h3>
+<p>For the authoritative payout ledger, <code>PayLedger</code> uses PostgreSQL because the workload is dominated by short transactions, point lookups by payout ID, constrained state transitions, and range queries such as "all payouts for employer X created today." A page-oriented engine fits that shape by organizing data into fixed-size pages and using page-aware index structures, usually B-trees, so reads can navigate a relatively compact path to the needed tuples.</p>
+<p>The crucial mechanism is that the durable database is the page set, not the log. When a payout changes from <code>processing</code> to <code>settled</code>, PostgreSQL records the change in the write-ahead log first, updates in-memory copies of the affected heap and index pages, and flushes those dirty pages later during checkpoints or background writes. The log exists so that if the node crashes after acknowledging the commit, recovery can replay the change and bring the pages back to a consistent state.</p>
+<p>That means page-oriented does not literally imply "overwrite one row in place." PostgreSQL's MVCC model often writes a new tuple version and marks older versions dead, but those versions still live on heap pages and are managed by page-level structures, free space maps, vacuum, and page splits in indexes. The page is still the unit the engine must cache, dirty, flush, and eventually reclaim.</p>
+<div class="codehilite"><pre><span></span><code>transaction commit
+      |
+      v
+ append WAL record
+      |
+      v
+update heap/index pages in memory
+      |
+      v
+flush dirty pages later
+      |
+      v
+replay WAL on crash if needed
+</code></pre></div>
+
+<p>This design pays part of the cost early so the read path stays comparatively short. If the working set is warm and the index layout is healthy, a point lookup or ordered range scan does not need to consult a long chain of immutable files. The trade-off is that hot keys, random writes, page fragmentation, and cleanup tasks such as vacuum and checkpoint flushing can push latency into the write path.</p>
+<h3>Concept 2: Log-structured engines turn writes into append now and organization later</h3>
+<p>The search side of <code>PayLedger</code> has a different job. Support agents need to filter payouts by employer, bank, failure code, and settlement date across a large corpus, and the index is constantly ingesting fresh changes from the payout stream. For that pattern, a log-structured design is attractive because it converts many small writes into mostly sequential appends, then defers structural cleanup to background work.</p>
+<p>Broadly, the engine accepts an update into an in-memory structure and durability log, flushes immutable files such as SSTables or Lucene segments, and later merges those files so reads do not have to consult an unbounded number of versions. The exact implementation differs: RocksDB uses leveled or tiered compaction over sorted tables, while Lucene builds immutable segments and periodically merges them. The shared idea is that the append path is cheap up front and the engine pays the organization cost later.</p>
+<p>An update is therefore usually represented as a new version, not a direct overwrite of the old one. Deletes become tombstones. Secondary structures are rebuilt through flush and merge rather than page edits. Reads may check multiple files, bloom filters, or posting lists before they know which version is current.</p>
+<div class="codehilite"><pre><span></span><code>write request
+    |
+    v
+WAL + memtable / indexing buffer
+    |
+    v
+flush immutable SSTable / segment
+    |
+    v
+background compaction or merge
+    |
+    v
+fewer files, lower lookup fan-out
+</code></pre></div>
+
+<p>This is why log-structured engines often excel at sustained ingest, bulk mutation, or event-heavy pipelines. They are converting random write pressure into append-friendly I/O. The bill shows up elsewhere: compaction can rewrite bytes multiple times, tombstones can hurt scans until merged away, and reads can become more expensive when too many files or segments overlap. The engine is not avoiding work. It is shifting work in time.</p>
+<h3>Concept 3: Choosing an engine family means choosing where amplification and maintenance will live</h3>
+<p>By the time <code>PayLedger</code> reaches payroll cutoff, the difference becomes operationally visible. PostgreSQL pays for durable transactional behavior with WAL volume, dirty-page management, vacuum pressure, and index maintenance. Elasticsearch pays with refresh, merge scheduling, temporary disk growth, and query fan-out across segments until merges finish. Both systems are healthy only if the team budgets for the maintenance work implied by the storage layout.</p>
+<p>The useful comparison is not "page-oriented for reads, log-structured for writes" because that slogan is too shallow. A better framing is:</p>
+<ul>
+<li>Page-oriented engines often spend more effort keeping the primary structure queryable during each update, which can make many transactional reads and ordered lookups simpler.</li>
+<li>Log-structured engines often spend less effort on the initial write and more effort on deferred cleanup, which can make ingestion smoother but background maintenance more consequential.</li>
+<li>Neither family wins in the abstract; the right choice depends on access pattern, update locality, latency SLOs, and how much operational variability the system can absorb.</li>
+</ul>
+<p>For <code>PayLedger</code>, that leads to a coherent role assignment. PostgreSQL remains the system of record because the payout workflow needs strong transactional semantics and predictable point reads on authoritative state. Elasticsearch remains a derived store because its segment-oriented design is well suited to search-style indexing and replayable rebuilds from the committed source stream. If the team tried to push every mutable ledger decision into a heavily compacting log-structured store, it would need to manage different read-path and compaction risks. If it forced operational search into only a page-oriented transactional store, it would pay for filter-heavy text and faceted queries in a structure not optimized for that access pattern.</p>
+<p>The next lesson, <a href="016.md">Module Capstone: Data Model and Storage Baseline</a>, asks you to make those trade-offs explicit across a full architecture. The follow-on deep dives into <a href="017.md">B-Tree Path and Maintenance Costs</a> and <code>LSM</code> compaction will then unpack the two cost profiles in more detail.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: PostgreSQL commit latency spikes during batch settlement even though CPU is not saturated.</p>
+<p><strong>Why it happens / is confusing</strong>: In a page-oriented engine, the critical path includes WAL pressure, dirty-buffer accumulation, checkpoint behavior, and index-page churn. The problem can look like "the database is randomly slow" when the real cause is that page maintenance work is bunching up under write bursts.</p>
+<p><strong>Clarification / Fix</strong>: Inspect WAL generation rate, checkpoint timing, buffer write activity, and table or index bloat. If the workload is truly write-heavy and append-dominant, separate that flow from the authoritative ledger instead of forcing every pattern through the same page-oriented path.</p>
+<p><strong>Issue</strong>: Search ingest looks healthy, but query latency and disk usage climb for hours afterward.</p>
+<p><strong>Why it happens / is confusing</strong>: A log-structured index can accept writes cheaply up front while compaction or segment merging falls behind. Users experience the deferred cost as slower reads, temporary space amplification, and bursty background I/O rather than obvious write failures.</p>
+<p><strong>Clarification / Fix</strong>: Check segment counts, merge backlog, tombstone accumulation, and disk headroom. If the system is always recovering from compaction debt, the ingest rate, retention policy, or shard sizing is out of line with the merge budget.</p>
+<p><strong>Issue</strong>: Deleting or updating many records does not reclaim space quickly in either engine family.</p>
+<p><strong>Why it happens / is confusing</strong>: Both families keep historical artifacts around for correctness and concurrency reasons. Page-oriented engines may need vacuum or page reuse cycles before dead tuples disappear from the physical footprint. Log-structured engines may keep tombstones and superseded versions until compaction rewrites the overlapping files.</p>
+<p><strong>Clarification / Fix</strong>: Treat space reclamation as a maintenance pipeline, not an instant side effect of <code>DELETE</code> or <code>UPDATE</code>. Monitor bloat and compaction debt explicitly instead of assuming the filesystem view will track logical row counts in real time.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="014.html">Systems of Record vs Derived Data</a> explains the authority boundary; storage engines explain the cost profile underneath it</h3>
+<p>The previous lesson decided that PostgreSQL is allowed to settle payout truth and Elasticsearch is allowed to project it. This lesson shows why that division is not arbitrary. The system of record benefits from page-oriented transactional locality, while the derived search layer benefits from log-structured indexing and rebuildability. Authority and storage mechanics are different axes, but production systems work best when they reinforce each other.</p>
+<h3>Connection 2: Recovery, caching, and maintenance policy all depend on the same physical model</h3>
+<p>Checkpoint tuning, buffer cache hit rate, and vacuum settings make sense only if you understand a page-oriented engine's dependence on mutable pages. Bloom filters, compaction strategy, segment merges, and read amplification make sense only if you understand a log-structured engine's dependence on immutable files plus deferred cleanup. The operational knobs are not arbitrary vendor trivia; they are consequences of the write path.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/btree.html">B-Tree Indexes</a><ul>
+<li>Focus: How PostgreSQL's page-oriented index structure organizes lookups, updates, and page splits in the common OLTP path.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">Database Page Layout</a><ul>
+<li>Focus: How PostgreSQL organizes heap pages, item identifiers, and tuple storage inside a page-oriented engine.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide">RocksDB Tuning Guide</a><ul>
+<li>Focus: Practical consequences of LSM compaction, write amplification, and memory or disk trade-offs in a log-structured engine.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-merge.html">Merge settings</a><ul>
+<li>Focus: How Lucene-style segment merging surfaces as an operational concern in a production search system.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: High-level comparison of B-trees, LSM trees, and storage-engine trade-offs in modern data systems.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>The key distinction is where durable truth lives after a crash</strong> - Page-oriented engines recover mutable pages from a journal, while log-structured engines recover append-built files and then clean them up with merges or compaction.</li>
+<li><strong>Write cost is never eliminated, only relocated</strong> - Page-oriented systems pay more during page maintenance and checkpoints; log-structured systems pay more during read fan-out, merge work, and compaction debt.</li>
+<li><strong>Engine choice should follow workload role, not brand preference</strong> - An authoritative ledger, a search index, and a replayable projection may all store the same business entities while needing different physical write paths.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>What most directly distinguishes a page-oriented engine from a log-structured engine in this lesson?</strong></p>
+<ul>
+<li>A) Whether the database keeps any kind of write-ahead log</li>
+<li>B) Whether the durable state is primarily maintained as mutable pages or as immutable append-built files</li>
+<li>C) Whether the system supports secondary indexes</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can a log-structured engine show good ingest throughput but later suffer slower reads?</strong></p>
+<ul>
+<li>A) Because background merge or compaction debt can leave many overlapping files or segments for the read path to consult</li>
+<li>B) Because append-only designs prevent durability</li>
+<li>C) Because immutable files cannot be cached in memory</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does <code>PayLedger</code> keep PostgreSQL as the authoritative payout ledger in this scenario?</strong></p>
+<ul>
+<li>A) Because page-oriented engines are always faster than log-structured engines</li>
+<li>B) Because the workload needs transactional point updates and authoritative reads more than append-first indexing behavior</li>
+<li>C) Because Elasticsearch cannot store fields such as payout IDs</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Both families may use logs, caches, and background work. The difference is whether the engine's durable data model centers on mutable pages or immutable append-built files.</p>
+<p><strong>2. A</strong>: Log-structured designs often make the initial write cheap and defer organization. If compaction or merging lags, reads must search across more files or segments and may pay extra latency.</p>
+<p><strong>3. B</strong>: <code>PayLedger</code> needs the ledger to validate and commit small transactional state changes with predictable authoritative reads. That aligns with the page-oriented ledger role in this architecture, even though other workloads in the platform benefit from log-structured behavior.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="014.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Systems of Record vs Derived Data</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

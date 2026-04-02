@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Synchronous vs Asynchronous Replication - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Synchronous vs Asynchronous Replication</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 019 | Lesson ID: 418
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 418: Synchronous vs Asynchronous Replication</h1>
+<blockquote>
+<p><strong>The core idea</strong>: The real difference between synchronous and asynchronous replication is the commit acknowledgment boundary: which replica milestone must happen before the primary is allowed to tell the client "your write is durable."</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="018.html">01.md</a>, Harbor Point separated three standby milestones: receiving WAL, flushing it durably, and replaying it into query-visible state. This lesson adds the question that turns those milestones into a production policy: when trader <code>R-88421</code> is approved, which of those milestones must happen before the API returns <code>201 Created</code>?</p>
+<p>An asynchronous primary answers that question narrowly. It fsyncs its own WAL, acknowledges the client, and lets replicas catch up afterward. That keeps the reservation path fast, but it leaves a window in which the client has been told the approval committed even though no standby has durably stored it yet. If the primary dies inside that window and the standby is promoted, the acknowledged reservation can disappear.</p>
+<p>A synchronous primary moves at least one remote milestone into the commit path. The client does not get success until some standby has reached the configured point, usually remote flush and sometimes remote apply. That shrinks the data-loss window across failover, but the write is now paying for network latency, remote disk latency, and standby availability. The key design question is not "Do we prefer sync or async in theory?" It is "What failure are we willing to expose to the caller, and what latency or availability cost are we willing to pay to avoid it?"</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's compliance team treats a reservation approval as a legally meaningful event. If support tells a trader that reservation <code>R-88421</code> was accepted, the database cannot quietly lose it just because the primary crashed two milliseconds later. At the same time, the desk will not accept an approval path that stalls every time a remote replica has a brief I/O hiccup. The replication mode is therefore not a storage footnote. It is part of the product's contract.</p>
+<p>Without an explicit acknowledgment rule, teams talk past each other. Application engineers say "the write committed" because the primary returned success. Database operators say "the standby was almost caught up" because replay lag looked small. Incident commanders later discover that both statements were true and the data was still lost on failover, because "committed" only meant local durability. Once the team names the commit boundary precisely, latency, RPO, failover behavior, and read freshness stop being vague aspirations and become measurable properties.</p>
+<p>This lesson connects directly to <a href="018.html">01.md</a>: log shipping gave Harbor Point a way to reproduce history on a standby, but it did not decide when a history prefix becomes part of the durability promise made to clients. The next lesson, <a href="020.html">03.md</a>, shows what happens when that durability promise is no longer "one primary plus replicas" but "a quorum commits a log entry together."</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain the commit boundary in synchronous and asynchronous replication</strong> - Identify which local and remote milestones a database waits for before acknowledging a write.</li>
+<li><strong>Analyze failover outcomes from the acknowledgment policy</strong> - Predict when an acknowledged write can still be lost after primary failure.</li>
+<li><strong>Choose a replication mode for a concrete workload</strong> - Match reservation-critical writes, standby-read needs, and latency budgets to the right durability policy.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The commit path changes when replica acknowledgment enters the critical path</h3>
+<p>Harbor Point's approval service already writes to WAL on the primary before reporting success. The difference between asynchronous and synchronous replication is what happens after that local WAL flush. In asynchronous mode, the primary treats local durability as sufficient for the client contract and pushes the new WAL to standbys in the background. In synchronous mode, local durability is necessary but not sufficient: the primary must also wait for one or more standby milestones before it may return success.</p>
+<p>That makes the commit path materially different:</p>
+<div class="codehilite"><pre><span></span><code>Asynchronous commit
+client -&gt; primary WAL flush -&gt; ACK to client -&gt; ship WAL -&gt; standby flush -&gt; standby replay
+
+Synchronous commit (remote flush)
+client -&gt; primary WAL flush -&gt; ship WAL -&gt; standby flush -&gt; ACK to primary -&gt; ACK to client -&gt; standby replay
+</code></pre></div>
+
+<p>The important detail is that "synchronous" is not one universal milestone. Some systems wait until a standby confirms the WAL bytes were received. Others wait for the standby to flush them durably. A stricter variant waits until the standby has replayed the change so standby reads can observe it immediately after commit. Harbor Point usually cares most about remote flush, because the regulatory requirement is "do not lose approved reservations on failover," not "make every standby query instantly current."</p>
+<p>This is why synchronous replication is a semantics choice before it is a performance choice. The setting answers a precise question: when the API says "committed," does that mean "durable on one machine" or "durable on more than one machine"? Only after that answer is clear does it make sense to measure the latency cost.</p>
+<h3>Concept 2: Failover risk is the real difference, not just average write latency</h3>
+<p>Suppose Harbor Point receives approval for reservation <code>R-88421</code> at 09:30:00.120. The primary writes the commit record locally at <code>09:30:00.123</code> and returns success at <code>09:30:00.124</code>. In asynchronous mode, that success may still outrun replication. If the primary host fails at <code>09:30:00.125</code> and the standby had not yet flushed the WAL for <code>R-88421</code>, promotion will recover to an older history prefix. Support now sees a contradiction: the client was told the reservation succeeded, but the new primary has no trace of it.</p>
+<p>In synchronous mode with remote flush, the same crash produces a different result. The primary would not have acknowledged <code>R-88421</code> until a standby confirmed that the commit record was durably stored. Promotion can then continue recovery from that durable prefix even if replay was slightly behind. The standby may need a brief moment to finish applying the WAL before queries show the reservation, but the event is not lost.</p>
+<p>That distinction also corrects a common misconception. Synchronous replication does not automatically mean "no stale standby reads." If Harbor Point waits for remote flush but not remote apply, an acknowledged reservation is failover-safe without necessarily being visible on a hot standby query at the same instant. Read freshness and failover durability are related, but they are not the same guarantee. The difference matters when teams build trader dashboards on standbys and assume that a synchronous commit setting solved every read-after-write problem.</p>
+<p>The same mechanism explains why asynchronous replication is still a rational choice for some data. If Harbor Point emits a derived analytics event or refreshes a low-value search projection, accepting a tiny failover loss window may be cheaper than putting another network round-trip into the user's critical path. The mode should follow the consequence of loss, not a blanket preference for "faster" or "safer."</p>
+<h3>Concept 3: Production systems usually implement a policy spectrum, not a pure binary</h3>
+<p>Real deployments rarely stay at the textbook endpoints. Harbor Point might require one nearby standby to flush every reservation approval before acknowledging the trader, while allowing additional reporting replicas to lag asynchronously. Another team might configure quorum-based synchronous replication so any one of two local standbys can satisfy the commit rule. Yet another might run "semi-sync," where the primary waits for a receipt or flush from one standby but falls back to asynchronous mode after a timeout. All of those are really policies about what durability guarantee survives degraded conditions.</p>
+<p>Those policy choices create explicit trade-offs:</p>
+<ul>
+<li>Strict synchronous replication reduces the chance of acknowledged-write loss during failover, but it ties write availability to replica health and network quality.</li>
+<li>Asynchronous replication preserves write throughput and keeps the primary available when replicas are unhealthy, but it accepts a non-zero RPO window for acknowledged writes.</li>
+<li>Intermediate policies such as quorum sync or semi-sync reduce some risk without paying the full cost of waiting for every replica, but they also make the guarantee more conditional and therefore harder to explain operationally.</li>
+</ul>
+<p>Harbor Point should therefore document the acknowledgment rule in product language, not only database language. "Reservation approvals survive loss of the primary because one standby must flush the WAL before commit returns" is an operationally useful promise. So is "search suggestions may roll back a few seconds after failover because they replicate asynchronously." If the team cannot state the rule that clearly, it probably has not chosen the mode deliberately enough.</p>
+<p>This lesson also prepares the ground for <a href="020.html">03.md</a>. Synchronous leader-follower replication adds a remote acknowledgment to a primary's commit path. Raft goes further by making quorum acknowledgment the definition of commit itself. The same design pressure appears in both: durability improves when multiple nodes must confirm ordered history, but latency and failure handling become part of the write path.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Enabling synchronous replication caused approval latency spikes even though the primary's own disk is healthy.</p>
+<p><strong>Why it happens / is confusing</strong>: The extra delay is no longer coming only from local WAL flush. The commit path now includes network transport, standby disk flush, and any queuing on the designated synchronous replica.</p>
+<p><strong>Clarification / Fix</strong>: Measure each hop separately. Verify whether Harbor Point is waiting for remote receive, remote flush, or remote apply, and whether the synchronous standby is in the same region and provisioned for peak WAL volume.</p>
+<p><strong>Issue</strong>: A failover lost a reservation that the API had already confirmed, even though replication lag dashboards looked small.</p>
+<p><strong>Why it happens / is confusing</strong>: Small replay lag does not prove that the acknowledged transaction had already been flushed on a standby when the primary died. If the system was running asynchronously, the acknowledgment only guaranteed local durability.</p>
+<p><strong>Clarification / Fix</strong>: Compare the configured commit policy with the business RPO. If acknowledged approvals must survive failover, require at least one standby flush before success or move that workload onto a quorum-commit design.</p>
+<p><strong>Issue</strong>: The primary stopped accepting writes when a replica link flapped for a few seconds.</p>
+<p><strong>Why it happens / is confusing</strong>: In strict synchronous mode, the primary is not allowed to complete commits without the configured replica acknowledgment. What looks like a "replica problem" has become a write-availability problem by design.</p>
+<p><strong>Clarification / Fix</strong>: Decide whether the business prefers blocking writes, failing over quickly, or temporarily degrading to asynchronous behavior. Then encode that policy explicitly instead of relying on an implicit timeout or an undocumented operator decision.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="018.html">01.md</a> supplies the replica milestones that synchronous commit can wait for</h3>
+<p>The previous lesson separated receive, flush, and replay positions on a standby. This lesson turns those positions into a client-facing contract. "Async" means the commit boundary stops at local durability. "Sync" means the boundary extends to one of those remote positions.</p>
+<h3>Connection 2: <a href="020.html">03.md</a> replaces single-primary acknowledgment with quorum commit</h3>
+<p>Primary-standby systems ask, "Should this leader wait for a follower before acknowledging?" Raft-based systems ask, "Has this log entry reached a majority, making it committed by protocol definition?" The machinery changes, but the core trade-off is the same: stronger failover guarantees come from waiting for more nodes to confirm ordered history.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION">PostgreSQL Documentation: Synchronous Replication</a><ul>
+<li>Focus: The exact standby milestones PostgreSQL can wait for and how those choices affect latency and failover durability.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html">MySQL Reference Manual: Semisynchronous Replication</a><ul>
+<li>Focus: A production example of a middle ground between fully asynchronous replication and stricter synchronous policies.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Leader-based replication, failover data loss windows, and why acknowledgment policy is the real semantic boundary.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Replication mode is a commit-contract choice</strong> - The important question is which remote milestone must happen before a client can be told the write is durable.</li>
+<li><strong>Async is fast because it accepts a failover loss window</strong> - An acknowledged write can still disappear if the primary dies before any standby has durably stored it.</li>
+<li><strong>Sync improves failover safety by adding coordination to the write path</strong> - The benefit is real, but so are the latency and availability costs of waiting for replicas.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Harbor Point wants approved reservations to survive loss of the primary after the API returns success. Which acknowledgment rule best matches that goal in a leader-follower system?</strong></p>
+<ul>
+<li>A) Return success after the primary flushes WAL locally and let replicas catch up later</li>
+<li>B) Return success only after at least one standby durably flushes the reservation's WAL</li>
+<li>C) Return success as soon as the standby receives the bytes in memory, even if it has not persisted them</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can a hot standby still show stale data even when the database is using synchronous replication?</strong></p>
+<ul>
+<li>A) Because synchronous replication always disables standby reads</li>
+<li>B) Because the system may wait for remote flush, not remote apply, before acknowledging the write</li>
+<li>C) Because acknowledged writes are never shipped to replicas until after failover</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the clearest reason a strict synchronous primary may stop accepting writes when its replica link becomes unstable?</strong></p>
+<ul>
+<li>A) The primary forgot how to flush WAL locally</li>
+<li>B) The commit rule now depends on replica acknowledgment, so replica health is part of write availability</li>
+<li>C) Synchronous replication automatically converts every write into a distributed transaction across all tables</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Waiting for a standby to flush the WAL means the reservation exists durably on more than one machine before the client is told it committed. Option A is asynchronous and leaves an acknowledged-write loss window. Option C is weaker than durable remote flush because in-memory receipt can still vanish on standby crash.</p>
+<p><strong>2. B</strong>: Synchronous replication can protect failover durability without guaranteeing immediate query visibility on standbys. If the policy waits for remote flush but replay is still behind, standby reads can remain stale for a short period. Options A and C describe behaviors that are not generally true.</p>
+<p><strong>3. B</strong>: Once the configured guarantee requires replica acknowledgment, a replica outage or network problem can block commits by design. Option A is unrelated to the mode change, and option C overstates what ordinary synchronous leader-follower replication does.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="018.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Replication Primitives: Log Shipping and Apply</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="020.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Raft for Database Replication</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

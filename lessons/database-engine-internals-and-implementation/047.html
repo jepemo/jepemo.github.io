@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monthly Capstone: Primary Region Outage Runbook - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Monthly Capstone: Primary Region Outage Runbook</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 047 | Lesson ID: 448
+        </p>
+        <p>
+          Difficulty: advanced | Kind: final_capstone
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 448: Monthly Capstone: Primary Region Outage Runbook</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A primary-region outage runbook is a commit-order recovery protocol. You freeze new writes, prove which WAL prefix is durable in the failover region, fence the old primary, and only then promote, reroute, and decide which background jobs may resume.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="046.html">046.md</a>, Harbor Point treated online reindexing as a resumable state machine: choose a snapshot frontier, backfill a shadow index, catch up with live writes, validate parity, and cut over only when the catalog says the new structure is trustworthy. At 09:33 on a volatile Monday, that exact rebuild is still in progress on the <code>reservations</code> cluster when the primary region, <code>iad</code>, disappears behind a power and network event. The trading desk still needs to open reservations, compliance still needs same-day visibility, and the index job is stuck somewhere between catch-up and validation.</p>
+<p>The tempting mistake is to frame the problem as "bring up the replica quickly." That is not the real task. The real task is to decide what database state is authoritative. Which commits acknowledged in <code>iad</code> are definitely durable in <code>phx</code>? Did the reindex job publish a new catalog state, or was it still only writing into a shadow structure? Are application workers, cron jobs, and queue consumers guaranteed to stop sending writes to the old primary if it comes back half-alive? A runbook exists so those questions have deterministic answers before humans improvise under stress.</p>
+<p>That is why outage handling belongs inside database internals, not outside them. Failover is not only an SRE procedure and not only a routing change. It is the moment when WAL durability, replication mode, MVCC visibility, job metadata, and process-level fencing all have to agree on one timeline. If they do not, Harbor Point can reopen the system quickly and still lose reservation writes, double-apply side effects, or let an invalid index become visible after promotion.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation system is the kind of database where "mostly correct" is operationally useless. A missed reservation can leave issuer exposure understated. A duplicated reservation can over-reserve headroom and block trading that should succeed. A failover that promotes a replica without knowing the state of the in-flight reindex from <a href="046.html">046.md</a> can create a subtler failure: queries keep running, but one region believes a shadow index is ready while another never durably recorded the cutover.</p>
+<p>Production runbooks are supposed to turn scary moments into bounded decisions. In practice, many organizations still keep disaster recovery as a loose checklist: promote the most up-to-date replica, switch DNS, watch dashboards, and clean up later. That is not enough for a transactional database. The hard parts happen before traffic is reopened: stop every remaining write path, identify the highest safe WAL position, choose whether the organization will accept any data loss beyond that point, and preserve job and schema metadata so the new primary does not inherit an ambiguous half-state.</p>
+<p>When the runbook is mechanistic, RTO and RPO stop being slogans. The team knows which metrics gate promotion, what gets paused, what can resume, and which writes need reconciliation after the incident. When the runbook is vague, speed becomes a liability. The cluster comes back faster, but the business learns hours later that the recovered timeline was never made authoritative.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Determine whether a failover target is safe to promote</strong> - Use WAL durability, replay position, fencing state, and replicated job metadata to decide what commit prefix can become authoritative.</li>
+<li><strong>Walk through a concrete primary-region outage runbook</strong> - Explain the sequence of write freeze, fencing, promotion, traffic reopening, and maintenance-job handling for Harbor Point's reservation database.</li>
+<li><strong>Plan post-failover reconciliation</strong> - Identify which requests, side effects, and database nodes must be reconciled before the incident can truly be considered closed.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Promotion means choosing an authoritative commit prefix</h3>
+<p>Harbor Point runs the <code>reservations</code> primary in <code>iad</code> and streams WAL to a warm standby in <code>phx</code>. During normal operation, the desk accepts a little cross-region replication lag because fully synchronous remote commits would slow the hot path too much during the 09:30 market-open burst. That design choice is reasonable, but it changes what failover can promise. Once <code>iad</code> disappears, <code>phx</code> is not automatically allowed to become the new primary for "everything the old primary ever acknowledged." It is only allowed to become primary for the commit prefix it can prove is durably present.</p>
+<p>That proof starts with WAL, not with query latency and not with a vague "replica looks healthy" dashboard. Harbor Point needs the highest WAL location that is definitely replayed or at least durably received in <code>phx</code>, depending on the failover policy. It also needs to know whether acknowledgments in <code>iad</code> were local-only or required remote durability. If client commits were acknowledged before <code>phx</code> had them, then some acknowledged transactions may now be outside the safe promotion frontier. The runbook has to say whether the business accepts that bounded loss or whether writes stay offline until archive recovery or another replica can close the gap.</p>
+<p>The mental model looks like this:</p>
+<div class="codehilite"><pre><span></span><code>client commit
+    |
+    v
+iad primary WAL append -----&gt; WAL archive
+    |
+    +-----------------------&gt; phx standby receive -&gt; replay
+
+safe promotion frontier = highest commit prefix that Harbor Point
+can prove is durable on the region it is about to promote
+</code></pre></div>
+
+<p>The same rule applies to metadata, not only to user rows. The in-flight reindex from <a href="046.html">046.md</a> has state in job tables and catalog records: snapshot frontier, completed spans, validation progress, and whether cutover was ever committed. If that metadata is not present on <code>phx</code>, operators cannot assume the new primary "knows" where the maintenance job was. Promotion therefore chooses an authoritative prefix for the entire database state machine, including background work.</p>
+<p>This is the first trade-off the runbook makes explicit. Asynchronous cross-region replication keeps the hot path faster, but it means the outage procedure may involve a data-loss boundary that humans have to acknowledge. Tighter durability guarantees reduce that ambiguity, but they spend latency on every healthy-day commit. A production runbook is where the system finally admits which side of that trade-off it chose.</p>
+<h3>Concept 2: The runbook is a sequence of authority transfers, not a bag of recovery tricks</h3>
+<p>Once <code>iad</code> is considered unhealthy, Harbor Point should not improvise from scratch. The database runbook needs ordered phases, because each phase answers one authority question before the next one starts.</p>
+<div class="codehilite"><pre><span></span><code>1. Freeze writes and background mutators
+2. Fence the old primary region
+3. Verify the candidate standby and choose promotion LSN
+4. Promote with a new epoch/timeline
+5. Reopen traffic in stages
+6. Resume or abort unfinished maintenance jobs explicitly
+</code></pre></div>
+
+<p>Freezing writes means more than setting the application to read-only mode. Harbor Point has API servers, asynchronous queue consumers that emit reservation amendments, and schema-maintenance workers left over from the reindex job. If any of them can still reach <code>iad</code> or cache the old writer endpoint, the system does not yet have one writer. The first phase therefore disables writer feature flags, pauses job schedulers, and stops any process that could emit new WAL before the database team has proved which region is in charge.</p>
+<p>Fencing is the next non-negotiable step. If <code>iad</code> comes back with stale leader state while <code>phx</code> is already accepting writes, Harbor Point has a split-brain event rather than a recovery. Fencing can involve load-balancer removal, lease revocation in service discovery, credential revocation for automation, or even forceful node shutdown if a host is reachable but unhealthy. The exact mechanism depends on the platform, but the invariant is stable: the old primary must be unable to accept writes before the new one is opened.</p>
+<p>Only after fencing does Harbor Point validate <code>phx</code> as the failover target. Operators check replay position, replication health, disk pressure, and whether the replicated metadata for the in-flight reindex is coherent. A practical checklist for the reservation cluster looks like this:</p>
+<div class="codehilite"><pre><span></span><code>- highest replayed WAL location in phx
+- highest archived WAL location available to phx
+- current job record for idx_reservations_by_settlement rebuild
+- catalog flag showing whether new index is visible to the planner
+- replication lag on read replicas that will follow phx after promotion
+- lease/epoch store ready to issue a new writer term
+</code></pre></div>
+
+<p>Promotion itself should create a new epoch or timeline that every write path can recognize. The database becomes writable in <code>phx</code>, service discovery points writer traffic there, and only leader-scoped background workers start up. This is where <a href="046.html">046.md</a> matters again. If the reindex metadata on <code>phx</code> says "backfill complete, validation incomplete, cutover not committed," the job can resume from validation under the new primary. If the metadata says the cutover was already committed and replicated, the index is authoritative and the job should not rerun old phases. If the metadata is missing or contradictory, the runbook must force the safer branch: keep the shadow index non-public and rebuild or revalidate instead of guessing.</p>
+<p>The production trade-off is between automation speed and state richness. Fully automatic failover only works if every phase marker that matters to correctness is persisted and replicated: leader epoch, schema-job state, durable replay position, and service-level write permissions. If those markers do not exist, a human can still recover the system, but the runbook becomes slower because humans must reconstruct state from logs and side channels.</p>
+<h3>Concept 3: Recovery is incomplete until Harbor Point reconciles side effects and quarantines the old primary</h3>
+<p>After <code>phx</code> is promoted and writes reopen, the incident is not over. Harbor Point still has a gray window around the outage boundary where three classes of work may disagree: client requests near the failover moment, asynchronous side effects triggered from committed transactions, and the old <code>iad</code> region if it comes back with unreplicated WAL.</p>
+<p>The reservation service therefore needs an explicit reconciliation pass. Every write request already carries a durable <code>request_id</code>, and reservation creation uses idempotent inserts keyed by <code>reservation_id</code>. That design is what makes the runbook survivable. Once <code>phx</code> is primary, Harbor Point can compare the last minute of API request logs and outbox events against committed rows on the new timeline. Requests that reached the API but never became durable can be retried safely because the idempotency key prevents duplicates. Side effects such as downstream risk notifications are rebuilt from the transactional outbox on the promoted primary, not replayed blindly from application memory.</p>
+<p>The in-flight reindex also needs a post-failover decision. Suppose the job had finished backfill in <code>iad</code>, but validation was still running when the outage started. On <code>phx</code>, the safe response is not "continue as if nothing happened." The safe response is "resume from the last replicated phase marker, then rerun any proof step whose result might have depended on the missing prefix." Validation is cheap compared with letting an index become visible based on a proof that lived only in the dead region's memory or logs.</p>
+<p>The biggest operational mistake is how teams treat the old primary when it returns. <code>iad</code> must not simply reconnect and "catch up somehow." It may contain writes from a divergent timeline that were never accepted into <code>phx</code>. Mature runbooks treat the returned primary as contaminated until it has been rewound or re-seeded from the new authority. In PostgreSQL terms that could mean <code>pg_rewind</code> when histories are compatible or a fresh base backup when they are not. In managed systems it often means discarding the old volume and rebuilding a replica from the promoted region. The important principle is the same: there is one authoritative timeline after failover, and the old primary has to rejoin that timeline as a follower, not as a peer with partially valid history.</p>
+<p>This final phase exposes the deeper trade-off in disaster recovery design. Faster failover is only safe when application requests are idempotent, side effects are tied to committed database state, job progress is durable, and node reincorporation is automated. Teams that skip those investments can still write a runbook, but it will be slower, more manual, and less certain right when certainty matters most.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The standby is only a second or two behind, so the team wants to promote immediately.</p>
+<p><strong>Why it happens / is confusing</strong>: Lag dashboards often summarize transport delay, not the exact WAL prefix that is durably replayed and not the state of catalog or job metadata. "Almost caught up" is not a correctness condition.</p>
+<p><strong>Clarification / Fix</strong>: Promote only after selecting an explicit safe frontier. Record the chosen WAL position in the incident log, confirm fencing first, and verify that the metadata for unfinished schema or index work is present on the candidate.</p>
+<p><strong>Issue</strong>: The old primary comes back after <code>phx</code> is live, and someone suggests re-enabling it as a second writer temporarily for capacity.</p>
+<p><strong>Why it happens / is confusing</strong>: The node may look healthy again, so operators focus on CPU and reachability instead of timeline divergence.</p>
+<p><strong>Clarification / Fix</strong>: Treat the returned node as read-disabled until it has been rewound or rebuilt from the new primary. A recovered old primary without timeline repair is a split-brain risk, not spare capacity.</p>
+<p><strong>Issue</strong>: After promotion, the reservation API is healthy but dashboard queries show unstable plans around the rebuilt index.</p>
+<p><strong>Why it happens / is confusing</strong>: The new primary may have the shadow index files and job metadata, but not the same planner statistics, cache warmth, or completed validation proof the old region had in memory.</p>
+<p><strong>Clarification / Fix</strong>: Resume the index job from the last replicated phase marker, rerun validation if there is any doubt, and delay planner visibility for the new index until the proof is durable on the promoted region.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="046.html">046.md</a> gave the outage runbook something precise to preserve</h3>
+<p>Online reindexing became manageable only when Harbor Point represented it as durable phases instead of a background blur. The outage runbook uses that same structure. Failover is no longer "what happens if the job crashes," but "which job phase is durably part of the authoritative WAL prefix and which proof steps must be repeated on the new leader."</p>
+<h3>Connection 2: <a href="../consistency-and-replication/018.html">../consistency-and-replication/018.md</a> generalizes this capstone into steady-state policy</h3>
+<p>This lesson is a one-incident view of a larger design question: what durability and visibility guarantees should a replicated database offer every day? The next replication-focused material takes the same questions about commit order, promotion safety, and remote lag and turns them into normal operating policy instead of emergency procedure.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby-failover.html">PostgreSQL Documentation: Warm Standby, Failover, and Replication</a><ul>
+<li>Focus: Read the sections on promotion, streaming replication, and failover triggers to connect the lesson's "safe prefix" idea to a concrete WAL-based system.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/continuous-archiving.html">PostgreSQL Documentation: Continuous Archiving and Point-in-Time Recovery (PITR)</a><ul>
+<li>Focus: Study how archived WAL extends recovery beyond a single live standby and why archive completeness matters when the promoted replica is missing the last acknowledged commits.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/app-pgrewind.html">PostgreSQL Documentation: pg_rewind</a><ul>
+<li>Focus: See why the old primary cannot simply reconnect after failover and how a divergent node is brought back under the new authoritative timeline.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://patroni.readthedocs.io/en/latest/replication_modes.html">Patroni Documentation: Replication Modes</a><ul>
+<li>Focus: Compare asynchronous, synchronous, and quorum-style replication choices and map them to the RPO and failover trade-offs discussed in this runbook.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Failover promotes a commit prefix, not a server</strong> - The new primary is authoritative only for the WAL and metadata it can prove are durable in the failover region.</li>
+<li><strong>Fencing is part of correctness, not an operations afterthought</strong> - If the old primary can still accept writes, the system does not have a runbook; it has two competing timelines.</li>
+<li><strong>Recovery finishes after reconciliation, not after traffic returns</strong> - Request idempotency, transactional outboxes, resumable maintenance jobs, and safe old-primary rebuilds are what turn a fast failover into a correct one.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why was Harbor Point not allowed to promote <code>phx</code> immediately after the <code>iad</code> outage?</strong></p>
+<ul>
+<li>A) Because every failover must wait for all regions to become writable</li>
+<li>B) Because the team first had to identify the highest commit prefix and maintenance metadata that were durably present on <code>phx</code>, then fence <code>iad</code></li>
+<li>C) Because replicas can never be promoted while an index rebuild exists</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main reason the runbook pauses queue consumers and schema workers before promotion?</strong></p>
+<ul>
+<li>A) To reduce cloud costs during the incident</li>
+<li>B) To make query plans deterministic</li>
+<li>C) To stop every remaining path that could still produce writes or mutate catalog state before the new primary is chosen</li>
+</ul>
+</li>
+<li>
+<p><strong>Why must the old <code>iad</code> primary be rewound or rebuilt before it rejoins the cluster?</strong></p>
+<ul>
+<li>A) Because its local history may contain WAL from a divergent timeline that the promoted region never accepted</li>
+<li>B) Because read replicas are not allowed in a multi-region topology</li>
+<li>C) Because reindex jobs can only run on freshly installed servers</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Promotion is safe only for the WAL prefix and replicated metadata that <code>phx</code> can prove it has durably. Fencing the old primary is part of the same decision because two writable regions would create split brain. Option A is false, and option C is too absolute; an index rebuild does not forbid promotion if its phase state is durable and understood.</p>
+<p><strong>2. C</strong>: API servers are not the only writers in a production system. Queue consumers, maintenance workers, and schema jobs can all mutate durable state, so they must be paused before the new writer is selected. Options A and B miss the correctness boundary the runbook is protecting.</p>
+<p><strong>3. A</strong>: Once <code>phx</code> is promoted, <code>iad</code> may contain transactions from a history that is no longer authoritative. Rewind or rebuild is how the returned node rejoins the chosen timeline safely. Options B and C are unrelated to the core failover mechanism.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="046.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Online Reindexing and Maintenance at Scale</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Online Reindexing and Maintenance at Scale - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Online Reindexing and Maintenance at Scale</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 046 | Lesson ID: 447
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 447: Online Reindexing and Maintenance at Scale</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Online reindexing is a long-running state machine, not a background convenience. The engine has to backfill a shadow index from a stable snapshot, keep up with concurrent writes, prove the rebuilt structure is equivalent to the old one, and cut over atomically without letting maintenance work steal the serving path.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="045.html">045.md</a>, Harbor Point learned that tenant identity has to survive all the way into quotas, queues, and background work. That lesson becomes painfully concrete when <code>CedarHarbor</code> asks to rebuild the bloated <code>idx_reservations_by_settlement</code> index on its <code>reservations</code> table. The index has grown inefficient after months of correction imports and delete churn, but Harbor Point cannot pause <code>NorthPier</code>'s 09:30 booking traffic just to clean up one tenant's access path.</p>
+<p>That is the real shape of online reindexing. It is not "make a copy in the background and swap it later." Rows keep changing while the rebuild runs. New inserts arrive, updates move keys between index pages, deletes create garbage, replicas lag, and compaction or vacuum work accumulates behind the scenes. A correct rebuild therefore behaves like a resumable protocol: establish a snapshot frontier, build a shadow structure, capture everything that changed after the snapshot, validate parity, and only then flip the metadata that makes planners trust the new index.</p>
+<p>The misconception to discard is that the scan is the hard part. At scale, the scan is usually the easy part. The hard part is preserving invariants while the rest of the system is still live: every committed row that should be visible after cutover must have a matching entry in the new index, queries must never read from a half-built structure, and one tenant's maintenance job must not silently consume another tenant's latency budget. Once you see reindexing as a state machine with budgets, the operational decisions become much clearer.</p>
+<h2>Why This Matters</h2>
+<p>Indexes age. In B-tree engines they become bloated after heavy update and delete churn. In LSM-backed engines they accumulate write amplification and compaction debt in new ways as schemas evolve. Query regressions often appear long before a table itself is "too large"; the hot path slows down because the access structure no longer matches the workload or has become physically inefficient.</p>
+<p>The naive fix is downtime: block writes, rebuild the index, then reopen the table. That works for a small internal tool. It does not work for Harbor Point's production cluster, where <code>NorthPier</code> is making time-sensitive reservations, <code>BeaconStreet</code> is replaying corrections, and <code>CedarHarbor</code> still needs its audit queries to recover. Taking a long exclusive lock would turn a maintenance task into a customer-visible outage.</p>
+<p>Online reindexing changes the problem from "can we rebuild the index?" to "can we rebuild it while the database remains honest about visibility, durability, and resource ownership?" If the answer is yes, the organization gains a safer maintenance path, shorter incident windows, and fewer emergency migrations caused by avoidable index decay. If the answer is no, maintenance becomes something teams postpone until the day it is urgent and dangerous.</p>
+<p>This lesson also prepares the ground for <a href="047.html">047.md</a>. Once maintenance is modeled as a resumable protocol, failover and outage handling stop being afterthoughts. Operators need to know whether a cutover can resume, roll back, or safely wait when a region disappears halfway through a rebuild.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain the correctness invariant behind online reindexing</strong> - Describe what must be true about the old and new index before the planner is allowed to trust the rebuilt structure.</li>
+<li><strong>Trace the reindexing state machine</strong> - Follow snapshot selection, backfill, concurrent change capture, validation, and atomic cutover in a live system.</li>
+<li><strong>Evaluate production trade-offs</strong> - Judge when online reindexing is worth the extra write amplification, storage overhead, and operational controls required at scale.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The real invariant is index equivalence under live traffic</h3>
+<p>Harbor Point is not rebuilding <code>idx_reservations_by_settlement</code> because the name of the index changed. It is rebuilding because the existing structure has become expensive: page splits and dead entries have increased read cost for <code>CedarHarbor</code>'s audit lookups, and the planner is starting to prefer broader scans during end-of-day checks. The database cannot simply delete the old index and recreate it, because <code>NorthPier</code> and <code>BeaconStreet</code> are still writing new reservations, correcting settlement dates, and canceling stale holds while the rebuild is happening.</p>
+<p>That leads to the central invariant: after cutover, the new index must represent the same logical row set the old index represented for every committed transaction that should be visible. "Same logical row set" is stronger than "the build job finished." It means inserts that happened after the initial snapshot cannot be missed, deletes cannot leave ghost entries that would produce wrong lookups, and updates that move a row from one key range to another cannot appear in both places or neither place. If the engine cannot guarantee that equivalence, then the rebuilt index is not a maintenance improvement. It is silent data corruption at the access-path layer.</p>
+<p>This is why mature engines treat online reindexing as a descriptor or catalog state transition rather than as one monolithic command. The old index remains authoritative while the new one sits in a state such as <code>write_only</code>, <code>backfilling</code>, or <code>not_valid</code>, depending on the engine. Queries are either forbidden from using the shadow index or allowed to use it only under narrowly defined rules. The important point is not the exact label. The important point is that planner visibility and write visibility move in controlled phases instead of changing all at once.</p>
+<p>The trade-off starts here. Offline rebuilds are simpler because there is only one truth at a time. Online rebuilds preserve availability, but they introduce dual structures, extra metadata states, and more failure paths to test. That complexity is justified only when the application cannot tolerate the lock profile or downtime of an offline rebuild.</p>
+<h3>Concept 2: The mechanism is snapshot backfill plus catch-up, not a single pass</h3>
+<p>Once Harbor Point commits to an online rebuild, the engine usually follows a sequence close to this:</p>
+<div class="codehilite"><pre><span></span><code>old index remains serving queries
+        |
+choose snapshot frontier T0
+        |
+scan base table as of T0 -&gt; build shadow index
+        |
+concurrent writes after T0
+   -&gt; old index
+   -&gt; shadow index or change log
+        |
+catch up shadow index to present frontier
+        |
+validate parity
+        |
+atomic metadata cutover
+        |
+retire old index and reclaim space
+</code></pre></div>
+
+<p>The first critical move is choosing a consistent snapshot frontier, <code>T0</code>. In an MVCC system, the backfill reads the table as it existed at <code>T0</code> so the job sees a stable version of each row instead of a moving target. Without that snapshot guarantee, the scan could read half of one transaction and half of another, building an index that never matched any real database state.</p>
+<p>The second critical move is handling writes that arrive after <code>T0</code>. Engines do this in different ways. Some dual-write directly into both old and new indexes once the shadow structure exists. Others record post-snapshot changes in a side log or schema-change job queue and replay them into the new index before cutover. PostgreSQL's concurrent builds, distributed SQL schema changers, and online DDL systems in MySQL-derived fleets differ in details, but they all solve the same problem: a long backfill alone cannot make the new index current, because the table keeps changing while the scan runs.</p>
+<p>At scale, the catch-up phase is often where reality bites. If <code>CedarHarbor</code> writes rows faster than the rebuild can absorb post-snapshot changes, the lag between the shadow index and the serving frontier keeps growing. The database then has three bad options: let the rebuild run forever, increase maintenance throughput and risk hurting foreground traffic, or pause and resume under tighter budgets. That is why engines persist progress durably. The rebuild must be resumable by range, partition, or key span, with a recorded frontier, so a node crash or lease transfer does not force a full restart.</p>
+<p>Validation and cutover are the last correctness gate. The engine checks that the shadow index is complete enough to trust, sometimes with row-count parity, duplicate detection for unique indexes, checksum-style consistency checks, or a combination of metadata proofs and targeted scans. Only then does it flip the catalog or descriptor pointer that makes the planner prefer the rebuilt index. The cutover needs to be atomic from the reader's point of view: there may be long background work before and after the switch, but there cannot be a period where queries are free to use a half-valid index because a maintenance job "looked mostly done."</p>
+<h3>Concept 3: At scale, maintenance is a resource-scheduling problem as much as a correctness problem</h3>
+<p>Rebuilding one index on an idle database is mostly a storage-engine concern. Rebuilding indexes in Harbor Point's shared production cluster is also an admission-control problem. The backfill reads table pages, writes new index entries, emits WAL or replication traffic, warms and evicts cache lines, and may trigger page splits or LSM compaction. Every one of those steps competes with foreground work. If the system treats maintenance as free background progress, then <code>CedarHarbor</code>'s repair job can consume the same IO queue depth and WAL bandwidth that <code>NorthPier</code> needs for booking commits.</p>
+<p>This is where the previous lesson matters. Online reindexing must spend the owning tenant's budget, not invisible cluster magic. Harbor Point therefore needs tenant-aware maintenance tokens: limits for scan bandwidth, write rate, compaction debt, and concurrent schema jobs. Those controls should interact with the same admission system that governs foreground workloads, so the cluster can say "pause the backfill for 30 seconds because market-open writes are burning the latency budget" instead of discovering the conflict afterward in an incident review.</p>
+<p>The observability surface also changes. Median query latency is not enough. Operators need to see shadow-index size growth, backfill scan throughput, post-snapshot catch-up lag, WAL bytes generated by the job, replica apply lag, lock wait time around cutover, and any user-visible query-plan changes once the new index becomes available. A rebuild that "completed successfully" but pushed replica lag high enough to break read scaling was not actually successful in production terms.</p>
+<p>Unique indexes make the trade-offs sharper. If Harbor Point rebuilds a unique index on reservation reference numbers, the job must detect duplicates that were introduced or revealed while the shadow index was catching up. That can require stronger validation phases, duplicate resolution rules, or failure semantics that leave the old index in place and mark the new one as invalid. The lesson is general: the more semantic meaning an index carries, the more the cutover behaves like a controlled migration rather than a mechanical copy.</p>
+<p>At some point, the cheapest answer is not "make the online rebuild smarter." It is "change the operating plan." Teams often rate-limit by tenant, split the rebuild into partitions, run follower-side preparation work before final cutover, or schedule the last validation phase away from known traffic peaks. Those decisions are not signs of weakness. They are signs that the team understands maintenance as part of the serving system, not as work that happens outside it.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The rebuild never reaches cutover because catch-up lag keeps increasing.</p>
+<p><strong>Why it happens / is confusing</strong>: The initial backfill can look healthy while post-snapshot writes outpace the job's ability to apply deltas. Dashboards may show strong scan throughput even though the shadow index is falling further behind the live frontier.</p>
+<p><strong>Clarification / Fix</strong>: Track a real freshness metric, such as "shadow index caught up through timestamp X" or "delta queue depth," not just rows scanned. If lag grows under normal traffic, lower maintenance concurrency, shard the work more finely, or move the final catch-up phase to a quieter window rather than pretending the scan rate is the whole story.</p>
+<p><strong>Issue</strong>: Foreground write latency spikes whenever the rebuild is active.</p>
+<p><strong>Why it happens / is confusing</strong>: Online reindexing preserves availability, but it does not eliminate extra work. Dual writes, additional WAL, cache churn, and compaction can all show up as write-path regression even when no table lock is held.</p>
+<p><strong>Clarification / Fix</strong>: Charge the rebuild to explicit maintenance budgets and graph its write amplification separately from application traffic. If the cluster cannot throttle scan and index-write tokens independently, the job is operating outside the same control system that protects user-facing SLOs.</p>
+<p><strong>Issue</strong>: A node or region fails during validation or cutover, leaving operators unsure whether the new index is safe to use.</p>
+<p><strong>Why it happens / is confusing</strong>: "Job running" is not precise enough state for failure recovery. Without durable phase markers, teams do not know whether to resume validation, retry cutover, or discard the shadow index.</p>
+<p><strong>Clarification / Fix</strong>: Persist rebuild state explicitly: snapshot frontier, completed spans, validation status, and cutover status. Recovery logic should be able to answer "resume," "abort," or "already public" from metadata alone. If humans must infer the state from logs during an outage, the maintenance protocol is under-specified.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="045.html">045.md</a> explains who pays for the maintenance work</h3>
+<p>Multi-tenant isolation defined the policy boundary: one tenant's background work should not quietly consume another tenant's latency budget. Online reindexing is the exact case that tests whether that policy is real. A shadow index build produces read amplification, write amplification, and compaction or vacuum debt, so it forces the engine to prove that maintenance tokens and tenant ownership reach below the SQL surface.</p>
+<h3>Connection 2: <a href="047.html">047.md</a> turns online maintenance into an outage-management problem</h3>
+<p>A resumable rebuild already looks like a runbook: it has phase markers, cutover conditions, and abort criteria. The capstone lesson on primary-region outages extends that operational mindset. If the primary region fails during a schema job, teams need deterministic answers about whether the secondary can continue serving, whether the rebuild should resume after failover, and which metadata state is authoritative.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] PostgreSQL <code>CREATE INDEX</code><ul>
+<li>Link: <a href="https://www.postgresql.org/docs/current/sql-createindex.html">https://www.postgresql.org/docs/current/sql-createindex.html</a></li>
+<li>Focus: Read the <code>CONCURRENTLY</code> behavior and locking notes to see how a widely used MVCC engine exposes online index builds while keeping planner visibility staged.</li>
+</ul>
+</li>
+<li>[DOC] PostgreSQL <code>REINDEX</code><ul>
+<li>Link: <a href="https://www.postgresql.org/docs/current/sql-reindex.html">https://www.postgresql.org/docs/current/sql-reindex.html</a></li>
+<li>Focus: Compare ordinary <code>REINDEX</code> with <code>REINDEX CONCURRENTLY</code> and note why some repairs still require extra cleanup and multiple passes.</li>
+</ul>
+</li>
+<li>[DOC] CockroachDB Docs: Online Schema Changes<ul>
+<li>Link: <a href="https://www.cockroachlabs.com/docs/stable/online-schema-changes.html">https://www.cockroachlabs.com/docs/stable/online-schema-changes.html</a></li>
+<li>Focus: Study how a distributed SQL engine persists schema-change jobs, backfill progress, and cutover state so maintenance can survive node movement and failures.</li>
+</ul>
+</li>
+<li>[DOC] MySQL 8.4 Reference Manual: InnoDB and Online DDL<ul>
+<li>Link: <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html">https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html</a></li>
+<li>Focus: Separate true online behavior from <code>INPLACE</code> and <code>COPY</code> implementation details, and map those choices to the availability and write-amplification trade-offs in this lesson.</li>
+</ul>
+</li>
+<li>[DOC] Vitess Online DDL Overview<ul>
+<li>Link: <a href="https://vitess.io/docs/24.0/user-guides/schema-changes/overview/">https://vitess.io/docs/24.0/user-guides/schema-changes/overview/</a></li>
+<li>Focus: See how large fleets wrap schema and index changes in queued, resumable workflows instead of treating DDL as a one-shot administrative command.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Online reindexing is a correctness protocol before it is a performance tool</strong> - The rebuilt index is safe only if snapshot backfill, concurrent-write capture, validation, and cutover preserve logical equivalence with the old structure.</li>
+<li><strong>The catch-up phase is where scale shows up</strong> - A rebuild that cannot keep pace with live writes is not "almost done"; it is a maintenance job whose operating budget no longer matches the workload.</li>
+<li><strong>Maintenance belongs inside the same control plane as serving traffic</strong> - If reindexing is not throttled, attributed, and observable like any other tenant workload, it becomes a hidden path for noisy-neighbor incidents.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is a stable snapshot frontier necessary during online reindexing?</strong></p>
+<ul>
+<li>A) So the engine can build the new index against one coherent database state instead of a moving mix of row versions</li>
+<li>B) So the planner can immediately route all reads to the shadow index</li>
+<li>C) So the rebuild can avoid writing WAL for the new index entirely</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main purpose of the catch-up phase after the initial backfill?</strong></p>
+<ul>
+<li>A) To compress the old index before dropping it</li>
+<li>B) To apply writes that happened after the snapshot so the new index reaches the live serving frontier before cutover</li>
+<li>C) To force all tenants onto the same maintenance schedule</li>
+</ul>
+</li>
+<li>
+<p><strong>Why did Harbor Point need tenant-aware maintenance budgets in this lesson?</strong></p>
+<ul>
+<li>A) Because online reindexing consumes shared resources such as IO, WAL bandwidth, and compaction capacity, and those costs must be charged to the tenant that triggered the job</li>
+<li>B) Because index builds are purely metadata changes with no runtime cost</li>
+<li>C) Because tenant budgets matter only after the new index becomes public</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The snapshot frontier gives the backfill a consistent view of the table. Without it, the scan could mix row versions from different transactional moments and build an index that never matched any valid state. Options B and C are unrelated to the core invariant.</p>
+<p><strong>2. B</strong>: The backfill only captures the table as of the chosen snapshot. The catch-up phase closes the gap created by live inserts, updates, and deletes so the shadow index can safely replace the old one. Options A and C describe different operational concerns.</p>
+<p><strong>3. A</strong>: Online reindexing is live maintenance work, not free bookkeeping. It competes for shared CPU, IO, WAL, cache, and background-worker capacity, so a shared cluster has to attribute and throttle that work by tenant. Options B and C ignore the central production risk.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="045.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Multi-Tenant Isolation in Shared Clusters</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="047.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Monthly Capstone: Primary Region Outage Runbook</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

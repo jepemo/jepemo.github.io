@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Join Algorithms in Distributed Engines - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Join Algorithms in Distributed Engines</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 042 | Lesson ID: 443
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 443: Join Algorithms in Distributed Engines</h1>
+<blockquote>
+<p><strong>The core idea</strong>: In a distributed engine, join planning is mostly a decision about data movement. The local join operator matters, but the expensive question is which rows have to move, which side can stay put, and how much skew or spill the cluster can survive.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>The Harbor Point compliance desk has moved past the routing problem from <a href="040.html">040.md</a> and the stage-boundary problem from <a href="041.html">041.md</a>. Its morning report now needs to join today's <code>reservations</code> with <code>issuer_limits</code> so the desk can flag open trades that are already above the approved limit. The SQL looks ordinary:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">issuer_id</span><span class="p">,</span><span class="w"> </span><span class="k">SUM</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">notional_usd</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">open_notional</span><span class="p">,</span><span class="w"> </span><span class="n">l</span><span class="p">.</span><span class="n">limit_usd</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">reservations</span><span class="w"> </span><span class="n">r</span>
+<span class="k">JOIN</span><span class="w"> </span><span class="n">issuer_limits</span><span class="w"> </span><span class="n">l</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">issuer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">l</span><span class="p">.</span><span class="n">issuer_id</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">trading_day</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">CURRENT_DATE</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">l</span><span class="p">.</span><span class="n">active</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span>
+<span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">issuer_id</span><span class="p">,</span><span class="w"> </span><span class="n">l</span><span class="p">.</span><span class="n">limit_usd</span><span class="p">;</span>
+</code></pre></div>
+
+<p>What decides whether this query feels instant or melts the cluster is not the word <code>JOIN</code> by itself. It is whether <code>issuer_limits</code> is small enough to broadcast, whether both tables are already partitioned by <code>issuer_id</code>, or whether the engine has to repartition both sides and pay a full shuffle. The algorithm name, such as hash join or merge join, only becomes meaningful after that distribution choice is made.</p>
+<p>That is the misconception to correct. Engineers often ask, "Should the engine use a hash join or a merge join?" In a single-node database that can be a good first question. In a distributed engine it is usually the second question. The first is, "How do matching rows meet at all?" Once you see a join as a combination of exchange strategy plus local matching strategy, the performance pathologies become much easier to predict.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point stores <code>reservations</code> as a large sharded fact table. <code>issuer_limits</code> is much smaller and changes only a few times per day. Later in the same workflow, the desk also joins <code>reservations</code> to <code>fills</code>, which is another large table distributed independently because it is written by a different ingestion path. Those two joins look similar in SQL and behave very differently in production.</p>
+<p>If the engine broadcasts <code>issuer_limits</code>, each worker can keep scanning its local shard of <code>reservations</code> and join against an in-memory copy of the limit table. That is cheap because only the small side moves. If the engine applies the same broadcast strategy to the <code>reservations</code>-to-<code>fills</code> join, every worker suddenly needs a copy of a large relation and the query can blow through memory before it returns the first row.</p>
+<p>Distributed joins therefore determine more than raw speed. They shape network traffic, exchange spill volume, retry cost, and the amount of skew the system can tolerate. When a cluster becomes slower after more nodes are added, a bad distributed join is one of the first places to look because extra nodes also mean extra network paths, extra copies of broadcast data, and more opportunities for one hot key to dominate a partition.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why join planning starts with data placement</strong> - Describe how broadcast, repartition, and colocated joins decide where matching rows can meet.</li>
+<li><strong>Compare local join algorithms inside a distributed stage</strong> - Analyze when a worker should use hash, merge, or lookup-style execution after the distribution choice is fixed.</li>
+<li><strong>Diagnose production join failures</strong> - Trace how skew, stale statistics, spill, and late-arriving filters turn a plausible join plan into a bad one.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The first distributed join decision is who moves</h3>
+<p>The previous lesson introduced exchange operators as the stage boundaries where rows change ownership. Distributed joins are where those exchanges stop being abstract. Before Harbor Point's engine can run any local join code, it has to choose one of three broad shapes.</p>
+<p>The cheapest case is a colocated join. If <code>reservations</code> and <code>issuer_limits</code> are both partitioned by <code>issuer_id</code> with the same hash function and compatible partition counts, then each worker already holds the matching rows it needs. The plan can stay local:</p>
+<div class="codehilite"><pre><span></span><code>Worker 1: reservations[issuer_id hash 1] join issuer_limits[issuer_id hash 1]
+Worker 2: reservations[issuer_id hash 2] join issuer_limits[issuer_id hash 2]
+...
+</code></pre></div>
+
+<p>This is ideal because there is no extra shuffle. The trade-off is that colocated joins are fragile. The moment one table is repartitioned differently, filtered through a stage that changes distribution, or bucketed on another key, the optimizer loses that free win.</p>
+<p>The next-best case for Harbor Point's limit check is a broadcast join. Because <code>issuer_limits</code> is small, the coordinator can send a copy of it to every worker that scans <code>reservations</code>. Each worker then performs the join locally against the broadcast copy. Broadcast is attractive because it avoids shuffling the large fact table, but the small side is replicated <code>N</code> times. A table that looks harmless at 50 MB becomes a 1 GB memory commitment on a 20-worker cluster before the hash table overhead is counted.</p>
+<p>When neither colocated nor broadcast is safe, the engine falls back to a repartitioned join. Both inputs pass through a repartition exchange on the join key so that all rows for one key land in the same downstream partition:</p>
+<div class="codehilite"><pre><span></span><code>reservations -- hash(issuer_id) --&gt; partition 0..P-1
+issuer_limits -- hash(issuer_id) --&gt; partition 0..P-1
+</code></pre></div>
+
+<p>This is the general solution because it works even when both sides are large and initially misaligned. It is also the most expensive one because both sides pay network, buffering, and possible spill. The optimizer's first real job is to avoid this plan unless the other two options are worse or impossible.</p>
+<h3>Concept 2: After rows meet, each worker still needs the right local join algorithm</h3>
+<p>Once Harbor Point's engine has decided how rows arrive at a worker, the local join algorithm takes over. In distributed analytical engines, the default is usually a hash join. One side becomes the build side: the worker reads that side first, constructs a hash table keyed by <code>issuer_id</code>, and then probes it with rows from the other side. Broadcast joins almost always turn the replicated input into the build side because it is intentionally the smaller relation.</p>
+<p>Hash join is popular because it handles unsorted inputs and can be extremely fast when the build side fits in memory. The danger is memory pressure. If the optimizer underestimates the build side, the worker spills partitions to disk, repartitions internally, or fails outright. In a distributed plan that means the join is now paying both cluster-level shuffle cost and node-level spill cost.</p>
+<p>Merge join becomes attractive when both inputs are already sorted or can be streamed in key order cheaply. Imagine Harbor Point's later reconciliation query joining <code>reservations</code> and <code>fills</code> after both have passed through an upstream sort on <code>reservation_id</code>. A merge join can walk both ordered streams once, consuming much less random-access memory than a large hash table. The trade-off is that sorting is expensive; if the engine has to sort both sides only for the join, the merge join often loses to a hash join.</p>
+<p>Some distributed SQL engines also support lookup joins, which are essentially controlled nested-loop joins with indexing. Suppose the compliance desk starts with 200 flagged reservation IDs from a rules engine and needs to fetch matching rows from a partitioned <code>fills</code> table keyed by <code>reservation_id</code>. Instead of shuffling the whole <code>fills</code> table, the engine can send targeted point lookups to the owning partitions. That is excellent for a tiny outer input and catastrophic for a large one because it turns into thousands or millions of remote index probes.</p>
+<p>The important point is that "distributed join algorithm" is a two-layer decision. The outer layer decides distribution. The inner layer decides how each worker matches rows once the distribution is fixed.</p>
+<h3>Concept 3: Real systems fail on skew, bad estimates, and missed pruning opportunities</h3>
+<p>Harbor Point's unpleasant join incidents rarely come from a plan that is obviously absurd. They come from plans that were reasonable under the wrong assumptions. The classic example is stale statistics. If <code>issuer_limits</code> unexpectedly grows because the risk team adds intraday overrides per desk and region, yesterday's "small dimension table" may no longer fit comfortably as a broadcast build side. The optimizer can still choose broadcast if its row-count estimate is stale, and the query then dies under per-worker memory pressure.</p>
+<p>Skew is the other common failure mode. Suppose one issuer is responsible for 40 percent of today's open notional because of a market event. In a repartitioned hash join, all rows for that issuer land in one downstream partition. Most workers finish quickly while one worker builds an oversized hash table, spills heavily, and keeps the query open. From the user's perspective the cluster is slow; from the engine's perspective one partition is doing almost all the work.</p>
+<p>Modern engines try to reduce this pain with runtime filters, bloom filters, or dynamic filtering. If the <code>issuer_limits</code> side first applies <code>active = true</code> and reduces the key set to a few hundred issuers, the engine can push that information back toward the <code>reservations</code> scan and avoid reading or shuffling rows for irrelevant issuers. This optimization is powerful because it cuts work before the join happens. It is also timing-sensitive. If the dynamic filter is produced after the large scan already ran, the theoretical win arrives too late to matter.</p>
+<p>Fault tolerance adds one more trade-off. A repartitioned join creates large exchange outputs that may need to be retried if one worker fails. Materializing those exchange partitions makes the query more resilient, but it adds I/O and storage churn. Keeping everything in memory minimizes latency, but a single worker loss can force upstream stages to rerun. The right choice depends on whether Harbor Point is serving a fast interactive check or a long compliance report that is expensive to restart.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The optimizer picks a broadcast join and workers run out of memory.</p>
+<p><strong>Why it happens / is confusing</strong>: The supposedly small side was estimated from stale statistics, or it is small on disk but expands significantly once decoded and hashed in memory.</p>
+<p><strong>Clarification / Fix</strong>: Check estimated versus actual row counts on the build side, then force repartition or refresh statistics if the broadcast threshold is no longer safe. Memory sizing for a broadcast join must include one copy per worker plus hash-table overhead.</p>
+<p><strong>Issue</strong>: Adding nodes makes a large join slower instead of faster.</p>
+<p><strong>Why it happens / is confusing</strong>: More nodes increase parallel scan capacity, but they also increase the number of exchange buffers, network transfers, and copies of any broadcast input. If one hot key dominates, the extra workers do not help the overloaded partition.</p>
+<p><strong>Clarification / Fix</strong>: Inspect exchange-level row counts, skew ratio, and spill volume. If the problem is skew, use adaptive partition splitting or key salting where the engine supports it. If the problem is broadcast replication cost, switch to repartition and let each worker own only one key range.</p>
+<p><strong>Issue</strong>: A lookup join looks elegant in the plan but pounds the storage layer.</p>
+<p><strong>Why it happens / is confusing</strong>: The outer side is larger than expected, so what looked like a few indexed remote probes has become a high-fanout RPC pattern with poor locality.</p>
+<p><strong>Clarification / Fix</strong>: Cap lookup joins to genuinely small outer relations or to cases where the outer side is already narrowed by a selective predicate. Once probe count grows, a repartitioned hash join is often cheaper than thousands of random remote reads.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="041.html">041.md</a> defines the stage boundaries that joins exploit</h3>
+<p>The exchange operators from the previous lesson are the mechanism that makes distributed joins possible. Broadcast join means inserting an exchange that copies one side to many consumers. Repartitioned join means inserting matching hash-partition exchanges on both sides. Colocated join is interesting precisely because it avoids those exchanges.</p>
+<h3>Connection 2: <a href="043.html">043.md</a> asks what happens inside the worker after the join shape is chosen</h3>
+<p>Once the optimizer chooses broadcast, repartition, or colocated execution, the next performance question is no longer "which node gets which rows?" It is "how efficiently does each worker process its batches?" The next lesson picks up there by looking at vectorized execution, cache-friendly layouts, and why a good join plan can still waste CPU if the local executor processes rows one at a time.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] Trino Documentation: Cost-based optimizations and join distribution selection<ul>
+<li>Link: <a href="https://trino.io/docs/current/optimizer/cost-based-optimizations.html#join-distribution-selection">https://trino.io/docs/current/optimizer/cost-based-optimizations.html#join-distribution-selection</a></li>
+<li>Focus: See how a production distributed SQL engine decides between broadcast and partitioned joins from cost estimates.</li>
+</ul>
+</li>
+<li>[DOC] Apache Spark SQL Performance Tuning<ul>
+<li>Link: <a href="https://spark.apache.org/docs/latest/sql-performance-tuning.html">https://spark.apache.org/docs/latest/sql-performance-tuning.html</a></li>
+<li>Focus: Read the sections on join strategy hints and adaptive handling of skew to connect optimizer choices with runtime behavior.</li>
+</ul>
+</li>
+<li>[DOC] CockroachDB Documentation: Joins<ul>
+<li>Link: <a href="https://www.cockroachlabs.com/docs/stable/joins">https://www.cockroachlabs.com/docs/stable/joins</a></li>
+<li>Focus: Compare hash, merge, and lookup joins in a distributed SQL engine that has to balance KV lookups against repartitioned execution.</li>
+</ul>
+</li>
+<li>[PAPER] Encapsulation of Parallelism in the Volcano Query Processing System<ul>
+<li>Link: <a href="https://sigmodrecord.org/1990/06/06/encapsulation-of-parallelism-in-the-volcano-query-processing-system/">https://sigmodrecord.org/1990/06/06/encapsulation-of-parallelism-in-the-volcano-query-processing-system/</a></li>
+<li>Focus: Use the exchange operator model to understand why data movement is a first-class execution decision rather than a hidden implementation detail.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Distributed joins begin with row placement</strong> - Broadcast, repartition, and colocated execution decide whether the cluster moves one input, both inputs, or neither before any local join logic runs.</li>
+<li><strong>The local join algorithm is only half the story</strong> - Hash, merge, and lookup joins are worker-level strategies that inherit the costs created by the distribution plan above them.</li>
+<li><strong>Most production pain comes from wrong assumptions</strong> - Stale statistics, skewed keys, late runtime filters, and retry policy choices are what turn an acceptable join plan into an expensive one.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is "hash join versus merge join" usually the wrong first question for a distributed engine?</strong></p>
+<ul>
+<li>A) Because distributed engines do not implement local join algorithms</li>
+<li>B) Because the engine must first decide how matching rows will be colocated through broadcast, repartition, or existing partition alignment</li>
+<li>C) Because merge join is always slower than hash join in a cluster</li>
+</ul>
+</li>
+<li>
+<p><strong>When is a broadcast join the best fit for Harbor Point's <code>reservations</code> to <code>issuer_limits</code> query?</strong></p>
+<ul>
+<li>A) When <code>issuer_limits</code> is small enough to replicate to each worker without dangerous memory amplification</li>
+<li>B) When both tables are already partitioned identically by <code>issuer_id</code></li>
+<li>C) When the build side is too large to fit in memory</li>
+</ul>
+</li>
+<li>
+<p><strong>What makes a lookup join attractive and what usually breaks it?</strong></p>
+<ul>
+<li>A) It is attractive for tiny outer inputs with indexed remote lookups, and it breaks when the probe side grows into a high-fanout RPC pattern</li>
+<li>B) It is attractive whenever both sides are huge, and it breaks only if the network is down</li>
+<li>C) It is attractive because it avoids all remote reads, and it breaks only on outer joins</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The cluster cannot execute a join until it decides where rows for the same key will meet. Hash and merge are local execution choices that come after the distribution strategy is fixed. Options A and C are false.</p>
+<p><strong>2. A</strong>: Broadcast is ideal when the replicated side is genuinely small after filtering and decoding. Option B describes a colocated join, and option C is exactly when broadcast becomes dangerous.</p>
+<p><strong>3. A</strong>: Lookup joins are efficient when a small outer relation can issue a limited number of targeted probes into an indexed inner relation. Once those probes become numerous, remote-read overhead dominates and a repartitioned join is often cheaper.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="041.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Parallel Query Execution and Exchange Operators</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="043.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Vectorized Execution and CPU Cache Efficiency</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

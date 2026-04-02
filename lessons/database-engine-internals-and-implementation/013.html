@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>File Organization: Heap, Sorted, and Hash - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>File Organization: Heap, Sorted, and Hash</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 013 | Lesson ID: 390
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 390: File Organization: Heap, Sorted, and Hash</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Once <a href="012.html">05.md</a> has made a change durable, file organization decides where that row lives on disk, which means it decides whether your workload pays mostly during writes, range reads, or exact-key lookups.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="012.html">05.md</a>, Harbor Point's municipal-bond database learned how to make a quote durable before every affected data page had been rewritten in place. That answered the durability question. It did not answer the placement question. After the WAL record is safe, where should the new quote row actually go? The answer matters because future reads and updates will inherit whatever physical layout choice the storage engine makes today.</p>
+<p>Suppose Harbor Point stores live quotes as rows keyed by <code>cusip</code> and <code>quote_ts</code>. A heap file can drop a new row onto any page with free space, so the market-open ingest path stays cheap. A sorted file can keep rows physically ordered by <code>(cusip, quote_ts)</code>, so compliance sweeps and range scans become efficient. A hash-organized file can route each row straight to a bucket based on <code>cusip</code>, so exact lookups avoid scanning unrelated pages. The same logical row therefore creates three very different I/O patterns even before query planning enters the picture.</p>
+<p>The misconception to discard is that physical layout is a minor implementation detail because "we can always add an index later." In practice, the base file organization determines how much page movement inserts cause, how stable row locations are, how much locality the buffer pool can exploit, and why the next lesson on <a href="014.html">07.md</a> needs B-trees at all. File organization is the first access-path decision, not an afterthought.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point has three competing access patterns against the same <code>municipal_quotes</code> relation. The ingest service appends thousands of quote revisions at market open. Trader dashboards ask for the latest quote on one <code>cusip</code> at a time. Compliance analysts run range scans over issuers and time windows to reconstruct how pricing moved during a market event.</p>
+<p>Those requests want different physical guarantees. The ingest service wants inserts that touch as few pages as possible. The compliance team wants related rows packed together so one sequential scan can answer a wide query without random seeks. The trader dashboard wants a direct path to one instrument without wading through neighboring rows that happen to sit nearby on disk.</p>
+<p>This is why file organization is a production decision, not a classroom taxonomy. If the table is heap-organized, writes stay cheap, but selective reads depend on secondary indexes or broad scans. If the table is kept fully sorted, range queries get beautiful locality, but steady inserts start paying for page shifts, overflow pages, and background reorganization. If the table is hash-organized, equality probes can be fast, but any query that cares about order or neighboring keys becomes much more expensive. Real engines are built around these trade-offs, which is why many of them combine a heap table with ordered indexes rather than pretending one layout solves every workload.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what each file organization optimizes</strong> - Describe why heap, sorted, and hash layouts make different operations cheap.</li>
+<li><strong>Trace the mechanics behind each layout</strong> - Follow how inserts, lookups, and reorganizations interact with pages, free space, and buckets.</li>
+<li><strong>Choose a layout using workload evidence</strong> - Match a production access pattern to the layout whose trade-offs actually fit it.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Heap files minimize movement and keep the write path simple</h3>
+<p>For Harbor Point's ingest service, the most attractive property of a heap file is that the storage engine does not need to preserve any global row order. Once the WAL record is durable, the engine can place the new quote on any page that still has space or append a new page if none do. That means one logical insert usually dirties a small, predictable set of pages: the target data page, some free-space metadata, and whatever indexes exist above the heap.</p>
+<p>The mechanics are simple on purpose. A heap-organized relation is typically just a collection of pages plus a free-space directory or bitmap that helps the engine find candidate pages for future inserts. Each row is identified by a physical locator such as <code>(page_id, slot_id)</code>, so the page can manage variable-length tuples internally without the whole table needing to stay ordered. Deletes and updates may leave holes behind, and compaction or vacuum later turns those holes back into usable space.</p>
+<p>That simplicity is why heap organization is common for general-purpose OLTP tables. Harbor Point can accept quote revisions quickly even when inserts arrive out of key order, because the base table is not trying to keep related <code>cusip</code> values adjacent at all times. The trade-off is just as important: without an index, a heap file has no direct story for "find all rows for this issuer" beyond scanning pages and checking tuples. Heap layout makes writes cheap by refusing to encode lookup structure into the table itself.</p>
+<p>You can think of the heap file as saying, "durability comes from WAL, identity comes from the row locator, and locality will be supplied by some other structure if we need it." That is a strong production default when write volume is high and the access pattern is mixed, but it is not magic. A heap table that serves many range queries will usually need an ordered index to recover the locality it gave up at the base-file layer.</p>
+<h3>Concept 2: Sorted files turn physical order into an access path</h3>
+<p>Now switch Harbor Point's thought experiment. Suppose the dominant query is not single-row ingest but repeated scans such as "show every quote for issuers between <code>CUSIP 13000</code> and <code>CUSIP 13999</code> from 09:30 to 09:45." A sorted file makes that query attractive because the rows are physically maintained in key order. The engine can binary-search a page directory or fence keys to find the first relevant page, then read forward through mostly sequential pages while the key range remains relevant.</p>
+<p>That layout buys real locality. Nearby keys tend to live on nearby pages, so large ordered scans become cache-friendly and device-friendly in a way that a heap file cannot match by itself. If Harbor Point bulk-loads yesterday's quote archive sorted by <code>(cusip, quote_ts)</code>, the result is almost ideal for analytical replay work and end-of-day reporting.</p>
+<p>The pain begins when fresh quotes arrive continuously. An insert into a sorted file is not "write the row wherever space exists." It is "find the correct page for this key and preserve the invariant that keys remain ordered afterward." If the destination page is full, the engine must shift records to neighboring pages, create overflow pages, or periodically rebuild larger regions. All of those options add write amplification. Overflow pages are especially revealing: they preserve correctness, but they chip away at the locality advantage that justified the sorted file in the first place.</p>
+<p>That maintenance burden is why fully sorted files are common for bulk-loaded or append-in-order workloads, but much less common as the primary structure for hot OLTP tables. The next lesson on <a href="014.html">07.md</a> exists because engineers wanted the read benefits of sorted order without forcing every insert to rewrite an ever-growing suffix of the file. B-trees solve that by storing order hierarchically and localizing change to one root-to-leaf path plus occasional node splits.</p>
+<h3>Concept 3: Hash organization buys direct equality access by giving up order</h3>
+<p>A hash-organized file makes the opposite bet. Instead of preserving global order, it computes a bucket from the search key, such as <code>bucket = h(cusip)</code>, and stores the row in the pages assigned to that bucket. If Harbor Point's hottest operation is "fetch the latest quote for exactly this one <code>cusip</code>," hashing can skip a lot of irrelevant pages because the engine does not need to preserve any relationship between neighboring key values.</p>
+<p>The attractive case is straightforward. Equality lookups can jump directly to a bucket, examine only the rows or pointers stored there, and ignore the rest of the file. Inserts are also naturally distributed when hash values are well balanced, because new rows spread across many buckets instead of fighting for the right place in one global order. That is why hash organization shows up in key-value systems and in equality-focused access methods.</p>
+<p>The limitations are structural, not accidental. Hashing destroys order, so the database cannot use bucket adjacency to answer "all quotes from <code>CUSIP 13000</code> to <code>CUSIP 13999</code>" efficiently. It also depends heavily on distribution. If one issuer becomes unusually hot, its bucket can develop overflow chains, extra locking pressure, and latency cliffs that did not exist in the balanced case. Dynamic hashing schemes reduce the need for full-table rehashing, but they do not change the basic bargain: you are trading away ordered access to make equality probes cheap.</p>
+<p>For Harbor Point, that means hash organization only wins when the workload is dominated by exact-key access and the team is willing to pair it with something else for range queries. In mixed workloads, a pure hash-organized base file often feels too narrow. The engine either adds an ordered secondary structure anyway or adopts a different primary organization whose weaknesses are easier to balance across many query shapes.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Market-open ingest is healthy, but range scans over quote history read far more pages than expected.</p>
+<p><strong>Why it happens / is confusing</strong>: A heap file kept inserts cheap by ignoring order. WAL and buffer tuning cannot create locality that the base file never encoded.</p>
+<p><strong>Clarification / Fix</strong>: Add an ordered access path for the range predicate, or change the physical organization for workloads where scans dominate. Do not expect heap layout alone to cluster related <code>cusip</code> and time ranges.</p>
+<p><strong>Issue</strong>: A sorted-file prototype looks excellent in bulk-load benchmarks but falls apart once real-time quote revisions start arriving.</p>
+<p><strong>Why it happens / is confusing</strong>: Benchmarks often measure read locality after an ideal load, not the cost of preserving order under continuous out-of-order inserts. Page shifts and overflow chains become the hidden write bill.</p>
+<p><strong>Clarification / Fix</strong>: Measure insert amplification and overflow growth, not just scan speed. If steady writes matter, a B-tree or LSM-style design is usually a better long-term answer than a strictly sorted base file.</p>
+<p><strong>Issue</strong>: Exact <code>cusip</code> lookups are fast in a hash layout, but compliance queries over issuer or time ranges become unpredictable.</p>
+<p><strong>Why it happens / is confusing</strong>: Hashing grouped rows by bucket identity, not by neighboring key values, so range predicates lost the physical order they need.</p>
+<p><strong>Clarification / Fix</strong>: Use hash organization only when equality probes dominate, or pair it with an ordered secondary structure that can answer the range side of the workload.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Sorted files -&gt; B-tree node structure</h3>
+<p>A sorted file is the simplest way to say "disk pages should reflect key order," but it becomes expensive once inserts must preserve that invariant continuously. B-trees keep the same idea of ordered leaves while reducing maintenance from "rewrite long stretches of the file" to "search one path and sometimes split one node." That is why <a href="014.html">07.md</a> is the natural continuation of this lesson rather than a separate topic.</p>
+<h3>Connection 2: File organization -&gt; write amplification and recovery pressure</h3>
+<p>The physical layout does not change the WAL rule from <a href="012.html">05.md</a>, but it changes how many pages a logical write tends to dirty. Heap insertion often touches a small number of pages. Sorted files may cascade across neighbors to keep order intact. Hash layouts can trigger bucket overflows or splits. Those differences show up later as checkpoint pressure, cache churn, and recovery work, which is why file organization belongs in the same mental model as logging and buffer management rather than in a separate "storage trivia" box.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PostgreSQL Documentation: Database Page Layout</a><ul>
+<li>Focus: Review page headers, item identifiers, and tuple storage to connect heap files to page-level row placement.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/hash-index.html">PostgreSQL Documentation: Hash Indexes</a><ul>
+<li>Focus: Notice bucket pages, overflow chains, and why hash access methods only help equality predicates.</li>
+</ul>
+</li>
+<li>[COURSE] <a href="https://cs186berkeley.net/fa22/">UC Berkeley CS186 course site</a><ul>
+<li>Focus: Use the notes around disks/files and B+ trees to compare heap organization with sorted access paths and their maintenance costs.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://www.vldb.org/dblp/db/conf/vldb/Litwin80.html">Linear Hashing: A New Tool for File and Table Addressing</a><ul>
+<li>Focus: See how dynamic hashing grows buckets incrementally instead of forcing a full rehash when the file expands.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A file organization is a physical promise about locality</strong> - Heap promises flexibility, sorted files promise order, and hash files promise direct equality access.</li>
+<li><strong>Cheap writes and cheap reads rarely come from the same invariant</strong> - The work you avoid during insertion usually reappears during scans, reorganization, or overflow handling.</li>
+<li><strong>Modern storage structures are responses to these trade-offs</strong> - B-trees, clustered indexes, and LSM designs exist because pure heap, pure sorted, and pure hash layouts each leave an important workload unsolved.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Harbor Point ingests quote revisions all morning and wants the cheapest base-table insert path without preserving key order in the table itself. Which layout matches that goal best?</strong></p>
+<ul>
+<li>A) Heap file</li>
+<li>B) Sorted file</li>
+<li>C) Hash-organized file</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does a sorted file help compliance queries that scan a contiguous <code>cusip</code> range?</strong></p>
+<ul>
+<li>A) Because hashing places neighboring keys in the same bucket</li>
+<li>B) Because ordered keys let the engine find a start point and then read forward through nearby pages</li>
+<li>C) Because WAL replays rows in sorted order after every checkpoint</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main structural weakness of a hash-organized file for Harbor Point's mixed workload?</strong></p>
+<ul>
+<li>A) It cannot support inserts</li>
+<li>B) It removes physical order, so range queries lose locality and hot buckets can form overflow chains</li>
+<li>C) It requires every row to be rewritten after each checkpoint</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: A heap file does not preserve global order, so inserts can target any page with free space or append a new page. That keeps the base-table write path simple and cheap.</p>
+<p><strong>2. B</strong>: The benefit of a sorted file is physical key order. Once the engine finds the first matching page, it can continue through adjacent pages instead of hopping around the file randomly.</p>
+<p><strong>3. B</strong>: Hash organization is built for equality access, not ordered access. That makes range scans weak, and skew can create overflow chains that damage the fast path.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="012.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Write Path Fundamentals and Append-Only Logging</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="014.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>B-Tree Node Structure and Search Path</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

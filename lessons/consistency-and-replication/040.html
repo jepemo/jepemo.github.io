@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Failure Detectors and Membership Changes - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Failure Detectors and Membership Changes</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 040 | Lesson ID: 439
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 439: Failure Detectors and Membership Changes</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Failure detectors turn missing communication into suspicion, and membership changes turn that suspicion into a committed cluster configuration; treating those as the same step is how failovers become split-brain or unnecessary data movement.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="039.html">039.md</a>, Harbor Point used Merkle trees to compare replicas cheaply, but that only worked because every participant agreed which shard members were supposed to own the data. This lesson starts one layer earlier. During market open, <code>ny-db-3</code> stops answering heartbeats for shard <code>184</code> during an Atlantic congestion burst. The leader can observe silence, but silence does not reveal whether New York crashed, whether packets were delayed, or whether the process is alive but paused. That uncertainty is the raw material of every real failure detector.</p>
+<p>The important correction is that a detector does not output truth. It outputs suspicion strong enough to drive policy. If Harbor Point ejects <code>ny-db-3</code> the moment one timeout fires, a merely slow node can be replaced, its range ownership can be reassigned, and repair can begin against the wrong topology. If Harbor Point waits too long, a genuinely dead voter keeps counting in quorum calculations and write availability collapses. Fast failover and false-positive resistance are trading against each other from the start.</p>
+<p>Membership changes solve a different problem: they turn local suspicion into an authoritative cluster view with an epoch number, a quorum rule, and an explicit catch-up path for any replacement node. A node is not "out of the cluster" because one peer feels nervous. It is out only after the reconfiguration is committed. That separation is what keeps returning nodes from serving stale traffic and sets up the next lesson, <a href="041.html">041.md</a>, where newly added or badly lagging members catch up through log compaction and snapshot installation.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p>Harbor Point runs each reservation shard as a three-voter Raft group. For shard <code>184</code>, the current voters are <code>md-db-2</code>, <code>md-db-4</code>, and <code>ny-db-3</code>; a warm standby <code>sg-db-1</code> can join if a voter must be replaced. A 1.8-second WAN stall is long enough to trip a heartbeat timeout even though <code>ny-db-3</code> may still be alive and may still hold the freshest durable copy for some entries. If the automation removes New York too early, quorum math changes in the middle of trading, Merkle-based repair work from the previous lesson becomes invalid because ownership just moved, and the leader suddenly has to stream state to a replacement node while clients are already contending for bandwidth.</p>
+<p>Teams that understand this layer stop asking "is the node dead?" as if the system can ever know that directly. The better operational question is: what evidence do we have, how much delay can the product tolerate, and what configuration change can we commit without breaking quorum intersection? That framing matters because the same decision affects leader election, write availability, lease safety, repair scheduling, and how much surprise the cluster will absorb when the supposedly dead node comes back.</p>
+<p>In production, failure detectors and membership changes are not just control-plane details. They decide whether a brief network hiccup becomes a harmless suspicion event, a noisy failover, or a full-blown split-brain incident with stale reads and duplicated rebalancing work.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what a practical failure detector actually knows</strong> - Distinguish observed communication failure from an authoritative claim that a node has crashed.</li>
+<li><strong>Trace a safe membership change from suspicion to committed configuration</strong> - Show how epochs, learners, and quorum intersection protect the cluster during replacement.</li>
+<li><strong>Evaluate the operational trade-offs around detector tuning and reconfiguration</strong> - Reason about false positives, failover speed, fencing, and catch-up cost in a production replica group.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Failure detectors observe missing communication, not machine death</h3>
+<p>Harbor Point's leader expects regular heartbeats from <code>ny-db-3</code>. When four heartbeat intervals pass with no acknowledgment, the replica becomes suspicious. That sounds simple until you remember the environment is asynchronous enough that a paused process, a congested router, and a power-off event can all look identical from the outside for a while. A timeout is evidence about communication, not proof about process state.</p>
+<p>That is why the formal language around failure detectors talks about completeness and accuracy rather than certainty. A useful detector should eventually suspect nodes that have really crashed, but any practical timeout-based implementation can also suspect healthy nodes when the network or the local machine behaves badly enough. Production systems hide the mathematics behind friendlier tools such as fixed heartbeat thresholds, phi-accrual suspicion scores, or SWIM-style gossip probes, but the mechanism is the same: convert missing or delayed messages into a level of suspicion.</p>
+<p>For Harbor Point, the tuning problem is concrete. A 500 ms timeout gives fast reaction when a voter actually dies, but it also treats a brief transatlantic stall as failure and can trigger an unnecessary election. A 3 second timeout reduces false positives, but every real failure now blocks quorum decisions for much longer. The correct setting depends less on average latency than on tail latency, garbage-collection pauses, packet loss bursts, and the business cost of a delayed failover.</p>
+<p>The operational rule is to keep detector output separate from authority. Suspicion may trigger extra probes, lease reevaluation, or a reconfiguration proposal, but it should not by itself authorize a new node to vote or serve writes. That boundary is what membership change machinery is for.</p>
+<h3>Concept 2: Membership changes must be committed like any other replicated state change</h3>
+<p>Suppose Harbor Point decides <code>ny-db-3</code> should be replaced by <code>sg-db-1</code>. The unsafe shortcut would be to let the leader locally stop counting New York and start counting Singapore immediately. That creates a window where different nodes can believe in different quorums, which is exactly how split-brain behavior appears even when every individual node thinks it is being sensible.</p>
+<p>Safe systems instead attach membership to the replicated log or another authoritative configuration store. One common pattern is "add learner, catch up, then promote." Another is Raft joint consensus, where the cluster briefly enters a configuration whose commits must satisfy overlapping quorum rules from both the old and new membership sets. The invariant underneath both approaches is the same: any quorum that could commit before the change must intersect with any quorum that can commit after the change.</p>
+<p>For Harbor Point, the sequence looks like this:</p>
+<div class="codehilite"><pre><span></span><code>epoch 81: voters   = {md-db-2, md-db-4, ny-db-3}
+timeout on ny-db-3 -&gt; suspect locally, but epoch 81 is still authoritative
+epoch 82: learner  = sg-db-1 added and begins catch-up
+epoch 83: joint or equivalent transitional config is committed
+epoch 84: voters   = {md-db-2, md-db-4, sg-db-1}
+</code></pre></div>
+
+<p>Only after the new epoch is committed do client routing, repair scheduling, and quorum math switch over. That matters directly to the previous lesson. A Merkle tree comparison is meaningful only when both sides agree they are still responsible for the same ranges under the same membership epoch. Reconfiguration is therefore not just about availability; it is part of keeping every later consistency mechanism honest.</p>
+<h3>Concept 3: Returning and replacement nodes are dangerous until they are fenced and caught up</h3>
+<p>Now imagine <code>ny-db-3</code> was only slow, not dead, and comes back after epoch <code>84</code> has committed. Its local disk may still contain shard data, and it may still believe it belongs to the replica set. If Harbor Point lets that node continue serving reads or participating in write coordination, an old configuration has just leaked back into the live system. This is why returning members need fencing: every RPC, lease, and client route must be validated against the current term and configuration epoch, and removed nodes must refuse service or shut themselves down.</p>
+<p>Node identity also needs a generation boundary. Gossip-based systems often use incarnation numbers so that old membership messages cannot resurrect a superseded process. Consensus systems use term numbers and committed membership state for the same reason. The underlying problem is identical: once a node has been removed, "same hostname" is not enough to trust it again.</p>
+<p>Catch-up is the second half of the story. Harbor Point does not want <code>sg-db-1</code> to become a full voter while it is missing committed history, because that would increase quorum size without increasing useful fault tolerance. If the gap is small, the leader can stream the missing log entries. If the gap is large or the replacement starts from an empty disk, shipping a snapshot is cheaper and safer than replaying an unbounded log. That handoff from membership change to state transfer is exactly why <a href="041.html">041.md</a> follows this lesson.</p>
+<p>The trade-off is between fast automation and cluster stability. Aggressive auto-remove and auto-add policies minimize operator involvement, but they can cause flapping during intermittent network loss and force repeated full-state catch-up. Conservative policies reduce churn and leader load, but they keep suspected nodes in quorum longer and slow down real failovers. Good systems make that policy explicit instead of pretending the detector answered the whole question.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: The cluster keeps removing and re-adding the same replica during WAN jitter.</p>
+<ul>
+<li><strong>Why it happens</strong>: Detector thresholds are tight enough that transient delay looks like failure, and the automation treats first suspicion as permission to reconfigure.</li>
+<li><strong>Clarification / Fix</strong>: Add a suspicion grace period, use extra probes or a stronger evidence threshold before eviction, and require a stable interval before reversing membership again.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Adding a replacement node causes write latency and leader CPU to spike.</p>
+<ul>
+<li><strong>Why it happens</strong>: The new member is being counted as a voter before it has caught up, so the leader is doing quorum-critical replication and full-state transfer at the same time.</li>
+<li><strong>Clarification / Fix</strong>: Add the node as a learner or non-voter first, let it catch up through log replay or snapshot, and promote it only after the cluster verifies it is current enough to vote safely.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: A removed node comes back and serves stale reads through an old client route.</p>
+<ul>
+<li><strong>Why it happens</strong>: The data plane is not checking the current configuration epoch or leader term, so an obsolete member still looks superficially healthy.</li>
+<li><strong>Clarification / Fix</strong>: Fence removed nodes with epoch-aware routing and RPC validation, and quarantine them until they rejoin through the normal membership workflow.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="039.html">039.md</a> assumed stable ownership; this lesson explains how the system decides who owns a shard after a suspected failure</h3>
+<p>Merkle trees localize divergence only if both replicas are comparing the same logical range under the same repair epoch. Failure detectors and membership changes provide that precondition. If topology is still in dispute, anti-entropy can waste work or compare the wrong peers entirely.</p>
+<h3>Connection 2: <a href="041.html">041.md</a> is the catch-up mechanism that makes safe membership changes practical</h3>
+<p>Replacing <code>ny-db-3</code> with <code>sg-db-1</code> is not finished when the configuration commits. The new member still needs the cluster's state. When the missing history is too large for ordinary log replay, snapshot installation becomes the bridge between safe reconfiguration and full usefulness.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Extended Version)</a><ul>
+<li>Focus: Read the cluster membership section and notice how joint consensus preserves quorum intersection during reconfiguration.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.6/op-guide/runtime-reconf-design/">Design of runtime reconfiguration</a><ul>
+<li>Focus: Compare the lesson's "suspicion versus committed configuration" split with etcd's two-phase member change design.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/concept/gossip">Consul Gossip</a><ul>
+<li>Focus: See how a production system separates gossip-based failure detection from the control-plane state that must remain authoritative.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/swim-scalable-weakly-consistent-infection-style-process-group-membership-protocol/">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a><ul>
+<li>Focus: Pay attention to how scalable suspicion dissemination differs from committing a new quorum-bearing membership.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Suspicion is not membership</strong> - A timeout only says communication is missing; it does not by itself change who may vote or own data.</li>
+<li><strong>Safe reconfiguration preserves quorum intersection</strong> - Add, catch up, and promote in a way that guarantees old and new commit quorums still overlap.</li>
+<li><strong>Rejoining nodes must be fenced before they are useful</strong> - Old epochs, stale leases, and missing history turn a returning node into a risk until the cluster catches it up explicitly.</li>
+</ol>
+<hr />
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why can Harbor Point not remove <code>ny-db-3</code> from quorum the moment a heartbeat timeout fires?</strong></p>
+<ul>
+<li>A) Because a timeout only creates suspicion about communication failure; the authoritative quorum still comes from the last committed membership</li>
+<li>B) Because heartbeat timeouts are relevant only for observability dashboards</li>
+<li>C) Because any healthy node can be removed safely without affecting quorum math</li>
+</ul>
+</li>
+<li>
+<p><strong>Why is <code>sg-db-1</code> added as a learner before becoming a voter?</strong></p>
+<ul>
+<li>A) Because non-voters can ignore committed log history until after promotion</li>
+<li>B) Because catching up first avoids counting a stale node in quorum and reduces the risk of destabilizing the leader during state transfer</li>
+<li>C) Because learners permanently replace the need for full voting members</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main reason to fence a removed node that later comes back online?</strong></p>
+<ul>
+<li>A) To prevent it from using an old term or configuration epoch to serve traffic or participate in replication after the cluster has moved on</li>
+<li>B) To make sure it can still answer client requests while catch-up is in progress</li>
+<li>C) To avoid running any repair or snapshot logic at all</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The timeout is detector evidence, not a committed topology change. Until the cluster records a new configuration, quorum rules still come from the old membership.</p>
+<p><strong>2. B</strong>: A learner can receive log entries or a snapshot without immediately changing the voting quorum. Promotion happens only after the cluster has evidence that the new member is caught up enough to count safely.</p>
+<p><strong>3. A</strong>: A removed node can hold old log entries, old lease assumptions, or stale routing state. Fencing keeps it from influencing the live cluster until it rejoins under the current configuration.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="039.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Merkle Trees for Replica Divergence Detection</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="041.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Raft Log Compaction and Snapshot Installation</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

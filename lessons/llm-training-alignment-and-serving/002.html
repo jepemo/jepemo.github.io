@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ZeRO & DeepSpeed - Training at Trillion-Parameter Scale - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>ZeRO & DeepSpeed - Training at Trillion-Parameter Scale</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/llm-training-alignment-and-serving.html">LLM Training, Alignment, and Serving</a>
+        </p>
+        <p>
+          Sequence: 002 | Lesson ID: 306
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 306: ZeRO &amp; DeepSpeed - Training at Trillion-Parameter Scale</h1>
+<blockquote>
+<p><strong>The core idea</strong>: once you know what data and tokens you want to train on, the next hard question is whether the model state can even fit in memory. ZeRO and DeepSpeed matter because large-scale LLM training is often limited less by raw FLOPs than by how badly parameters, gradients, and optimizer states are replicated.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><strong>The insight</strong>: A huge model does not only store weights. During training, you also need:</p>
+<ul>
+<li>gradients</li>
+<li>optimizer states</li>
+<li>activations</li>
+<li>communication buffers</li>
+</ul>
+<p>In naive data parallelism, too much of that state is replicated on every GPU. That means training fails not because the model is mathematically impossible, but because memory is being used wastefully.</p>
+<p><strong>Why this matters</strong>: ZeRO is best understood as a memory-partitioning strategy for distributed training. DeepSpeed is the system that operationalizes that strategy and combines it with offload, checkpointing, and execution optimizations.</p>
+<p><strong>Concrete anchor</strong>: With Adam-style optimization, optimizer state alone can cost multiple times the parameter memory. At large scale, "the model size" is not the real memory footprint. The real footprint is model state plus training state.</p>
+<p><strong>Keep this mental hook in view</strong>: Large-model training is not only a compute problem. It is a state-placement problem.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p><a href="001.html"><code>20/01.md</code></a> established that pretraining quality depends on the token stream you feed the model.</p>
+<p>This lesson asks the next systems question:</p>
+<ul>
+<li>how do you physically train that model once the state no longer fits comfortably on one accelerator?</li>
+</ul>
+<p>That is where the training stack changes from:</p>
+<ul>
+<li>"run PyTorch on one box"</li>
+</ul>
+<p>to:</p>
+<ul>
+<li>"decide where every category of state lives, when it is materialized, and how much communication overhead you can afford"</li>
+</ul>
+<p>Without that shift, scaling hits memory walls long before it hits theoretical model ambition.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you should be able to:</p>
+<ol>
+<li><strong>Explain why naive data parallelism becomes memory-inefficient</strong> for large LLM training.</li>
+<li><strong>Describe what ZeRO Stage 1, 2, and 3 partition</strong> and why each stage saves more memory.</li>
+<li><strong>Evaluate when DeepSpeed and ZeRO-style strategies are worth the communication and complexity cost</strong> compared with simpler setups.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: ZeRO Exists Because Training State Is Much Larger Than "Just the Weights"</h3>
+<p>For example, a team can load a model for inference on a cluster of GPUs, but training crashes immediately with out-of-memory errors once gradients and Adam states are enabled.</p>
+<p>At a high level, Inference memory and training memory are different worlds. Training must remember far more state than inference.</p>
+<p>Mechanically: A training job typically carries at least these categories of state:</p>
+<ul>
+<li>model parameters</li>
+<li>gradients</li>
+<li>optimizer states such as first and second moments</li>
+<li>activations needed for backpropagation</li>
+</ul>
+<p>Traditional data parallel training replicates most model and optimizer state on every worker. That replication is simple, but very expensive.</p>
+<p>For large models, the waste is obvious:</p>
+<ul>
+<li>every GPU stores the full parameter set</li>
+<li>every GPU stores the full gradient set</li>
+<li>every GPU stores the full optimizer state</li>
+</ul>
+<p>So memory pressure grows faster than people expect from just reading the parameter count.</p>
+<p>In practice:</p>
+<ul>
+<li>a model that appears "small enough" on paper may still be impossible to train with standard replication</li>
+<li>memory savings can unlock larger batch sizes, longer contexts, or bigger models without changing the math of the optimizer itself</li>
+<li>training systems need to reason about state categories separately, not as one monolithic blob</li>
+</ul>
+<p>The trade-off is clear: Full replication buys simpler programming and less fine-grained orchestration, but it wastes precious accelerator memory.</p>
+<p>A useful mental model is: Think of distributed training as warehouse management. If every warehouse stores the full inventory, operations are simple but storage is wasteful. ZeRO starts splitting inventory across warehouses and reassembling only what is needed when it is needed.</p>
+<p>Use this lens when:</p>
+<ul>
+<li>Best fit: any serious LLM training discussion beyond single-node or comfortably fitting models.</li>
+<li>Misuse pattern: assuming memory scaling is dominated only by parameters and ignoring optimizer state.</li>
+</ul>
+<h3>Concept 2: ZeRO Saves Memory by Partitioning Different Kinds of State Across Workers</h3>
+<p>For example, a cluster has enough aggregate memory to hold the training state, but no single GPU can hold the full replicated copy. ZeRO makes the cluster's total memory more usable by sharding state across workers.</p>
+<p>At a high level, ZeRO is not "magic compression." It is a structured decision about what not to replicate everywhere.</p>
+<p>Mechanically: ZeRO is usually taught in stages:</p>
+<ol>
+<li><strong>Stage 1</strong><ul>
+<li>shard optimizer states across data-parallel workers</li>
+</ul>
+</li>
+<li><strong>Stage 2</strong><ul>
+<li>shard optimizer states and gradients</li>
+</ul>
+</li>
+<li><strong>Stage 3</strong><ul>
+<li>shard optimizer states, gradients, and parameters</li>
+</ul>
+</li>
+</ol>
+<p>The pattern is simple:</p>
+<ul>
+<li>each higher stage removes another class of full replication</li>
+<li>each higher stage usually needs more coordination and communication</li>
+</ul>
+<p>At Stage 3, parameters themselves are no longer permanently replicated in full on every worker. Instead, relevant parameter shards are gathered when needed for computation and released afterward.</p>
+<p>DeepSpeed is the system layer that makes this practical with features like:</p>
+<ul>
+<li>ZeRO runtime support</li>
+<li>optimizer and parameter offload</li>
+<li>activation checkpointing integration</li>
+<li>fused kernels and training execution utilities</li>
+</ul>
+<p>In practice:</p>
+<ul>
+<li>Stage 1 is often the lowest-friction memory win</li>
+<li>Stage 2 helps when gradients are the next bottleneck</li>
+<li>Stage 3 is the strongest memory play, but also the most communication-sensitive</li>
+<li>CPU or NVMe offload can push scale further, but often at significant throughput cost</li>
+</ul>
+<p>The trade-off is clear: As you reduce memory replication, you usually increase orchestration complexity and communication overhead.</p>
+<p>A useful mental model is: ZeRO turns memory from "replicate everything locally" into "materialize just enough globally."</p>
+<p>Use this lens when:</p>
+<ul>
+<li>Best fit: choosing a distributed strategy for models that do not comfortably fit with ordinary data parallelism.</li>
+<li>Misuse pattern: jumping to the highest ZeRO stage by default without checking whether the communication budget or interconnect can support it.</li>
+</ul>
+<h3>Concept 3: DeepSpeed Is Valuable Because It Turns Scaling Tricks Into an Operational Training Stack</h3>
+<p>For example, a research team knows the theory of sharding optimizer state, but production training still fails because throughput collapses, checkpoints become unwieldy, and restarts are fragile.</p>
+<p>At a high level, Large-scale training is not solved by one algorithm. It is solved by an execution stack that coordinates memory layout, optimizer behavior, checkpoint format, and cluster realities.</p>
+<p>Mechanically: DeepSpeed is useful not only because it implements ZeRO, but because it packages several operational concerns together:</p>
+<ul>
+<li>distributed state partitioning</li>
+<li>mixed precision support</li>
+<li>offload policies</li>
+<li>large-scale checkpointing behavior</li>
+<li>integration with training loops and launch infrastructure</li>
+</ul>
+<p>This matters because real training jobs are constrained by more than raw math:</p>
+<ul>
+<li>restarts must be survivable</li>
+<li>checkpoints must be loadable</li>
+<li>cluster failures must be recoverable</li>
+<li>throughput must remain economically sensible</li>
+</ul>
+<p>In practice:</p>
+<ul>
+<li>the right ZeRO stage depends on hardware topology, not only on model size</li>
+<li>offloading can make an impossible run possible, but may make it too slow to be economically useful</li>
+<li>a training stack that barely fits but is operationally brittle is usually not a good production choice</li>
+</ul>
+<p>The trade-off is clear: DeepSpeed expands the feasible training envelope, but it also introduces more system surface area to tune, monitor, and debug.</p>
+<p>A useful mental model is: ZeRO is the memory strategy; DeepSpeed is the broader training platform that helps you live with that strategy at scale.</p>
+<p>Use this lens when:</p>
+<ul>
+<li>Best fit: multi-GPU and multi-node LLM training where memory and checkpointing are already first-class constraints.</li>
+<li>Misuse pattern: treating DeepSpeed as a performance button instead of a distributed systems stack with real operational consequences.</li>
+</ul>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: "The model fits for inference, so why does training still OOM?"</p>
+<p><strong>Why it happens / is confusing</strong>: Parameter size is easy to estimate, but people forget gradients, optimizer state, and activations.</p>
+<p><strong>Clarification / Fix</strong>: Separate memory accounting into parameters, gradients, optimizer state, and activations. Training memory is often several times larger than inference memory.</p>
+<p><strong>Issue</strong>: "Stage 3 saved memory, but throughput got much worse."</p>
+<p><strong>Why it happens / is confusing</strong>: Less memory use does not mean less total cost. More sharding can require more all-gathers, more synchronization, and more sensitivity to interconnect speed.</p>
+<p><strong>Clarification / Fix</strong>: Treat ZeRO stage choice as a latency/bandwidth trade-off, not a universal upgrade path. Re-evaluate with actual hardware topology and profiler data.</p>
+<p><strong>Issue</strong>: "Offload made the run possible, but the job is now painfully slow."</p>
+<p><strong>Why it happens / is confusing</strong>: Offload shifts pressure from GPU memory to slower devices and buses.</p>
+<p><strong>Clarification / Fix</strong>: Use offload when the goal is feasibility first. If throughput matters, compare that solution against smaller model changes, gradient checkpointing, or different parallelism strategies.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: ZeRO &lt;-&gt; FSDP and State Sharding</h3>
+<p>The deeper pattern is broader than one library: modern large-model training keeps asking the same question. Which state must be resident locally, and which state can be sharded and rematerialized on demand?</p>
+<h3>Connection 2: ZeRO &lt;-&gt; Model, Tensor, and Pipeline Parallelism</h3>
+<p>ZeRO mainly attacks replication inside data parallelism. It does not replace every other scaling strategy. Real large-model training often combines:</p>
+<ul>
+<li>state sharding</li>
+<li>tensor parallelism</li>
+<li>pipeline parallelism</li>
+<li>activation checkpointing</li>
+</ul>
+<p>That is why distributed training design becomes a composition problem rather than a single trick.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>
+<p>[PAPER] <a href="https://arxiv.org/abs/1910.02054">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></p>
+<ul>
+<li>Focus: The original ZeRO framing of optimizer-state, gradient, and parameter partitioning.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://www.deepspeed.ai/">DeepSpeed Documentation</a></p>
+<ul>
+<li>Focus: The practical training stack and configuration surface around ZeRO.</li>
+</ul>
+</li>
+<li>
+<p>[PAPER] <a href="https://arxiv.org/abs/2104.07857">ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning</a></p>
+<ul>
+<li>Focus: Extending the memory strategy with aggressive offload for even larger models.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://pytorch.org/docs/stable/fsdp.html">PyTorch FSDP Documentation</a></p>
+<ul>
+<li>Focus: A useful comparison point for understanding state sharding beyond DeepSpeed.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Large-model training is dominated by training state, not just parameter count</strong> - weights alone understate the real memory problem.</li>
+<li><strong>ZeRO works by removing unnecessary replication</strong> - each stage shards another category of state across workers.</li>
+<li><strong>DeepSpeed matters because scale is operational, not just theoretical</strong> - memory savings only matter if the training stack is still fast and recoverable enough to use.</li>
+</ol>
+<hr />
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why does naive data parallelism become expensive for very large models?</strong></p>
+<ul>
+<li>A) Because it eliminates gradients.</li>
+<li>B) Because it replicates too much training state on every worker.</li>
+<li>C) Because it removes the need for synchronization.</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main difference between ZeRO Stage 2 and Stage 3?</strong></p>
+<ul>
+<li>A) Stage 3 also shards parameters, not just optimizer state and gradients.</li>
+<li>B) Stage 2 disables the optimizer.</li>
+<li>C) Stage 3 removes all communication overhead.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why is DeepSpeed more than just an implementation detail of ZeRO?</strong></p>
+<ul>
+<li>A) Because it is only useful for inference.</li>
+<li>B) Because it turns sharding ideas into a broader operational training stack.</li>
+<li>C) Because it makes checkpointing unnecessary.</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The waste comes from replicating parameters, gradients, and optimizer state too broadly across workers.</p>
+<p><strong>2. A</strong>: Stage 3 goes further by partitioning parameters themselves, which saves more memory but usually requires more coordination.</p>
+<p><strong>3. B</strong>: Real large-scale training needs more than theory. It needs runtime support, checkpoint behavior, offload policies, and execution tooling that survive real clusters.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="001.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Dataset Curation & Tokenization - The Foundation of LLMs</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="003.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Pre-training from Scratch - Building Your Own LLM</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/llm-training-alignment-and-serving.html">← Back to LLM Training, Alignment, and Serving</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

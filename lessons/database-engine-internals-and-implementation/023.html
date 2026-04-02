@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monthly Capstone: Design a Minimal Storage Engine - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Monthly Capstone: Design a Minimal Storage Engine</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 023 | Lesson ID: 400
+        </p>
+        <p>
+          Difficulty: advanced | Kind: capstone
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 400: Monthly Capstone: Design a Minimal Storage Engine</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A minimal storage engine is not a database with features removed at random. It is a narrow workload contract where page layout, indexing, WAL, checkpointing, and recovery all protect the same explicit invariants.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="022.html">15.md</a>, Harbor Point's municipal-bond trading database reached the durable boundary only after the relevant WAL records were flushed. That solved one critical question: when is an acknowledged commit real? The capstone question is larger. If Harbor Point had to build a small storage engine for one production job, which pieces from the month are truly mandatory, and which ones can be postponed without lying about correctness?</p>
+<p>Assume the desk needs a local engine called <code>quotevault</code>. It stores every quote correction for thinly traded bonds so operators can answer two questions under stress: "what is the latest committed state for quote <code>Q12345</code>?" and "show me every correction for CUSIP <code>9128285M8</code> in the last fifteen minutes." The workload is specific: bursty single-row upserts, frequent point reads, short range scans, one writer process, many readers, and a hard rule that acknowledged corrections must survive a power loss. Recovery has to finish in under a minute because the trading desk cannot wait for a manual rebuild at market open.</p>
+<p>Once those constraints are explicit, the design stops being a vague "storage engine architecture" discussion. A heap file with slotted pages gives stable record identifiers. B-tree indexes give predictable point lookups and range scans. WAL plus group commit gives durable acknowledgements. Checkpoints keep recovery bounded. The important shift is that "minimal" does not mean "ignore failure cases." It means "promise only the capabilities you can defend mechanistically."</p>
+<p>That also explains what this engine will not do. <code>quotevault</code> will support single-operation atomic writes, not full multi-statement transactions. It will allow one mutation thread, not arbitrary concurrent writers. Those are not omissions by accident. They are deliberate scope boundaries, and they lead directly into <a href="024.html">../26/01.md</a>, where the curriculum starts adding ACID and isolation on top of a durable storage substrate.</p>
+<h2>Why This Matters</h2>
+<p>Many production teams end up building small storage engines without calling them that. An embedded metadata store, a workflow ledger inside a service, a local cache that must survive restarts, or an audit trail with indexed replay all force the same design questions. Which bytes are authoritative? Which accesses must be fast? Which writes may be acknowledged? What has to happen after a crash before the service is trustworthy again?</p>
+<p>Harbor Point currently has a weaker setup: append-only log files plus periodic snapshots. That is fine until the desk needs both durability and indexed reads during the same volatile morning. A raw log is excellent for sequential append, but point lookups turn into scans, snapshots lag behind committed state, and crash repair becomes a manual argument about which files were copied before the outage. That is exactly the kind of system that looks lightweight until the first stressful failure window.</p>
+<p>Designing a minimal storage engine fixes that by turning the month's isolated mechanisms into one contract. <a href="009.html">02.md</a> and <a href="010.html">03.md</a> decide how rows fit on pages. <a href="011.html">04.md</a> decides how hot pages stay in memory. <a href="014.html">07.md</a> and <a href="015.html">08.md</a> give the read path its structure. <a href="020.html">13.md</a>, <a href="021.html">14.md</a>, and <a href="022.html">15.md</a> decide what the engine may claim after a crash. If those pieces are designed together, the desk gets predictable reads, honest commit semantics, and bounded restart behavior. If they are bolted together late, the engine becomes a pile of fast paths with no trustworthy failure story.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Define a minimal storage-engine contract from a real workload</strong> - Translate read patterns, write patterns, and crash requirements into a narrow but defensible engine scope.</li>
+<li><strong>Trace the chosen engine's write, read, and recovery paths</strong> - Explain how heap pages, B-tree indexes, WAL, group commit, and checkpoints cooperate in one coherent design.</li>
+<li><strong>Explain which capabilities are intentionally deferred</strong> - Show why full transactions, multiple concurrent writers, and richer isolation belong in the next module rather than in this minimal engine.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Start from the workload, then pick the smallest engine shape that satisfies it</h3>
+<p>Harbor Point's <code>quotevault</code> workload is demanding but not unlimited. Most operations are quote corrections arriving from a single ingest service. Each correction replaces the latest state for one <code>quote_id</code> and carries variable-length payload such as dealer notes and provenance metadata. Reads are mostly of two kinds: exact lookup by <code>quote_id</code> during investigations, and recent-range scans by <code>(cusip, event_ts)</code> for one bond during a fast market. Deletes are rare because the store is an audit trail, not a mutable order book.</p>
+<p>That workload rules out several tempting designs. A flat append-only log is simple, but point lookups degrade into repeated scans unless a separate index is built anyway. An LSM tree would make the write path even more sequential, but it would also introduce compaction scheduling, stale SSTable overlap, and more complex secondary-index maintenance. For <code>quotevault</code>, Harbor Point values predictable read latency and a simple recovery story more than maximum ingest throughput. The dataset is measured in tens of gigabytes, not petabytes, so a B-tree-based engine is the better minimal choice.</p>
+<p>The resulting physical design is intentionally small:</p>
+<div class="codehilite"><pre><span></span><code>WAL file
+  -&gt; ordered redo records for every committed mutation
+
+Heap file (8 KiB slotted pages)
+  -&gt; authoritative row storage
+  -&gt; each row has a stable RID = (page_id, slot_id)
+
+Primary B-tree on quote_id
+  -&gt; quote_id -&gt; RID
+
+Secondary B-tree on (cusip, event_ts, quote_id)
+  -&gt; recent range scans per bond
+</code></pre></div>
+
+<p>The heap page layout uses the machinery from <a href="009.html">02.md</a> and <a href="010.html">03.md</a>: a page header, a slot directory, and variable-length records packed from the end of the page backward. That choice matters because dealer notes are not fixed-size, and stable slot identifiers let indexes point to records without rewriting every reference when the page compacts locally. A minimal engine still needs this discipline; otherwise even simple updates turn into pointer chaos.</p>
+<p>The trade-off is clear. Harbor Point avoids LSM compaction debt and gets stronger read locality for hot index paths, but it accepts B-tree page splits, random dirty-page writes, and the need to maintain two indexes on every mutation. Minimality here is not "fewest files." It is "fewest mechanisms that still satisfy the actual query contract."</p>
+<h3>Concept 2: The write path must treat durability and visibility as one boundary</h3>
+<p>Because <code>quotevault</code> has one mutation thread, Harbor Point can simplify the write path aggressively without pretending recovery is optional. Each incoming correction becomes a mini-transaction: update the heap row, update the two B-tree indexes, append corresponding WAL records, write a commit record, and acknowledge success only after the commit LSN becomes durable. Multiple client requests may still share one flush through group commit, but the engine never exposes a correction as committed before that flush boundary moves.</p>
+<p>The write path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>client correction
+   -&gt; writer thread builds new heap image in buffer pool
+   -&gt; update primary and secondary B-tree pages in buffer pool
+   -&gt; append redo records to WAL buffer
+   -&gt; assign commit_lsn
+   -&gt; group commit flush makes durable_lsn &gt;= commit_lsn
+   -&gt; acknowledge correction
+</code></pre></div>
+
+<p>This is the direct continuation of <a href="022.html">15.md</a>. The desk does not care whether the heap page reached disk at acknowledgement time. It cares whether the correction will survive a crash. WAL plus group commit answers that question honestly. Checkpoints and background page flush handle the slower task of moving dirty heap and index pages to their long-term files.</p>
+<p>The key design simplification is that background flush is allowed to write only pages whose <code>page_lsn</code> is at or below the durable boundary. In other words, the engine never writes uncommitted page images to disk. That means recovery can stay redo-only for this minimal scope: after a crash, the engine ignores any trailing WAL without a durable commit record and reapplies committed records whose LSNs are newer than the page image on disk. Harbor Point gives up concurrent writers and long-running write transactions to earn that simplicity.</p>
+<p>Operationally, that is a real trade-off, not a classroom shortcut. One writer thread keeps latch design simple and makes durability bugs easier to reason about. It also caps write throughput and means a slow correction can hold up the whole mutation stream. For a narrow audit store inside one service, that is acceptable. For a general-purpose DBMS with many overlapping writers, it would not be.</p>
+<h3>Concept 3: Checkpointing, recovery, and observability decide whether the design is publishable</h3>
+<p>The engine becomes production-ready only when Harbor Point can restart it after a crash and explain exactly what it will do. <code>quotevault</code> therefore keeps a fuzzy checkpoint every few seconds. The checkpoint records the redo start LSN and the list of dirty pages that had not yet reached disk. On restart, recovery finds the latest completed checkpoint, scans WAL forward from that redo point, and reapplies committed heap and index changes whenever the on-disk page LSN is older than the record being replayed.</p>
+<p>That recovery story is intentionally narrower than ARIES in <a href="021.html">14.md</a>. There is no general undo phase because the engine never flushes uncommitted page state. There is no MVCC visibility check because each key has only one committed current version. There is no lock table reconstruction because the writer thread serialized mutations in the first place. The restart sequence is therefore short enough to explain on one whiteboard, which is exactly what you want from a minimal engine.</p>
+<p>The design also needs a short list of metrics that prove its assumptions are still true:</p>
+<ul>
+<li>durable commit latency and group size, to confirm <a href="022.html">15.md</a>'s flush sharing is working</li>
+<li>dirty-page backlog, to catch checkpoints that are falling behind</li>
+<li>B-tree split rate on both indexes, to detect page layout pressure</li>
+<li>buffer-pool hit ratio for upper B-tree levels and hot heap pages, to confirm the read path stays memory-resident</li>
+<li>recovery replay volume since the last checkpoint, to bound restart time before an outage tests it for real</li>
+</ul>
+<p>Those metrics matter because storage engines usually fail first by violating one of their own hidden assumptions. If split rate spikes, the supposedly stable index shape is no longer stable. If replay volume grows without bound, the checkpoint policy is lying about restart time. If point lookups start missing cache residency, the chosen B-tree design may still be correct but no longer cheap enough.</p>
+<p>This is also where the boundary with the next module becomes explicit. <code>quotevault</code> can promise durable single-operation updates and reliable indexed reads on one node. It cannot promise serializable multi-statement transactions, deadlock handling, or reader-writer isolation anomalies, because those require a transaction manager layered over the storage engine. That is the handoff into <a href="024.html">../26/01.md</a>: first make the bytes durable and recoverable, then decide how multiple transactions are allowed to observe and modify them.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: After a crash, the heap contains the latest quote correction but the secondary <code>(cusip, event_ts, quote_id)</code> index misses it during range scans.</p>
+<p><strong>Why it happens / is confusing</strong>: The team treated heap persistence and index persistence as separate concerns, but recovery correctness depends on replaying both as one committed mini-transaction. A crash that lands between those writes exposes any mismatch immediately.</p>
+<p><strong>Clarification / Fix</strong>: Log heap and index page changes under the same commit boundary, and replay them from WAL together. Never assume an index can be "mostly current" in a store that promises crash-safe query answers.</p>
+<p><strong>Issue</strong>: Commit latency becomes erratic during the market open even though the WAL device is normally fast.</p>
+<p><strong>Why it happens / is confusing</strong>: The expensive step is often the flush barrier, not the number of log bytes. Checkpoint writeback, index-page churn, or OS cache pressure can interfere with the same storage path and make group commit look unreliable.</p>
+<p><strong>Clarification / Fix</strong>: Track durable-latency percentiles alongside checkpoint volume and dirty-page backlog. If they rise together, smooth checkpoint I/O or separate WAL and data-page traffic before blaming the commit algorithm itself.</p>
+<p><strong>Issue</strong>: The engine is correct, but one slow write blocks every other incoming correction.</p>
+<p><strong>Why it happens / is confusing</strong>: That is the cost of the single-writer simplification. Correctness is easier to reason about because mutations are serialized, but throughput and tail latency now depend on the longest operation in the queue.</p>
+<p><strong>Clarification / Fix</strong>: Keep the mutation path narrow, reject expensive per-write work, and be honest about the scale limit. If Harbor Point needs many concurrent writers, the right fix is not a larger queue. It is to move into the transaction and concurrency-control machinery introduced next month.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Minimal storage-engine design ↔ SQLite's pager and B-tree layering</h3>
+<p>SQLite is useful here because it shows how far a small engine can go when the boundaries stay disciplined. A pager layer decides which pages are authoritative and durable, while B-tree structures provide logical access paths on top. <code>quotevault</code> is not SQLite, but the architectural lesson is similar: a storage engine becomes understandable when the page manager, WAL contract, and index structures are clearly separated.</p>
+<h3>Connection 2: Durable storage substrate ↔ transaction management</h3>
+<p>Month 25 focused on where bytes live, when they become durable, and how the engine recovers them. Month 26 starts asking a different question: if two transactions overlap, which versions are visible, which schedules are legal, and how do locks or timestamps preserve those rules? The second layer depends completely on the first. Isolation without a trustworthy storage substrate is just a more complicated way to lose data.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://sqlite.org/arch.html">SQLite Architecture</a><ul>
+<li>Focus: See how a compact production engine separates pager, B-tree, and recovery responsibilities.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PostgreSQL Documentation: Database Page Layout</a><ul>
+<li>Focus: Compare the slotted-page design in this lesson with a mature heap-page implementation.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-intro.html">PostgreSQL Documentation: Write Ahead Logging (WAL)</a><ul>
+<li>Focus: Relate commit, checkpoint, and recovery boundaries in this capstone to a production database.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging">ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging</a><ul>
+<li>Focus: See what extra machinery appears once you move beyond the simplified redo-only recovery boundary used in <code>quotevault</code>.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Minimal means narrow scope, not weak correctness</strong> - A small engine is credible only when its invariants are explicit and its omitted features are intentional.</li>
+<li><strong>The write path defines the truth boundary</strong> - Heap updates, index maintenance, WAL, and acknowledgement must share one durability contract or the engine will lie after a crash.</li>
+<li><strong>Recovery is part of the architecture, not an appendix</strong> - A storage design is only complete when restart steps, checkpoint policy, and replay cost are all predictable.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point choose a heap plus B-tree design instead of an LSM tree for <code>quotevault</code>?</strong></p>
+<ul>
+<li>A) Because B-trees eliminate the need for WAL</li>
+<li>B) Because the workload values predictable point and short-range reads more than maximum write throughput, and the dataset is still small enough that compaction complexity is not worth it</li>
+<li>C) Because LSM trees cannot support range scans</li>
+</ul>
+</li>
+<li>
+<p><strong>What allows <code>quotevault</code> to use redo-only recovery in this lesson's design?</strong></p>
+<ul>
+<li>A) The engine allows uncommitted pages to flush freely, then reconstructs them from the secondary index</li>
+<li>B) The engine delays all data-page flushing until every page in memory is clean</li>
+<li>C) The engine flushes only pages whose changes are already durable, so restart can ignore incomplete trailing WAL and replay committed records forward</li>
+</ul>
+</li>
+<li>
+<p><strong>Which capability is deliberately left for the next module rather than included in this minimal engine?</strong></p>
+<ul>
+<li>A) Maintaining a B-tree index over heap records</li>
+<li>B) Grouping several waiting commits behind one WAL flush</li>
+<li>C) Supporting overlapping transactions with defined isolation behavior</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: <code>quotevault</code> is read-sensitive and moderate in size, so predictable B-tree lookups are more valuable than the extra write optimization of an LSM design. Option A is false because B-trees still need WAL for durability. Option C is false because LSM trees can serve range scans; the issue is the surrounding compaction and secondary-index trade-off.</p>
+<p><strong>2. C</strong>: Redo-only recovery works here because the engine never writes uncommitted page images to disk. Option A would require a richer undo story, and option B is too strict to be practical because checkpoints would never make progress under sustained write load.</p>
+<p><strong>3. C</strong>: The capstone intentionally stops at durable single-operation writes on one node. Isolation across overlapping transactions is exactly the next layer introduced in <a href="024.html">../26/01.md</a>.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="022.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>fsync, Group Commit, and Durable Latency</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="024.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Transaction Model and ACID in Practice</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

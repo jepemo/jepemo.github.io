@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Disaster Recovery Drills and PITR Validation - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Disaster Recovery Drills and PITR Validation</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+        </p>
+        <p>
+          Sequence: 005 | Lesson ID: 453
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 453: Disaster Recovery Drills and PITR Validation</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A disaster recovery plan is real only when a restored cluster can replay durable history to a chosen point, prove the business invariants still hold, and be cut over without guessing about what committed before the failure.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="004.html">Cross-Region Commit Protocols</a>, <code>PayLedger</code> learned how to make a payroll approval and a treasury reservation become one durable business action. That lesson answered the question, "How does the system decide that a cross-region write committed?" Disaster recovery asks the harder follow-up: "Could you rebuild that answer tomorrow, on different machines, after a region loss or an operator mistake?"</p>
+<p>Use one concrete incident. At 10:14 UTC, an engineer runs a faulty cleanup job against <code>treasury_holds</code> while the April payroll close is in progress for tenant <code>globex-eu</code>. The job deletes active hold rows for transactions older than ten minutes, including holds that were paired with already approved payroll runs. The primary cluster is healthy enough to keep serving traffic, which makes the situation worse: replication faithfully spreads the mistake, dashboards still look mostly green, and "restore last night's backup" would also erase legitimate approvals from the morning.</p>
+<p>This is where point-in-time recovery stops being a storage feature and becomes an engineering proof. A drill says: start from a known snapshot, replay the archived log and transaction metadata to the last safe boundary before the bad commit, then verify that every payroll run marked <code>approved</code> still has the treasury reservation that made it safe to approve. The useful mental shift is that backup success is only raw material. Recoverability is the ability to name an exact target, restore to it, and defend the result with invariant checks.</p>
+<p>That changes how you think about RPO and RTO. RPO is not "we keep backups every night." It is "we can reconstruct the authoritative timeline up to this specific point." RTO is not just "the database process started." It is "the restored system passed the checks required before finance can trust it again." The next capstone, <a href="006.html">Database Internals Final Integration</a>, depends on this shift because commit protocols, storage logs, and operational drills only form a real platform when they survive the restore path together.</p>
+<h2>Why This Matters</h2>
+<p><code>PayLedger</code> handles payroll approvals, treasury holds, and downstream settlement work. Those records are not just analytics. They are the system of record for whether money is allowed to move. If the platform restores to the wrong point, it can produce one of two expensive failures: it can lose legitimate approvals that should still exist, or it can keep approvals whose matching treasury holds were already deleted by the faulty job. Either outcome creates manual reconciliation during the exact window when payroll operations need certainty.</p>
+<p>Teams often mistake disaster recovery for a backup retention policy. A green backup job proves only that bytes were copied somewhere. It does not prove that the archived log chain is complete, that transaction records are restorable, that credentials for a clean restore environment still work, or that operators know which timestamp or log position marks the last safe state. The first real incident is then spent discovering missing WAL segments, stale restore scripts, or invariant checks that were never written down.</p>
+<p>Disaster recovery drills turn those hidden assumptions into mechanisms you can inspect. A good drill makes the recovery target explicit, restores into an isolated environment, replays forward to the declared boundary, runs the same validation queries every time, and records how long each phase took. That is the production value of PITR validation: it converts "we think restore should work" into a repeatable argument about the exact data state the business will recover.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why PITR needs more than a backup file</strong> - Identify the snapshot, log archive, transaction metadata, and target-selection data required to rebuild a trustworthy state.</li>
+<li><strong>Trace the flow of a recovery drill end to end</strong> - Follow incident timeline reconstruction, isolated restore, replay to a target boundary, invariant validation, and cutover readiness checks.</li>
+<li><strong>Evaluate the operational trade-offs in disaster recovery design</strong> - Decide how snapshot cadence, log retention, drill depth, and validation scope change real RPO, RTO, and cost.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: PITR works only when the restore target and recovery artifacts line up</h3>
+<p>Keep the <code>PayLedger</code> incident concrete. At 09:45 UTC the platform completed a base snapshot. Between 09:45 and 10:14, the cluster accepted normal payroll-close traffic: approvals on the payroll shard, matching treasury holds on the treasury shard, and transaction records describing which cross-region commits became authoritative. At 10:14, the cleanup job committed the destructive delete. The recovery objective is not "go back to 09:45." It is "reconstruct the cluster exactly as it looked just before the bad commit at 10:14."</p>
+<p>That requires a precise chain of artifacts:</p>
+<div class="codehilite"><pre><span></span><code>09:45 base snapshot
+   +
+archived WAL / redo / binlog history from 09:45 onward
+   +
+transaction records and timeline metadata for cross-region commits
+   +
+an explicit recovery target before the destructive commit
+</code></pre></div>
+
+<p>The mechanism matters. The snapshot gives the engine a crash-consistent starting image. The archived log history replays every durable change after that image. The transaction metadata from the previous lesson is what lets recovery decide whether in-flight cross-region work committed or aborted before the incident. If the payroll row says <code>approved</code> but the transaction record that proves the treasury hold committed is missing from the archive, the restore is not trustworthy even if the database starts cleanly.</p>
+<p>This is why disaster recovery depends on commit-path design. The platform cannot validate point-in-time restore from application rows alone. It also needs the recovery artifacts that explain commit order, transaction outcome, and timeline history. In systems with MVCC or intent records, that may include metadata tables, WAL entries, or coordinator records that normal product engineers rarely read directly but operators rely on during recovery.</p>
+<p>The trade-off is simple and expensive: tighter recovery targets require longer log retention, stricter archive monitoring, and more disciplined handling of metadata. If the organization wants the option to restore to 10:13:58 instead of "some time this morning," it must pay for the storage, automation, and auditability that make that exact stop point possible.</p>
+<h3>Concept 2: A drill is a rehearsal of the full restore path, not a backup smoke test</h3>
+<p>Once the incident timeline is known, <code>PayLedger</code> should not restore on top of the production cluster and hope for the best. A real drill provisions an isolated environment with the same engine version, the same restore tooling, and a controlled copy of the archive location. The team restores the 09:45 snapshot, replays the log stream until the chosen boundary before the cleanup job, and promotes the restored cluster onto a new timeline that can accept validation traffic without risking accidental writes back into production.</p>
+<p>In practice, the drill is a sequence of deliberate gates:</p>
+<div class="codehilite"><pre><span></span><code>1. Freeze the incident timeline and choose a restore target
+2. Provision a clean restore environment
+3. Restore the base snapshot
+4. Replay logs and transaction metadata to the target
+5. Promote the restored cluster on a new timeline
+6. Run invariant checks and application cutover checks
+</code></pre></div>
+
+<p>Every gate exists because a common failure mode hides there. Target selection can be wrong if operators use local time instead of UTC or guess at the destructive commit boundary. Restore provisioning can fail because credentials, network policies, or object-store permissions changed since the runbook was written. Log replay can stall because archive retention silently dropped a segment two weeks ago. Promotion can be unsafe if the old primary is not fenced and background workers still point at the wrong writer endpoint.</p>
+<p>The production lesson is that a drill must include more than database bytes. <code>PayLedger</code> also needs the playbook for pausing mutating consumers, validating secrets, reconfiguring service discovery, and proving the restored cluster is isolated until it is intentionally cut over. A database that can replay WAL in a lab but cannot be promoted safely under the real application topology does not have a finished recovery story.</p>
+<p>The trade-off here is organizational. Full-fidelity drills consume compute, operator time, and sometimes temporary downtime windows in staging or shadow environments. But shallow drills, such as "we restored one table once," generate false confidence because they avoid the exact dependencies that fail during an actual incident.</p>
+<h3>Concept 3: PITR validation is an invariant check, not a process-complete check</h3>
+<p>The restored <code>PayLedger</code> cluster is useful only if it proves the business state is coherent. For this lesson's scenario, the core validation query is not "does the database accept connections?" It is "for every payroll run with <code>status = approved</code>, is there a matching treasury hold and a committed transaction record that authorizes that pair?" That is the same invariant the commit protocol enforced on the write path, now re-tested on the restore path.</p>
+<p>The validation suite for a drill should therefore include at least three classes of checks. First are storage-level checks: the snapshot manifest matches expectations, log replay reached the requested boundary, and there are no unresolved intents or prepared transactions that are older than the target point. Second are data-invariant checks: approved payroll runs match treasury holds, aggregate reserved cash matches the hold ledger, and the transactional outbox contains no entries past the intended cut line. Third are cutover checks: application credentials work against the restored cluster, mutating workers are still fenced from the old writer, and downstream rebuild steps are understood for any derived system that was not restored in lockstep.</p>
+<p>For <code>PayLedger</code>, that might look like this:</p>
+<div class="codehilite"><pre><span></span><code>- no WAL/archive gaps between snapshot start and target
+- no unresolved cross-region transaction older than target timestamp
+- every approved payroll run has one committed treasury hold
+- outbox events after the target are absent or marked for rebuild
+- restored cluster can be promoted without reconnecting the old primary
+</code></pre></div>
+
+<p>What makes this a validation discipline rather than a checklist is repetition. The same query set should run on every drill so the team can compare results over time. If replay time is drifting upward, if unresolved-intent cleanup is getting slower, or if one invariant query keeps requiring manual interpretation, that is not drill noise. It is evidence that the recovery system is becoming harder to trust.</p>
+<p>The trade-off is between speed and confidence. A thin validation pass may hit the RTO number faster, but it shifts risk into post-cutover surprises. A richer validation suite adds minutes to the drill, yet prevents the much more expensive outcome where the platform returns to service with internally inconsistent money movement records.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The drill restores successfully, but replay takes far longer than the published RTO.</p>
+<p><strong>Why it happens / is confusing</strong>: Teams often measure only snapshot copy time and ignore how much WAL or binlog history must be replayed after the snapshot. A recovery design with infrequent snapshots can look cheap on normal days and still miss the restore budget because replay becomes the dominant step.</p>
+<p><strong>Clarification / Fix</strong>: Measure snapshot restore time and replay time separately. If replay dominates, shorten the snapshot interval, increase replay throughput, or reduce how much derived state must be restored instead of rebuilt.</p>
+<p><strong>Issue</strong>: The restored cluster starts, but some approved payroll runs are missing treasury holds.</p>
+<p><strong>Why it happens / is confusing</strong>: The target boundary may be wrong, or the archive may be incomplete around the transaction record and intent-resolution data that proves the cross-region commit finished. The database can be structurally healthy while the business invariant is still broken.</p>
+<p><strong>Clarification / Fix</strong>: Validate against transaction IDs, not only row counts. Reconstruct the incident timeline from audit logs and commit metadata, then re-run the restore to a known-good target. If the invariant still fails, inspect archive completeness around the affected transaction records before trusting the drill.</p>
+<p><strong>Issue</strong>: The database drill meets the RTO in isolation, but a real failover would still be slow or unsafe.</p>
+<p><strong>Why it happens / is confusing</strong>: The exercise measured storage recovery only. It did not include service discovery changes, secret rotation, worker fencing, or the steps required to stop the old primary from accepting writes if it comes back.</p>
+<p><strong>Clarification / Fix</strong>: Expand the drill boundary to include cutover mechanics. A usable recovery test includes the application and operational controls that determine whether the restored timeline can become authoritative without split brain or duplicate side effects.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Disaster recovery drills ↔ cross-region commit protocols</h3>
+<p>The previous lesson explained how <code>PayLedger</code> creates a durable transaction decision before exposing a cross-region write. PITR validation proves those decision records survive restore. If the system cannot recover the commit record, the write path's atomicity guarantee becomes meaningless during the very incidents it was meant to survive.</p>
+<h3>Connection 2: Disaster recovery drills ↔ observability and operational budgets</h3>
+<p>Recovery is a pipeline with measurable stages: snapshot freshness, archive lag, replay throughput, invariant-check duration, and cutover time. Those metrics are the only honest way to talk about RPO and RTO, and they feed directly into the broader platform trade-offs that the capstone in <a href="006.html">Database Internals Final Integration</a> will pull together.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/continuous-archiving.html">PostgreSQL Documentation: Continuous Archiving and Point-in-Time Recovery (PITR)</a><ul>
+<li>Focus: Read the sections on base backups, recovery targets, and timeline history to connect this lesson's snapshot-plus-log model to a concrete WAL-based engine.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby-failover.html">PostgreSQL Documentation: Warm Standby, Failover, and Replication</a><ul>
+<li>Focus: Study how promotion, replication lag, and failover mechanics interact with the question "which timeline is authoritative after restore?"</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.percona.com/percona-xtrabackup/8.4/point-in-time-recovery.html">Point-in-time recovery - Percona XtraBackup</a><ul>
+<li>Focus: Compare PostgreSQL-style WAL replay with a MySQL ecosystem that pairs physical backup artifacts with binary log replay to reach a target boundary.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the chapters on storage, transactions, and fault tolerance, then map them to the lesson's recovery claim: a backup is useful only when the system can re-establish a coherent history from it.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Recoverability is a timeline claim</strong> - PITR is credible only when the platform can name an exact target and replay durable history to that boundary.</li>
+<li><strong>A drill must exercise the whole path</strong> - Snapshot restore without archive replay, invariant checks, and cutover controls is not a meaningful disaster recovery test.</li>
+<li><strong>Validation should reuse write-path invariants</strong> - The same business rules that justified cross-region commit must be checked again after restore before the recovered cluster is trusted.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is the 09:45 snapshot alone not enough to recover <code>PayLedger</code> after the 10:14 cleanup mistake?</strong></p>
+<ul>
+<li>A) Because snapshots cannot be restored while the engine is online</li>
+<li>B) Because the platform also needs the archived durable history and transaction metadata needed to replay forward to the last safe point before the bad commit</li>
+<li>C) Because snapshots store only schema definitions and not row data</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the most important outcome of a disaster recovery drill in this lesson?</strong></p>
+<ul>
+<li>A) Proving that the restore script can start a database process somewhere</li>
+<li>B) Proving that the restored cluster reaches the chosen target boundary and still satisfies the business invariants required for cutover</li>
+<li>C) Proving that the team can avoid keeping archived logs between snapshots</li>
+</ul>
+</li>
+<li>
+<p><strong>Which change most directly improves confidence in <code>PayLedger</code>'s published RTO?</strong></p>
+<ul>
+<li>A) Replacing invariant checks with a quick ping test so the drill finishes faster</li>
+<li>B) Measuring restore, replay, and cutover phases separately and updating the drill when one phase begins to dominate</li>
+<li>C) Running fewer drills so production metrics remain less noisy</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The snapshot is only the starting image. <code>PayLedger</code> must also replay the archived log and transaction history that preserve the valid approvals and holds between 09:45 and the safe stop point just before the destructive commit.</p>
+<p><strong>2. B</strong>: A real drill proves both state reconstruction and correctness. Starting a database process is necessary, but it does not tell finance whether approved payroll runs still line up with treasury holds and committed transaction records.</p>
+<p><strong>3. B</strong>: RTO is only trustworthy when the team knows which phase consumes the time budget. Measuring restore, replay, and cutover separately is what turns recovery from folklore into an operable system.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="004.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Cross-Region Commit Protocols</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="006.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Database Internals Final Integration</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

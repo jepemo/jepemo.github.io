@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Polyglot Persistence and Data Integration - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Polyglot Persistence and Data Integration</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+        </p>
+        <p>
+          Sequence: 013 | Lesson ID: 461
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 461: Polyglot Persistence and Data Integration</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Polyglot persistence works in production only when each fact has one authoritative home and every other store is fed through explicit, replayable integration paths instead of ad hoc dual writes.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="012.html">Schema Evolution and Compatibility Modes</a>, <code>PayLedger</code> learned how to change event schemas without breaking lagging consumers or replay jobs. That solved the "can old and new binaries still understand the same message?" problem. The next production question is harder: where should those messages go when one database can no longer serve every workload well?</p>
+<p><code>PayLedger</code> now has three very different needs. Payroll coordinators need strict transactional updates when a payroll run moves from <code>draft</code> to <code>approved</code> to <code>settled</code>. Support agents need fast search by employee name, bank reference, and payout status across millions of records. Finance analysts need multi-month aggregation over settlement fees and country-level payout patterns. PostgreSQL is a good home for the first job, but a poor fit for the other two once traffic and data volume grow.</p>
+<p>The tempting mistake is to treat this as a shopping problem: add Elasticsearch for search, a warehouse for analytics, maybe Redis for hot reads, and call the architecture "modern." The real challenge is integration. If <code>settled_at</code> changes in PostgreSQL but the search index lags, support sees stale state. If the warehouse loads the same payout twice during a retry, finance reports drift. Polyglot persistence is not about owning many databases. It is about making multiple stores cooperate without creating multiple truths.</p>
+<h2>Why This Matters</h2>
+<p>Production systems rarely have one workload forever. The same payroll data that begins as OLTP rows later becomes search documents, risk features, reconciliation inputs, and executive reporting. Trying to force all of that into one engine often creates familiar pain: overloaded replicas, fragile hand-built reporting queries, bloated indexes, and operators arguing about whether the database is slow or the access pattern is wrong.</p>
+<p>Splitting workloads across stores can absolutely help. A relational database preserves transactional invariants. A search index optimizes inverted lookups and faceting. A columnar or lakehouse-style analytics store handles long scans and wide aggregations far more efficiently than an OLTP engine. The benefit is real, but the failure modes move. Instead of one overloaded database, you now have consistency windows, replay requirements, change contracts, and multiple operational surfaces to monitor.</p>
+<p>For <code>PayLedger</code>, the central question becomes: when a payroll fact changes, what is the authoritative record, how does that change leave the source system, and how do downstream stores apply it exactly once or at least idempotently? If that path is vague, every new store adds accidental complexity. If that path is explicit, specialized stores become an advantage rather than an integrity risk.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain when polyglot persistence is justified</strong> - Distinguish a legitimate workload mismatch from database sprawl disguised as architecture.</li>
+<li><strong>Trace a safe integration path across stores</strong> - Follow how authoritative writes, change capture, replay, and derived projections fit together.</li>
+<li><strong>Evaluate the operational trade-offs</strong> - Judge freshness, failure recovery, and ownership boundaries before adding another durable store.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Different stores solve different workload shapes, but authority must stay singular</h3>
+<p><code>PayLedger</code> keeps payroll runs, settlement instructions, and idempotency keys in PostgreSQL because those records need transactional guarantees. A coordinator approving a payroll batch cannot tolerate duplicate payouts or half-applied state transitions. The system needs constraints, point updates, and predictable commit semantics. That is classic relational territory.</p>
+<p>The same data becomes painful when used for other jobs. Support agents want to search <code>"Garcia"</code> and filter by failed SEPA transfers in the last 24 hours. Finance wants to compute average settlement fees by corridor across six months of data. Those queries are possible in PostgreSQL, but not at the same efficiency or operational safety once the table sizes and concurrency levels climb. Search engines and analytics stores exist because they optimize different read paths, storage layouts, and indexing strategies.</p>
+<p>This is the legitimate case for polyglot persistence: one product domain, multiple access patterns, each with materially different performance and query needs. The mistake is to stop the analysis there. Before adding a second store, the team has to answer four ownership questions for every fact it cares about: where is the authoritative write accepted, what identifier travels across stores, what freshness is acceptable downstream, and whether downstream copies are allowed to derive or reinterpret the source data.</p>
+<p>For <code>PayLedger</code>, the answers are explicit. PostgreSQL is authoritative for payout state. Elasticsearch holds a searchable projection of that state for operations staff. The warehouse holds historical facts and derived aggregates for finance. Those latter stores are valuable, but they are not allowed to invent settlement truth. That constraint sounds administrative, yet it is the mechanism that prevents a stale search index or a buggy ETL job from becoming an accidental source of record.</p>
+<p>The trade-off is straightforward. Specialized stores let each workload run on machinery designed for it, but every additional durable copy creates a synchronization obligation. If the team cannot name the owner of a fact in one sentence, it is adding persistence diversity faster than it is adding architecture clarity.</p>
+<h3>Concept 2: Safe integration starts with one durable write and a replayable change stream</h3>
+<p>The worst version of <code>PayLedger</code>'s write path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>API request
+   |-- write payout row to PostgreSQL
+   |-- index document in Elasticsearch
+   `-- publish event for analytics
+</code></pre></div>
+
+<p>That looks efficient until the middle call fails. The request may commit in PostgreSQL but never reach Elasticsearch. Or the search index may update while the database transaction later rolls back. Direct dual writes push distributed coordination into application code, where retries, partial failure, and ordering bugs are hardest to reason about.</p>
+<p>The safer pattern is to make the authoritative store the only place where the business write becomes durable, then let downstream systems subscribe to a change stream derived from that source. In <code>PayLedger</code>, the payroll API commits the business row and an outbox row in the same PostgreSQL transaction. Logical decoding or an outbox relay publishes that committed change to Kafka. A search projector consumes the event and updates Elasticsearch. A finance ingestion job consumes the same stream and lands normalized facts in the warehouse.</p>
+<div class="codehilite"><pre><span></span><code>API request
+   |
+   v
+PostgreSQL transaction
+   |- payroll tables
+   `- outbox table
+   |
+   v
+CDC / outbox relay
+   |
+   v
+Kafka topic
+   |\
+   | \-&gt; search projector -&gt; Elasticsearch
+   `--&gt; finance loader -&gt; warehouse
+</code></pre></div>
+
+<p>This design does not eliminate distributed systems problems; it relocates them to a shape the team can manage. The atomicity boundary is local and clear: either the source-of-truth row and its outbox record commit together or neither does. Downstream consumers still need idempotency, ordering discipline, and replay support, but they no longer have to guess whether the original business write happened. That is a major simplification.</p>
+<p>The previous lesson on schema evolution matters here immediately. Once changes are moving through Kafka and living long enough for replays, integration messages become durable contracts, not just internal implementation details. <code>PayLedger</code> cannot casually rename a field or change the meaning of <code>amount_minor</code> because search reindexing and warehouse backfills may process old and new events in the same week.</p>
+<p>The trade-off is that freshness becomes asynchronous by design. Search results might lag committed state by a few seconds. Analytics may lag by minutes. That is acceptable only if the product acknowledges those windows and the platform makes lag measurable. Safe polyglot persistence is usually eventual consistency plus strong replay and observability, not fake synchrony spread across multiple stores.</p>
+<h3>Concept 3: Operating polyglot persistence means managing lag, repair, and drift explicitly</h3>
+<p>Once <code>PayLedger</code> adds Elasticsearch and a warehouse, it now owns a living pipeline, not just a database schema. The support team will ask why a payout shows as <code>settled</code> on the detail page but still appears as <code>processing</code> in search. Finance will ask why yesterday's fee totals changed after a backfill. Those are not edge cases. They are the normal operational cost of derived data.</p>
+<p>The right response is not to promise perfect simultaneity. It is to define which inconsistencies are allowed, for how long, and how they are detected. <code>PayLedger</code> can say that PostgreSQL-backed payout detail pages are authoritative immediately after commit, search freshness should stay within 30 seconds, and finance dashboards are rebuilt hourly with replay-safe loads. That is a much more honest and operable contract than implying all views are equally current.</p>
+<p>Three capabilities matter in practice. First, each projection needs an idempotent apply model, usually keyed by a stable event identifier and version, so retries do not duplicate or regress state. Second, each projection needs a repair path: reindexing Elasticsearch from the source stream, replaying warehouse loads from Kafka, or recomputing a derived table from retained events. Third, the team needs observability on the integration layer itself: outbox age, consumer lag, dead-letter rates, projection version skew, and reconciliation mismatches between source and derived stores.</p>
+<p>This is also where architecture discipline starts shading into product semantics. If a support workflow can initiate a customer-visible action from a search result, the UI must either tolerate staleness or fetch final confirmation from the authoritative store before acting. If finance closes the books from warehouse data, the ingestion pipeline needs stronger completeness checks than a casual dashboard would. The technical mechanism and the business consequence are linked.</p>
+<p>The next lesson, <a href="014.html">Systems of Record vs Derived Data</a>, sharpens that distinction directly. Polyglot persistence tells you why multiple stores may exist. The follow-up lesson clarifies which of those stores are allowed to define truth when they disagree.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A payout is visible on the PostgreSQL-backed detail page but missing from search for several minutes.</p>
+<p><strong>Why it happens / is confusing</strong>: The business transaction committed, but the search projection is behind because the outbox relay or Kafka consumer lagged. Teams often misdiagnose this as a "database inconsistency" when it is really an integration freshness problem.</p>
+<p><strong>Clarification / Fix</strong>: Monitor outbox age and consumer lag as first-class metrics. In user-facing flows, label search as near-real-time and let authoritative detail views read from the source store when exact current status matters.</p>
+<p><strong>Issue</strong>: Warehouse totals double-count some payouts after a retry storm.</p>
+<p><strong>Why it happens / is confusing</strong>: The ingestion job treated events as append-only facts without deduplicating by stable event key or source version. Retries are normal in distributed pipelines, so "processed twice" is not exceptional behavior.</p>
+<p><strong>Clarification / Fix</strong>: Make downstream writes idempotent. Use immutable event IDs, source sequence numbers, or merge semantics that replace older versions instead of blindly inserting duplicates.</p>
+<p><strong>Issue</strong>: Engineers start adding direct writes from application code into Elasticsearch "for freshness."</p>
+<p><strong>Why it happens / is confusing</strong>: The search lag is visible to users, so bypassing the integration path feels like a targeted optimization. In reality it creates two write authorities and makes repair much harder after failure.</p>
+<p><strong>Clarification / Fix</strong>: Keep the source-of-truth boundary strict. If freshness requirements tighten, improve projection latency or product behavior; do not reintroduce ad hoc dual writes that undermine replay and auditability.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="012.html">Schema Evolution and Compatibility Modes</a> defines the contract carried by integration pipelines</h3>
+<p>Once change propagation is event-driven, message schemas become part of the storage architecture. Safe polyglot persistence depends on compatible evolution because search reindex jobs, warehouse backfills, and lagging consumers all rely on being able to read historical events long after the source schema has changed.</p>
+<h3>Connection 2: <a href="014.html">Systems of Record vs Derived Data</a> turns integration topology into decision authority</h3>
+<p>This lesson explains how data moves across heterogeneous stores. The next one asks the governance question hidden inside that movement: when PostgreSQL, Elasticsearch, and the warehouse disagree, which one is allowed to settle the argument? That distinction is what keeps polyglot persistence from collapsing into truth by whichever dashboard updated last.</p>
+<h2>Resources</h2>
+<ul>
+<li>[ARTICLE] <a href="https://martinfowler.com/bliki/PolyglotPersistence.html">Polyglot Persistence</a> - Martin Fowler<ul>
+<li>Focus: Why different persistence models emerge in one system and why this is a workload-design decision, not just a tooling preference.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html">Debezium Outbox Event Router</a><ul>
+<li>Focus: A concrete implementation pattern for publishing committed relational changes without application-level dual writes.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://www.confluent.io/blog/turning-the-database-inside-out-with-apache-samza/">Turning the database inside out with Apache Samza</a> - Martin Kleppmann<ul>
+<li>Focus: How logs and materialized views support replayable derived data systems.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html">Near real-time search</a> - Elasticsearch<ul>
+<li>Focus: Why search freshness is usually measured in seconds rather than instantaneous transaction visibility.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Polyglot persistence starts with workload mismatch, not database collecting</strong> - Use multiple stores only when transactional, search, and analytical needs truly differ.</li>
+<li><strong>Integration safety depends on one authoritative write path</strong> - Commit once in the source of truth, then derive downstream views through replayable change capture.</li>
+<li><strong>Derived stores are operational systems, not passive copies</strong> - They need lag budgets, idempotent consumers, repair workflows, and explicit authority boundaries.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is direct dual-writing from the payroll API to PostgreSQL and Elasticsearch fragile?</strong></p>
+<ul>
+<li>A) Because Elasticsearch cannot store payroll-related data</li>
+<li>B) Because application code now has to survive partial failure and ordering problems across two durable writes</li>
+<li>C) Because PostgreSQL always rejects writes when a search index exists</li>
+</ul>
+</li>
+<li>
+<p><strong>In the <code>PayLedger</code> design from this lesson, which store should be authoritative for payout state?</strong></p>
+<ul>
+<li>A) Elasticsearch, because support agents query it most often</li>
+<li>B) The warehouse, because finance needs historical data</li>
+<li>C) PostgreSQL, because that is where transactional state transitions are committed</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main value of an outbox or CDC-based integration path in a polyglot architecture?</strong></p>
+<ul>
+<li>A) It makes every downstream store strongly consistent at commit time</li>
+<li>B) It creates a replayable change stream tied to the authoritative transaction boundary</li>
+<li>C) It removes the need for idempotent downstream consumers</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Dual writes force application code to coordinate two durable side effects under retries and partial failure. That is where "database committed but search missed it" incidents often come from.</p>
+<p><strong>2. C</strong>: Search and analytics are useful projections, but the transactional database remains the source of truth for payout state transitions and auditability.</p>
+<p><strong>3. B</strong>: Outbox and CDC patterns make the authoritative commit explicit, then let downstream projections catch up through a durable stream that can be replayed and monitored. They do not remove lag or the need for idempotent consumers.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="012.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Schema Evolution and Compatibility Modes</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="014.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Systems of Record vs Derived Data</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

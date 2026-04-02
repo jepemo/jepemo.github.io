@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Health Checks and Circuit Breakers - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Health Checks and Circuit Breakers</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a>
+        </p>
+        <p>
+          Sequence: 010 | Lesson ID: 078
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 078: Health Checks and Circuit Breakers</h1>
+<blockquote>
+<p><strong>These two patterns both deal with failure, but they act at different boundaries: health checks control who should receive traffic, and circuit breakers control whether a dependency call should keep happening at all.</strong></p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>When systems start failing in production, teams often reach for the same vague language: "the service is unhealthy" or "we need resilience." That usually hides two different questions. First: should this instance still receive new traffic? Second: should this caller keep trying the same dependency call when recent attempts are already failing?</p>
+<p>Keep one example throughout the lesson. The learning platform runs several API instances behind a load balancer. Those instances depend on Redis for session and rate-limit state, and they also call an external payment provider during checkout. If one API instance loses access to Redis, it may still be alive as a process but unsafe to route traffic to. If the payment provider starts timing out across the fleet, every API instance may still be healthy locally, but continuing to hammer the provider can exhaust threads, queues, and patience everywhere.</p>
+<p>That is the aha. Health checks and circuit breakers are not interchangeable resilience gadgets. Health checks help the traffic layer make better routing decisions about a specific instance. Circuit breakers help the caller decide when repeated dependency calls have become wasteful or dangerous. One is about admitting work into an instance. The other is about refusing to extend failure into a dependency path.</p>
+<p>Once you see that separation, the design becomes much clearer. A good readiness check does not try to solve downstream retry storms. A circuit breaker does not tell the load balancer whether a pod should be in rotation. They solve adjacent but different problems, and the system becomes more understandable when each pattern stays in its proper role.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p><strong>The problem</strong>: Partial failure is normal, but systems without clear control points tend to amplify it. Unready instances keep receiving traffic, callers keep waiting on already failing dependencies, and one localized problem spreads across the fleet.</p>
+<p><strong>Before</strong>:</p>
+<ul>
+<li>"Healthy" means only that the process has not crashed.</li>
+<li>Callers keep retrying slow or failing dependencies until thread pools, queues, or user patience run out.</li>
+<li>One local failure turns into broad latency and cascading errors.</li>
+</ul>
+<p><strong>After</strong>:</p>
+<ul>
+<li>Traffic is removed from instances that are alive but not actually ready.</li>
+<li>Callers fail fast or degrade safely when a dependency is clearly in trouble.</li>
+<li>Failures stay more local, recover faster, and create less collateral damage.</li>
+</ul>
+<p><strong>Real-world impact</strong>: Safer rollouts, fewer cascading outages, lower tail latency during incidents, and much clearer operational behavior under partial failure.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Distinguish health checks from circuit breakers</strong> - Explain what each pattern controls and why they are not substitutes.</li>
+<li><strong>Reason about readiness versus dependency failure</strong> - Separate instance-level traffic fitness from caller-side protection against bad downstream calls.</li>
+<li><strong>Explain graceful failure behavior</strong> - Connect probes, breakers, timeouts, and fallbacks into one coherent resilience story.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Health Checks Tell the Platform Whether an Instance Should Be Trusted with New Traffic</h3>
+<p>The first thing to clarify is that "healthy" is not a single yes/no concept. An instance may be alive enough that the orchestrator should not restart it, yet not ready enough to receive user traffic.</p>
+<p>That is why modern systems often separate at least these ideas:</p>
+<ul>
+<li><code>liveness</code>: is the process still running at all?</li>
+<li><code>readiness</code>: can this instance serve real requests safely right now?</li>
+<li><code>startup</code> or warmup semantics: has the instance finished initialization and become safe to expose?</li>
+</ul>
+<p>In the learning platform example, an API pod may still answer a simple <code>/healthz</code> endpoint while its Redis dependency is disconnected or its cache warmup is incomplete. Sending live checkout traffic to that pod anyway only turns a local problem into visible user failure.</p>
+<div class="codehilite"><pre><span></span><code>load balancer / orchestrator
+        |
+        +--&gt; pod A: alive + ready      -&gt; keep in rotation
+        +--&gt; pod B: alive + not ready  -&gt; remove from rotation
+        +--&gt; pod C: dead               -&gt; restart or replace
+</code></pre></div>
+
+<p>This is why readiness is the operationally important probe for traffic control. It answers, "Should this instance get more work right now?" That is a very different question from "Is the process technically still running?"</p>
+<p>The trade-off is accuracy versus simplicity. Richer readiness checks make routing safer, but they also need careful design so transient blips or over-eager dependencies do not cause needless flapping.</p>
+<h3>Concept 2: Circuit Breakers Protect the Caller When Repeated Dependency Calls Stop Making Sense</h3>
+<p>Now shift from the traffic edge to the call path inside the service. Suppose checkout requests begin timing out against the payment provider. Without a circuit breaker, every API instance keeps trying, each request waits, retries pile up, and the fleet spends more and more of its time doing work that has little chance of succeeding.</p>
+<p>A circuit breaker is a caller-side policy that says, roughly:</p>
+<div class="codehilite"><pre><span></span><code>recent calls healthy      -&gt; keep allowing calls
+recent calls failing hard -&gt; open circuit, stop calling for a while
+probe after cool-down     -&gt; half-open, test recovery carefully
+recovery observed         -&gt; close circuit and resume normal flow
+</code></pre></div>
+
+<p>The key point is not the metaphor of the "circuit." The key point is conserving caller resources and containing blast radius. Once repeated calls are mostly producing latency and failure, a fast local refusal is often better than another doomed remote wait.</p>
+<p>This is also why circuit breakers are not just for microservices. Any dependency with meaningful latency or failure behavior can justify them: a payment API, a search cluster, a database proxy, a cache tier, or even a remote file store.</p>
+<p>The trade-off is false positives versus protection. Opening too aggressively may reject calls that could have succeeded. Opening too slowly means the caller keeps burning resources on a dependency that is already in trouble. Good breaker policy therefore depends on reasonable windows, thresholds, and recovery probes.</p>
+<h3>Concept 3: Detection Alone Is Not Enough; the System Needs a Safe Failure Mode</h3>
+<p>A readiness probe can remove bad instances from traffic. A circuit breaker can stop unproductive calls. Neither one is useful by itself unless the system also knows what behavior should replace the failing path.</p>
+<p>For the learning platform, the right behavior depends on the workflow:</p>
+<ul>
+<li>if recommendations are down, the course page may still load without them</li>
+<li>if Redis-backed rate-limit state is unavailable, the API may prefer to fail closed for sensitive paths</li>
+<li>if the payment provider is timing out, checkout should fail quickly and clearly rather than hanging until the client gives up</li>
+</ul>
+<p>That is where resilience becomes an actual product decision. The system must define which dependencies are optional, which are mandatory, and what "degraded but acceptable" looks like for each path.</p>
+<div class="codehilite"><pre><span></span><code>dependency unhealthy
+      |
+      +--&gt; optional feature -&gt; degrade gracefully
+      +--&gt; mandatory feature -&gt; fail fast, clearly, and cheaply
+</code></pre></div>
+
+<p>Health checks and breakers are therefore pieces of a larger control loop that also includes timeouts, retry policy, and fallback design. A breaker without a clear fallback still protects resources, but it may leave the user experience vague. A readiness check without explicit degraded behavior may route traffic correctly while the service still responds in confusing ways.</p>
+<p>The trade-off is implementation complexity versus predictable behavior under failure. Clear degraded modes require more thought upfront, but they turn production incidents from improvised chaos into bounded, understandable service behavior.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Treating a liveness endpoint as enough for the load balancer.</p>
+<p><strong>Why it happens / is confusing</strong>: A simple <code>200 OK</code> endpoint is easy to add, and it feels like "health" has been covered.</p>
+<p><strong>Clarification / Fix</strong>: Use readiness for routing decisions. Liveness only tells you whether the process should keep existing; readiness tells you whether it should receive more user traffic.</p>
+<p><strong>Issue</strong>: Expecting a circuit breaker to solve every dependency problem by itself.</p>
+<p><strong>Why it happens / is confusing</strong>: The breaker has a clear state machine, so it can feel like the whole resilience design.</p>
+<p><strong>Clarification / Fix</strong>: Pair breakers with sensible timeouts, retry policy, and explicit fallback or fail-fast behavior. Otherwise you only change the shape of failure, not its usability.</p>
+<p><strong>Issue</strong>: Putting downstream dependency checks blindly into readiness probes.</p>
+<p><strong>Why it happens / is confusing</strong>: Teams want readiness to reflect real serving ability, which is reasonable.</p>
+<p><strong>Clarification / Fix</strong>: Include only dependencies that truly determine whether the instance should receive traffic. If every optional dependency can evict the instance from rotation, the service may flap more than it helps.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Health Checks ↔ Load Balancing</h3>
+<p><strong>The parallel</strong>: A load balancer is only as good as the signals it uses to decide which backends deserve more traffic.</p>
+<p><strong>Real-world case</strong>: An API fleet with bad readiness checks can keep routing to pods that are technically alive but practically broken, destroying the benefit of the balancer.</p>
+<h3>Connection 2: Circuit Breakers ↔ Backpressure and Retry Control</h3>
+<p><strong>The parallel</strong>: Once a dependency is failing, breaker policy, timeout policy, and retry policy all shape how much extra pressure the caller adds to the incident.</p>
+<p><strong>Real-world case</strong>: A payment outage is much easier to survive when the caller fails fast and reduces retry amplification instead of turning the outage into a fleet-wide resource drain.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>These resources are optional and are not required for the core 30-minute path.</li>
+<li>[ARTICLE] Martin Fowler on Circuit Breaker<ul>
+<li>Link: <a href="https://martinfowler.com/bliki/CircuitBreaker.html">https://martinfowler.com/bliki/CircuitBreaker.html</a></li>
+<li>Focus: Review the mental model and state transitions behind breaker behavior.</li>
+</ul>
+</li>
+<li>[DOC] Kubernetes Liveness, Readiness, and Startup Probes<ul>
+<li>Link: <a href="https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/">https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/</a></li>
+<li>Focus: See how different probe types support traffic routing and lifecycle control.</li>
+</ul>
+</li>
+<li>[DOC] Resilience4j CircuitBreaker<ul>
+<li>Link: <a href="https://resilience4j.readme.io/docs/circuitbreaker">https://resilience4j.readme.io/docs/circuitbreaker</a></li>
+<li>Focus: Connect the concept to a concrete breaker state machine and threshold model.</li>
+</ul>
+</li>
+<li>[BOOK] Release It!<ul>
+<li>Link: <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">https://pragprog.com/titles/mnee2/release-it-second-edition/</a></li>
+<li>Focus: Place probes and breakers inside a broader production resilience toolkit.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Health checks and circuit breakers act at different boundaries</strong> - Probes influence routing to an instance, while breakers influence whether a caller should keep attempting a dependency call.</li>
+<li><strong>Readiness is the traffic-facing notion of health</strong> - A process can be alive and still be unsafe to expose to new requests.</li>
+<li><strong>Failure handling needs a behavior policy, not just detection</strong> - Fast failure, graceful degradation, and resource protection matter once trouble has been detected.</li>
+</ol>
+<hr />
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>What is the main difference between readiness checks and circuit breakers?</strong></p>
+<ul>
+<li>A) Readiness controls whether an instance should receive traffic, while a circuit breaker controls whether a caller should keep attempting a failing dependency call.</li>
+<li>B) They are two names for the same resilience pattern.</li>
+<li>C) Circuit breakers only matter for databases.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can a liveness-only health check be misleading?</strong></p>
+<ul>
+<li>A) Because the process may still be running even when the instance is not actually safe to serve real traffic.</li>
+<li>B) Because liveness checks are only useful for frontend code.</li>
+<li>C) Because readiness always replaces the need for liveness completely.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why is a fast local failure sometimes better than another remote call attempt?</strong></p>
+<ul>
+<li>A) Because once a dependency is clearly failing, more calls may only consume caller resources and amplify the outage.</li>
+<li>B) Because remote dependencies should never be retried under any circumstances.</li>
+<li>C) Because circuit breakers guarantee immediate downstream recovery.</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. A</strong>: Readiness is a routing decision about the instance. A circuit breaker is a call-policy decision about a dependency path.</p>
+<p><strong>2. A</strong>: Liveness only tells you that the process exists. It does not prove the instance is ready for user-facing traffic.</p>
+<p><strong>3. A</strong>: Fast failure can protect threads, queues, and latency budgets when another remote attempt is likely to be expensive and unproductive.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="009.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Load Balancing Fundamentals</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="011.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Horizontal Scaling Patterns</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/caching-workers-and-performance.html">← Back to Caching, Workers, and Performance</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

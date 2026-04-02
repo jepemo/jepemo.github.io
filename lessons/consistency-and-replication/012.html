@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MVCC Internals: Snapshot Reads and Write Visibility - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>MVCC Internals: Snapshot Reads and Write Visibility</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 012 | Lesson ID: 283
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 283: MVCC Internals: Snapshot Reads and Write Visibility</h1>
+<blockquote>
+<p><strong>The core idea</strong>: MVCC lets readers observe a stable snapshot without forcing them to wait on every concurrent writer, by keeping multiple logical versions of rows and applying visibility rules at read time.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><strong>The insight</strong>: MVCC is not "magic non-blocking reads." It works because the database stores version metadata and decides, for each row version, whether that version is visible to the current transaction's snapshot.</p>
+<p><strong>Why this matters</strong>: Once you see MVCC as "versions + snapshot + cleanup," many database behaviors stop feeling mysterious: why readers often do not block writers, why old row versions accumulate, and why vacuum or garbage collection is operationally important.</p>
+<p><strong>Concrete anchor</strong>: Transaction A starts a long report. Transaction B updates the same customer row and commits. Transaction A still sees the old version because its snapshot says that B's newer version does not yet belong to A's view of the world.</p>
+<p><strong>The practical sentence to remember</strong>:<br />
+<strong>MVCC trades waiting now for extra versions and later cleanup.</strong></p>
+<hr />
+<h2>Why This Matters</h2>
+<p><strong>The problem</strong>: If every read had to wait on every concurrent write, databases would become painful under mixed workloads. But if reads simply ignored writes without rules, snapshots would be inconsistent and anomalies would explode.</p>
+<p><strong>Without this model</strong>:</p>
+<ul>
+<li>Teams think "reads don't block writes" means there is no coordination cost.</li>
+<li>Storage growth from old versions feels surprising.</li>
+<li>Isolation levels are discussed without understanding the mechanism they depend on.</li>
+</ul>
+<p><strong>With this model</strong>:</p>
+<ul>
+<li>You can explain how snapshot reads work.</li>
+<li>You can see why long-running transactions create cleanup pressure.</li>
+<li>You can connect row versions directly to visibility rules and later to isolation semantics.</li>
+</ul>
+<p><strong>Operational payoff</strong>: Better debugging of long transactions, bloat, vacuum pressure, and unexpected read behavior under concurrent writes.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this lesson, you should be able to:</p>
+<ol>
+<li><strong>Explain why MVCC exists</strong> as a way to reduce reader-writer blocking without giving up transaction semantics.</li>
+<li><strong>Describe how row versions and snapshots interact</strong> to decide visibility.</li>
+<li><strong>Reason about the cost side of MVCC</strong> including version churn, cleanup, and long-running transaction side effects.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: MVCC Turns One Logical Row into Multiple Physical Versions</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A product row is updated from price <code>10</code> to <code>12</code>. Instead of overwriting the only copy in place for every reader immediately, the system may create a new version while preserving metadata that lets old snapshots still reason about the earlier state.</p>
+<p><strong>Intuition</strong>: Under MVCC, a "row" is really a chain or set of versions, each with metadata describing when it became visible and when it stopped being current.</p>
+<p><strong>Typical metadata ideas</strong>:</p>
+<ul>
+<li>Creating transaction ID</li>
+<li>Deleting or superseding transaction ID</li>
+<li>Commit state or commit timestamp</li>
+<li>Pointers to older/newer versions, depending on the engine</li>
+</ul>
+<p><strong>What this enables</strong>:</p>
+<ul>
+<li>Readers can walk visibility rules rather than waiting for the newest writer to finish</li>
+<li>Writers can produce a new version instead of always blocking all concurrent readers</li>
+</ul>
+<p><strong>Why this is useful</strong>: It separates <em>logical freshness</em> from <em>physical overwrite</em>. The engine does not need one global current value for all transactions at the same instant.</p>
+<p><strong>Important caveat</strong>: MVCC does not remove write-write conflicts. Two writers trying to update the same logical row still need coordination. MVCC mainly improves how reads interact with concurrent writes.</p>
+<hr />
+<h3>Concept 2: Snapshots Decide What a Transaction Is Allowed to See</h3>
+<p><strong>Concrete example / mini-scenario</strong>: Transaction T1 starts, then T2 updates and commits a row. T1 reads after T2 commits, but still sees the older version because its snapshot was taken earlier.</p>
+<p><strong>Intuition</strong>: A snapshot is a rule about which committed transactions "exist" from this transaction's point of view.</p>
+<p><strong>How it works mechanically</strong>:</p>
+<ol>
+<li>The transaction begins and captures a snapshot boundary.</li>
+<li>When it reads a row, the engine checks row-version metadata.</li>
+<li>Versions created by transactions outside the snapshot may be invisible.</li>
+<li>Versions deleted by transactions outside or after the snapshot may still remain visible depending on the rules.</li>
+</ol>
+<p><strong>This is the heart of MVCC</strong>:</p>
+<ul>
+<li>The row version stored physically is not enough</li>
+<li>Visibility depends on the reader's snapshot</li>
+</ul>
+<p>That is why two concurrent transactions can read the "same row" and legally get different visible versions.</p>
+<p><strong>Mental model</strong>:<br />
+Think of the database as a library of edited documents.<br />
+Your transaction is allowed to open only the editions that existed in your assigned reading window.</p>
+<p><strong>Why this connects directly to isolation levels</strong>: Different systems define snapshots and visibility boundaries differently, and those choices determine which anomalies are still possible.</p>
+<hr />
+<h3>Concept 3: Old Versions Must Eventually Be Cleaned Up</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A busy table is updated all day. Readers keep using snapshots, so old row versions accumulate. Disk usage grows, index maintenance gets heavier, and vacuum falls behind.</p>
+<p><strong>Intuition</strong>: MVCC makes concurrent reads easier by preserving history temporarily. That history becomes debt if it is not reclaimed.</p>
+<p><strong>Why cleanup is needed</strong>:</p>
+<ul>
+<li>Old versions consume disk and cache space</li>
+<li>Long version chains make reads and maintenance more expensive</li>
+<li>Indexes may still reference tuples or states that are no longer useful to any active snapshot</li>
+</ul>
+<p><strong>Why cleanup cannot be immediate</strong>:</p>
+<ul>
+<li>A long-running transaction may still need an older version</li>
+<li>Replication or recovery mechanisms may still depend on history</li>
+<li>The engine must be sure no active snapshot can legally see the version anymore</li>
+</ul>
+<p><strong>Operational consequences</strong>:</p>
+<ul>
+<li>Long transactions delay cleanup</li>
+<li>Vacuum or garbage collection becomes part of steady-state performance</li>
+<li>Write-heavy workloads can create version churn even if reads look cheap</li>
+</ul>
+<p><strong>The trade-off</strong>:</p>
+<ul>
+<li>MVCC improves concurrency for readers</li>
+<li>But it introduces background cleanup, storage amplification, and operational sensitivity to transaction age</li>
+</ul>
+<p>This is why MVCC should be understood as a concurrency <em>and</em> storage design, not just an isolation feature.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Reads do not block writers, but storage bloat keeps growing.</p>
+<p><strong>Why it happens</strong>: MVCC is preserving old versions faster than cleanup can reclaim them.</p>
+<p><strong>Clarification / Fix</strong>: Look for long-lived transactions, cleanup lag, and write-heavy tables with high version churn.</p>
+<p><strong>Issue</strong>: A reporting query sees older data than expected.</p>
+<p><strong>Why it happens</strong>: The query may be reading from a snapshot that legitimately excludes more recent committed versions.</p>
+<p><strong>Clarification / Fix</strong>: Check transaction boundaries and isolation semantics before assuming replication lag or caching bugs.</p>
+<p><strong>Issue</strong>: Autovacuum or background cleanup seems to be the source of pressure.</p>
+<p><strong>Why it happens</strong>: MVCC turned concurrency benefits into cleanup debt, and the engine is now trying to pay it down.</p>
+<p><strong>Clarification / Fix</strong>: Treat cleanup as a first-class workload, not background trivia. If it falls behind, read and write costs both drift upward.</p>
+<p><strong>Issue</strong>: Long-running transactions cause system-wide pain.</p>
+<p><strong>Why it happens</strong>: Their snapshots keep old versions alive, which blocks reclamation and stretches version history.</p>
+<p><strong>Clarification / Fix</strong>: Limit transaction lifetime where possible, especially for interactive or analytical sessions that hold snapshots open far longer than OLTP paths.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: MVCC &lt;-&gt; Optimistic Concurrency</h3>
+<p><strong>The parallel</strong>: Both reduce eager blocking and push more of the concurrency story into validation, visibility, or version rules.</p>
+<p><strong>Why this matters</strong>: The previous lesson explained the idea at the control-policy level. MVCC is one of the most important concrete mechanisms that makes that philosophy practical for reads.</p>
+<h3>Connection 2: MVCC &lt;-&gt; Isolation Levels</h3>
+<p><strong>The bridge</strong>: MVCC gives the engine the raw material for snapshot-based reads, but isolation levels still decide which anomalies are allowed or forbidden.</p>
+<p><strong>Why this matters</strong>: The next lesson is easier once you see that isolation levels are not magic labels. They are policies built on top of concrete visibility rules.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Suggested Resources</h3>
+<ul>
+<li>[DOC] PostgreSQL MVCC Introduction - <a href="https://www.postgresql.org/docs/current/mvcc-intro.html">Documentation</a><br />
+  Focus: a production-grade explanation of snapshots, row versions, and visibility.</li>
+<li>[DOC] InnoDB Multi-Versioning - <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-multi-versioning.html">Documentation</a><br />
+  Focus: practical MVCC behavior in a widely used transactional engine.</li>
+<li>[BOOK] <em>Designing Data-Intensive Applications</em> - <a href="https://dataintensive.net/">Book site</a><br />
+  Focus: strong conceptual grounding for MVCC, snapshots, and transaction semantics.</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>MVCC works because rows have versions and reads apply visibility rules</strong>, not because reads somehow ignore concurrency.</li>
+<li><strong>Snapshot reads reduce reader-writer blocking</strong>, but write-write conflicts and cleanup work still remain.</li>
+<li><strong>Old versions are not free</strong>: they improve concurrency now and create storage and maintenance debt later.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>What is the main mechanism behind MVCC?</strong></p>
+<ul>
+<li>A) A single global lock for all readers</li>
+<li>B) Multiple row versions plus per-transaction visibility rules</li>
+<li>C) Replaying WAL for every query</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can two concurrent transactions read different visible versions of the same row?</strong></p>
+<ul>
+<li>A) Because SQL syntax is ambiguous</li>
+<li>B) Because each transaction reads through its own snapshot rules</li>
+<li>C) Because indexes are randomly chosen</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does MVCC need vacuum or garbage collection?</strong></p>
+<ul>
+<li>A) Because old row versions must be reclaimed once no active snapshot can see them</li>
+<li>B) Because transactions cannot commit without it</li>
+<li>C) Because replication requires schema rewrites</li>
+</ul>
+</li>
+<li>
+<p><strong>What is a common operational risk of long-running transactions under MVCC?</strong></p>
+<ul>
+<li>A) They make parsing slower</li>
+<li>B) They keep old versions alive and delay cleanup</li>
+<li>C) They disable indexes</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: MVCC relies on multiple versions and rules about which version each transaction may see.</p>
+<p><strong>2. B</strong>: Visibility is defined relative to the transaction's snapshot, not by one universal "current row" for everyone.</p>
+<p><strong>3. A</strong>: Old versions are useful only while some snapshot may still need them; after that they become reclaimable debt.</p>
+<p><strong>4. B</strong>: Long-lived snapshots often prevent the engine from cleaning up obsolete versions promptly.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="011.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Database Replication Topologies and Failover Behavior</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="013.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Transaction Isolation Levels and Anomaly Prevention</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

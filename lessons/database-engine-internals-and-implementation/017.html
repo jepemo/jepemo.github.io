@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LSM Compaction Strategies and Amplification - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>LSM Compaction Strategies and Amplification</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 017 | Lesson ID: 394
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 394: LSM Compaction Strategies and Amplification</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Compaction is the policy that pays back the disorder created by cheap LSM writes, and the chosen policy decides whether the engine spends more of that bill on write amplification, read amplification, or temporary extra space.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="016.html">09.md</a>, Harbor Point's municipal-bond audit store got its fast write path by admitting updates into a memtable, flushing that memtable into new SSTables, and postponing full on-disk cleanup. After a trading spike, that delay becomes visible: the engine may have several overlapping level-0 files, each individually sorted but collectively messy. A point lookup for one bond now has to check more places, and disk still contains older versions that are no longer logically current.</p>
+<p>Compaction is the mechanism that turns that pile of sorted runs back into a manageable shape. It reads overlapping SSTables in key order, resolves which version of each record is the newest visible one, carries forward tombstones when they are still needed, and writes replacement SSTables. That sounds like background housekeeping, but it is actually where the engine decides how aggressively it will trade extra rewriting for better reads and lower space usage.</p>
+<p>The important shift is that "amplification" is not accidental overhead. It is the price of an LSM design. Write amplification is how many bytes the engine rewrites in compaction for each byte of logical update. Read amplification is how many files, blocks, or key ranges a lookup must consult before it can answer. Space amplification is how much extra disk remains occupied by obsolete versions and overlapping files. No compaction strategy minimizes all three at once.</p>
+<p>That is why leveled and tiered compaction feel different in production even when they store the same logical dataset. Leveled compaction spends more background I/O to keep overlap low and reads predictable. Tiered compaction preserves write throughput by merging less often, but it allows more overlap and more temporary disk growth between merges. The next lesson on <a href="018.html">11.md</a> matters because once overlap exists, the engine needs Bloom filters and fence pointers to avoid paying the full read cost on every lookup.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's audit store has two conflicting jobs. During the trading day, it must absorb every quote revision for tens of thousands of bonds without turning bursts into foreground write stalls. At the end of the day, compliance analysts and downstream pricing services run point lookups and short range queries that expect stable latency. Flush alone solves only the first half of that problem. Compaction policy decides whether the system stays queryable after the burst.</p>
+<p>This is also where teams misread capacity signals. If storage usage spikes, it may not mean the dataset suddenly grew; it may mean compaction has not yet collapsed overlapping runs and obsolete versions. If read latency climbs, it may not mean the SSDs are failing; it may mean the current strategy is allowing too many files per lookup. If writes stall, the culprit may not be WAL sync at all; it may be compaction debt forcing the engine to slow new writes before overlap becomes unbounded.</p>
+<p>Once you can explain compaction mechanically, those symptoms stop looking random. You can reason about whether the engine is intentionally paying more write amplification for predictable reads, intentionally preserving ingest throughput at the cost of query fan-out, or simply falling behind on background maintenance.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why compaction exists after flush</strong> - Describe how overlapping SSTables, stale versions, and tombstones create deferred work in an LSM tree.</li>
+<li><strong>Compare leveled and tiered compaction precisely</strong> - Relate each strategy to write amplification, read amplification, and space amplification.</li>
+<li><strong>Diagnose production compaction pressure</strong> - Interpret write stalls, read-latency regressions, and disk growth as consequences of compaction debt and policy choices.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Compaction is the deferred merge contract created by flush</h3>
+<p>After the Federal Reserve announcement hits, Harbor Point flushes several memtables in quick succession. The result might look like this:</p>
+<div class="codehilite"><pre><span></span><code>L0: [A-D] [B-F] [E-H] [G-K]
+        \    |     |    /
+         overlapping key ranges
+</code></pre></div>
+
+<p>Each SSTable is internally sorted, but level 0 is not globally tidy. If Harbor Point asks for the latest quote of <code>CUSIP 13042AB7</code>, the engine may have to inspect multiple files because the newest version could be in any overlapping run. Older versions and tombstones also remain on disk because the engine has not yet done the work of proving which bytes are safe to discard.</p>
+<p>Compaction performs that proof by streaming multiple input SSTables together in key order. For each key, it compares sequence numbers or version metadata, keeps the newest visible record, and decides whether an older version or tombstone can finally be dropped. That last step is stricter than it first appears. A tombstone is only removable when the engine knows there is no older live version hiding in a lower level, no snapshot that still needs the deleted row, and no recovery or replication rule that requires preserving it longer.</p>
+<p>This is where the three amplification terms become concrete rather than abstract vocabulary. If Harbor Point inserts 1 GB of logical updates and compaction later rewrites 8 GB while pushing those updates through the level hierarchy, the engine incurred high write amplification. If a point lookup touches one memtable, two Bloom filters, and six SSTables before it can answer, that is read amplification. If 40 GB of live quote history occupies 70 GB on disk because old versions and overlapping runs have not yet collapsed, that is space amplification. Compaction strategy is the policy that chooses where those costs will land.</p>
+<h3>Concept 2: Leveled and tiered compaction buy different amplification profiles</h3>
+<p>Leveled compaction tries to keep each level, except level 0, mostly non-overlapping by key range. When Harbor Point compacts from one level into the next, it takes an input file or key range from level N, finds all overlapping files in level N+1, merges them, and writes replacement files whose key ranges no longer overlap within the destination level. Reads benefit because a point lookup usually needs at most one candidate file per level after level 0. The cost is that the same data may be rewritten repeatedly as it moves through several levels, which increases write amplification.</p>
+<p>Tiered compaction, sometimes called size-tiered or universal compaction depending on the engine, makes the opposite bet. It allows multiple sorted runs of similar size to coexist and waits until enough runs accumulate before merging them into a larger run. That means Harbor Point can absorb ingest bursts with less immediate rewriting, which lowers write amplification and often improves sustained write throughput. The downside is that reads must search more overlapping files, and temporary disk usage can grow substantially before the next large merge finishes.</p>
+<p>For Harbor Point, the trade-off is tied directly to workload shape. If daytime traffic is dominated by quote ingest and analysts rarely query the freshest data until after the market closes, a tiered strategy may be acceptable because it keeps writes cheap when they matter most. If pricing services need tight p99 point-lookups throughout the day, leveled compaction is often worth the extra background I/O because it keeps the number of candidate SSTables per lookup under better control.</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>What it optimizes first</th>
+<th>How it does it</th>
+<th>Main bill it creates</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leveled</td>
+<td>Lower read amplification and tighter space bounds</td>
+<td>Repeatedly merge overlapping key ranges so lower levels stay mostly non-overlapping</td>
+<td>Higher write amplification from frequent rewrites</td>
+</tr>
+<tr>
+<td>Tiered</td>
+<td>Lower write amplification and higher ingest throughput</td>
+<td>Accumulate multiple runs, then merge in larger batches</td>
+<td>Higher read amplification and more temporary disk growth</td>
+</tr>
+</tbody>
+</table>
+<p>Neither strategy is "the LSM way" in the abstract. Each is a policy choice about which amplification profile best matches the product's workload and SLOs.</p>
+<h3>Concept 3: Production tuning is mostly about controlling compaction debt</h3>
+<p>Compaction becomes operationally visible when the engine is generating new SSTables faster than it can merge old ones. At Harbor Point, this first shows up as growing <code>pending_compaction_bytes</code>, rising level-0 file counts, and read latency drift on hot bond identifiers. If the debt continues to grow, the engine may deliberately throttle or stall foreground writes. That is not a bug; it is a safety mechanism that stops level 0 from expanding until every read becomes a file-system treasure hunt.</p>
+<p>This is also why manual compaction is not automatically a fix. If the team launches a broad manual compaction in the middle of the trading day, it may compete with foreground traffic for disk bandwidth and CPU, causing the very p99 regression it was meant to solve. Smarter tuning starts with the workload shape: memtable size, flush bandwidth, size ratios between levels, number of background compaction threads, compaction priority, and whether hot levels live on faster storage. The question is always the same: where should the engine spend I/O so that user-visible latency stays within budget?</p>
+<p>Deletes make the same point in a less obvious way. Suppose Harbor Point drops a large batch of expired quote records after the retention window closes. Disk usage may stay high for hours because the delete only created tombstones; reclaiming space requires compactions that encounter those tombstones together with every older version they invalidate. Until that happens, the logical delete is complete but the physical bytes are still present.</p>
+<p>The next lesson on <a href="018.html">11.md</a> picks up exactly here. Even a well-tuned engine cannot keep overlap at zero all the time, especially near level 0 or under tiered policies. Bloom filters and fence pointers are the read-side tools that reduce how much of that overlap a lookup actually has to pay for.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point starts throttling writes after an ingest burst even though WAL fsync latency still looks normal.</p>
+<p><strong>Why it happens / is confusing</strong>: The foreground write path is short, so teams often assume stalls must come from logging or locks. In LSM engines, a common cause is compaction debt: too many level-0 files or too many pending bytes waiting to be merged.</p>
+<p><strong>Clarification / Fix</strong>: Inspect level-0 file count, <code>pending_compaction_bytes</code>, background compaction throughput, and write-stall counters together. If compaction is the bottleneck, retune triggers, increase background bandwidth, or choose a strategy that matches the actual ingest pattern.</p>
+<p><strong>Issue</strong>: Disk usage stays elevated long after a large delete campaign.</p>
+<p><strong>Why it happens / is confusing</strong>: The delete is logically complete as soon as the tombstone is durable, but the old bytes are still present in older SSTables until compaction rewrites the affected key ranges.</p>
+<p><strong>Clarification / Fix</strong>: Check whether snapshots, retention windows, or lower-level overlaps still require preserving tombstones. Space returns only after compaction can prove that no older visible version remains that the tombstone must suppress.</p>
+<p><strong>Issue</strong>: Point lookups got slower after switching from leveled to tiered compaction.</p>
+<p><strong>Why it happens / is confusing</strong>: Write throughput often improves immediately, which makes the strategy change look successful at first. The delayed cost arrives on the read path because more overlapping runs survive between merge events.</p>
+<p><strong>Clarification / Fix</strong>: Measure files consulted per lookup, Bloom-filter usefulness, and read p95/p99. If the query SLO matters more than peak ingest, the engine may need leveled compaction or tighter tiered merge thresholds.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Compaction ↔ external merge sort</h3>
+<p>The I/O pattern in compaction looks like external merge sort because both stream multiple sorted runs and produce fewer sorted runs through mostly sequential reads and writes. The storage-engine version is harder because it must also honor version visibility, tombstones, snapshots, and crash-safe installation of replacement files.</p>
+<h3>Connection 2: Compaction ↔ MVCC garbage collection</h3>
+<p>Compaction is one of the places where an LSM engine performs version garbage collection. The engine cannot drop an older value simply because a newer value exists; it has to know that no active snapshot, replica, or lower-level file still makes the older version relevant. That is the same discipline MVCC systems apply when deciding which row versions are safe to reclaim.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Compaction">RocksDB Wiki: Compaction</a><ul>
+<li>Focus: Read how RocksDB defines compaction triggers, files-by-level layout, and the metrics it exposes when background work falls behind.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Leveled-Compaction">RocksDB Wiki: Leveled Compaction</a><ul>
+<li>Focus: Trace how overlap rules per level reduce read amplification while increasing the number of bytes rewritten.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Universal-Compaction">RocksDB Wiki: Universal Compaction</a><ul>
+<li>Focus: Compare a tiered-style policy that preserves write throughput by allowing more overlapping runs between merge events.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub27898/">Bigtable: A Distributed Storage System for Structured Data</a><ul>
+<li>Focus: Review the sections on minor and major compaction to see the classic LSM trade-off between foreground ingest and background consolidation.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Compaction is where an LSM engine repays deferred ordering work</strong> - Flush creates sorted runs cheaply, but compaction decides how expensive those deferred writes, reads, and bytes on disk will become.</li>
+<li><strong>Leveled and tiered strategies optimize different pain points</strong> - Leveled spends more rewrite I/O to keep reads predictable, while tiered preserves ingest throughput by tolerating more overlap.</li>
+<li><strong>Compaction debt eventually becomes user-visible</strong> - Write stalls, elevated disk usage, and slower lookups are all ways deferred merge work leaks into production behavior.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Which statement best describes write amplification in an LSM engine?</strong></p>
+<ul>
+<li>A) The number of client writes that fit in one memtable before flush</li>
+<li>B) The number of bytes background compaction rewrites relative to the logical bytes inserted or updated</li>
+<li>C) The amount of cache memory used by the read path</li>
+</ul>
+</li>
+<li>
+<p><strong>Why would Harbor Point choose leveled compaction over tiered compaction for its audit store?</strong></p>
+<ul>
+<li>A) Because leveled compaction avoids all background rewriting</li>
+<li>B) Because leveled compaction usually keeps point lookups more predictable by reducing overlap across levels</li>
+<li>C) Because leveled compaction makes tombstones disappear immediately after a delete</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can disk space remain high after a logical delete has succeeded?</strong></p>
+<ul>
+<li>A) Because the delete only removes data from the memtable and never reaches SSTables</li>
+<li>B) Because the tombstone must survive until compaction proves that no older visible version still needs to be suppressed</li>
+<li>C) Because tiered compaction disables garbage collection entirely</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Write amplification measures how much physical rewriting the engine performs in the background for each logical update. It is about compaction cost, not memtable size or cache usage.</p>
+<p><strong>2. B</strong>: Leveled compaction rewrites more data, but it usually keeps overlap lower across persistent levels. That makes read fan-out and p99 point-lookups easier to control.</p>
+<p><strong>3. B</strong>: A durable tombstone records the delete logically, but the old bytes remain on disk until compaction encounters the tombstone together with the older versions it invalidates and can safely drop them.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="016.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>LSM Trees: Memtables, SSTables, and Flush</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="018.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Bloom Filters, Fence Pointers, and Read Avoidance</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

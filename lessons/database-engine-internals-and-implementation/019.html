@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Compression and Encoding in Storage Engines - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Compression and Encoding in Storage Engines</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 019 | Lesson ID: 396
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 396: Compression and Encoding in Storage Engines</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A storage engine does not try to maximize compression ratio in the abstract. It encodes bytes at the same granularity it must still search, cache, flush, and recover, then applies compression only in ways that preserve that access path.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="018.html">11.md</a>, Harbor Point's municipal-bond audit store used Bloom filters and fence pointers to narrow a lookup down to one candidate SSTable block. That solved the "which block should I touch?" problem, but not the "what should the bytes inside that block look like?" problem. If every key and value were stored verbatim, Harbor Point would waste SSD bandwidth on repeated prefixes, repeated field names, and timestamps that differ by only a few bytes from the previous record.</p>
+<p>The important shift is that encoding and compression are not the same thing. The engine first exploits structure it already knows about: keys are sorted, neighboring records share prefixes, sequence numbers often move in one direction, and some value fields repeat. Only after it has turned that structure into a denser block layout does it optionally run a general-purpose codec such as LZ4, Snappy, or Zstd over the block. Encoding preserves navigability; compression shrinks the remaining redundancy.</p>
+<p>That is why "just compress the whole file harder" is usually the wrong instinct. Harbor Point serves mostly point lookups during the trading day. If a point lookup has to inflate a huge byte region or reconstruct too many keys before it can compare the target CUSIP, the store may save disk space while making p99 latency worse. Storage-engine compression is successful only when the block stays cheap to seek inside after the bytes become compact.</p>
+<p>This also prepares the ground for the next lesson. Once the engine decides how records are represented inside blocks or pages, it still has to decide when modified in-memory pages are written back and how much dirty state can accumulate before writeback becomes dangerous. Compression changes the size and cost of that writeback path; checkpointing and dirty-page control decide when the bill is paid.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point stores quote history for thousands of bonds whose keys share long prefixes: desk, issuer family, CUSIP, and timestamp. The values are not random either. Venue codes repeat, price deltas between consecutive quotes are small, and tombstones or version metadata follow predictable layouts. A raw representation would force the engine to write more bytes during flush and compaction, keep fewer hot blocks in cache, and read more data per lookup than the logical workload actually needs.</p>
+<p>Poorly chosen compression is not harmless optimization debt. If the engine uses a heavy codec on hot levels, point lookups spend too much CPU decompressing blocks. If restart points are too sparse, seeks degrade because the reader has to reconstruct many prefix-compressed keys before it can compare the target. If the encoding hides fields needed for sequence ordering or tombstone visibility, the engine risks returning the wrong version. In production, compression sits on the data path for reads, writes, and recovery, so the trade-offs show up everywhere.</p>
+<p>Once you can describe the pipeline precisely, the tuning questions become concrete. You can ask whether block size is too large for point probes, whether bottommost levels deserve a denser codec than top levels, whether prefix compression is helping the actual key layout, and whether the buffer manager or compaction threads are spending too much time rebuilding compressed pages.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why storage engines separate encoding from compression</strong> - Relate sorted-order-aware layouts to later codec choices and lookup behavior.</li>
+<li><strong>Trace how a compressed block is written and read</strong> - Follow the path from block builder to restart array to point lookup and decompression.</li>
+<li><strong>Evaluate production trade-offs in block layout choices</strong> - Connect block size, restart interval, codec strength, and workload shape to read, write, and recovery costs.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Encoding comes first because the engine already knows structural facts about neighboring records</h3>
+<p>Harbor Point's SSTable block might contain keys like these in sorted order:</p>
+<div class="codehilite"><pre><span></span><code>desk=muni|cusip=59333LAE2|ts=2026-03-31T14:32:10.123Z
+desk=muni|cusip=59333LAE2|ts=2026-03-31T14:32:10.140Z
+desk=muni|cusip=59333LAF0|ts=2026-03-31T14:32:11.005Z
+</code></pre></div>
+
+<p>Storing each key in full would repeat <code>desk=muni|cusip=</code> over and over, even though sorted order guarantees that adjacent keys often share a long prefix. A block encoder uses that fact directly. Instead of writing the full key every time, it can write <code>shared_prefix_length</code>, <code>unshared_suffix_length</code>, the suffix bytes, and the value length. The first key in a restart interval is stored in full; later keys in the same interval are reconstructed by copying the shared prefix from the previous reconstructed key and appending the suffix.</p>
+<p>LevelDB-style and RocksDB-style block formats make this idea concrete because they encode each entry as metadata plus bytes rather than as a raw record dump. Similar tricks apply to values. Sequence numbers, lengths, and other small integers are often written as varints so short numbers cost fewer bytes. If the value layout contains repetitive low-cardinality fields such as quote venue or trade side, the engine can map them to compact codes before any general-purpose compression runs.</p>
+<p>The invariant is that encoding must preserve the logical comparator and the metadata needed for visibility. Harbor Point still needs to know which version of a quote is newest, whether a tombstone masks older entries, and where one key ends so the next can begin. Compression can remove redundancy, but it cannot remove ordering information or the fields required to resolve versions correctly.</p>
+<h3>Concept 2: Block compression is aligned with lookup granularity, not with the entire file</h3>
+<p>After the previous lesson's read-avoidance steps, Harbor Point usually arrives at one candidate data block. At that point the engine wants to do the minimum work required to answer the lookup:</p>
+<div class="codehilite"><pre><span></span><code>Bloom/filter metadata says &quot;maybe&quot;
+        -&gt;
+fence pointer selects one block handle
+        -&gt;
+read one compressed block from disk
+        -&gt;
+decompress that block only
+        -&gt;
+binary-search restart points
+        -&gt;
+reconstruct keys within one restart interval
+        -&gt;
+compare target key and return value or tombstone
+</code></pre></div>
+
+<p>That sequence explains why storage engines compress per block or per page rather than as one opaque file blob. If Harbor Point had to decompress an entire SSTable to answer a point probe for a single bond, every lookup would inherit the cost of unrelated data. Block-local compression keeps the unit of decompression aligned with the unit chosen by the fence-pointer index and the block cache.</p>
+<p>Restart points make this read path practical. Prefix compression saves space, but a binary search cannot jump into the middle of a block unless some entries are stored in full. The restart array provides those anchors. The reader binary-searches the restart offsets, decompresses or reconstructs only from the chosen restart point onward, and then scans a short local segment to find the exact key. Denser restart points make seeks cheaper but consume more metadata bytes; sparser restart points save space but force more key reconstruction work per lookup.</p>
+<p>This layered approach also explains why engines often stack two forms of compaction-friendly density. First they apply semantic encodings such as prefix compression, delta encoding, or short integer encodings. Then they run a byte-level codec over the whole block. The first layer exploits domain structure the codec does not know about; the second layer squeezes the remaining repeated byte patterns. Together they reduce I/O without giving up fast in-block navigation.</p>
+<h3>Concept 3: Codec choice, block size, and restart interval are operational budget decisions</h3>
+<p>Suppose Harbor Point enables Zstd on all SSTables because benchmarks show a better compression ratio than LZ4. The disk footprint drops, but during the trading day the hot levels now spend more CPU decompressing small blocks on every point lookup. The block cache also behaves differently: fewer bytes per block means more logical data can fit, but each miss is more expensive to inflate. Whether that is a win depends on the real workload, not on the compression ratio alone.</p>
+<p>The same trade-off appears in block size. Larger blocks usually compress better because the codec sees more repeated material, and they reduce index overhead because fewer block handles are needed per file. They also make a miss more expensive because each point lookup pulls in more unrelated keys and values. Smaller blocks improve point-read locality and reduce over-read, but they create more index metadata and give the codec less context. Harbor Point's quote-probe workload often prefers smaller or medium blocks on hot data even if archival levels use larger ones.</p>
+<p>Restart interval tuning is a third dial. If full keys appear every 16 entries, Harbor Point pays extra metadata overhead but reconstructs only a short prefix-compressed run during a seek. If full keys appear every 128 entries, the block shrinks, but CPU work per seek rises sharply because the reader may rebuild many keys before it can compare the target. That cost is easy to miss in synthetic throughput tests and obvious in p99 latency once production point probes dominate.</p>
+<p>These choices leak into the write path too. Every flush or compaction must rebuild encoded blocks, compute checksums, and emit the chosen compressed representation. If the engine keeps many modified pages or blocks in memory, later writeback has to perform that work at eviction or checkpoint time. That is the bridge to <a href="020.html">13.md</a>: storage layout determines not only how much data is written, but how expensive it is to turn dirty in-memory state back into durable bytes.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point's disk footprint improved after enabling stronger compression, but point-lookups became slower.</p>
+<p><strong>Why it happens / is confusing</strong>: Teams often assume fewer bytes on disk must imply faster reads. For point-heavy workloads, the real bottleneck may shift from SSD I/O to CPU decompression on hot blocks.</p>
+<p><strong>Clarification / Fix</strong>: Measure read CPU, block-cache hit rate, and per-level latency separately. A common production fix is to use a lighter codec on hot levels and reserve denser compression for colder or bottommost data.</p>
+<p><strong>Issue</strong>: Seeks inside one SSTable block got slower after a format change, even though the compression ratio barely moved.</p>
+<p><strong>Why it happens / is confusing</strong>: The problem may not be the outer codec at all. A sparser restart interval or more aggressive prefix compression can increase the amount of key reconstruction needed after each binary search step.</p>
+<p><strong>Clarification / Fix</strong>: Inspect restart interval, average comparisons per seek, and the number of keys reconstructed per lookup. In point-probe workloads, a modest increase in metadata can be worth a large drop in CPU per seek.</p>
+<p><strong>Issue</strong>: Compaction throughput dropped after dictionary or block compression changes.</p>
+<p><strong>Why it happens / is confusing</strong>: Compression work happens on writes too. Flush and compaction threads must re-encode every output block, so a heavier format can move the bottleneck from storage bandwidth to background CPU.</p>
+<p><strong>Clarification / Fix</strong>: Compare compaction bytes-written, compaction CPU, and write-stall counters before and after the change. If background work is falling behind, reduce codec cost on frequently rewritten levels or increase compaction parallelism only if CPU headroom exists.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Storage-engine encoding ↔ columnar encoding</h3>
+<p>Columnar systems such as Parquet also exploit repetition with dictionary encoding, delta encoding, and varints. The difference is access shape. A columnar file is optimized for scanning many values from one column; Harbor Point's storage engine is optimized for point lookups, short seeks, and overwrite-friendly compaction. The encoding families overlap, but the chosen unit of compression is different because the query path is different.</p>
+<h3>Connection 2: Compression layout ↔ checkpoint and dirty-page policy</h3>
+<p>Compression is not independent from writeback control. If rebuilding a page or block into its compressed form is CPU-heavy, a checkpoint that flushes many dirty pages at once can create bursts of latency and background pressure. Systems with compressed pages, log-structured flush buffers, or bottommost recompression all face the same operational question: how much transformed state can remain dirty before flushing becomes disruptive?</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Compression">RocksDB Wiki: Compression</a><ul>
+<li>Focus: Review the codec options RocksDB exposes and how teams often use different compression strengths for hot versus cold levels.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/rocksdb-blockbasedtable-format">RocksDB Wiki: Rocksdb BlockBasedTable Format</a><ul>
+<li>Focus: See how a production LSM engine lays out data blocks, index blocks, restart intervals, and compression boundaries.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://chromium.googlesource.com/external/leveldb/+/HEAD/doc/table_format.md">LevelDB Table Format</a><ul>
+<li>Focus: Read the canonical explanation of data blocks, restart arrays, and the block-oriented layout inherited by later LSM implementations.</li>
+</ul>
+</li>
+<li>[CODE] <a href="https://chromium.googlesource.com/external/leveldb/+/HEAD/table/block_builder.cc">LevelDB <code>block_builder.cc</code></a><ul>
+<li>Focus: Inspect how prefix sharing and restart points are emitted in code, which makes the space-versus-seek trade-off tangible.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Encoding is structural; compression is residual</strong> - The engine first uses sorted-order facts such as shared prefixes and small integers, then applies a general codec to what remains.</li>
+<li><strong>The decompression unit must match the lookup unit</strong> - Block-local compression works because the reader can decompress one candidate block rather than an entire file.</li>
+<li><strong>Compression settings are workload policy, not free savings</strong> - Block size, restart interval, and codec strength move cost between SSD I/O, CPU, cache residency, and background write throughput.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point apply prefix compression before a general-purpose codec?</strong></p>
+<ul>
+<li>A) Because general-purpose codecs cannot compress byte patterns at all</li>
+<li>B) Because prefix compression uses sorted-key structure to preserve navigable block layout before later byte-level compression</li>
+<li>C) Because prefix compression removes the need for restart points</li>
+</ul>
+</li>
+<li>
+<p><strong>What role do restart points play inside a compressed block?</strong></p>
+<ul>
+<li>A) They let the reader binary-search into the block without reconstructing keys from the very beginning</li>
+<li>B) They guarantee that the block never needs decompression on reads</li>
+<li>C) They replace Bloom filters for whole-file membership tests</li>
+</ul>
+</li>
+<li>
+<p><strong>Why might a stronger codec hurt Harbor Point's daytime read latency even if storage usage falls?</strong></p>
+<ul>
+<li>A) Because stronger compression changes key ordering and breaks fence pointers</li>
+<li>B) Because point lookups on hot levels may become CPU-bound on decompression instead of I/O-bound</li>
+<li>C) Because stronger codecs make restart arrays illegal in SSTable blocks</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Prefix compression exploits something the engine already knows about sorted neighboring keys and keeps the block searchable. The outer codec then compresses the remaining byte redundancy.</p>
+<p><strong>2. A</strong>: Restart points store periodic full-key anchors so the reader can jump into the block, reconstruct a short local run of keys, and complete the seek efficiently.</p>
+<p><strong>3. B</strong>: A denser codec can reduce bytes on disk while making each lookup spend more CPU inflating hot blocks. Whether that trade-off is acceptable depends on the workload and SLOs.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="018.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Bloom Filters, Fence Pointers, and Read Avoidance</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="020.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Checkpointing and Dirty Page Control</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bloom Filters, Fence Pointers, and Read Avoidance - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Bloom Filters, Fence Pointers, and Read Avoidance</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 018 | Lesson ID: 395
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 395: Bloom Filters, Fence Pointers, and Read Avoidance</h1>
+<blockquote>
+<p><strong>The core idea</strong>: In an LSM tree, Bloom filters and fence pointers save reads at different layers of the lookup path: the filter tells you which SSTables cannot possibly contain the key, and the fence pointers tell you which block to read inside the few SSTables that remain.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="017.html">10.md</a>, Harbor Point's municipal-bond audit store accepted that compaction cannot erase overlap instantly. After a volatile trading hour, the engine may have several fresh level-0 SSTables plus deeper levels that still contain older versions of the same bond quote. That overlap is manageable for writes, but it makes point lookups expensive because every possible file is another potential disk read.</p>
+<p>Harbor Point's downstream pricing service makes this worse in a very specific way. It receives thousands of candidate CUSIPs from market-data enrichment jobs and asks the audit store, "Do we already have a quote for this identifier?" Most of those probes are negative: the identifier may belong to a bond that never traded today, expired last quarter, or belongs to another market. Without read avoidance, the store would keep opening SSTables only to discover that the key is absent again and again.</p>
+<p>The important shift is that "skip unnecessary reads" is not one mechanism. Bloom filters answer an early probabilistic question: "Is this key definitely not in this SSTable?" Fence pointers answer a later exact question: "If the key is in this SSTable, which block should I inspect?" One saves entire file touches; the other saves scans within a file. Together they turn a lookup from repeated blind probing into a staged elimination process.</p>
+<p>That distinction matters in production because the failure modes are different. A Bloom filter may produce a false positive, which wastes some work but preserves correctness. A fence-pointer index is exact metadata; if it is wrong, the engine can miss the right block entirely. So the read path is deliberately asymmetric: probabilistic metadata is allowed only where mistakes cost extra I/O, never where mistakes could return the wrong answer.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's read latency problem does not come from a single expensive query. It comes from a flood of cheap-looking existence checks that fan out across too many SSTables. Each individual lookup is small, but if the engine opens ten files and several blocks to prove "not found," the aggregate cost shows up as SSD queue depth, cache churn, and p99 latency spikes for unrelated readers.</p>
+<p>This is why teams often misdiagnose LSM read regressions. They see a slower point lookup and blame compaction, storage bandwidth, or the block cache in isolation. In reality, the user-visible symptom is often a pipeline problem: too many candidate files survive the first filter, and too much data gets read inside the survivors. Bloom filters and fence pointers exist to reduce those two kinds of waste separately.</p>
+<p>Once you can narrate that pipeline, tuning becomes concrete. You can ask whether the filter budget is too small and causing too many false positives, whether the block index is too coarse for the key distribution, whether prefix Bloom filters fit the workload better than full-key filters, or whether compaction has created so many overlapping files that even good metadata can no longer hide the debt.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why negative lookups are expensive in an LSM tree</strong> - Relate overlap, recency ordering, and absent keys to extra file and block reads.</li>
+<li><strong>Trace the staged lookup path through Bloom filters and fence pointers</strong> - Distinguish probabilistic file elimination from exact block targeting.</li>
+<li><strong>Evaluate tuning trade-offs for production read avoidance</strong> - Connect memory budget, false positives, cache pressure, and range-query behavior to real operational choices.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Bloom filters cut off impossible SSTables before the engine touches data blocks</h3>
+<p>Harbor Point receives a lookup for <code>CUSIP 59333LAE2</code>, and the current day's trading spike means the engine must consider the memtable, two immutable memtables, four level-0 SSTables, and one SSTable per lower level. If the key is absent, the naive path is expensive: each file has to be opened, its index consulted, and often at least one data block read before the engine can conclude "not here." Negative probes become the worst kind of repetitive work because they multiply across every overlapping run.</p>
+<p>A Bloom filter changes the first question the engine asks. When an SSTable is written during flush or compaction, the engine hashes each key into a compact bitset stored with that table. On lookup, the engine recomputes the same hashes for the target key. If any required bit is zero, the SSTable definitely does not contain that key, so the engine can skip the file immediately. If all bits are set, the answer is only "maybe," so the engine keeps going.</p>
+<p>That "maybe" is the price of a probabilistic structure. Bloom filters are designed to allow false positives but not false negatives. A false positive means Harbor Point may read a file that turns out not to contain the CUSIP after all. A false negative would be unacceptable because the store could skip the newest visible version or a tombstone and return stale data from an older SSTable. For that reason, the filter is built from the actual keys stored in the table, including entries that represent deletes.</p>
+<p>In practice, Bloom filters work best on point lookups and short seeks, not broad range scans. A range scan is going to read adjacent blocks anyway, so there is less value in asking "is this exact key absent?" before every step. Harbor Point's enrichment service, however, is almost pure point-probe traffic, which makes filter quality directly relevant to user-visible latency.</p>
+<p>You can picture the first part of the read path like this:</p>
+<div class="codehilite"><pre><span></span><code>lookup CUSIP 59333LAE2
+   |
+   +--&gt; memtable / immutable memtables
+   |
+   +--&gt; SSTable A  -- Bloom says &quot;no&quot; --&gt; skip file
+   +--&gt; SSTable B  -- Bloom says &quot;maybe&quot; --&gt; inspect file index
+   +--&gt; SSTable C  -- Bloom says &quot;no&quot; --&gt; skip file
+   +--&gt; SSTable D  -- Bloom says &quot;maybe&quot; --&gt; inspect file index
+</code></pre></div>
+
+<p>The key production trade-off is memory versus wasted reads. More bits per key reduce false positives, but they consume RAM or block-cache space and add some CPU for hashing. Too little filter budget makes the metadata nearly decorative; too much budget steals memory from the block cache that could have held real data blocks.</p>
+<h3>Concept 2: Fence pointers narrow a maybe-positive SSTable down to one candidate block</h3>
+<p>Suppose Bloom filtering leaves Harbor Point with one likely level-0 SSTable and one deeper-level SSTable to inspect. The engine still does not want to scan either file linearly. SSTables are sorted, so the next optimization is exact navigation metadata that tells the reader where a target key would live if it is present.</p>
+<p>That metadata is commonly stored as an index block with fence-pointer-like entries. Each entry covers one data block and records a boundary key together with the block's offset and size. The exact encoding varies by engine, but the idea is stable: the reader binary-searches the block boundaries to find the single data block whose key range could contain <code>CUSIP 59333LAE2</code>, then reads only that block from disk.</p>
+<p>The difference from Bloom filtering is important. Bloom filters answer a probabilistic membership question about the whole SSTable. Fence pointers answer an exact positioning question inside a specific SSTable. Once Harbor Point has decided a file is worth checking, the index cannot be allowed to "maybe" the right block. It must map the search key to the correct block interval so the engine can perform a local binary search inside that block and then continue visibility checks across levels if necessary.</p>
+<p>This is why fence pointers remain useful even when the key is actually present. A Bloom filter cannot tell the engine where the record lives; it only prevents pointless file reads. Fence pointers convert one surviving file into one targeted block read, which keeps the block cache hotter and reduces read amplification for positive lookups as well as negative ones.</p>
+<p>For Harbor Point's query path, the sequence is usually:</p>
+<div class="codehilite"><pre><span></span><code>1. Search mutable structures first.
+2. For each SSTable in recency order:
+   - consult Bloom filter
+   - if &quot;maybe&quot;, binary-search the fence-pointer index
+   - read the candidate data block
+   - search inside the block
+   - stop only when visibility rules allow an answer
+</code></pre></div>
+
+<p>That last step still matters because LSM correctness depends on search order. A deeper-level block may contain an older value for the same CUSIP, but a newer level-0 SSTable may contain a tombstone or a fresher quote. Read avoidance reduces unnecessary reads; it does not change the version-resolution rules established by the LSM design.</p>
+<h3>Concept 3: Tuning read avoidance is mostly about matching metadata strategy to workload shape</h3>
+<p>The tempting mistake is to talk about Bloom filters and fence pointers as free speedups. Harbor Point learns quickly that they are budgeted features. Filters need bits per key, index blocks need space, and both consume CPU when building SSTables during flush and compaction. If the team increases filter size aggressively, point lookups improve, but memory pressure may evict useful data blocks and hurt range queries or compaction buffers.</p>
+<p>Workload shape changes the right answer. Prefix Bloom filters are attractive when many lookups share a stable prefix, such as tenant or partition identifiers, because they can skip SSTables for entire classes of probes with less memory than full-key filters. They are dangerous if the application assumes exact-key semantics while the key layout or comparator no longer makes the prefix meaningful. The metadata must reflect how the engine actually orders keys, not how the application casually describes them.</p>
+<p>Compaction also keeps these structures alive. Every new SSTable produced by flush or compaction rebuilds its filter and block index from scratch. That means Harbor Point cannot treat read avoidance as a one-time tuning knob. If compaction falls behind and overlap grows, even good filters face more candidate files. If block size changes, the fence-pointer density changes too: smaller blocks create finer-grained navigation but more index overhead, while larger blocks reduce index size but increase the amount of data read on a miss.</p>
+<p>This sets up the next lesson on <a href="019.html">12.md</a>. Once the engine has done a good job deciding which files and blocks to touch, the remaining cost is the work performed on the bytes it does read: compression format, restart points, key encoding, and CPU spent decoding blocks. Read avoidance decides how much data reaches the CPU; encoding and compression decide how expensive that surviving data is to process.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point enabled Bloom filters, but point-lookups barely improved.</p>
+<p><strong>Why it happens / is confusing</strong>: Teams often assume "Bloom filter on" is enough. In practice, a very small bits-per-key budget, filters that are constantly evicted from cache, or a workload dominated by range scans can make the effect negligible.</p>
+<p><strong>Clarification / Fix</strong>: Measure false-positive rate, filter-memory residency, and the fraction of requests that are point probes versus scans. If most lookups are negative point probes, increase filter quality before assuming the storage device is the bottleneck.</p>
+<p><strong>Issue</strong>: A lookup still reads too much data from a maybe-positive SSTable.</p>
+<p><strong>Why it happens / is confusing</strong>: The filter only decided the file might contain the key. Large data blocks, a coarse index, or a hot block-cache miss can still make the surviving read expensive.</p>
+<p><strong>Clarification / Fix</strong>: Inspect block size, index block behavior, and whether the engine is using partitioned indexes or cache-friendly table layouts. The optimization target may be inside the file, not across files.</p>
+<p><strong>Issue</strong>: After a compaction-policy change, read latency regressed even though the Bloom filter configuration did not change.</p>
+<p><strong>Why it happens / is confusing</strong>: Filter quality per SSTable may be unchanged, but a different compaction policy can increase the number of SSTables a lookup must test. More overlap means more Bloom checks and more false positives in aggregate.</p>
+<p><strong>Clarification / Fix</strong>: Review level-0 file count, files-per-level, and compaction debt together with filter metrics. Read avoidance metadata helps most when the number of candidate files stays within the envelope it was tuned for.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Bloom filters ↔ probabilistic networking and caching structures</h3>
+<p>Bloom filters show up in packet processing, cache admission, and distributed metadata services for the same reason they appear here: they cheaply eliminate impossible work before the expensive stage starts. In an LSM engine, the expensive stage is disk or cache access rather than a network lookup, but the pattern is identical: spend a little CPU and memory to avoid a much costlier miss path.</p>
+<h3>Connection 2: Fence pointers ↔ sparse indexes in storage systems</h3>
+<p>Fence pointers are the SSTable version of a sparse index. Instead of indexing every row, the engine indexes block boundaries and relies on sorted order inside each block to finish the search cheaply. Bigtable's SSTable layout and modern block-based tables use the same basic idea because exact navigation metadata at block granularity is a good compromise between lookup speed and index size.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter">RocksDB Wiki: Bloom Filter</a><ul>
+<li>Focus: See how a production LSM engine exposes Bloom filter configuration, false-positive trade-offs, and prefix-filter variants.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Index-Block-Format">RocksDB Wiki: Index Block Format</a><ul>
+<li>Focus: Review how separator keys and block handles let the reader jump to one candidate data block instead of scanning the file.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub27898/">Bigtable: A Distributed Storage System for Structured Data</a><ul>
+<li>Focus: Read the SSTable discussion to connect Bloom filters and sparse block indexes to the original large-scale LSM-style read path.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Read avoidance happens in layers</strong> - Bloom filters remove impossible SSTables first, and fence pointers then localize the remaining work to one candidate block.</li>
+<li><strong>Probabilistic metadata is acceptable only where errors cost performance, not correctness</strong> - False positives waste I/O, but false negatives or wrong block boundaries would break visibility guarantees.</li>
+<li><strong>Metadata tuning is a workload decision</strong> - Filter size, block size, prefix strategy, and compaction policy all interact to determine whether point lookups stay cheap in production.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>What problem is a Bloom filter solving on Harbor Point's read path?</strong></p>
+<ul>
+<li>A) It tells the engine the exact block offset of a key inside an SSTable</li>
+<li>B) It lets the engine skip SSTables that definitely do not contain the key</li>
+<li>C) It guarantees that a lookup will require only one SSTable check</li>
+</ul>
+</li>
+<li>
+<p><strong>Why are false positives acceptable in Bloom filters but not in fence-pointer indexes?</strong></p>
+<ul>
+<li>A) Because a false positive only causes extra work, while an incorrect block index could miss the correct data entirely</li>
+<li>B) Because Bloom filters run only during compaction and never during reads</li>
+<li>C) Because fence pointers are used only for range scans, not point lookups</li>
+</ul>
+</li>
+<li>
+<p><strong>Why might read latency worsen after Harbor Point adopts a more overlap-friendly compaction strategy, even with the same Bloom filter settings?</strong></p>
+<ul>
+<li>A) Because Bloom filters stop working once compaction changes levels</li>
+<li>B) Because more overlapping SSTables create more candidate files and more opportunities for aggregate false-positive work</li>
+<li>C) Because fence pointers force the engine to read every block in sorted order</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Bloom filters answer the whole-file membership question: if the filter says "definitely not," the engine can skip that SSTable before touching its data blocks.</p>
+<p><strong>2. A</strong>: A Bloom-filter false positive is a performance cost, not a correctness bug. An incorrect fence-pointer mapping could direct the reader away from the block that actually contains the key, which is not acceptable.</p>
+<p><strong>3. B</strong>: Read avoidance metadata still has to be consulted per candidate file. If overlap increases, the lookup performs more filter checks and accumulates more maybe-positive files to inspect, even if each individual filter is configured exactly as before.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="017.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>LSM Compaction Strategies and Amplification</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="019.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Compression and Encoding in Storage Engines</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

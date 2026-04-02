@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mixture of Experts (MoE) - Routing to Specialized Models - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Mixture of Experts (MoE) - Routing to Specialized Models</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/rag-agents-and-llm-production.html">RAG, Agents, and LLM Production</a>
+        </p>
+        <p>
+          Sequence: 012 | Lesson ID: 332
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 332: Mixture of Experts (MoE) - Routing to Specialized Models</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Mixture of Experts replaces a single dense feed-forward block with many candidate experts and a router that activates only the top few for each token. That can buy much larger model capacity at similar active FLOPs, but it turns model execution into a routing, load-balancing, and communication problem.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><a href="011.html"><code>21/11.md</code></a> ended with a clean question: once planning and verification are separated, should one dense model still do all the work? Keep Elena's stolen-laptop incident in view. The assistant handling her case sees Jamf inventory fields, OAuth session logs, shell commands for revocation, policy prose, and free-form explanations for the human responder. A dense Transformer pushes every one of those tokens through the same feed-forward capacity.</p>
+<p>MoE changes that bargain inside the model rather than outside it. There is still one Transformer, one training loop, and one final output stream. The difference is that some layers stop behaving like one large feed-forward network and start behaving like a bank of candidate specialists. A router scores the token, chooses the top one or two experts, and only those experts run.</p>
+<p>That is the mental hook to keep: MoE is not a committee of separate models and it is not an agent architecture. It is conditional computation inside a single network. The payoff is sparse activation. The risk is that "which expert should handle this token?" becomes a production routing problem. If Elena's incident and thousands of similar security tickets all hammer the same experts, the cluster can become slow or brittle even when the average FLOP budget looks favorable.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p>Teams hit the dense-scaling wall for a simple reason: the easiest way to get more capacity is to make the whole model wider or deeper, but dense inference pays for that larger network on every token. An internal assistant like Elena's may need to reason about policy language, device-management identifiers, and code-like remediation steps in the same request, yet a dense layer uses the same feed-forward subnetwork for all of them.</p>
+<p>MoE offers a more selective form of scaling. The total parameter count can grow because the model holds many experts, but the active compute per token stays closer to a smaller dense model because only a few experts fire. That is why MoE matters to frontier training and to production inference budgets: it changes the relationship between parameter capacity and per-token work.</p>
+<p>The catch is that sparse arithmetic is not the whole bill. Once experts live on different devices, every batch creates dispatch traffic. Once routing is learned, some experts become hot and others go idle unless training and serving both manage capacity carefully. Once the router misbehaves, quality failures can look like infrastructure failures and infrastructure failures can look like model regressions.</p>
+<p>That is why this lesson sits naturally between yesterday's workflow patterns and tomorrow's observability lesson. ReWOO and self-consistency changed how the assistant reasons at the workflow level. MoE changes how the model allocates internal compute. <a href="013.html"><code>21/13.md</code></a> follows directly from that shift: once routing decisions matter, you need visibility into expert usage, overflow, and latency hotspots instead of treating the model as one opaque block.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you should be able to:</p>
+<ol>
+<li><strong>Explain why MoE exists</strong> as a way to increase parameter capacity without activating a fully dense layer on every token.</li>
+<li><strong>Describe how an MoE layer works internally</strong> including router scores, top-k dispatch, capacity limits, and output recombination.</li>
+<li><strong>Evaluate when MoE helps or hurts in production</strong> by reasoning about specialization, communication cost, hotspot risk, and observability needs.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: An MoE Layer Replaces One Feed-Forward Path With Conditional Alternatives</h3>
+<p>Start with the part of the Transformer that MoE usually changes. In a dense decoder layer, every token passes through the same feed-forward network after attention. Elena's incident prompt may contain <code>device_id</code>, <code>refresh_token</code>, shell syntax, and policy text, but the layer still applies one shared transformation to all of them.</p>
+<p>An MoE layer swaps that one feed-forward block for many expert feed-forward blocks plus a small router. For each token representation <code>h</code>, the router computes scores over the experts, keeps the top <code>k</code>, and dispatches <code>h</code> only to those experts. Their outputs are then combined, usually as a weighted sum. A simplified view looks like this:</p>
+<div class="codehilite"><pre><span></span><code>token state h
+    |
+ router scores
+    |
+ top-k experts
+  /      \
+E7(h)   E19(h)
+  \      /
+ weighted combine
+    |
+ layer output
+</code></pre></div>
+
+<p>The key detail is what does not change. Attention is often still dense. The model is still trained end to end. The experts are not separate products with separate prompts. They are learned sub-networks that become good at different token patterns because the router keeps sending them certain kinds of work.</p>
+<p>That is why MoE can hold far more total parameters than a dense model with similar active compute. If a layer has 64 experts and each token uses only the top 2, the model can expose much more total capacity than a dense feed-forward block while only executing a small fraction of that capacity per token. The whole point of MoE is this decoupling between total parameters and active computation.</p>
+<h3>Concept 2: The Router Turns Model Capacity Into a Scheduling Problem</h3>
+<p>Now return to the incident assistant. During a theft spike after a company travel event, many prompts contain the same kinds of tokens: MDM identifiers, session-revocation steps, device state summaries, and terse policy fragments. If the router learns that a few experts are especially useful for this distribution, it may send a large share of the batch to them. That is good for specialization but dangerous for throughput.</p>
+<p>Every MoE implementation therefore has to answer a capacity question: what happens when more tokens want expert 7 than expert 7 can process in this step? Systems use different answers. Some impose a fixed expert capacity derived from batch size and a capacity factor. Some reroute to the next-best expert. Some drop overflow tokens from the expert path and let the residual stream carry them through. None of those choices is free.</p>
+<p>Training usually adds a load-balancing objective because "let the router do whatever it wants" often produces collapsed behavior where a few experts receive most of the traffic and other experts never learn much. But too much balancing pressure can also hurt specialization. If you force the router to spread tokens almost uniformly, you may preserve throughput at the expense of letting experts become meaningfully distinct.</p>
+<p>The same trade-off appears in routing style. Top-1 routing, used by Switch Transformers, is cheaper because each token is sent to only one expert. Top-2 routing is often more stable and expressive because the token can mix two expert outputs, but it roughly doubles dispatch and merge work for that layer. MoE is not just about choosing experts; it is about choosing a routing regime that keeps specialization, load balance, and infrastructure cost in workable tension.</p>
+<h3>Concept 3: Sparse FLOPs Only Matter If Communication and Observability Stay Under Control</h3>
+<p>MoE papers often report active FLOPs, but production systems pay for transport and tail latency too. In large training or inference deployments, experts are distributed across GPUs or nodes. Once the router has chosen experts, the system usually needs an all-to-all exchange so each device can ship token activations to the devices hosting the right experts, run those expert networks, and send the results back for combination.</p>
+<p>That means a supposedly cheaper sparse layer can become slower than a dense one if interconnect bandwidth is weak, batches are shaped poorly, or a few experts become hotspots. In Elena's workflow, one traffic mix may produce smooth utilization, while another mix dominated by device-remediation language may saturate only a small slice of the expert fleet. Average utilization can look healthy while the p99 request still degrades.</p>
+<p>Operating an MoE model therefore requires metrics that dense-model teams can often ignore. You want per-expert token counts, overflow rate, router entropy, dropped-token rate, all-to-all latency, and quality sliced by request type. If expert 19 quietly becomes the bottleneck for security-heavy prompts, latency and answer quality may both move before aggregate benchmark scores reveal anything obvious.</p>
+<p>This is also the right way to connect MoE back to the previous lesson. ReWOO and self-consistency helped structure external reasoning and final decision confidence for Elena's incident. MoE is about internal compute allocation: where inside the network each token's work gets done. Once that allocation is dynamic, the model starts to look less like one monolith and more like a routed distributed system that happens to live inside a Transformer.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: "Each expert corresponds to a clean human label like code, security, or policy."</p>
+<p><strong>Why it happens / is confusing</strong>: The word "expert" makes the architecture sound more interpretable than it usually is.</p>
+<p><strong>Clarification / Fix</strong>: Experts specialize through learned token statistics, not through a product manager's taxonomy. Some experts may correlate with domains or languages, but many learn narrower patterns that only become visible through probing and traffic analysis.</p>
+<p><strong>Issue</strong>: "If router imbalance appears, we should just force stronger balancing."</p>
+<p><strong>Why it happens / is confusing</strong>: Overloaded experts look like a pure utilization bug.</p>
+<p><strong>Clarification / Fix</strong>: Balancing losses and capacity controls help, but too much pressure can erase useful specialization. Treat imbalance as an optimization problem with a quality-throughput trade-off, not as a rule that traffic must be perfectly uniform.</p>
+<p><strong>Issue</strong>: "Sparse activation guarantees lower latency and lower cost."</p>
+<p><strong>Why it happens / is confusing</strong>: It is tempting to compare only expert FLOPs between dense and sparse models.</p>
+<p><strong>Clarification / Fix</strong>: Real deployments also pay for expert memory footprint, dispatch traffic, synchronization, and hotspot handling. MoE wins only when those overheads stay smaller than the dense compute it avoids.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Mixture of Experts ↔ Load Balancers and Hot Shards</h3>
+<p>An MoE router is doing a token-level version of traffic steering. The similarity to a distributed cache or search cluster is direct: average capacity can look fine while one hot shard dictates p99 behavior. The practical lesson transfers cleanly from infrastructure to models: admission control, placement, and skew matter as much as total fleet size.</p>
+<h3>Connection 2: Mixture of Experts ↔ Control Plane and Data Plane Design</h3>
+<p>The router behaves like a control plane because it decides where work goes; the experts behave like a data plane because they perform the actual transformation. That mirrors systems such as Kubernetes scheduling or software-defined networking, where the decision layer is lightweight but absolutely determines whether the execution layer stays efficient and healthy.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer - Shazeer et al. (2017)<ul>
+<li>Link: <a href="https://arxiv.org/abs/1701.06538">https://arxiv.org/abs/1701.06538</a></li>
+<li>Focus: The original sparse gating formulation, auxiliary balancing losses, and why expert capacity becomes part of the architecture.</li>
+</ul>
+</li>
+<li>[PAPER] GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding - Lepikhin et al. (2020)<ul>
+<li>Link: <a href="https://arxiv.org/abs/2006.16668">https://arxiv.org/abs/2006.16668</a></li>
+<li>Focus: How MoE layers are mapped across distributed hardware and why conditional computation depends on systems support.</li>
+</ul>
+</li>
+<li>[PAPER] Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity - Fedus et al. (2021)<ul>
+<li>Link: <a href="https://arxiv.org/abs/2101.03961">https://arxiv.org/abs/2101.03961</a></li>
+<li>Focus: The top-1 routing design, simplified expert dispatch, and the engineering trade-offs behind a widely cited MoE variant.</li>
+</ul>
+</li>
+<li>[ARTICLE] Mixture of Experts Explained - Hugging Face<ul>
+<li>Link: <a href="https://huggingface.co/blog/moe">https://huggingface.co/blog/moe</a></li>
+<li>Focus: A practical bridge from the papers to real implementation concerns such as router behavior, capacity factors, and serving overhead.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>MoE changes the unit of scaling</strong> - total parameter capacity can grow much faster than active per-token compute because only a few experts fire on each token.</li>
+<li><strong>The router is a scheduler, not a decorative add-on</strong> - routing quality, capacity rules, and balancing losses determine whether expert specialization helps or collapses.</li>
+<li><strong>Sparse models move the bottleneck rather than deleting it</strong> - dense arithmetic may shrink, but communication cost, hotspots, and monitoring requirements grow.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can an MoE model have many more total parameters than a dense model with similar active compute per token?</strong></p>
+<ul>
+<li>A) Because each token activates all experts and averages their outputs.</li>
+<li>B) Because only the top few experts run for each token while the rest stay inactive for that step.</li>
+<li>C) Because MoE removes the feed-forward network entirely.</li>
+</ul>
+</li>
+<li>
+<p><strong>What usually turns sparse compute into a disappointing production result?</strong></p>
+<ul>
+<li>A) The router selects experts alphabetically instead of by score.</li>
+<li>B) The model can no longer be trained end to end.</li>
+<li>C) Communication overhead and hotspot experts erase the theoretical FLOP savings.</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: MoE keeps many parameters available in the model, but only a small subset of experts are active for each token, so active compute stays sparse.</p>
+<p><strong>2. C</strong>: In real systems, all-to-all dispatch traffic and overloaded experts can dominate latency and cost even when the arithmetic count looks favorable on paper.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="011.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>ReWOO & Self-Consistency - Planning and Verification</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="013.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>LLM Monitoring & Observability - Production Visibility</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/rag-agents-and-llm-production.html">← Back to RAG, Agents, and LLM Production</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

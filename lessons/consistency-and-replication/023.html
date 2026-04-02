@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rebalancing and Consistent Hashing - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Rebalancing and Consistent Hashing</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 023 | Lesson ID: 422
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 422: Rebalancing and Consistent Hashing</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Rebalancing is safe only when placement changes move a bounded slice of the keyspace and ownership changes are fenced so one shard hands off to another without creating two writers or losing recent history.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="022.html">05.md</a>, Harbor Point chose a state-plus-hash layout so California traffic would not melt one giant shard. That solved the static placement problem, but it did not solve the dynamic one. By the next week, California bucket <code>CA/3</code> was three times larger than <code>CA/7</code>, and two new storage nodes were waiting to be added before the morning market open. The tempting implementation was simple: change the router from <code>hash(issuer_id) % 8</code> to <code>hash(issuer_id) % 10</code> and let the fleet spread out.</p>
+<p>That change would have been a production incident, not a scale-out. Changing the divisor in a direct modulo scheme remaps almost every issuer, which means almost every cache entry, ownership table, and background replica stream becomes stale at once. Harbor Point does not need "more even math" in the abstract. It needs a placement rule where adding one node mostly affects the data that should move to that node, not the entire California issuer population.</p>
+<p>This is why consistent hashing matters. The point is not that the ring diagram looks elegant. The point is that capacity changes should have local consequences. A node join, failure, or decommission should move a bounded subset of logical shards, and the move should happen through a staged handoff: copy state, catch up on live writes, fence the old owner, switch routing, then drain the source. Once that mental model clicks, rebalancing stops sounding like "copy data somewhere else" and starts sounding like what it really is: a controlled transfer of authority.</p>
+<p>That transfer-of-authority idea also sets up the next lesson, <a href="024.html">07.md</a>. Rebalancing can preserve single-shard correctness while ownership moves, but it does not define how one business operation commits across multiple shards. That is where distributed transactions enter.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation API cannot treat rebalancing as background housekeeping. At 09:28, traders are already reserving California paper for the 09:30 open. If the team adds capacity and accidentally remaps most issuers, the cluster pays for that mistake all at once: caches cold-start, follower catch-up spikes, and the risk dashboard begins timing out on exactly the data the business is watching most closely. A "balanced" result on paper is useless if the path to get there destabilizes the live system.</p>
+<p>Safe rebalancing therefore has two concrete jobs. First, it must limit how much data changes owner when topology changes. Second, it must change ownership without ambiguity. For one issuer bucket, Harbor Point needs to know which replica group is authoritative right now, which one is still catching up, and what happens when a router still holds stale placement metadata. Those are routing and fencing questions, not just copy-speed questions.</p>
+<p>This lesson follows naturally from sharding strategy. <a href="022.html">05.md</a> decided which workloads deserved locality. This lesson is about keeping that layout operable as load drifts, nodes fail, and new capacity arrives. The design trade-off is explicit: consistent hashing and virtual buckets reduce movement, but they add metadata, background streaming, and more control-plane logic to the storage layer.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why direct modulo hashing makes rebalancing expensive</strong> - Show why a membership change remaps most keys and how consistent hashing or stable hash slots bound the blast radius.</li>
+<li><strong>Trace a shard move from planning to cutover</strong> - Follow snapshot transfer, catch-up replication, routing-epoch changes, and source-drain behavior for one bucket.</li>
+<li><strong>Evaluate the real trade-offs of consistent hashing in production</strong> - Reason about virtual nodes, hotspot limits, control-plane complexity, and why bounded movement is not the same as automatic balance.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Consistent hashing exists to keep topology changes local</h3>
+<p>Harbor Point's California partition currently uses eight logical buckets. Bucket <code>CA/3</code> lives on replica group <code>rg-ca-b</code>, bucket <code>CA/4</code> lives on <code>rg-ca-c</code>, and routers compute the bucket from the issuer identifier before sending the request onward. If the team directly uses <code>hash(issuer_id) % 8</code>, a later change to <code>% 10</code> does not merely move "some" issuers to the two new nodes. It changes the bucket identity of almost every issuer because the divisor defines every bucket boundary.</p>
+<p>That is the failure mode consistent hashing is trying to avoid. In the textbook ring form, both nodes and keys are hashed onto the same circular space, and a key belongs to the first node clockwise from its hash. When Harbor Point adds node <code>node-e</code>, only the interval between <code>node-e</code> and its predecessor changes owner. Keys outside that interval stay where they were. The operational win is not mystical; it is simply bounded movement under membership change.</p>
+<div class="codehilite"><pre><span></span><code>Direct modulo resize
+
+hash(MUNI-77) % 8  -&gt; bucket 3
+hash(MUNI-77) % 10 -&gt; bucket 7   # denominator changed, so mapping jumps
+
+Consistent-hash ring
+
+... token 120 node-b ... token 170 node-e(new) ... token 240 node-c ...
+keys in (120, 170] move to node-e
+all other keys stay on their previous owners
+</code></pre></div>
+
+<p>In practice, Harbor Point would not hash every issuer directly to a small set of physical nodes. Real systems usually add indirection: many virtual tokens, hash slots, or fixed logical buckets mapped onto machines. That is how Redis Cluster can move a subset of hash slots, and how Dynamo-style systems use virtual nodes to avoid one huge interval per server. The principle is the same in every case: keep the key-to-logical-partition mapping stable enough that adding or removing capacity only relocates a fraction of the workload.</p>
+<p>The trade-off is that bounded movement does not guarantee perfect balance. With too few tokens, one node may own a lopsided share of the ring. With heterogeneous hardware, equal token counts may still be wrong. Consistent hashing solves the "everything moves" problem much better than it solves the "every node is equally busy" problem, which is why production systems combine it with virtual nodes, weights, and separate hotspot handling.</p>
+<h3>Concept 2: Rebalancing is a staged handoff of state and authority</h3>
+<p>Suppose Harbor Point decides to move logical bucket <code>CA/3</code> from replica group <code>rg-ca-b</code> to a new group <code>rg-ca-e</code>. The safe sequence is not "update the routing table and start copying." If routers switch first, fresh writes land on a destination that does not yet have the bucket's prior history. If copying finishes first but the source keeps accepting writes with no fencing, the two groups can diverge. Rebalancing works only when state transfer and authority transfer are coordinated deliberately.</p>
+<p>The usual flow has four distinct phases. First, the allocator chooses the bucket based on size, QPS, disk pressure, or hotspot concentration. Second, the destination ingests a snapshot or SSTable copy representing bucket <code>CA/3</code> at a specific log position. Third, the source streams every write after that position so the destination can catch up while traffic stays live. Fourth, once the lag is near zero, Harbor Point advances the placement epoch and gives the destination the right to serve the bucket.</p>
+<p>For one move, the timeline looks like this:</p>
+<div class="codehilite"><pre><span></span><code>1. plan move      CA/3 : rg-ca-b -&gt; rg-ca-e
+2. snapshot       rg-ca-e loads CA/3 at log position 9F/40
+3. catch up       rg-ca-b streams updates after 9F/40
+4. cut over       epoch 18 says owner=rg-ca-e
+5. drain source   rg-ca-b forwards or rejects stale writes, then drops data
+</code></pre></div>
+
+<p>The fencing step is the part that protects correctness. Harbor Point's routers attach the placement epoch they believe is current. If a request reaches <code>rg-ca-b</code> after epoch <code>18</code> made <code>rg-ca-e</code> the owner, the old group must not quietly accept it. It should forward the request or reject it with enough metadata for the router to refresh. That turns stale routing into a retriable control-plane problem instead of a data-corruption bug.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">handle_write</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">local_epoch</span><span class="p">,</span> <span class="n">owner</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">placement_epoch</span> <span class="o">&lt;</span> <span class="n">local_epoch</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">RetryWithNewOwner</span><span class="p">(</span><span class="n">epoch</span><span class="o">=</span><span class="n">local_epoch</span><span class="p">,</span> <span class="n">owner</span><span class="o">=</span><span class="n">owner</span><span class="p">)</span>
+    <span class="n">apply_write</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+</code></pre></div>
+
+<p>This is why rebalancing metrics need more than "bytes copied." Harbor Point should watch snapshot age, catch-up lag in log positions or milliseconds, forwarded-write rate, and how long the bucket spends in the moving state. The move finishes when the destination is authoritative and current, not when the first bulk copy ends. The trade-off is straightforward: aggressive parallel moves shorten imbalance but consume network, disk, and compaction budget that the live workload also needs.</p>
+<h3>Concept 3: Production systems usually rebalance logical shards, not raw keys, and consistent hashing does not remove hotspot work</h3>
+<p>Harbor Point's best production design is therefore not "hash every issuer directly around a ring." It is "keep a stable set of logical buckets, then place those buckets with a bounded-movement policy." For example, California might have 256 virtual buckets even if only 12 replica groups exist. Rebalancing then means moving selected buckets, not rewriting the hash rule for every issuer. That keeps movement granular enough to smooth load without forcing cluster-wide remapping.</p>
+<p>This indirection is also how the team handles asymmetric capacity. A newer node with more SSD bandwidth can own more virtual buckets than an older host. A rack-aware policy can require that bucket replicas land in distinct failure domains. A node drain can move buckets away gradually rather than as one giant operation. The consistent-hashing idea still matters here, but it has been adapted into a control plane that respects operational constraints the textbook ring does not model.</p>
+<p>What consistent hashing does not do is split a single hot issuer automatically. If <code>CA-MUNI-77</code> alone dominates traffic because every desk is trading the same bond family, keeping movement bounded will not make that one key cooler. Harbor Point may need to split the logical bucket around that issuer, introduce a more granular shard key, or create a specialized aggregation path for the hotspot. That is the same limitation from <a href="022.html">05.md</a> in a new form: distribution across many keys is different from relief for one extremely hot key.</p>
+<p>The final trade-off is conceptual clarity versus operational flexibility. A direct ring is elegant and easy to explain. A production rebalancer with virtual buckets, weighted placement, epochs, and background catch-up is messier, but it lets Harbor Point scale without treating every node join as a fleet-wide cache invalidation event. Once the system reaches that point, the next hard question is no longer "who owns this bucket?" It is "what if one business operation must update two different buckets together?" That is the bridge to <a href="024.html">07.md</a>.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point adds two nodes, and suddenly most California issuer caches miss even though only a small amount of capacity was added.</p>
+<p><strong>Why it happens / is confusing</strong>: The router changed a direct modulo rule such as <code>% 8</code> to <code>% 10</code>, which remapped far more issuers than the team expected.</p>
+<p><strong>Clarification / Fix</strong>: Introduce stable logical buckets or a consistent-hash placement layer so topology changes move only the buckets assigned to the new capacity.</p>
+<p><strong>Issue</strong>: A rebalance spends hours in "catching up" and never reaches cutover.</p>
+<p><strong>Why it happens / is confusing</strong>: The destination can copy the snapshot, but live write traffic for that bucket is arriving faster than the catch-up stream can drain.</p>
+<p><strong>Clarification / Fix</strong>: Move a smaller bucket, throttle foreground traffic if the product allows it, or split the hotspot before moving it. A rebalance cannot complete if the destination never closes the log gap.</p>
+<p><strong>Issue</strong>: Some clients keep writing to the old owner after cutover and see intermittent retry storms.</p>
+<p><strong>Why it happens / is confusing</strong>: Routers are holding stale placement metadata, so they continue sending requests with an old epoch to the source group.</p>
+<p><strong>Clarification / Fix</strong>: Fence writes with placement epochs, return the new owner explicitly, and keep a short forwarding window instead of accepting ambiguous writes on both sides.</p>
+<p><strong>Issue</strong>: One node is still overloaded even after consistent hashing was introduced.</p>
+<p><strong>Why it happens / is confusing</strong>: Bounded movement is not the same as perfect balance, and a single hot issuer or too-few virtual buckets can still concentrate load.</p>
+<p><strong>Clarification / Fix</strong>: Increase virtual bucket granularity, use weighted placement for stronger hardware, and treat true hot keys as an application or data-model problem rather than a hashing problem.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="022.html">05.md</a> chooses the locality shape; this lesson makes that shape evolvable over time</h3>
+<p>The previous lesson asked whether Harbor Point wanted range locality, hash spread, or a hybrid. Rebalancing adds the time dimension to that decision. A shard layout that looks good only on the day it was created is incomplete. Consistent hashing and stable buckets are the mechanisms that let the chosen layout survive growth, skew, and hardware replacement without rewriting the entire keyspace map.</p>
+<h3>Connection 2: <a href="024.html">07.md</a> starts where rebalancing stops</h3>
+<p>Rebalancing preserves the invariant that one logical shard has one authoritative owner at a time. It does not make a two-shard reservation update atomic. Once Harbor Point needs one workflow to commit across <code>CA/3</code> and <code>GLOBAL-EXPOSURE</code>, the system leaves the world of ownership transfer and enters the world of distributed transaction coordination.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://doi.org/10.1145/258533.258660">Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web</a><ul>
+<li>Focus: The original consistent-hashing paper explains why membership changes can move only a bounded fraction of keys instead of remapping the whole space.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
+<li>Focus: Sections on partitioning and virtual nodes show how production systems use consistent hashing plus indirection to make rebalancing practical.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/">Redis Cluster Specification</a><ul>
+<li>Focus: Hash slots, <code>MOVED</code> redirection, and live resharding provide a concrete example of stable logical partitions with explicit routing changes.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://cassandra.apache.org/doc/4.1.0/cassandra/architecture/overview.html">Apache Cassandra Architecture Overview</a><ul>
+<li>Focus: Token ranges, partitioning, and vnode-based data distribution show how a widely used database spreads and relocates ownership around a ring.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Bounded movement is the real value of consistent hashing</strong> - Capacity changes should relocate only a subset of logical shards, not force a near-total remap of the keyspace.</li>
+<li><strong>Rebalancing is an ownership protocol, not a copy job</strong> - Snapshot transfer matters, but correctness depends on catch-up replication, fencing, and a clear cutover epoch.</li>
+<li><strong>Consistent hashing reduces remapping, not all imbalance</strong> - Virtual buckets and weighted placement help, but hot keys and operational constraints still require separate design work.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why would Harbor Point's simple change from <code>hash(issuer_id) % 8</code> to <code>hash(issuer_id) % 10</code> be dangerous during a live scale-out?</strong></p>
+<ul>
+<li>A) Because direct modulo resizing changes the bucket identity for most issuers, causing broad remapping and cluster-wide disruption</li>
+<li>B) Because consistent hashing requires exactly eight buckets to function</li>
+<li>C) Because rebalancing can only happen when the cluster has no live traffic</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the key correctness step at cutover when moving bucket <code>CA/3</code> from <code>rg-ca-b</code> to <code>rg-ca-e</code>?</strong></p>
+<ul>
+<li>A) Finishing the bulk snapshot copy, even if routers still send writes to both groups</li>
+<li>B) Advancing the placement epoch so stale requests are rejected or forwarded and only the new owner remains authoritative</li>
+<li>C) Deleting the source copy immediately so there is no duplicate data on disk</li>
+</ul>
+</li>
+<li>
+<p><strong>Which problem does consistent hashing not solve by itself for Harbor Point?</strong></p>
+<ul>
+<li>A) Limiting the amount of data that must move when nodes join or leave</li>
+<li>B) Giving the cluster a way to assign logical buckets to physical nodes</li>
+<li>C) Eliminating a single hot issuer whose traffic overwhelms whichever bucket owns it</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The <code>% N</code> rule defines every bucket boundary, so changing <code>N</code> remaps far more issuers than the added capacity actually needs. Option B is false because consistent hashing does not depend on eight buckets, and option C is false because live systems rebalance under traffic all the time when the protocol is designed correctly.</p>
+<p><strong>2. B</strong>: Cutover becomes safe when the system fences authority with a new epoch and forces stale routers to refresh or forward. Option A is incomplete because copied bytes do not guarantee current ownership, and option C is dangerous because deleting the source before authority is transferred can strand in-flight requests or recovery paths.</p>
+<p><strong>3. C</strong>: Consistent hashing bounds placement churn, but one extremely hot issuer still overwhelms the logical bucket that owns it unless Harbor Point changes the data model, split strategy, or application behavior. Options A and B are exactly the kinds of problems consistent hashing is meant to help with.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="022.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Sharding Strategies: Range, Hash, and Hybrid</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="024.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Distributed Transactions and Two-Phase Commit</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

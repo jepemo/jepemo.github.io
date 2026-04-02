@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Materialized Views and Incremental Maintenance - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Materialized Views and Incremental Maintenance</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 027 | Lesson ID: 426
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 426: Materialized Views and Incremental Maintenance</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A materialized view stores a query result as real state, and incremental maintenance keeps that state current by applying only the base-table deltas that matter, but the design is trustworthy only when inserts, updates, deletes, replay, and freshness are modeled explicitly.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="026.html">09.md</a>, Harbor Point built a WAL-based CDC pipeline so committed reservation changes could leave PostgreSQL in commit order instead of through a fragile poller. That solved the extraction problem. It did not solve the read problem. Risk officers still need a dashboard that answers a question like "how much open municipal-bond exposure does desk <code>ALPHA</code> currently hold with issuer <code>CA-MUNI</code>?" in a few milliseconds, even during the 09:30 market burst.</p>
+<p>The naive query is easy to write and painful to run repeatedly:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">desk_id</span><span class="p">,</span><span class="w"> </span><span class="n">issuer_id</span><span class="p">,</span><span class="w"> </span><span class="k">SUM</span><span class="p">(</span><span class="n">notional</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">open_notional</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">reservation_count</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">bond_reservations</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span>
+<span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">desk_id</span><span class="p">,</span><span class="w"> </span><span class="n">issuer_id</span><span class="p">;</span>
+</code></pre></div>
+
+<p>That query is fine when an engineer runs it once. It is a bad serving plan when dozens of dashboards and alerts run it every few seconds against hot OLTP tables. A normal view does not help, because it still reruns the query each time. A materialized view changes the contract: the system persists the answer itself, so reads become cheap.</p>
+<p>The second realization is the important one. If Harbor Point recomputes the whole view every minute, the dashboard becomes a sawtooth: very fresh right after refresh, clearly stale just before the next one, and expensive every time the rebuild scans the source tables. Incremental maintenance avoids that by converting each committed base change into a delta against the derived state. Reserve <code>CA-MUNI-77</code> for <code>ALPHA</code>, and the row for <code>(ALPHA, CA-MUNI)</code> should move by <code>+2_000_000</code> notional and <code>+1</code> reservation. Release it, and the same row should move back down.</p>
+<p>That is why materialized views are not just "cached queries." In production they are maintained state machines. The hard part is not persisting the result once. The hard part is guaranteeing that every change to the source tables is reflected in the derived tables exactly as the chosen freshness contract promises. The next lesson, <a href="028.html">11.md</a>, matters because even a correct materialized view can still look stale if clients read it from replicas with lag.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's trading workflow generates a steady stream of small writes: reserve a bond, partially fill it, release the remainder, transfer exposure between desks, cancel stale holds. The dashboard query that risk officers use is read-heavy, but its answer depends on those writes being incorporated quickly and correctly. If every dashboard request scans <code>bond_reservations</code>, joins issuer metadata, and recomputes aggregates from scratch, the read path competes directly with the write path that keeps market activity moving.</p>
+<p>Materialized views matter because they let the system spend work once on the write side so many readers can reuse the result cheaply. For Harbor Point, that means the dashboard can hit a compact table such as <code>desk_issuer_exposure_mv</code> keyed by <code>(desk_id, issuer_id)</code> instead of repeating a large aggregation over live reservation rows. Query latency becomes predictable, and the primary database stops doing the same grouping work over and over.</p>
+<p>But the operational gain comes with a tighter correctness burden. A materialized view is useful only if its update rules are complete. If an <code>open -&gt; released</code> transition forgets to subtract notional, the dashboard lies. If a replayed CDC batch applies the same delta twice, exposure doubles. If the team promises "under two seconds stale" but cannot expose the view's last applied log position, operators have no way to distinguish a truly fresh dashboard from one that simply answers quickly with old data.</p>
+<p>The production question is therefore not "should we cache this query?" It is "which derived state is valuable enough to maintain continuously, and what consistency contract can we actually defend?" That framing turns materialized views from a performance trick into a storage design choice.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what a materialized view stores and why full recomputation is often the wrong serving strategy</strong> - Distinguish ordinary views, periodic refreshes, and persisted derived state in Harbor Point's risk workflow.</li>
+<li><strong>Trace incremental maintenance from a committed base-table change to a view-row update</strong> - Show how inserts, updates, deletes, and replay-safe offsets become deltas against <code>desk_issuer_exposure_mv</code>.</li>
+<li><strong>Evaluate the production trade-offs of different maintenance strategies</strong> - Choose among immediate, asynchronous, and periodic refresh approaches based on write cost, freshness targets, and recovery complexity.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A materialized view stores the answer, not just the query</h3>
+<p>An ordinary SQL view is a saved query definition. When Harbor Point reads it, PostgreSQL still has to execute the joins, filters, and aggregates against the base tables at read time. That can be perfectly reasonable for light workloads or exploratory analysis. It does nothing to reduce repeated read cost for a high-traffic dashboard.</p>
+<p>A materialized view stores the derived rows themselves. If Harbor Point persists one row per <code>(desk_id, issuer_id)</code> with <code>open_notional</code>, <code>reservation_count</code>, and a freshness marker such as <code>last_applied_lsn</code>, dashboard reads can become a simple indexed lookup instead of a repeated aggregation over the write-heavy <code>bond_reservations</code> table. The system has effectively moved work from query time to maintenance time.</p>
+<p>That distinction explains why built-in materialized views and incrementally maintained projection tables are often discussed together. In PostgreSQL, <code>REFRESH MATERIALIZED VIEW</code> usually rebuilds the stored result by rerunning the defining query. In other systems, or in custom application tables, the derived rows may be updated continuously as base data changes. Both patterns persist derived state. The real difference is how the stored result becomes fresh again.</p>
+<p>For Harbor Point, a once-per-minute full refresh is already too coarse for live exposure monitoring. The read path becomes fast, but freshness oscillates and the refresh job still scans the whole source dataset. That is acceptable for overnight reporting. It is the wrong fit for a market-open dashboard that must reflect a release or fill almost immediately.</p>
+<p>The trade-off is now visible. Fast reads are purchased with extra storage, write-side maintenance, and rebuild procedures. If the view definition changes from "sum open notional" to "sum only notional above risk threshold," Harbor Point must either backfill the view from the source tables or replay the relevant history. Persisted answers are valuable, but they create their own lifecycle.</p>
+<h3>Concept 2: Incremental maintenance applies deltas, not full recomputations</h3>
+<p>Incremental maintenance starts from one simple question: after a single committed change, which derived rows are now different, and by how much? For Harbor Point's <code>desk_issuer_exposure_mv</code>, an inserted open reservation for <code>desk_id='ALPHA'</code>, <code>issuer_id='CA-MUNI'</code>, <code>notional=2_000_000</code> means one group should change by <code>(+2_000_000, +1)</code>. A release of that same reservation means the group should change by <code>(-2_000_000, -1)</code>.</p>
+<p>Updates require more care than inserts because an update is usually two logical actions at once: remove the old contribution and add the new one. If a reservation moves from desk <code>ALPHA</code> to desk <code>BETA</code>, the correct delta is not "add to BETA." It is "subtract from <code>(ALPHA, CA-MUNI)</code> and add to <code>(BETA, CA-MUNI)</code> in the same committed change set." If status changes from <code>open</code> to <code>released</code>, the old row contributed to the aggregate but the new row does not, so the net effect is a subtraction only.</p>
+<p>That logic is why production systems often normalize every change into <code>before</code> and <code>after</code> records before touching the view. The maintenance code does not ask "what SQL statement did the application run?" It asks "what contribution did the old row make to the view, and what contribution does the new row make now?" The delta is <code>contribution(after) - contribution(before)</code>.</p>
+<p>Harbor Point can drive this from the ordered CDC stream introduced in <a href="026.html">09.md</a>:</p>
+<div class="codehilite"><pre><span></span><code>bond_reservations commit
+        |
+        v
+  WAL / CDC event with before+after images
+        |
+        v
+  delta builder groups net changes by (desk_id, issuer_id)
+        |
+        v
+  upsert into desk_issuer_exposure_mv
+        |
+        v
+  advance last_applied_lsn / freshness watermark
+</code></pre></div>
+
+<p>The upsert itself can be small and mechanical:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">desk_issuer_exposure_mv</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">desk_id</span><span class="p">,</span>
+<span class="w">    </span><span class="n">issuer_id</span><span class="p">,</span>
+<span class="w">    </span><span class="n">open_notional</span><span class="p">,</span>
+<span class="w">    </span><span class="n">reservation_count</span><span class="p">,</span>
+<span class="w">    </span><span class="n">last_applied_lsn</span>
+<span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="err">$</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="err">$</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="err">$</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="err">$</span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="err">$</span><span class="mi">5</span><span class="p">)</span>
+<span class="k">ON</span><span class="w"> </span><span class="n">CONFLICT</span><span class="w"> </span><span class="p">(</span><span class="n">desk_id</span><span class="p">,</span><span class="w"> </span><span class="n">issuer_id</span><span class="p">)</span><span class="w"> </span><span class="k">DO</span><span class="w"> </span><span class="k">UPDATE</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">open_notional</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">desk_issuer_exposure_mv</span><span class="p">.</span><span class="n">open_notional</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">EXCLUDED</span><span class="p">.</span><span class="n">open_notional</span><span class="p">,</span>
+<span class="w">    </span><span class="n">reservation_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">desk_issuer_exposure_mv</span><span class="p">.</span><span class="n">reservation_count</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">EXCLUDED</span><span class="p">.</span><span class="n">reservation_count</span><span class="p">,</span>
+<span class="w">    </span><span class="n">last_applied_lsn</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">GREATEST</span><span class="p">(</span>
+<span class="w">        </span><span class="n">desk_issuer_exposure_mv</span><span class="p">.</span><span class="n">last_applied_lsn</span><span class="p">,</span>
+<span class="w">        </span><span class="n">EXCLUDED</span><span class="p">.</span><span class="n">last_applied_lsn</span>
+<span class="w">    </span><span class="p">);</span>
+</code></pre></div>
+
+<p>Here <code>EXCLUDED.open_notional</code> and <code>EXCLUDED.reservation_count</code> are the already computed deltas, not full recomputed totals. That distinction matters. If Harbor Point replays the same source transaction, it must detect that replay before applying the delta again. If several reservation rows in one transaction hit the same <code>(desk_id, issuer_id)</code> key, it is usually better to net those changes before updating the view so the view reflects the transaction as one state transition instead of a burst of intermediate states.</p>
+<h3>Concept 3: Freshness and recovery are part of the design, not afterthoughts</h3>
+<p>There are three common maintenance styles, and each changes the contract Harbor Point can offer. Immediate maintenance updates the view in the same transaction as the base write, often through engine support or trigger-like logic. That gives the strongest consistency because once the base row commits, the view is already correct. The cost is higher write latency, more contention on hot aggregate keys, and tighter coupling between OLTP writes and read-model maintenance.</p>
+<p>Asynchronous maintenance decouples the two. Harbor Point can commit the reservation first, stream the change through CDC, and let a projection worker update <code>desk_issuer_exposure_mv</code> moments later. That usually improves write throughput and operational separation, but it creates a staleness window. The window is only manageable if the view exposes a watermark such as <code>last_applied_lsn</code> or <code>last_applied_commit_ts</code>. A "fast" dashboard response is not enough; operators need to know how current that answer is.</p>
+<p>Periodic full refresh is the simplest operationally and often the weakest semantically. It can be enough for end-of-day reporting, where a fifteen-minute lag is acceptable and rebuild cost is predictable. It is a poor fit for a risk screen that must reflect a cancelled hold before another trader relies on the old exposure number. Incremental maintenance exists because many production uses sit between those extremes: readers need low latency and bounded staleness, but full synchronous maintenance on every write would cost too much.</p>
+<p>Recovery planning makes the trade-off sharper. If Harbor Point discovers a bug in the delta logic or changes the aggregation definition, the materialized view may need a full reconciliation from source state plus a replay of newer log positions. Incremental maintenance does not remove the need for periodic truth checks. It makes them cheaper to run between rebuilds, but the source tables remain authoritative.</p>
+<p>This is also where query shape matters. Aggregates keyed by a small, stable grouping set are usually good candidates for incremental maintenance. Views with wide fan-out joins, non-deterministic functions, or heavy reclassification logic may be much harder to maintain correctly because one base-row change can force many derived-row changes. The right question is not whether a query can be materialized. It is whether the dependency graph and delta surface stay understandable under failure and change.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The dashboard totals drift upward after a projection worker restart.</p>
+<p><strong>Why it happens / is confusing</strong>: Replay is normal in an at-least-once CDC pipeline. If the worker republishes or reapplies a source transaction without deduplicating by source position or event identity, the same exposure delta is added twice even though the base tables are correct.</p>
+<p><strong>Clarification / Fix</strong>: Store replay-safe source metadata such as transaction ID, event ID, or last applied LSN, and make delta application idempotent at that boundary. Recompute a sample of groups from the source tables regularly to catch drift early.</p>
+<p><strong>Issue</strong>: The materialized view answers quickly, but risk officers still complain that recent releases are missing.</p>
+<p><strong>Why it happens / is confusing</strong>: Query latency and freshness are different properties. The view table may be indexed and fast to read while the maintenance worker is several seconds behind the source commit stream.</p>
+<p><strong>Clarification / Fix</strong>: Monitor freshness directly with backlog depth and last applied source position. If the product promise is "near real time," expose the watermark in dashboards and alerts instead of assuming low query latency means fresh data.</p>
+<p><strong>Issue</strong>: Moving a reservation between desks creates a negative count in one group and an inflated count in another.</p>
+<p><strong>Why it happens / is confusing</strong>: The maintenance code treated an update as an overwrite instead of decomposing it into "remove old contribution, add new contribution." Aggregates hide this bug until specific key changes occur.</p>
+<p><strong>Clarification / Fix</strong>: Compute contributions from both the <code>before</code> and <code>after</code> row images. Any column that participates in filtering, grouping, or aggregation must be part of the delta logic, not just the numeric measure being summed.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="026.html">09.md</a> provides the ordered change stream that makes incremental maintenance reliable</h3>
+<p>CDC from WAL streams gives Harbor Point committed, ordered base-table changes with replay positions attached. Incremental view maintenance consumes that same stream and turns it into derived state. Without ordered source deltas, the view layer would have to infer correctness from periodic rescans or application-side hooks.</p>
+<h3>Connection 2: <a href="028.html">11.md</a> asks what happens when the materialized view is served from lagging replicas</h3>
+<p>A perfectly maintained view on the primary can still look inconsistent to a client if the client reads from a replica that has not applied the newest changes. Once Harbor Point has a fast derived table, the next design problem is session consistency: when does a user need read-your-writes, and how should routing react to replica lag?</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/rules-materializedviews.html">PostgreSQL Materialized Views</a><ul>
+<li>Focus: What PostgreSQL materialized views are, how refresh works, and why built-in refresh semantics differ from true incremental maintenance.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://materialize.com/docs/self-managed/v25.1/sql/create-materialized-view/">CREATE MATERIALIZED VIEW | Materialize Documentation</a><ul>
+<li>Focus: A production system that keeps views incrementally updated and makes the maintenance/storage trade-offs explicit.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/sraoss/pg_ivm">pg_ivm</a><ul>
+<li>Focus: A practical PostgreSQL extension that shows how immediate incremental view maintenance works and where its limitations appear.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://doi.org/10.1007/s00778-013-0348-4">DBToaster: Higher-order Delta Processing for Dynamic, Frequently Fresh Views</a><ul>
+<li>Focus: The algebraic idea behind propagating deltas through derived queries instead of recomputing entire results.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A materialized view is stored state with a freshness contract</strong> - It helps because readers reuse a persisted answer, not because the SQL text became shorter.</li>
+<li><strong>Incremental maintenance is delta propagation</strong> - Correct systems translate <code>before</code> and <code>after</code> source records into precise additions and subtractions on derived rows.</li>
+<li><strong>The write path becomes responsible for read performance</strong> - Faster reads come from paying maintenance, replay handling, and reconciliation costs somewhere else in the system.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is a once-per-minute full refresh usually the wrong fit for Harbor Point's live exposure dashboard?</strong></p>
+<ul>
+<li>A) Because materialized views cannot store aggregate rows</li>
+<li>B) Because it still recomputes the whole result and creates predictable staleness windows between refreshes</li>
+<li>C) Because WAL-based CDC can only be used with ordinary views</li>
+</ul>
+</li>
+<li>
+<p><strong>How should the projection layer handle a reservation update that moves exposure from desk <code>ALPHA</code> to desk <code>BETA</code>?</strong></p>
+<ul>
+<li>A) Add the new desk contribution and leave the old desk row unchanged</li>
+<li>B) Recompute the entire materialized view immediately</li>
+<li>C) Subtract the old row's contribution and add the new row's contribution in the same committed delta set</li>
+</ul>
+</li>
+<li>
+<p><strong>Which piece of metadata makes an asynchronously maintained view operationally trustworthy?</strong></p>
+<ul>
+<li>A) A freshness watermark such as last applied LSN or commit timestamp</li>
+<li>B) The number of columns in the materialized view</li>
+<li>C) The optimizer cost estimate of the original query</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: A periodic full refresh can make reads fast, but it still scans the whole source dataset and guarantees that the answer becomes stale between refresh points. Option A is false because aggregate rows are exactly what materialized views often store, and option C is false because CDC can feed incremental maintenance precisely to avoid this full recomputation pattern.</p>
+<p><strong>2. C</strong>: Changing the grouping key means the old group must lose the contribution while the new group gains it. Option A leaves stale data behind, and option B throws away the main benefit of incremental maintenance for a simple per-row change.</p>
+<p><strong>3. A</strong>: An asynchronous projection is only defensible when operators and applications can tell how current it is. The number of columns and the original optimizer cost say nothing about whether the view has applied the latest committed source changes.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="026.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Change Data Capture from WAL Streams</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="028.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Read Replicas, Lag, and Read-Your-Writes</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Buffer Pools, Caching, and I/O Scheduling - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Buffer Pools, Caching, and I/O Scheduling</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 007 | Lesson ID: 279
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 279: Buffer Pools, Caching, and I/O Scheduling</h1>
+<blockquote>
+<p><strong>The core idea</strong>: a good query plan still needs the right pages in memory at the right time, and a storage engine lives or dies by how it manages that working set and schedules background I/O around foreground reads.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><strong>The insight</strong>: Query cost is not just about operators. It is also about whether the pages those operators need are already hot, whether dirty pages are blocking eviction, and whether background writeback is quietly competing with foreground latency.</p>
+<p><strong>Why this matters</strong>: Two identical queries can behave very differently depending on cache warmth, eviction pressure, and I/O scheduling.</p>
+<p><strong>Concrete anchor</strong>: Yesterday's query plan looked fine in staging, but production is slower. The SQL did not change. The data did not change much. What changed was the memory working set and the fact that checkpoint writeback, scans, and index probes are now competing for the same storage path.</p>
+<p><strong>The practical sentence to remember</strong>:<br />
+<strong>Execution plans decide what work is needed; buffer pools and I/O scheduling decide how painful that work becomes.</strong></p>
+<hr />
+<h2>Why This Matters</h2>
+<p><strong>The problem</strong>: Storage is orders of magnitude slower than CPU, so engines try hard to keep useful pages in memory. But memory is limited, some pages are dirty, some are pinned by active work, and scans can easily evict data that short point-lookups needed.</p>
+<p><strong>Without this model</strong>:</p>
+<ul>
+<li>Teams over-focus on SQL text and under-focus on memory residency.</li>
+<li>Cache hit rate is treated as a vanity metric instead of a workload signal.</li>
+<li>Writeback storms and flush pressure get mistaken for "random storage slowness."</li>
+</ul>
+<p><strong>With this model</strong>:</p>
+<ul>
+<li>You can reason about why a warm-cache query is fast and a cold-cache query is not.</li>
+<li>You can explain why eviction and dirty-page policy matter as much as index choice.</li>
+<li>You can see I/O scheduling as part of query performance, not just a storage-layer concern.</li>
+</ul>
+<p><strong>Operational payoff</strong>: Better sizing of memory, better tuning of shared buffers and flush policy, fewer checkpoint spikes, and a clearer understanding of why some workloads get hurt by scans while others get hurt by writeback.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this lesson, you should be able to:</p>
+<ol>
+<li><strong>Explain the role of the buffer pool</strong> as the managed in-memory working set for data pages.</li>
+<li><strong>Describe the main cache-management decisions</strong> around hits, misses, dirty pages, eviction, and scan pollution.</li>
+<li><strong>Reason about I/O scheduling trade-offs</strong> between foreground latency and background maintenance work.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The Buffer Pool Is the Engine's Working Memory</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A query needs a B-Tree root page, then a few internal pages, then a leaf page, then finally the target row page. If all of them are already in memory, the query feels instant. If not, each miss may trigger storage I/O.</p>
+<p><strong>Intuition</strong>: A buffer pool is not just "a cache." It is the engine's actively managed set of database pages in memory.</p>
+<p><strong>What lives there</strong>:</p>
+<ul>
+<li>Table pages</li>
+<li>Index pages</li>
+<li>Metadata pages</li>
+<li>Sometimes temporary or internal work pages</li>
+</ul>
+<p><strong>How it works mechanically</strong>:</p>
+<ol>
+<li>An operator requests a page.</li>
+<li>If the page is already resident, the engine gets a <strong>buffer hit</strong>.</li>
+<li>If not, the engine triggers a <strong>buffer miss</strong> and loads the page from storage.</li>
+<li>The page is pinned while in use so it cannot be evicted mid-operation.</li>
+<li>If modified, the page becomes <strong>dirty</strong> and must be flushed later before eviction or checkpoint progress.</li>
+</ol>
+<p><strong>Why engines manage this directly</strong>:</p>
+<ul>
+<li>They understand page semantics better than the generic OS cache.</li>
+<li>They need precise control over dirty pages, checkpoints, and eviction.</li>
+<li>They often need to distinguish foreground critical pages from background scan traffic.</li>
+</ul>
+<p><strong>Important subtlety</strong>: In many systems, the database cache and the OS page cache can interact awkwardly. This is why some engines prefer direct I/O or careful buffer sizing: too many layers of caching can waste memory and hide pressure until it hurts.</p>
+<hr />
+<h3>Concept 2: Cache Policy Is About Protecting the Right Working Set</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A reporting query sequentially scans a huge table. Meanwhile, OLTP traffic keeps asking for the same small hot index pages. If the scan pollutes the cache, point lookups suddenly slow down.</p>
+<p><strong>Intuition</strong>: The hard question is not "should we cache?" It is "which pages deserve to stay?"</p>
+<p><strong>Common pressures on eviction policy</strong>:</p>
+<ul>
+<li>Hot small working sets versus large cold scans</li>
+<li>Read-mostly pages versus dirty pages that are expensive to evict</li>
+<li>Random point lookups versus sequential access</li>
+</ul>
+<p><strong>Why a naive policy fails</strong>:</p>
+<ul>
+<li>Plain LRU can be polluted by long scans.</li>
+<li>Dirty pages cannot be dropped as cheaply as clean ones.</li>
+<li>Pages pinned by active operators cannot be evicted at all.</li>
+</ul>
+<p><strong>What engines typically add</strong>:</p>
+<ul>
+<li>Clock or second-chance style replacement</li>
+<li>Separate treatment for sequential scans</li>
+<li>Background flushing to create clean eviction candidates</li>
+<li>Readahead or prefetch when access patterns look predictable</li>
+</ul>
+<p><strong>The key systems idea</strong>:<br />
+Eviction policy is really admission control for memory pressure.</p>
+<p>If the engine protects the wrong pages, I/O explodes even though nothing about the query text changed.</p>
+<p><strong>Connection to yesterday's lesson</strong>: A great query plan can still run badly if the pages it expects to probe cheaply keep getting evicted by unrelated work.</p>
+<hr />
+<h3>Concept 3: I/O Scheduling Is a Latency Policy, Not Just Plumbing</h3>
+<p><strong>Concrete example / mini-scenario</strong>: Foreground user queries need low-latency random reads, but a checkpoint starts flushing large numbers of dirty pages and saturates the device queue.</p>
+<p><strong>Intuition</strong>: Once reads, writeback, checkpointing, log flushes, and scans all share the same storage path, "I/O scheduling" becomes a policy question about whose latency matters most right now.</p>
+<p><strong>Main sources of I/O pressure</strong>:</p>
+<ul>
+<li>Buffer misses during reads</li>
+<li>Dirty page flushes</li>
+<li>Checkpoints</li>
+<li>Background compaction or vacuum-like maintenance</li>
+<li>Readahead for scans</li>
+</ul>
+<p><strong>Why background work is dangerous</strong>:</p>
+<ul>
+<li>It is usually necessary for correctness or long-term health.</li>
+<li>But if scheduled badly, it steals bandwidth from foreground latency-sensitive requests.</li>
+</ul>
+<p><strong>Typical balancing mechanisms</strong>:</p>
+<ul>
+<li>Limit checkpoint aggressiveness</li>
+<li>Smooth writeback instead of letting debt accumulate into a flush storm</li>
+<li>Separate log devices from data devices when possible</li>
+<li>Throttle background maintenance</li>
+<li>Batch I/O when it improves throughput without blowing tail latency</li>
+</ul>
+<p><strong>The trade-off</strong>:</p>
+<ul>
+<li>Aggressive flushing reduces future risk and can shorten recovery.</li>
+<li>But it can damage current latency.</li>
+<li>Delaying background work protects immediate queries for a while.</li>
+<li>But it increases future debt and raises the chance of bigger latency spikes later.</li>
+</ul>
+<p><strong>Mental model</strong>:<br />
+The buffer pool decides what deserves scarce memory.<br />
+The I/O scheduler decides which debt gets paid first when memory is no longer enough.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Queries are fast after warm-up but very slow after restart or failover.</p>
+<p><strong>Why it happens</strong>: The working set is no longer resident, so operators that used to hit memory now miss and fetch from storage.</p>
+<p><strong>Clarification / Fix</strong>: Distinguish cold-cache from warm-cache performance. Capacity planning should consider both, especially for failover scenarios.</p>
+<p><strong>Issue</strong>: Checkpoints cause periodic latency spikes.</p>
+<p><strong>Why it happens</strong>: Dirty-page flushing may be too bursty, so checkpoint work competes with foreground reads and writes in large bursts.</p>
+<p><strong>Clarification / Fix</strong>: Smooth writeback, revisit checkpoint cadence, and measure how much dirty-page debt accumulates between flush phases.</p>
+<p><strong>Issue</strong>: Cache hit rate looks acceptable, but user-facing latency is still unstable.</p>
+<p><strong>Why it happens</strong>: Averages can hide the fact that the pages missing are exactly the ones on latency-sensitive paths, or that background writes are saturating storage anyway.</p>
+<p><strong>Clarification / Fix</strong>: Look beyond overall hit rate. Segment by workload class, page type, and tail latency.</p>
+<p><strong>Issue</strong>: Large scans hurt unrelated OLTP traffic.</p>
+<p><strong>Why it happens</strong>: Scan pages may pollute the buffer pool and evict hot pages needed by point lookups.</p>
+<p><strong>Clarification / Fix</strong>: Use scan-aware caching behavior, readahead policy, or separate analytical workloads when needed.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Buffer Pools &lt;-&gt; WAL and Checkpoints</h3>
+<p><strong>The parallel</strong>: Dirty pages can stay in memory for performance, but WAL is what makes that safe. Checkpoints then decide how much of that dirty state should be pushed out to bound recovery time.</p>
+<p><strong>Why this matters</strong>: Memory management, durability, and recovery are one system, not three separate topics.</p>
+<h3>Connection 2: Buffer Pools &lt;-&gt; Concurrency Control</h3>
+<p><strong>The parallel</strong>: Once many queries touch the same in-memory pages, coordination matters too. That is why the next lesson moves naturally into locks, latches, and deadlocks.</p>
+<p><strong>Why this matters</strong>: Hot pages are good for I/O, but they can also become hot contention points.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Suggested Resources</h3>
+<ul>
+<li>[DOC] PostgreSQL Resource Consumption and Shared Buffers - <a href="https://www.postgresql.org/docs/current/runtime-config-resource.html">Documentation</a><br />
+  Focus: practical tuning intuition for memory, buffers, and cache-related trade-offs.</li>
+<li>[DOC] MySQL InnoDB Buffer Pool - <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-buffer-pool.html">Documentation</a><br />
+  Focus: a concrete production example of how a major engine manages its in-memory working set.</li>
+<li>[BOOK] <em>Database Internals</em> - <a href="https://www.databass.dev/">Book site</a><br />
+  Focus: deep mental models for page caching, buffer management, and storage-engine behavior.</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>The buffer pool is the engine's managed working set</strong>, not just a generic cache.</li>
+<li><strong>Eviction policy is a workload decision</strong> because the wrong pages in memory can ruin an otherwise good plan.</li>
+<li><strong>I/O scheduling is part of latency control</strong> because background maintenance and foreground queries compete for the same storage path.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is a buffer pool more than just "some cached pages"?</strong></p>
+<ul>
+<li>A) Because it is the engine's managed in-memory page set with pinning, dirty tracking, and eviction policy</li>
+<li>B) Because it stores only indexes</li>
+<li>C) Because it replaces storage completely</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can a large sequential scan hurt unrelated point-lookups?</strong></p>
+<ul>
+<li>A) Because scans disable WAL</li>
+<li>B) Because scan traffic can pollute the cache and evict hot lookup pages</li>
+<li>C) Because the SQL parser slows down</li>
+</ul>
+</li>
+<li>
+<p><strong>Why are dirty pages operationally special?</strong></p>
+<ul>
+<li>A) Because they can be dropped immediately</li>
+<li>B) Because they must be written back safely before eviction or checkpoint completion</li>
+<li>C) Because they are never cached</li>
+</ul>
+</li>
+<li>
+<p><strong>What usually causes checkpoint-related latency spikes?</strong></p>
+<ul>
+<li>A) Too many cached query plans</li>
+<li>B) Bursty background flushing competing with foreground I/O</li>
+<li>C) Schema normalization</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The engine tracks page residency, dirty state, pinning, and eviction, which makes the buffer pool an active subsystem, not just passive caching.</p>
+<p><strong>2. B</strong>: Scan traffic can fill memory with pages that are not useful to latency-sensitive point lookups.</p>
+<p><strong>3. B</strong>: Dirty pages contain modified state that cannot simply disappear; they must be flushed safely.</p>
+<p><strong>4. B</strong>: When writeback arrives in large bursts, it competes with user-facing reads and writes on the same device path.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="006.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Query Execution Pipelines and Operator Costs</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="008.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>DBMS Architecture and Storage Hierarchy</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

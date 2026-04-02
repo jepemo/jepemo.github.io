@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Timestamp Ordering and Optimistic Concurrency - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Timestamp Ordering and Optimistic Concurrency</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 029 | Lesson ID: 406
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 406: Timestamp Ordering and Optimistic Concurrency</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Once MVCC stops readers from waiting on every writer, the database still needs a way to decide which overlapping transactions can commit together; timestamp ordering and optimistic concurrency control do that by choosing a serial order and aborting work that no longer fits it.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="028.html">05.md</a>, Harbor Point's risk dashboard could keep reading an older committed version of <code>MUNI-77</code> exposure instead of blocking behind every trader update. That solved one kind of waiting, but it did not solve the harder question: what if two transactions each read a valid snapshot and still make a jointly invalid decision?</p>
+<p>The bond desk hits that problem at 09:31. The issuer cap for <code>MUNI-77</code> is <code>10.0M</code>, and open reservations currently total <code>9.2M</code>. Trader <code>R1</code> tries to reserve <code>0.5M</code> for one client, while trader <code>R2</code> tries to reserve another <code>0.5M</code> for a different client. Each transaction reads the same snapshot, sees enough headroom, and inserts a different reservation row. If the engine only checks whether they touched the same physical row, both can appear safe and the desk ends up at <code>10.2M</code>, violating the issuer limit even though neither transaction looked wrong in isolation.</p>
+<p>That is the mental shift for this lesson. MVCC visibility explains what each transaction was allowed to read. Timestamp ordering and OCC explain whether the system can still pretend those reads and writes happened in one serial order. If not, one transaction has to restart. Production systems vary in the details, but they all rely on the same contract: speculative work is cheap only if the engine can reject it before the bad history becomes durable.</p>
+<p>This is also the bridge to <a href="030.html">07.md</a>. A successful validation only says, "this transaction may commit." The next lesson asks how the engine makes that commit order crash-safe with WAL sequence numbers, page state, and flush ordering.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point cannot protect the issuer cap with a vague promise that "concurrent transactions usually work out." The desk needs high throughput during the market-open burst, and it also needs a serializable answer to a business rule that spans many rows. Locking everything pessimistically would prevent mistakes, but it would also put every reservation request into a wait queue around a hot issuer. That is a poor fit when most reservations do not conflict and the desk cares about latency as much as correctness.</p>
+<p>Timestamp ordering and OCC offer a different bargain. Let transactions read, compute, and even stage writes without grabbing every lock up front. Then, at carefully chosen points, compare what they observed with a chosen serialization order. If another committed transaction invalidated the assumptions behind the work, abort and retry instead of letting the invariant drift.</p>
+<p>The production relevance is immediate. When Harbor Point sees a sudden spike in abort retries on <code>MUNI-77</code>, that is not a random application bug. It usually means contention is high enough that speculative execution is wasting CPU and tail latency. When validation is implemented too weakly, the symptom is worse: the system looks fast and silently admits impossible histories. This lesson is about telling those two failure modes apart.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain how timestamp-based serial order constrains concurrency</strong> - Describe why a transaction may need to abort even after reading a valid snapshot.</li>
+<li><strong>Trace the OCC lifecycle from read phase to commit validation</strong> - Follow Harbor Point's reservation transactions through speculative execution, conflict checking, and retry.</li>
+<li><strong>Reason about production trade-offs</strong> - Decide when optimistic schemes outperform lock-heavy coordination and when contention turns retries into the dominant cost.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Timestamp ordering is a claim about which transaction must appear first</h3>
+<p>Harbor Point's <code>R1</code> and <code>R2</code> problem is not "who touched the row last?" It is "can the final history still be explained as if one transaction happened entirely before the other?" Timestamp ordering answers that by assigning each transaction a position in a serial order, often with a start timestamp, a commit timestamp, or both. Once the engine makes that choice, every read and write has to be consistent with it.</p>
+<p>In the textbook form, each logical item keeps metadata such as <code>read_ts(X)</code> and <code>write_ts(X)</code>. If transaction <code>T=105</code> wants to read item <code>X</code>, but <code>write_ts(X)=110</code>, then a newer transaction has already written a value that should appear after <code>T</code> in serial order. Letting <code>T</code> read now would mean an "older" transaction saw the future, so <code>T</code> must abort. If <code>T</code> wants to write <code>X</code>, but some newer transaction has already read or written <code>X</code>, the same problem appears in the other direction: the write would arrive too late to fit the chosen ordering.</p>
+<p>For Harbor Point, imagine the issuer exposure aggregate or the relevant index range for open reservations carries version metadata that effectively says, "a transaction newer than <code>R1</code> has already consumed this state." If <code>R1</code> now tries to write based on an older assumption, timestamp ordering rejects it. The database is not being conservative for style points; it is refusing a history that cannot be serialized without contradiction.</p>
+<p>That explains both the power and the limit of basic timestamp ordering. It gives a clean rule for conflicts on tracked items, and it can avoid long lock waits because the losing transaction restarts instead of blocking. But real invariants often live on predicates and ranges, not single rows. Harbor Point's issuer cap depends on "all open reservations for <code>MUNI-77</code>," so a production engine needs index-range tracking, predicate locking, dependency tracking, or another way to represent the fact that a new row in that range changes what the transaction was allowed to conclude.</p>
+<h3>Concept 2: OCC lets transactions run first and proves safety at validation time</h3>
+<p>Optimistic concurrency control takes the same serial-order goal and turns it into an execution strategy. Instead of checking every operation against the global order immediately, the engine lets the transaction do most of its work speculatively. The classic shape is read phase, validation phase, then write phase.</p>
+<p>For Harbor Point, <code>R1</code> reads the current open reservations for issuer <code>MUNI-77</code>, computes that another <code>0.5M</code> reservation would still fit under the cap, and prepares its insert in a private workspace. It has not changed the durable table yet. While <code>R1</code> is thinking, <code>R2</code> does the same thing. Both transactions look locally correct because each is reading a consistent snapshot and staging private writes.</p>
+<p>At commit time, the engine chooses a serialization point and asks a narrower question than "did anything happen?" It asks, "did any transaction that committed since my snapshot change something that would have changed my decision?" For a simple item update, that might mean a read-set or write-set intersection. For Harbor Point's issuer-cap rule, the validation surface is broader: a newly inserted reservation in the <code>MUNI-77</code> range changes the result of the aggregate query, so it conflicts even if the two traders inserted different rows.</p>
+<p>One useful way to picture it is this:</p>
+<div class="codehilite"><pre><span></span><code>R1: read snapshot S100 -&gt; compute reservation -&gt; validate against commits since S100 -&gt; commit C110
+R2: read snapshot S101 -&gt; compute reservation -&gt; validate against commits since S101 -&gt; sees R1 changed MUNI-77 exposure range -&gt; abort/retry
+</code></pre></div>
+
+<p>The crucial detail is that OCC does not mean "ignore conflicts until the end and hope." It means "record enough about what I depended on that I can detect whether my chosen serial position is still legal." If the engine only tracks exact rows and not the range or predicate behind Harbor Point's cap check, validation is too weak and the invariant can still break. Correct OCC therefore depends as much on what the read set means as on when validation runs.</p>
+<h3>Concept 3: Optimism wins on low-conflict workloads and falls apart when retries become the queue</h3>
+<p>Harbor Point prefers optimism during normal trading because most reservations are for different issuers and different clients. In that regime, locking every candidate row or index range up front would create unnecessary waits. OCC keeps the hot path short: read from a snapshot, compute privately, validate quickly, and write once. Abort rates stay low, CPU does useful work, and throughput is good.</p>
+<p>The failure mode is not subtle. If many traders hammer <code>MUNI-77</code> at once, the system can degrade from "little waiting" to "lots of wasted work." Transactions finish their read phase, burn application and database CPU, reach validation, and then lose because a slightly earlier transaction already committed a conflicting change. A pessimistic system pays in blocking time; an optimistic system pays in retries. Under enough contention, retries become a hidden queue with worse tail latency than explicit locks because the discarded work has already consumed resources.</p>
+<p>That is why production systems rarely use one pure textbook algorithm. They mix MVCC snapshots with optimistic validation, attach commit timestamps to version chains, or fall back to stronger locking on the hottest keys and ranges. Engineers then watch concrete signals: abort rate, retry budget, hot-key skew, validation latency, and whether retries amplify upstream traffic. Harbor Point does not care whether a whitepaper called the design "timestamp ordering" or "serializable OCC." It cares whether the issuer-cap invariant holds and whether the desk can still trade through the open.</p>
+<p>This is the point where durability re-enters the story. Once <code>R1</code> wins validation, the engine still has to assign a commit record, establish a durable order, and make sure crash recovery reproduces the same winner. That is exactly why <a href="030.html">07.md</a> follows next: validation decides which history is allowed, while WAL decides how that history survives a crash.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point sees repeated transaction retries on one issuer even though average database CPU is not maxed out.</p>
+<p><strong>Why it happens / is confusing</strong>: OCC pushes contention cost into aborted work, so the database can look superficially healthy while many transactions are doing speculative reads that never commit.</p>
+<p><strong>Clarification / Fix</strong>: Inspect retry counts, abort reasons, and hot-key distribution alongside CPU. If conflicts cluster on <code>MUNI-77</code>, shard the invariant differently, serialize that path more explicitly, or reduce how much work happens before validation.</p>
+<p><strong>Issue</strong>: Two concurrent reservations inserted different rows, yet the issuer cap was still violated after both committed.</p>
+<p><strong>Why it happens / is confusing</strong>: Validation may be tracking exact row conflicts but not the predicate or index range behind the cap check, so the engine misses a write-skew-style dependency.</p>
+<p><strong>Clarification / Fix</strong>: Validate the actual read dependency, not just touched row IDs. In practice that can mean predicate locks, index-range tracking, materialized aggregate rows, or a serializable isolation mechanism that records read-write dependencies.</p>
+<p><strong>Issue</strong>: Engineers assume timestamp ordering removes the need for waiting entirely.</p>
+<p><strong>Why it happens / is confusing</strong>: The algorithm often aborts instead of blocking on logical conflicts, but engines still wait on latches, log flushes, index-page access, and sometimes explicit locks used alongside optimistic schemes.</p>
+<p><strong>Clarification / Fix</strong>: Separate concurrency-control policy from the rest of the storage stack. A transaction may be optimistic about logical conflicts and still wait on physical structures or durability boundaries.</p>
+<p><strong>Issue</strong>: Retry logic "fixes" failed validations, but client latency becomes unpredictable during bursts.</p>
+<p><strong>Why it happens / is confusing</strong>: Automatic retries preserve correctness, but they can multiply load when every retry replays the same expensive read and compute path against the same hot contention point.</p>
+<p><strong>Clarification / Fix</strong>: Bound retries, add jitter or queueing upstream, and measure end-to-end request cost rather than counting only successful commit latency.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: MVCC snapshots ↔ optimistic validation</h3>
+<p>The previous lesson's snapshot rules tell Harbor Point what each transaction may read without blocking. OCC adds the missing serializability check: after reading from a legal snapshot, is the transaction still compatible with everything that committed in the meantime? Many production engines combine both ideas because snapshots make speculative reads cheap, while validation prevents those reads from justifying an impossible final history.</p>
+<h3>Connection 2: Timestamp ordering ↔ serializable transaction systems</h3>
+<p>FoundationDB, Spanner-style designs, and serializable MVCC engines all need a way to map overlapping real execution into a legal serial order. Some expose that as optimistic retries, some as dependency tracking, and some as timestamp-based commit rules. The common thread is not the API shape but the mechanism: commit is allowed only if the engine can still assign the transaction a position in a history that preserves the invariant it read.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://dl.acm.org/doi/10.1145/319566.319567">On Optimistic Methods for Concurrency Control</a><ul>
+<li>Focus: The classic OCC paper by Kung and Robinson; read it for the original read/validate/write framing and the assumptions behind optimistic execution.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://apple.github.io/foundationdb/developer-guide.html#transactions">FoundationDB Developer Guide: Transactions</a><ul>
+<li>Focus: A production system that exposes optimistic transactions and retry loops directly to application developers.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Documentation: Transaction Isolation</a><ul>
+<li>Focus: How snapshot-based reads interact with serializable behavior and why a legal snapshot is not the same as a legal final history.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Broader context for serializability, write skew, and the engineering trade-offs between pessimistic and optimistic concurrency control.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A valid snapshot is not a final correctness proof</strong> - Transactions can each read legal data and still conflict once the engine tries to serialize their combined effects.</li>
+<li><strong>Timestamp ordering chooses who is allowed to be "earlier"</strong> - Reads and writes that violate that order must abort because they imply an impossible history.</li>
+<li><strong>OCC turns contention into retries instead of waits</strong> - That is excellent on low-conflict workloads and dangerous when hot keys or hot ranges make speculative work mostly disposable.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point still need timestamp ordering or OCC after adopting MVCC snapshots?</strong></p>
+<ul>
+<li>A) Because MVCC makes every transaction fully serializable by itself</li>
+<li>B) Because snapshot visibility tells a transaction what it can read, but not whether overlapping transactions can all commit in one serial order</li>
+<li>C) Because OCC is only a durability feature for WAL replay</li>
+</ul>
+</li>
+<li>
+<p><strong>What must Harbor Point's validation logic track to protect the <code>MUNI-77</code> issuer cap when traders insert different reservation rows?</strong></p>
+<ul>
+<li>A) Only exact row IDs that were written</li>
+<li>B) Only the commit timestamp of the last successful transaction</li>
+<li>C) The predicate or index range that determined the cap calculation, not just the individual inserted rows</li>
+</ul>
+</li>
+<li>
+<p><strong>When does optimistic concurrency control usually become a poor fit?</strong></p>
+<ul>
+<li>A) When conflicts are rare and validation is cheap</li>
+<li>B) When contention is high enough that many transactions do substantial work before being aborted and retried</li>
+<li>C) When the workload contains any reads at all</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: MVCC defines snapshot visibility, but serializability still requires checking whether the overlapping work can be placed into one legal serial history. That extra step is what timestamp ordering and OCC provide.</p>
+<p><strong>2. C</strong>: The invariant depends on all open reservations for <code>MUNI-77</code>, so validation must represent that range or predicate. Row-only tracking can miss write skew when each transaction inserts a different row.</p>
+<p><strong>3. B</strong>: OCC is strongest when most speculative work commits. When hot contention causes many transactions to fail at validation, retries become the real queue and tail latency worsens.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="028.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>MVCC Snapshots and Visibility Rules</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="030.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>WAL Internals: LSN, pageLSN, and Flush Ordering</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Redis as a Shared Caching Layer - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Redis as a Shared Caching Layer</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a>
+        </p>
+        <p>
+          Sequence: 002 | Lesson ID: 066
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 066: Redis as a Shared Caching Layer</h1>
+<blockquote>
+<p><strong>Redis becomes useful when caching stops being a one-process optimization and turns into a fleet-wide question about shared hot data, coordinated expiration, and simple atomic state.</strong></p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>The previous lesson introduced caching as a copy plus a policy. Redis enters the story when that copy can no longer live comfortably inside one process. As soon as the backend runs across several instances, pods, or workers, local memory stops being enough for many important reuse cases. Each instance warms its own cache, expires entries on its own schedule, and gives you a different hit rate depending on which process handled the request.</p>
+<p>Take the learning platform running behind a load balancer with four API instances. All four serve the same course metadata reads. If each instance keeps only a local cache, the fleet is doing repeated work anyway because the hot answer must be rediscovered separately in each process. Redis changes the setup by providing one shared low-latency place where all instances can look for the same cached answer.</p>
+<p>That is the aha. Redis is not mainly interesting because it is "fast memory." It is interesting because it is shared fast state with expiration, atomic operations, and simple structures that fit common backend problems. It sits in the middle ground between local process memory and the slower source of truth.</p>
+<p>That middle ground matters a lot. It gives the fleet one common cache view, but it also becomes a new operational dependency. Once many requests depend on Redis for latency or coordination, Redis is no longer just an optimization detail. It becomes part of the behavior of the backend in production.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p><strong>The problem</strong>: Once a backend scales beyond one process, local caches become fragmented and stop producing predictable fleet-wide reuse.</p>
+<p><strong>Before</strong>:</p>
+<ul>
+<li>Each instance warms and expires its own hot keys independently.</li>
+<li>Load-balancer routing changes the apparent cache hit rate.</li>
+<li>Simple counters, dedup markers, or TTL-based state cannot be shared reliably through local memory alone.</li>
+</ul>
+<p><strong>After</strong>:</p>
+<ul>
+<li>The fleet can reuse one shared set of hot answers.</li>
+<li>TTLs, key naming, and atomic updates are centralized.</li>
+<li>Lightweight coordination tasks become much easier to express.</li>
+</ul>
+<p><strong>Real-world impact</strong>: Better cache reuse across instances, simpler rate-limiting and counters, and a practical production step between one-process caches and more complex distributed data systems.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why a shared cache exists</strong> - Distinguish process-local reuse from fleet-wide shared caching.</li>
+<li><strong>Use Redis concepts through access patterns</strong> - Understand why strings, hashes, expirations, and atomic increments matter.</li>
+<li><strong>Reason about Redis as a real dependency</strong> - Connect key design, TTLs, and atomicity to correctness and operations.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Redis Solves the "Many Instances, One Hot Copy" Problem</h3>
+<p>Start with the most important motivation. Local in-memory caches are fast, but they are private to one process. That means they only help the requests that land on that process. Once the fleet scales horizontally, that privacy becomes a limitation.</p>
+<p>With four API instances behind a load balancer, each process may hold its own copy of <code>course:204</code>. If traffic spreads evenly, each instance still pays the miss and refill cost at least once. If traffic distribution shifts, some instances stay cold while others stay warm. The result is fragmented reuse.</p>
+<p>Redis changes that because all instances ask the same shared cache:</p>
+<div class="codehilite"><pre><span></span><code>app instance A ----\
+app instance B -----\ 
+app instance C ------&gt; Redis shared cache
+app instance D -----/
+                    \
+                     -&gt; source of truth on miss
+</code></pre></div>
+
+<p>This makes Redis valuable whenever the system wants one fleet-wide reusable copy or one shared short-lived state marker. The trade-off is important: you lose the zero-hop speed and simplicity of local memory, but you gain shared behavior across instances. That is almost always worth it only when the reuse or coordination problem is truly shared.</p>
+<h3>Concept 2: Redis Data Structures Matter Because Backend Access Patterns Differ</h3>
+<p>Redis is often introduced like a giant key-value map, which is not wrong but it is incomplete. The practical value comes from matching simple data structures to the kind of access the backend actually needs.</p>
+<p>For example:</p>
+<ul>
+<li>a cached course payload fits well as a string holding serialized data</li>
+<li>per-course view counts fit naturally as atomic integers</li>
+<li>object-like field groups may fit better as hashes</li>
+<li>short-lived dedup markers may just be keys with expiration</li>
+</ul>
+<p>This matters because the access pattern is what determines the right operation:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">cache_course</span><span class="p">(</span><span class="n">redis_client</span><span class="p">,</span> <span class="n">course_id</span><span class="p">,</span> <span class="n">payload</span><span class="p">):</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;course:</span><span class="si">{</span><span class="n">course_id</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">redis_client</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">payload</span><span class="p">,</span> <span class="n">ex</span><span class="o">=</span><span class="mi">300</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">increment_course_views</span><span class="p">(</span><span class="n">redis_client</span><span class="p">,</span> <span class="n">course_id</span><span class="p">):</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;course:</span><span class="si">{</span><span class="n">course_id</span><span class="si">}</span><span class="s2">:views&quot;</span>
+    <span class="k">return</span> <span class="n">redis_client</span><span class="o">.</span><span class="n">incr</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The lesson is not the Python syntax. It is that "shared object cache" and "shared atomic counter" are different backend behaviors, and Redis can support both without forcing you to build atomicity or expiration yourself.</p>
+<p>This is why structure choice is not cosmetic. If everything is shoved into one serialized blob, simple operations like incrementing counters or expiring one field pattern become harder and more fragile. If the structure matches the access pattern, the code is often simpler and the behavior clearer.</p>
+<p>The trade-off is simplicity versus expressiveness. Strings are easy and general; richer structures help when the backend needs more specific shared operations.</p>
+<h3>Concept 3: TTLs, Key Design, and Atomic Operations Turn Redis from "Fast" into "Reliable Enough"</h3>
+<p>A shared cache becomes hard to reason about very quickly if the team does not design keys and expiration rules intentionally. Once many instances and services rely on Redis, key naming and TTLs are no longer just tidiness concerns. They are part of correctness.</p>
+<p>For example, these are not minor details:</p>
+<ul>
+<li>whether the key is <code>course:204</code> or <code>course:v2:204</code></li>
+<li>whether the value expires in 30 seconds or 30 minutes</li>
+<li>whether a counter increment is atomic</li>
+<li>whether a dedup marker disappears automatically</li>
+</ul>
+<div class="codehilite"><pre><span></span><code>good shared-cache hygiene:
+  stable key namespaces
+  explicit TTL policy
+  atomic commands where concurrency matters
+</code></pre></div>
+
+<p>Atomicity is especially important because shared cache state is touched concurrently by many instances. If a counter is updated with read-modify-write logic in application code, updates can be lost. If you use Redis's atomic operations directly, the cache layer can safely support simple coordination roles such as counters, rate limits, and deduplication markers.</p>
+<p>This is also the point where Redis stops being "just cache." The backend may now depend on it for latency and for simple correctness-adjacent behavior. That means Redis availability, eviction behavior, and operational hygiene start to matter.</p>
+<p>The trade-off is operational complexity versus shared capability. Redis gives the fleet one common low-latency state layer, but in return the team must treat it as an actual production dependency with naming, TTL, and failure discipline.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Treating Redis as if adding it automatically solves the caching problem.</p>
+<p><strong>Why it happens / is confusing</strong>: Redis is fast and convenient, which can make it feel like the tool itself solves the architectural problem.</p>
+<p><strong>Clarification / Fix</strong>: Redis only gives you a shared fast state layer. You still need clear keys, TTLs, invalidation logic, and a reason the answer should be cached in the first place.</p>
+<p><strong>Issue</strong>: Assuming Redis is just "temporary data" and therefore low risk.</p>
+<p><strong>Why it happens / is confusing</strong>: Cache data can feel temporary and therefore low-risk.</p>
+<p><strong>Clarification / Fix</strong>: Temporary does not mean unimportant. If the fleet depends on Redis for hot paths, counters, or deduplication, Redis behavior is now part of system reliability.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Redis ↔ Horizontal Scaling</h3>
+<p><strong>The parallel</strong>: Redis often appears at the moment a backend moves from one-instance assumptions to many-instance shared behavior.</p>
+<p><strong>Real-world case</strong>: A single-node app may do well with local memory, but once the API fleet is scaled horizontally, shared cache hits and shared TTL behavior start to matter much more.</p>
+<h3>Connection 2: Redis ↔ Lightweight Coordination</h3>
+<p><strong>The parallel</strong>: Redis sits on the boundary between caching and lightweight coordination because the same shared low-latency state can support counters, rate limits, and dedup markers.</p>
+<p><strong>Real-world case</strong>: Rate limiting, request deduplication, and hot-key protection often rely on short-lived shared state with atomic operations that local memory cannot coordinate across a fleet.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>These resources are optional and are not required for the core 30-minute path.</li>
+<li>[DOC] Redis Data Types<ul>
+<li>Link: <a href="https://redis.io/docs/latest/develop/data-types/">https://redis.io/docs/latest/develop/data-types/</a></li>
+<li>Focus: Review which structures fit which access patterns.</li>
+</ul>
+</li>
+<li>[DOC] Redis EXPIRE<ul>
+<li>Link: <a href="https://redis.io/docs/latest/commands/expire/">https://redis.io/docs/latest/commands/expire/</a></li>
+<li>Focus: See how explicit expiration works in practice.</li>
+</ul>
+</li>
+<li>[DOC] Redis INCR<ul>
+<li>Link: <a href="https://redis.io/docs/latest/commands/incr/">https://redis.io/docs/latest/commands/incr/</a></li>
+<li>Focus: See one of the simplest and most important atomic Redis operations used in counters and rate limiting.</li>
+</ul>
+</li>
+<li>[ARTICLE] Cache Consistency with Redis<ul>
+<li>Link: <a href="https://redis.io/blog/three-ways-to-maintain-cache-consistency/">https://redis.io/blog/three-ways-to-maintain-cache-consistency/</a></li>
+<li>Focus: Connect Redis use to freshness and invalidation concerns.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Redis matters when cache behavior must be shared across the fleet</strong> - It solves a many-instances problem, not just a single-process speed problem.</li>
+<li><strong>Data structures follow access patterns</strong> - Shared objects, counters, hashes, and short-lived markers are different behaviors, so they benefit from different Redis operations.</li>
+<li><strong>Shared fast state still needs discipline</strong> - Keys, TTLs, and atomic commands are part of making Redis understandable and safe enough in production.</li>
+</ol>
+<hr />
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why might a backend move from local caches to Redis?</strong></p>
+<ul>
+<li>A) Because several instances now need to reuse the same hot data and short-lived state consistently.</li>
+<li>B) Because Redis replaces the source of truth completely.</li>
+<li>C) Because local memory stops being fast once a service scales.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why do Redis data structures and commands matter in practice?</strong></p>
+<ul>
+<li>A) Because shared object caches, counters, and dedup markers require different operations and guarantees.</li>
+<li>B) Because Redis can only handle one kind of workload at a time.</li>
+<li>C) Because structure choice is only about memory optimization, not behavior.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why are key naming and TTLs important in a shared Redis layer?</strong></p>
+<ul>
+<li>A) Because shared state becomes hard to reason about if keys collide, versions blur together, or values outlive their intended freshness.</li>
+<li>B) Because Redis automatically infers the right freshness policy from traffic.</li>
+<li>C) Because TTLs matter only for memory use, not for correctness or behavior.</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. A</strong>: Redis becomes useful when reuse and short-lived state must be shared across many instances rather than staying private to one process.</p>
+<p><strong>2. A</strong>: Different backend behaviors need different operations, and Redis's structures help express those operations more clearly and safely.</p>
+<p><strong>3. A</strong>: In a shared cache, names and expirations are part of the behavior contract, not just housekeeping details.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="001.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Cache Fundamentals and Core Patterns</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="003.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>CDN and HTTP Caching Layers</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/caching-workers-and-performance.html">← Back to Caching, Workers, and Performance</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Query Routing and Shard Targeting - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Distributed Query Routing and Shard Targeting</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 040 | Lesson ID: 441
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 441: Distributed Query Routing and Shard Targeting</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A distributed SQL router is only as smart as the placement facts it can prove. If a query carries the shard key, the router can hit one shard and let local indexes do their job. If it does not, the system pays for fan-out, lookup indirection, or both.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="039.html">039.md</a>, Harbor Point chose a page-oriented MVCC engine, a small index portfolio, and an <code>issuer_exposure</code> row that every approval transaction must lock. That design made the single primary coherent. It did not make the primary infinite. At the market open, one machine now spends too much time on WAL flushes, buffer churn, and hot issuer traffic, so Harbor Point splits the reservation system into eight shards.</p>
+<p>The crucial shift is that sharding does not turn local indexes into global knowledge. Each shard still has its own B-trees, MVCC snapshots, and lock table. The new component is a router that has to decide, before execution, which shard or shards own the rows a query might touch. If the router can target exactly one shard, the old single-node reasoning mostly survives. If it cannot, even a well-indexed query turns into eight remote queries plus merge work.</p>
+<p>That is why query routing is not just a latency optimization. It is also part of the correctness contract. Harbor Point's issuer-limit invariant only remains safe if every reservation for one issuer and that issuer's summary row land on the same shard. Resharding only remains safe if routers notice metadata epochs changing and stop sending writes to the old owner. The next lesson on <a href="041.html">041.md</a> will assume the target shard set is already known; this lesson is about how the system earns that knowledge.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's workload has three very different query shapes. Traders ask for "open reservations for issuer <code>MUNI-77</code>, newest first." Incident responders fetch a reservation by <code>reservation_id</code> when an order is disputed. Compliance runs same-day scans by <code>risk_bucket</code> and <code>trading_day</code>, which may span the whole book. A sharded system only feels fast when those shapes are treated differently instead of being pushed through one generic "distributed SQL" abstraction.</p>
+<p>Without deliberate shard targeting, the failure mode is subtle. The dashboard query fans out to every shard even though the data for one issuer is colocated. The reservation lookup becomes a broadcast because the identifier does not reveal ownership. A reshard operation quietly leaves some routers with stale placement metadata, so retries bounce between shards and p99 spikes during the busiest part of the day. None of those incidents are fixed by adding another local index. They are routing failures.</p>
+<p>Good routing turns scale-out from "more nodes" into "smaller search spaces." The router extracts the shard key when possible, consults a versioned placement map, and sends the query only to the shards that can possibly match. When the query shape does not allow that, the system should admit it honestly and choose a controlled fan-out plan. Production relevance comes from knowing which case you are in before the query hits the network.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what a query router must know before execution</strong> - Describe the role of shard keys, placement metadata, and metadata epochs in directing a query to the correct shard set.</li>
+<li><strong>Distinguish exact targeting from lookup-based routing and scatter-gather</strong> - Predict how Harbor Point's main query shapes map to one shard, a small shard set, or the entire cluster.</li>
+<li><strong>Reason about routing failures during resharding and replica changes</strong> - Explain why stale route caches, global secondary lookups, and fan-out queries create different operational risks.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Routing metadata is the control plane for data ownership</h3>
+<p>Harbor Point shards both <code>reservations</code> and <code>issuer_exposure</code> by a stable function of <code>issuer</code>, so every issuer's hot rows and summary row stay together. The router does not discover that ownership by scanning shards. It keeps a placement map from key range to shard, plus role and health information for each shard replica. A simplified routing entry looks like this:</p>
+<div class="codehilite"><pre><span></span><code>epoch 18
+[00-1f] -&gt; shard-a  primary=db-a-p  replicas=[db-a-r1, db-a-r2]
+[20-3f] -&gt; shard-b  primary=db-b-p  replicas=[db-b-r1, db-b-r2]
+...
+</code></pre></div>
+
+<p>When the query arrives, the router normalizes the SQL into something it can reason about: predicates, parameter values, statement type, and transaction context. For <code>SELECT ... WHERE issuer = 'MUNI-77' AND status = 'open' ORDER BY submitted_at DESC LIMIT 50</code>, the router applies the same partitioning function used when the row was inserted, finds the owning key range, and targets exactly one shard. Only then do the local indexes from <a href="039.html">039.md</a> matter.</p>
+<p>This explains a common misconception in distributed databases: a local secondary index is not a cluster-wide directory. Every shard may have an index on <code>(issuer, submitted_at DESC)</code>, but the router still needs the shard key to know which shard's index to use. If the query arrives without an <code>issuer</code> predicate, the router cannot infer ownership from thin air. It either needs a separate lookup structure or it must ask multiple shards.</p>
+<p>The main trade-off is granularity. More shards let Harbor Point spread write load and isolate failures, but they also increase the routing-table size, metadata churn, and the chance that one query spans multiple key ranges. Sharding makes ownership explicit; it does not make ownership free.</p>
+<h3>Concept 2: Query shape determines whether targeting is exact, lookup-based, or scatter-gather</h3>
+<p>Harbor Point's three important query families show why "distributed query routing" is really a collection of routing modes.</p>
+<p>For dashboard reads filtered by <code>issuer</code>, targeting is exact. The router hashes or ranges on <code>issuer</code>, picks one shard, and sends down a normal local SQL plan. For writes that update <code>issuer_exposure</code> and insert a reservation, exact targeting is even more important because the transaction must remain local to preserve the invariant from <a href="039.html">039.md</a>.</p>
+<p>For incident lookups by <code>reservation_id</code>, Harbor Point has a design choice. It can encode shard ownership into the identifier, or it can maintain a lookup table such as <code>reservation_locator(reservation_id -&gt; issuer)</code> or <code>reservation_id -&gt; shard</code>. That turns the route into a two-step process: first resolve ownership, then target the shard. The operational cost is that the lookup structure itself must stay consistent with the base row. A missing or stale lookup entry makes a point lookup fail even though the reservation still exists.</p>
+<p>For compliance scans like <code>WHERE trading_day = CURRENT_DATE AND risk_bucket &gt;= 4</code>, the query does not contain the shard key at all. Harbor Point should not pretend otherwise. The router must fan the query out to all shards, push filters down, and merge the results:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">target_shards</span><span class="p">(</span><span class="n">predicates</span><span class="p">,</span> <span class="n">route_cache</span><span class="p">):</span>
+    <span class="k">if</span> <span class="s2">&quot;issuer&quot;</span> <span class="ow">in</span> <span class="n">predicates</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">route_cache</span><span class="o">.</span><span class="n">owner_for_issuer</span><span class="p">(</span><span class="n">predicates</span><span class="p">[</span><span class="s2">&quot;issuer&quot;</span><span class="p">])]</span>
+    <span class="k">if</span> <span class="s2">&quot;reservation_id&quot;</span> <span class="ow">in</span> <span class="n">predicates</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">lookup_locator</span><span class="p">(</span><span class="n">predicates</span><span class="p">[</span><span class="s2">&quot;reservation_id&quot;</span><span class="p">])]</span>
+    <span class="k">return</span> <span class="n">route_cache</span><span class="o">.</span><span class="n">all_shards</span><span class="p">()</span>
+</code></pre></div>
+
+<p>That scatter-gather path is sometimes the right answer, but it should be treated as expensive by design. It consumes network bandwidth, opens more remote executors, and turns tail latency into "slowest shard wins." This is the exact handoff into <a href="041.html">041.md</a>: once a router targets many shards, the engine needs exchange operators and merge logic to produce one result set.</p>
+<p>The trade-off is honest and production-relevant. Lookup-based routing reduces fan-out for non-shard-key queries, but it adds write amplification and another consistency surface. Pure scatter-gather keeps writes simpler, but it makes certain analytical or operational queries scale with the number of shards instead of the selectivity of the predicate.</p>
+<h3>Concept 3: The hard part is staying correct while ownership changes</h3>
+<p>Routing is easiest when the cluster is static. Production clusters are not static. Harbor Point will split a hot shard when one issuer range grows too fast, drain replicas during maintenance, and fail over a primary after a crash. Every one of those actions changes the answer to "where should this query go?" while clients are still sending traffic.</p>
+<p>Suppose shard <code>b</code> is split at metadata epoch 19 into <code>b1</code> and <code>b2</code>. A router that still caches epoch 18 may send <code>issuer = 'MUNI-77'</code> to the old shard. The old owner should not silently execute the write if ownership has moved. A safer pattern is to reject with a stale-route signal, including the newer epoch or a config reference, so the router refreshes placement metadata and retries. For retried writes, Harbor Point also needs idempotency keys; otherwise the refresh path can create duplicate reservations if the first attempt partially succeeded before the topology change was noticed.</p>
+<p>Replica choice is part of shard targeting too. Once the router knows the shard, it still has to choose a primary or follower. Harbor Point's approval path and trader dashboard both want current <code>open</code> state, so they normally target the primary or a follower that meets a strict staleness budget. A low-priority compliance scan may accept a replica that is a few seconds behind. That means the routing layer consumes placement metadata and freshness metadata together.</p>
+<p>The production trade-off is cache aggressiveness versus safety. Caching route maps and health data in the router reduces per-query control-plane chatter, which matters at high QPS. The price is a staleness window during resharding or failover. Forcing the router to revalidate on every query shrinks that window, but it pushes topology latency into the hot path. Mature systems usually mix both approaches: cache aggressively, version everything, and make stale-route retries explicit and observable.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A query that should be single-shard suddenly fans out to every shard.</p>
+<p><strong>Why it happens / is confusing</strong>: The application stopped carrying the shard key explicitly, or wrapped it in a transformation the router cannot analyze, such as <code>WHERE lower(issuer) = 'muni-77'</code>. The local indexes still exist, so teams often blame the database engine instead of the targeting logic.</p>
+<p><strong>Clarification / Fix</strong>: Canonicalize shard-key values before the query reaches the router and keep the predicate directly visible. If the product truly needs shard-key-free lookups, add a lookup structure deliberately instead of hoping the router will infer ownership.</p>
+<p><strong>Issue</strong>: Resharding causes bursts of <code>wrong shard</code> or <code>stale metadata</code> errors even though the new shards are healthy.</p>
+<p><strong>Why it happens / is confusing</strong>: The data move succeeded, but one or more routers are still serving traffic from an older placement epoch. The cluster looks healthy at the storage layer while the routing layer is temporarily inconsistent.</p>
+<p><strong>Clarification / Fix</strong>: Version route metadata, make stale-route retries automatic, and log the retry count by query shape. During shard moves, keep the old owner in a draining state long enough for routers to refresh instead of dropping traffic immediately.</p>
+<p><strong>Issue</strong>: Total cluster CPU is low, but one shard is saturated every market open.</p>
+<p><strong>Why it happens / is confusing</strong>: The shard key preserves locality for a hot issuer, which is useful for correctness, but it also preserves that tenant's traffic hotspot. Sharding by <code>issuer</code> solved cross-issuer routing but not within-issuer skew.</p>
+<p><strong>Clarification / Fix</strong>: Decide whether the workload can tolerate a finer-grained shard key, such as issuer plus time bucket, or whether the hot issuer deserves a dedicated shard. Do not split the key blindly if it would break the single-shard transaction boundary for <code>issuer_exposure</code>.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="039.html">039.md</a> still determines what happens after routing succeeds</h3>
+<p>The previous capstone chose the local engine, index structures, and isolation boundary inside one database node. This lesson does not replace that work. It decides which node gets to apply it. Distributed routing is therefore a multiplier on local design, not an alternative to it.</p>
+<h3>Connection 2: <a href="041.html">041.md</a> begins once the shard set is known</h3>
+<p>This lesson stops at target selection. The next lesson assumes the router has already chosen one shard or many and asks a different question: how do you run a distributed plan, exchange rows between workers, and merge partial results without letting the slowest shard dominate the whole query?</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] Vitess Documentation: Vindexes<ul>
+<li>Link: <a href="https://vitess.io/docs/reference/features/vindexes/">https://vitess.io/docs/reference/features/vindexes/</a></li>
+<li>Focus: How a production router turns keyspace IDs and lookup indexes into shard targeting decisions.</li>
+</ul>
+</li>
+<li>[DOC] MongoDB Manual: Shard Keys<ul>
+<li>Link: <a href="https://www.mongodb.com/docs/manual/core/sharding-shard-key/">https://www.mongodb.com/docs/manual/core/sharding-shard-key/</a></li>
+<li>Focus: Practical shard-key criteria, including cardinality, monotonicity, and hotspot risk.</li>
+</ul>
+</li>
+<li>[DOC] Citus Documentation: Choosing Distribution Columns<ul>
+<li>Link: <a href="https://docs.citusdata.com/en/stable/sharding/data_modeling.html">https://docs.citusdata.com/en/stable/sharding/data_modeling.html</a></li>
+<li>Focus: Why colocated tables and distribution-column choice determine whether queries stay single-shard.</li>
+</ul>
+</li>
+<li>[PAPER] F1 Query: Declarative Querying at Scale<ul>
+<li>Link: <a href="https://research.google/pubs/pub41344/">https://research.google/pubs/pub41344/</a></li>
+<li>Focus: How a distributed SQL layer uses placement and execution strategy to serve queries over sharded storage.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Shard targeting starts before execution</strong> - The router needs explicit ownership information from shard keys, lookup structures, or placement metadata before local indexes can help.</li>
+<li><strong>Query shape determines cluster cost</strong> - A shard-key predicate gives Harbor Point a local query on one shard; a missing shard key turns the same logical request into cluster-wide work.</li>
+<li><strong>Topology changes are routing events, not just storage events</strong> - Resharding and failover are safe only when route metadata is versioned, stale caches are expected, and retries are idempotent.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point's dashboard query stay cheap after sharding when it includes <code>WHERE issuer = 'MUNI-77'</code>?</strong></p>
+<ul>
+<li>A) Because every shard can evaluate the query independently and the router merges them later</li>
+<li>B) Because the router can map <code>issuer</code> to one owning shard before execution and let that shard's local index handle the rest</li>
+<li>C) Because the <code>status = 'open'</code> predicate automatically acts as a global shard key</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main trade-off of adding a lookup table for <code>reservation_id</code> routing?</strong></p>
+<ul>
+<li>A) It avoids all write amplification because lookups are read-only metadata</li>
+<li>B) It removes the need for placement metadata epochs</li>
+<li>C) It reduces broadcast lookups, but it creates another structure that must stay transactionally aligned with the base reservation row</li>
+</ul>
+</li>
+<li>
+<p><strong>Why should an old shard reject a write after ownership has moved to a new shard during resharding?</strong></p>
+<ul>
+<li>A) To force the router to refresh placement metadata and retry against the current owner instead of accepting writes on a stale route</li>
+<li>B) Because distributed databases never allow retries after topology changes</li>
+<li>C) Because only read queries are allowed during resharding</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The router can prove ownership from the shard key and hit one shard directly. Option A describes scatter-gather, which is more expensive. Option C confuses a local filter with a distribution key.</p>
+<p><strong>2. C</strong>: A lookup table can make point lookups precise, but it becomes part of the write path and can drift if not maintained correctly. Option A ignores the extra writes, and option B is false because resharding still changes placement metadata.</p>
+<p><strong>3. A</strong>: Rejecting stale-route writes protects ownership boundaries and lets the router recover by refreshing metadata. Option B is too absolute, and option C is false because resharding systems often continue serving traffic while ownership changes are rolled out.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="039.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Monthly Capstone: Pick Engine, Indexes, and Isolation</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="041.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Parallel Query Execution and Exchange Operators</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vectorized Execution and CPU Cache Efficiency - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Vectorized Execution and CPU Cache Efficiency</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 043 | Lesson ID: 444
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 444: Vectorized Execution and CPU Cache Efficiency</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Once a distributed plan has put the right rows on the right worker, the next bottleneck is usually CPU time spent materializing and branching over individual tuples. Vectorized execution changes the unit of work from one row at a time to cache-sized batches, so the executor spends more cycles doing useful comparisons and fewer cycles chasing pointers and missing cache lines.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="042.html">042.md</a>, Harbor Point's compliance query finally got a sensible join plan: <code>issuer_limits</code> was broadcast because it was small, and each worker kept its local shard of <code>reservations</code>. The team expected that fix to solve the latency problem. It did remove the big network shuffle, but the query still ran hot on CPU. Worker profiles showed millions of tiny function calls, branch-heavy predicate checks, and repeated tuple reconstruction just to discard most rows a few instructions later.</p>
+<p>That is where vectorized execution changes the picture. Instead of asking the executor to pull "the next row" through every operator, the engine processes a batch such as 1,024 values from <code>status</code>, <code>trading_day</code>, <code>issuer_id</code>, and <code>notional_usd</code> at once. The filter creates a selection vector saying which positions survived, the projection reads only the surviving positions, and the aggregate updates a small hash table in tight loops over contiguous memory. The important win is not "SIMD magic" by itself. The bigger win is that the CPU sees predictable loops over data that is already close together in memory.</p>
+<p>That corrects a common misconception. Vectorized execution is not just "the engine uses AVX instructions now." SIMD helps when the data and operators cooperate, but the architectural shift is broader: fewer virtual calls, less tuple materialization, better cache locality, and the option to defer wide or variable-length columns until the query actually needs them. A good distributed plan can still waste a core if the local executor treats every row like a separate object graph.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's morning exposure report scans tens of millions of open reservation rows, joins them to a small limit table, filters out inactive desks, and groups the survivors by issuer. By the time the plan reaches one worker, the interesting question is no longer "which node owns this row?" The question is "how many useful predicate checks and aggregate updates can this core finish before its cache and branch predictor become the bottleneck?"</p>
+<p>In a row-at-a-time executor, each operator repeatedly asks its child for one tuple, decodes fields, evaluates a predicate, constructs another tuple, and passes it onward. That design is simple and composable, but modern CPUs dislike it. The executor touches more memory than necessary, follows more pointers, and pays interpreter overhead on every row. When concurrency rises, those inefficiencies turn into tail-latency spikes because each query ties up a worker for longer.</p>
+<p>Vectorized execution makes the same query plan more cache-friendly. The filter can scan a compact batch of <code>status</code> values, produce a mask or selection vector, and avoid touching <code>comment_text</code> or other cold columns entirely. Aggregation can update hash table entries for a dense set of keys before the working set falls out of L1 or L2 cache. The result is not just better benchmark throughput. It is also more predictable CPU consumption, which matters directly for scheduler fairness, queueing, and the admission-control decisions in <a href="044.html">044.md</a>.</p>
+<p>The trade-offs are real. Batches that are too small throw away the locality benefit. Batches that are too large can hurt latency to first row, increase temporary memory pressure, and overflow caches instead of fitting inside them. Some operators, especially complex UDFs or highly irregular string processing, do not vectorize cleanly. Production engines succeed with vectorization only when they treat CPU caches, memory layout, and operator boundaries as first-class design constraints.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why row-at-a-time execution leaves CPU performance on the table</strong> - Describe how tuple materialization, pointer chasing, and branch-heavy loops waste cache bandwidth after data placement is already solved.</li>
+<li><strong>Trace the mechanics of a vectorized pipeline</strong> - Follow how batches, selection vectors, and late materialization move through a real query on a worker node.</li>
+<li><strong>Evaluate vectorization trade-offs in production</strong> - Judge when larger batches improve throughput, when they hurt latency or memory behavior, and why this matters for cluster-level workload governance.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The CPU does not experience a query plan as SQL, it experiences it as memory access patterns</h3>
+<p>Harbor Point's exposure query looks simple at the SQL layer: scan <code>reservations</code>, keep only today's open rows, join to <code>issuer_limits</code>, and sum <code>notional_usd</code> by issuer. On a worker, though, the CPU never sees SQL. It sees loads from memory, branches, hash lookups, and stores back into caches. That is why a row-at-a-time executor often disappoints even when the optimizer picked a good join strategy in the previous lesson.</p>
+<p>In the classic iterator model, every operator exposes a <code>next()</code> interface. The scan emits one tuple, the filter checks one tuple, the join probes one tuple, and the aggregate updates state for one tuple. That modularity is elegant, but it creates overhead at every row boundary. Each row may be wrapped in a tuple object or slot array, fields may be decoded repeatedly, and the CPU has fewer chances to predict branches because each predicate decision is isolated.</p>
+<p>CPU cache behavior is the hidden constraint. A cache line typically brings in 64 bytes at a time. If the executor stores a row as a mixed object containing hot fields, cold fields, pointers, and null metadata, fetching <code>status</code> may also drag unrelated bytes into cache. Worse, the next row may live somewhere else entirely. The worker spends time waiting on memory and reloading metadata instead of comparing values.</p>
+<p>Vectorized execution tries to keep the active working set inside cache by switching to small columnar batches:</p>
+<div class="codehilite"><pre><span></span><code>Batch 12 on worker-7
+
+issuer_id    [A12, A12, B04, C99, ...]
+status       [open, open, cxl, open, ...]
+trading_day  [2026-04-02, 2026-04-02, 2026-04-02, 2026-04-01, ...]
+notional_usd [5M, 2M, 1M, 8M, ...]
+positions    [0, 1, 2, 3, ... 1023]
+</code></pre></div>
+
+<p>Now the filter can run one tight loop over <code>status</code> and <code>trading_day</code>, mark surviving positions, and leave the rest of the columns untouched until needed. The CPU sees contiguous arrays instead of scattered row objects. Even without explicit SIMD code, that change often improves instruction cache use, data cache locality, and branch predictability enough to matter.</p>
+<h3>Concept 2: A vectorized pipeline moves batches, masks, and selection vectors instead of fully materialized rows</h3>
+<p>Return to Harbor Point's worker after the broadcast join from <a href="042.html">042.md</a>. The local executor receives batches from the <code>reservations</code> scan and a compact in-memory hash table built from <code>issuer_limits</code>. The first operator reads only the columns needed for the filter: <code>status</code>, <code>trading_day</code>, and perhaps <code>desk_state</code>. It produces a selection vector of the surviving positions:</p>
+<div class="codehilite"><pre><span></span><code>Input positions:      [0, 1, 2, 3, 4, 5, 6, 7]
+status == &quot;open&quot;:     [1, 1, 0, 1, 1, 0, 1, 1]
+trading_day == today: [1, 1, 1, 0, 1, 1, 1, 1]
+selection vector:     [0, 1, 4, 6, 7]
+</code></pre></div>
+
+<p>The next operator does not need to copy those surviving rows into a new table immediately. It can carry the selection vector forward and interpret "row 4 of this batch is live" without moving all the underlying values. That is one of the quiet advantages of vectorization: the engine can avoid materialization work until it reaches an operator that truly needs a compact output layout.</p>
+<p>Late materialization matters when a table has wide columns. Harbor Point stores free-form compliance notes alongside numeric facts. The report does not need those notes, so a vectorized scan can leave that varlen column on the side while filtering and grouping on narrow columns first. A row executor tends to pay more decoding cost up front because each tuple boundary encourages early assembly of a full logical row.</p>
+<p>The batch loop also gives the engine a natural place to use SIMD-friendly and branch-light code paths. Comparing 1,024 <code>status</code> values to the dictionary code for <code>"open"</code> is something compilers and handcrafted kernels can optimize well. The same is true for null checks via bitmaps and for arithmetic over packed numeric arrays. The executor does not need every operator to become heroic assembly; it needs enough of the hot path to operate over simple vectors.</p>
+<p>One simplified sketch looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">process_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">limits_hash_table</span><span class="p">,</span> <span class="n">today</span><span class="p">):</span>
+    <span class="n">selected</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">count</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">status</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">OPEN</span> <span class="ow">and</span> <span class="n">batch</span><span class="o">.</span><span class="n">trading_day</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">today</span><span class="p">:</span>
+            <span class="n">selected</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">selected</span><span class="p">:</span>
+        <span class="n">limit</span> <span class="o">=</span> <span class="n">limits_hash_table</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">limit</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">aggregate</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">batch</span><span class="o">.</span><span class="n">notional_usd</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">limit</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Real engines optimize this much further, but the structure is the key point: run the same operation over many adjacent values, then carry only the surviving positions to the next step.</p>
+<h3>Concept 3: Vectorization is a throughput strategy with clear failure modes, not a free speed button</h3>
+<p>Harbor Point's team could take the wrong lesson here and assume that "bigger batch equals faster query." In practice, vectorization is a negotiation with the memory hierarchy. A batch should be large enough to amortize function-call and interpretation overhead, but small enough that hot columns, hash tables, and selection vectors stay cache-resident. Engines therefore pick batch sizes such as a few hundred to a few thousand rows, then tune around operator behavior and data types.</p>
+<p>Selective filters create another trade-off. If only 2 out of 1,024 rows survive, carrying a sparse selection vector through many downstream operators can become inefficient. Some engines periodically compact the survivors into a new dense vector; others keep the indirection because copying would cost more than it saves. There is no universal answer. The right choice depends on selectivity, operator mix, and whether the next operator needs random access or streaming access.</p>
+<p>Variable-length data is the usual spoiler. Strings, JSON blobs, and nested structures break the illusion that every column is a neat fixed-width array. Engines respond with dictionary vectors, offset buffers, and separate varlen areas so they can still keep the hot control path compact. But once a query starts doing heavy string normalization or UDF calls on those values, the benefits of vectorization shrink because the workload becomes dominated by pointer chasing or opaque function calls again.</p>
+<p>The production consequence is broader than single-query speed. A well-vectorized engine can retire more rows per CPU second, which is excellent until too many such queries run at once and saturate shared caches or memory bandwidth. That is why the next lesson on <a href="044.html">044.md</a> matters. Admission control is not only about protecting disks or locks. It is also about preventing "efficient" vectorized scans from collectively destroying CPU locality for the whole cluster.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A query plan looks healthy, but worker CPU is high and instructions per cycle stay low.</p>
+<p><strong>Why it happens / is confusing</strong>: The optimizer solved data movement, but the local executor is still row-oriented or repeatedly materializing wide tuples. The cluster appears CPU-bound, yet the cores are mostly stalled on memory and branch mispredictions.</p>
+<p><strong>Clarification / Fix</strong>: Profile at the operator level. Look for tuple decoding, virtual dispatch, and cache-miss-heavy scans. Narrow the projected columns earlier, prefer late materialization where the engine supports it, and verify that hot operators are actually using vectorized kernels.</p>
+<p><strong>Issue</strong>: Enabling vectorization helps scan speed but hurts latency to first row.</p>
+<p><strong>Why it happens / is confusing</strong>: The engine now waits to fill a batch before pushing work forward, so startup latency can rise even while total CPU time falls.</p>
+<p><strong>Clarification / Fix</strong>: Distinguish throughput queries from interactive queries. Smaller batches or hybrid execution modes can improve first-row latency for dashboards, while larger batches remain appropriate for long analytical scans.</p>
+<p><strong>Issue</strong>: Highly selective filters still run slowly after vectorization.</p>
+<p><strong>Why it happens / is confusing</strong>: Sparse selection vectors, repeated compaction, or downstream operators that cannot handle indirection efficiently can eat the expected gains.</p>
+<p><strong>Clarification / Fix</strong>: Inspect where the batch stops being dense. If a selective predicate appears early, let the engine compact once before expensive downstream work, or restructure the plan so the highly selective filter runs before wide projections and joins.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="042.html">042.md</a> decides which rows arrive together; this lesson decides how efficiently a worker uses them</h3>
+<p>The previous lesson focused on exchange strategy: broadcast, repartition, or colocated join execution. Vectorized execution starts after that routing decision is made. It asks how the worker processes the rows it already owns without turning each tuple boundary into overhead.</p>
+<h3>Connection 2: <a href="044.html">044.md</a> turns local executor efficiency into a cluster policy problem</h3>
+<p>Once vectorized execution raises per-query throughput, the next operational question is how many such queries should run at once. Admission control and workload governance exist partly because CPU caches and memory bandwidth are shared resources, not isolated per query.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <em>MonetDB/X100: Hyper-Pipelining Query Execution</em> - Boncz, Zukowski, and Nes (CIDR 2005)<ul>
+<li>Link: <a href="https://www.cidrdb.org/cidr2005/papers/P19.pdf">https://www.cidrdb.org/cidr2005/papers/P19.pdf</a></li>
+<li>Focus: Read Sections 3 and 4 for the original argument that cache-conscious vectors outperform tuple-at-a-time interpretation on analytical workloads.</li>
+</ul>
+</li>
+<li>[DOC] DuckDB Documentation: Execution Format<ul>
+<li>Link: <a href="https://duckdb.org/docs/stable/internals/vector.html">https://duckdb.org/docs/stable/internals/vector.html</a></li>
+<li>Focus: See how a modern analytical engine represents flat, dictionary, and constant vectors while keeping batch processing explicit.</li>
+</ul>
+</li>
+<li>[DOC] Apache Arrow Columnar Format<ul>
+<li>Link: <a href="https://arrow.apache.org/docs/format/Columnar.html">https://arrow.apache.org/docs/format/Columnar.html</a></li>
+<li>Focus: Connect columnar memory layout, padding, and contiguous buffers to the cache-friendly execution patterns described in this lesson.</li>
+</ul>
+</li>
+<li>[DOC] Velox Documentation: Vectors<ul>
+<li>Link: <a href="https://facebookincubator.github.io/velox/develop/vectors.html">https://facebookincubator.github.io/velox/develop/vectors.html</a></li>
+<li>Focus: Study how dictionary vectors and encodings let a production execution engine avoid copying data while carrying selection-style indirection through operators.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A fast distributed plan can still be CPU-inefficient locally</strong> - Broadcast or repartition decisions only decide where rows meet; vectorization decides whether the worker burns cycles on useful comparisons or on row-by-row overhead.</li>
+<li><strong>Selection vectors and late materialization are as important as SIMD</strong> - The major win comes from avoiding unnecessary decoding and copying, not from treating "vectorized" as a synonym for one specific instruction set.</li>
+<li><strong>Vectorization changes capacity planning</strong> - Better per-core throughput is valuable, but it also makes shared CPU caches and memory bandwidth a cluster-level resource that admission control must protect.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can a well-chosen distributed join plan still produce disappointing CPU performance on each worker?</strong></p>
+<ul>
+<li>A) Because data placement solves network cost but does not remove tuple materialization, cache misses, and branch-heavy per-row execution inside the worker</li>
+<li>B) Because vectorized execution only matters for OLTP systems</li>
+<li>C) Because CPU cache behavior is irrelevant once a query is parallelized</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the primary purpose of a selection vector in a vectorized engine?</strong></p>
+<ul>
+<li>A) To permanently sort the batch before it reaches the next operator</li>
+<li>B) To record which positions in the current batch survived a filter so downstream operators can avoid copying full rows immediately</li>
+<li>C) To replace the hash table used by joins and aggregations</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does this lesson naturally lead into admission control and workload governance?</strong></p>
+<ul>
+<li>A) Because vectorized execution removes the need for workload policies</li>
+<li>B) Because vectorized scans are mainly a disk-protection mechanism</li>
+<li>C) Because faster local execution increases competition for shared CPU caches and memory bandwidth when many queries run concurrently</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The previous lesson can solve where rows meet without solving how the worker processes them. If the local executor still pays row-by-row overhead, CPU time is wasted even with a good join plan. Options B and C are false.</p>
+<p><strong>2. B</strong>: A selection vector carries the surviving positions forward so later operators can reuse the same batch storage instead of copying each live row into a new structure immediately. It does not sort the batch or replace join state.</p>
+<p><strong>3. C</strong>: Vectorization improves per-query efficiency, but shared caches and memory bandwidth remain finite. Workload governance is needed so many efficient scans do not collectively create cache thrash and queueing for the cluster.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="042.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Join Algorithms in Distributed Engines</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="044.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Admission Control and Workload Governance</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Caching & Performance Optimization - 10x Faster, 90% Cheaper - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Caching & Performance Optimization - 10x Faster, 90% Cheaper</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/rag-agents-and-llm-production.html">RAG, Agents, and LLM Production</a>
+        </p>
+        <p>
+          Sequence: 014 | Lesson ID: 334
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 334: Caching &amp; Performance Optimization - 10x Faster, 90% Cheaper</h1>
+<blockquote>
+<p><strong>The core idea</strong>: The cheapest LLM token is the one you never ask the model to process again. Production caching works when you separate immutable prompt work, slow-changing retrieval work, and live user state, then reuse only the layers whose correctness boundary is explicit.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>Yesterday's observability lesson ended with Elena's stolen-laptop incident and a trace that finally explained where the assistant was spending time. The surprising part was not the model's answer length. It was everything that happened before the first generated token: the assistant kept reloading the same incident-response instructions, the same tool schema, and the same device-policy excerpts for every analyst question in the same case.</p>
+<p>On Monday morning, three analysts ask variants of the same question: "Can the employee keep working until IT receives the laptop?", "Does policy require immediate session revocation?", and "What is the lost-device procedure for an encrypted MacBook?" The live facts are different per device, but the front half of the work is mostly identical. If the system recomputes that front half from scratch every time, latency and cost rise even though the product is not learning anything new.</p>
+<p>The key realization is that "cache the answer" is usually the wrong starting point. Final answers often depend on fresh device state, user identity, or the latest safety policy. The real win comes from caching the work that is truly shared: long static instructions, stable policy packs, repeated retrieval candidates, and occasionally exact non-personalized answers. Performance improves because the request stops being treated as brand-new from byte zero.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p>An internal security assistant is a good stress test for caching because it mixes two very different kinds of information. The lost-device policy, escalation playbook, and tool contract may stay stable for hours. The MDM record saying whether Elena's laptop is online, encrypted, or already wiped can change minute by minute. If you blur those layers together, you either waste money by recomputing stable context or create risk by serving stale conclusions as if they were live facts.</p>
+<p>That distinction matters most under bursty traffic. When a phishing wave or laptop-theft incident generates many similar questions, the assistant's common path dominates the bill: retrieval, prompt assembly, and model prefill happen over and over before any personalized reasoning begins. Good observability from <a href="013.html"><code>21/13.md</code></a> tells you where that repeated work lives. Good caching turns that visibility into a controlled speedup.</p>
+<p>It also sets up the next lesson. Once cached content is part of the runtime, every hit has to respect the same trust boundary as a fresh response. <a href="015.html"><code>21/15.md</code></a> will look at safety guardrails and content filtering, which still apply when an answer, prefix, or retrieved context came from cache instead of being generated anew.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you should be able to:</p>
+<ol>
+<li><strong>Distinguish cacheable layers inside an LLM application</strong> and explain what work each layer avoids in a real request path.</li>
+<li><strong>Design cache keys and invalidation rules that preserve correctness</strong> across policy versions, model versions, tenant boundaries, and live user state.</li>
+<li><strong>Combine caching with broader performance controls</strong> so the common path becomes cheap without making the miss path fragile or opaque.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Start by locating repeated work, not by picking a cache technology</h3>
+<p>In Elena's assistant, one request looks roughly like this:</p>
+<div class="codehilite"><pre><span></span><code>analyst question
+  -&gt; normalize / classify intent
+  -&gt; retrieve relevant policy chunks
+  -&gt; call live tools (MDM, session revocation, ticket state)
+  -&gt; assemble prompt
+  -&gt; prefill model on static prefix
+  -&gt; decode answer
+</code></pre></div>
+
+<p>That flow hides several different opportunities for reuse. An exact response cache can sometimes answer a public policy question immediately. A retrieval cache can reuse the ranked policy chunks for a normalized query when the corpus snapshot has not changed. An embedding cache can avoid recomputing vectors for identical texts. A prompt-prefix or KV cache can skip recomputing attention state for the long shared prefix made of system instructions, tool definitions, and stable policy text.</p>
+<p>Those layers are not interchangeable because they save different kinds of work. Response caching bypasses most of the request path. Retrieval caching saves upstream search and reranking effort. Prefix or KV caching saves model-side prefill on repeated prompt prefixes. If the trace from lesson 333 shows that most latency sits in retrieval and prefill, putting Redis in front of the final answer may do very little. The architecture decision has to match the measured hotspot.</p>
+<p>The recurring security-assistant scenario makes this concrete. "What is the lost-device policy for contractor laptops?" might be safe to answer from an exact cache if the policy pack version is unchanged and the question requires no live state. "Is Elena's laptop still encrypted right now?" is different. The policy explanation can be reused, but the final answer still depends on a fresh MDM lookup. One request is mostly shared context; the other has a thin but critical live layer.</p>
+<h3>Concept 2: Cache keys and invalidation rules are the real product contract</h3>
+<p>Caches do not fail because the lookup is slow. They fail because the hit was treated as valid when it should not have been. In practice, the cache key defines what the system claims is interchangeable.</p>
+<p>For Elena's assistant, that usually means different keys for different layers:</p>
+<ul>
+<li><strong>Exact response cache</strong>: normalized question + tenant + locale + policy version + authorization scope. Use only when no live tool result is required.</li>
+<li><strong>Retrieval cache</strong>: normalized query + corpus snapshot ID + reranker version. A new document ingest or reranker change should make the old candidate set irrelevant.</li>
+<li><strong>Embedding cache</strong>: text hash + embedding model version. If the embedding model changes, reuse is no longer guaranteed to be meaningful.</li>
+<li><strong>Prefix / KV cache</strong>: exact prompt bytes for the reusable prefix + model version. A single changed tool schema, policy paragraph, or system instruction creates a different prefix and therefore a different cached state.</li>
+</ul>
+<p>This is why TTL-only thinking is too weak for production correctness. Suppose the security team updates the lost-device playbook at 09:17 to require legal review before notifying a contractor. A ten-minute TTL still allows the old policy to keep circulating until 09:27. Versioned keys or explicit invalidation events are safer because they make the new policy cold-start immediately and old entries naturally miss. TTL is still useful for cleanup, but it should not be the main correctness mechanism for fast-changing contracts.</p>
+<p>Two other boundaries matter just as much. First, tenant and authorization scope belong in the key whenever cached material could reveal restricted information. Second, the model version belongs in any prefix cache because prompt tokenization, tool formatting, or serving behavior may differ across model updates. A cache hit is only correct when the serving conditions are equivalent, not merely similar.</p>
+<h3>Concept 3: Large wins come from shaping the common path, not from caching everything</h3>
+<p>The "10x faster, 90% cheaper" headline becomes plausible when a large share of traffic follows a narrow repeated path. In the security-assistant scenario, that common path might be dozens of analysts asking policy clarifications during the same incident burst. If the system can reuse the policy retrieval result, reuse the long static prompt prefix, and avoid the expensive model route for simple policy-only questions, the average request cost drops sharply even though the hardest requests still pay full price.</p>
+<p>That makes caching part of a broader runtime strategy. Exact caches help only when there is true repeat traffic. Prefix caches help only when the prompt is structured so static content comes first and dynamic fields come last. Retrieval caches help only when the corpus snapshot is explicit. For the remaining requests, you still need a well-designed slow path: live tool calls, fresh reasoning, bounded retries, and observability that explains misses rather than hiding them.</p>
+<p>The best production systems therefore optimize in layers. They make the common path cheap, keep the live path trustworthy, and measure both separately. Useful metrics are not just "cache hit rate." You also care about end-to-end latency by hit and miss, stale-hit incidents, invalidation lag after a policy update, and the fraction of traffic that still requires full live execution. Without those measurements, a cache can look healthy while silently bypassing new instructions or serving answers whose factual basis has expired.</p>
+<p>This is also where the next lesson naturally connects. Once a cache can replay prior outputs or prior context faster than the live path, safety rules have to travel with the cache key and invalidation plan. A harmful answer that is cheap to replay is more dangerous than one that is merely expensive.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: "We should cache the final answer whenever questions look similar."</p>
+<p><strong>Why it happens / is confusing</strong>: Similar wording feels like repeated intent, and repeated intent sounds like an obvious cache hit.</p>
+<p><strong>Clarification / Fix</strong>: Similar wording is not enough when the answer depends on live tool state, tenant scope, or recent policy changes. In Elena's assistant, a semantic or exact response cache is safest for stable policy FAQs, not for questions that depend on the current device record.</p>
+<p><strong>Issue</strong>: "A short TTL is basically the same as proper invalidation."</p>
+<p><strong>Why it happens / is confusing</strong>: TTL is easy to implement and creates the impression that staleness is bounded.</p>
+<p><strong>Clarification / Fix</strong>: TTL only bounds how long stale data can survive; it does not guarantee freshness after an urgent policy or safety update. Prefer versioned keys or event-driven invalidation for policy packs, retrieval snapshots, and guardrail changes, then use TTL as a cleanup mechanism.</p>
+<p><strong>Issue</strong>: "Prefix caching should just work automatically."</p>
+<p><strong>Why it happens / is confusing</strong>: Teams hear that provider-side caching is transparent and assume any long prompt will benefit.</p>
+<p><strong>Clarification / Fix</strong>: Prefix caches usually require exact repeated structure. If timestamps, request IDs, or user-specific fields appear early in the prompt, the shared prefix disappears. Put static instructions, tool definitions, and stable context first; append live fields at the end.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Prompt-prefix caching and database prepared statements</h3>
+<p>Both techniques separate stable structure from changing parameters. A prepared SQL statement reuses the parsed plan while new bind values supply the live parts. A prompt-prefix or KV cache does something similar for inference: it reuses the expensive prefill on the stable prefix, then processes only the request-specific tail. In Elena's assistant, the lost-device instructions and tool schema behave like the prepared portion, while the current device ID and MDM status are the runtime parameters.</p>
+<h3>Connection 2: Cache invalidation and configuration rollout safety</h3>
+<p>Policy caches behave a lot like distributed configuration. When the security team changes the contractor-notification rule, every region and every worker needs to stop trusting the old version quickly. The hard problem is not storing the cached value; it is making sure the new version becomes authoritative everywhere before analysts act on stale guidance. That is the same operational shape as a config rollout, a CDN purge, or a feature-flag update.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] Prompt caching - OpenAI<ul>
+<li>Link: <a href="https://platform.openai.com/docs/guides/prompt-caching/prompt-caching">https://platform.openai.com/docs/guides/prompt-caching/prompt-caching</a></li>
+<li>Focus: Exact prefix matching, prompt structuring, retention behavior, and the metrics that indicate whether provider-side prompt caching is actually helping.</li>
+</ul>
+</li>
+<li>[DOC] Prompt caching - Anthropic<ul>
+<li>Link: <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching</a></li>
+<li>Focus: Cache breakpoints, ordering of <code>tools</code>, <code>system</code>, and <code>messages</code>, and the practical limits that determine whether repeated prompts really hit.</li>
+</ul>
+</li>
+<li>[DOC] Automatic Prefix Caching - vLLM<ul>
+<li>Link: <a href="https://docs.vllm.ai/en/stable/design/prefix_caching/">https://docs.vllm.ai/en/stable/design/prefix_caching/</a></li>
+<li>Focus: How KV-cache blocks are identified, reused, and evicted inside an open-source serving stack, which makes the serving-side mechanics visible.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Caching starts with workload decomposition</strong> - You speed up LLM systems by reusing the right layer of work, not by assuming the whole answer is safely repeatable.</li>
+<li><strong>A cache key is a correctness claim</strong> - Policy version, tenant scope, model version, and live-state boundaries determine whether reuse is valid.</li>
+<li><strong>Common-path optimization is the real win</strong> - Large savings appear when repeated requests take a cheap path while the live miss path remains explicit, observable, and safe.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is a prefix or KV cache often safer than a final-answer cache for Elena's lost-device assistant?</strong></p>
+<ul>
+<li>A) Because prefix caching reuses static instructions and policy context while still forcing the system to fetch live device state before answering.</li>
+<li>B) Because prefix caching guarantees that the final answer will always be correct.</li>
+<li>C) Because provider caches automatically invalidate whenever a device record changes.</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the strongest reason to include policy version and tenant scope in cache keys?</strong></p>
+<ul>
+<li>A) They make the cache dictionary easier to debug, but they do not affect correctness.</li>
+<li>B) They prevent reuse across policy changes or organizational boundaries that should produce different outputs or context.</li>
+<li>C) They increase cache hit rate by grouping unrelated requests together.</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. A</strong>: Prefix or KV caching only reuses the stable front portion of the request. The assistant still has to run the live lookup and generate an answer using current device information, which is much safer than replaying an old final response.</p>
+<p><strong>2. B</strong>: Cache reuse is only correct when the same policy contract and organizational boundary still apply. If either changes, the old cached material may be stale or unauthorized even if the wording of the question looks similar.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="013.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>LLM Monitoring & Observability - Production Visibility</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="015.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Safety Guardrails & Content Filtering - Protecting Users and Brand</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/rag-agents-and-llm-production.html">← Back to RAG, Agents, and LLM Production</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

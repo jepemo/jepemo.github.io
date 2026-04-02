@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LSM Trees: Memtables, SSTables, and Flush - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>LSM Trees: Memtables, SSTables, and Flush</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 016 | Lesson ID: 393
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 393: LSM Trees: Memtables, SSTables, and Flush</h1>
+<blockquote>
+<p><strong>The core idea</strong>: An LSM tree keeps the foreground write path short by admitting updates into a sorted in-memory memtable and deferring on-disk reordering to flush and compaction, so the critical correctness boundary is the handoff from WAL to memtable to immutable SSTable.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="015.html">08.md</a>, Harbor Point's municipal-bond quote index paid for order immediately. Every insert that hit a full B-tree leaf risked a split, parent updates, and more latch pressure on the hot range. That works well when the main job is point lookup on a stable index, but Harbor Point also runs an audit store that must ingest every quote revision from every venue during market shocks. On a Federal Reserve announcement, that stream is dominated by writes, not by root-to-leaf page surgery.</p>
+<p>The LSM tree changes when sorting work happens. A new quote is first appended to the write-ahead log and inserted into a memtable, which is already ordered in memory. When that memtable fills, the engine freezes it, creates a fresh mutable memtable for new writes, and flushes the frozen snapshot into an immutable SSTable on disk. Each individual structure is sorted, but the store as a whole is only partially merged until later compaction.</p>
+<p>That is the mental shift that matters: an LSM tree does not eliminate maintenance; it reschedules maintenance. The foreground write path becomes cheap because it avoids rewriting deep page structure, while background flush and later compaction take on the cost of restoring durable sorted state. The next lesson on <a href="017.html">10.md</a> matters because once you accept that deferral, the central operational question becomes how much deferred work is accumulating.</p>
+<p>A common misconception is that LSM writes are "just append-only." They are append-friendly on the critical path, but they still depend on ordered in-memory state, version visibility rules, immutable sorted files, manifest updates, and crash-safe installation of new files. If any of those handoffs are wrong, fast writes merely produce durable corruption faster.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point uses its audit store for two jobs that do not tolerate guesswork. Compliance staff must be able to replay the exact quote history for a bond after the market closes, and production services must keep accepting bursts of quote updates without turning every spike into a page-split storm. An LSM tree is attractive here because the cost of "accept this write now" is mostly a log append plus an in-memory insert, not a structural rewrite of several on-disk pages.</p>
+<p>That operational benefit is easy to misread if you treat the engine as a black box. Seeing many small SSTables on disk can look like fragmentation when it is actually normal flush behavior. Seeing acknowledged writes survive a crash even though they never reached an SSTable can look mysterious until you remember WAL replay. Seeing read latency climb after an ingest burst can look like random I/O trouble when the real issue is that flushes created more overlapping files than the read path can cheaply consult.</p>
+<p>Once you understand memtables, SSTables, and flush, those symptoms become mechanically legible. You can tell whether the system is healthy but busy, briefly behind on background work, or approaching a real stall condition.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain the LSM admission path</strong> - Trace how a write moves through the WAL and mutable memtable before the client is acknowledged.</li>
+<li><strong>Describe flush mechanics precisely</strong> - Explain how a full memtable becomes an immutable SSTable without blocking all new writes.</li>
+<li><strong>Reason about production trade-offs</strong> - Connect flush backlog, read amplification, recovery behavior, and file growth to the design choices in an LSM engine.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The WAL and memtable form the write admission contract</h3>
+<p>When Harbor Point receives a new quote update for <code>CUSIP 13042AB7</code>, the storage engine does not start by searching for the correct disk page to rewrite. Instead, it assigns the update a sequence number, appends a record to the write-ahead log, and inserts the entry into the current mutable memtable. The memtable is usually implemented as an ordered in-memory structure such as a skip list or balanced tree, so new entries can be inserted quickly while still being readable in key order.</p>
+<p>The important invariant is not "the value exists somewhere in memory." It is that every acknowledged write has crossed a durability boundary and a visibility boundary. The durability boundary is the WAL append, because replaying the log after a crash can reconstruct the memtable state that had not yet reached disk. The visibility boundary is the memtable insert, because reads must be able to see the newest version before any flush happens. Many engines therefore treat the write as committed only after both steps are complete according to the configured sync policy.</p>
+<p>For Harbor Point, the sequence is intentionally short:</p>
+<div class="codehilite"><pre><span></span><code>client write
+   |
+   v
+append WAL record  ---&gt; durable recovery source
+   |
+   v
+insert into mutable memtable  ---&gt; newest visible version
+   |
+   v
+acknowledge write
+</code></pre></div>
+
+<p>This is why the foreground write path can stay smooth under bursty ingest. No parent pages are split, and no existing disk blocks are rewritten just to keep the key space ordered immediately. The trade-off is that the engine is accumulating future work. A larger memtable reduces how often that work is triggered, but it also increases peak flush time and the amount of WAL that may need to be replayed after a crash.</p>
+<h3>Concept 2: Flushing freezes one sorted snapshot and installs it as an SSTable</h3>
+<p>Eventually Harbor Point's mutable memtable reaches its configured size limit. At that point the engine does not stop taking writes and dump everything synchronously to disk. It marks the current memtable immutable, allocates a fresh mutable memtable, and lets new writes continue on the new structure while a background task drains the frozen one.</p>
+<p>Flush is possible because the immutable memtable is already sorted. The background worker can iterate it in key order and write an SSTable sequentially: data blocks first, then the block index and metadata, and finally the footer that lets the engine reopen the file later. The result is an immutable sorted-string table: a file whose entries are ordered by internal key and whose layout is optimized for sequential creation and block-based reads rather than in-place edits.</p>
+<p>One more correctness step matters before the file becomes part of the database state. The engine must make the SSTable durable and then install metadata that says, in effect, "this file now belongs to the current version of the store." In LevelDB- and RocksDB-style systems, that metadata lives in a manifest or version set. Only after the new file is durably referenced can the old WAL segment for that memtable be considered reclaimable. If the process crashes before the manifest update, recovery should ignore the half-installed file and rebuild state from the WAL instead.</p>
+<p>That ordering is what makes flush more than a background serialization job. It is a state transition from "this data exists as log plus memory" to "this data exists as a durable sorted run on disk." Larger flushes mean fewer files and better write efficiency, but they also create longer background tasks, more bytes to checkpoint into one file, and more risk of temporary stall if background bandwidth is insufficient.</p>
+<h3>Concept 3: Flush makes writes cheap now by making reads and background work harder later</h3>
+<p>Suppose Harbor Point asks for the latest quote history for <code>13042AB7</code> just after a burst. The newest version may still be in the mutable memtable. A slightly older version may sit in an immutable memtable waiting to flush. Older versions may already be in several SSTables created by previous flushes. The read path therefore has to search these structures in recency order and stop when it finds the newest visible version or tombstone for the key.</p>
+<p>This is the first major LSM trade-off. Each memtable and each SSTable is internally sorted, but the database is not yet globally consolidated after every write. Flush creates another sorted run; it does not eliminate overlap between runs. That deferred merge strategy is exactly why writes stay cheap, and it is exactly why read amplification appears if too many recent SSTables accumulate. The next lesson on <a href="017.html">10.md</a> takes that deferred-work problem head-on through compaction strategy.</p>
+<p>The same trade-off shows up in operations. If Harbor Point's flush thread keeps pace, the engine absorbs bursts gracefully and the write path remains short. If flush falls behind, immutable memtables pile up, level-0 files multiply, and the engine may throttle or stall foreground writes to keep the system recoverable. None of that is accidental behavior. An LSM engine is explicitly choosing to protect write throughput most of the time by accepting a more complex read path and a background-maintenance control problem.</p>
+<p>Seen from that angle, memtables and SSTables are not just data structures. They are a contract about where order exists right now, where recovery will rebuild it if the process dies, and where operational debt is being stored until the background pipeline catches up.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point sees bursty write latency even though memtable inserts are cheap and CPU usage is moderate.</p>
+<p><strong>Why it happens / is confusing</strong>: The foreground path is usually fast, so teams assume the problem cannot be inside the storage engine. In practice, stalls often come from the background side: too many immutable memtables, slow WAL syncs, or too many freshly flushed level-0 SSTables forcing write throttling.</p>
+<p><strong>Clarification / Fix</strong>: Inspect flush queue depth, pending bytes, WAL fsync latency, and write-stall counters together. A short write path is only sustainable when the background pipeline keeps consuming the work it creates.</p>
+<p><strong>Issue</strong>: After a crash, recently acknowledged quotes reappear even though no SSTable containing them had been flushed before the restart.</p>
+<p><strong>Why it happens / is confusing</strong>: Teams sometimes assume "durable" and "already present in an SSTable" mean the same thing. In an LSM engine, those are different milestones.</p>
+<p><strong>Clarification / Fix</strong>: Verify recovery by replaying the WAL into a rebuilt memtable. The flush boundary controls on-disk file creation, but the WAL controls whether acknowledged writes survive process failure.</p>
+<p><strong>Issue</strong>: Read latency rises after an ingest spike, especially for keys that were updated repeatedly.</p>
+<p><strong>Why it happens / is confusing</strong>: The write path looked healthy during the spike, so it is tempting to blame storage hardware later. Often the real cause is that the read path must consult more mutable state and more recently flushed SSTables before it finds the newest version.</p>
+<p><strong>Clarification / Fix</strong>: Measure memtable hit rate, number of immutable memtables, and level-0 file count. The symptom is usually deferred maintenance surfacing as read amplification, not random slowdown.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: LSM flush ↔ crash recovery protocol</h3>
+<p>An LSM flush plays the same role for sorted runs that page flushing plays in a page-oriented engine: it moves data from a transient in-memory form into a durable on-disk form. The recovery difference is that the unit of installation is an immutable file plus manifest metadata, not a rewritten page image. Systems like LevelDB, RocksDB, Bigtable tablets, and Cassandra SSTable-based storage all depend on that log-plus-install ordering.</p>
+<h3>Connection 2: LSM flush ↔ B-tree structural maintenance</h3>
+<p>Harbor Point's comparison between <a href="015.html">08.md</a> and this lesson is the core design fork. B-trees preserve global search order immediately and therefore pay maintenance on the foreground write path through page splits and merges. LSM trees preserve only local sortedness immediately and postpone global cleanup to flush and compaction. The same product requirement, "store every quote update durably," leads to very different latency profiles depending on where that maintenance cost is scheduled.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://research.google/pubs/pub27898/">Bigtable: A Distributed Storage System for Structured Data</a><ul>
+<li>Focus: Read the sections on memtables, SSTables, and minor compaction to see the classic production shape of the LSM write path.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/google/leveldb/blob/main/doc/impl.md">LevelDB Implementation Notes</a><ul>
+<li>Focus: Follow the concrete sequence from log write to memtable, immutable memtable, and version-set installation in a compact engine implementation.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Memtable">RocksDB Wiki: MemTable</a><ul>
+<li>Focus: Compare memtable implementations and notice how in-memory ordering choices affect insert cost, memory usage, and scan behavior.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Write-Stalls">RocksDB Wiki: Write Stalls</a><ul>
+<li>Focus: Connect flush debt and level-0 pressure to the real production symptoms that appear when background work stops keeping up.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>The first durable home of an LSM write is the WAL, not the SSTable</strong> - Flush changes the physical representation later, but recovery correctness starts at log append plus memtable visibility.</li>
+<li><strong>A memtable is already an ordered index, not a temporary bag of writes</strong> - The engine buys fast admission by keeping order in memory first and on disk second.</li>
+<li><strong>Flush is where deferred maintenance becomes durable state</strong> - It preserves write throughput in the short term while creating the read and compaction costs that the next lesson must manage.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can Harbor Point acknowledge an LSM write before any SSTable is created?</strong></p>
+<ul>
+<li>A) Because the WAL and memtable together already provide the required durability and visibility contract</li>
+<li>B) Because SSTables are optional in an LSM tree</li>
+<li>C) Because the engine silently converts every write into a B-tree page split later</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the key state transition during flush?</strong></p>
+<ul>
+<li>A) The engine merges all existing SSTables into one global file</li>
+<li>B) The engine rewrites hot disk pages in place to preserve full global sort order</li>
+<li>C) The engine turns one immutable memtable snapshot into a durable SSTable and installs metadata that makes the file part of the current store version</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can read latency rise after a write burst even if the write path looked healthy during the burst?</strong></p>
+<ul>
+<li>A) Because deferred maintenance leaves more mutable state and overlapping SSTables for reads to consult</li>
+<li>B) Because memtables stop preserving key order as soon as they become immutable</li>
+<li>C) Because an LSM tree guarantees identical read and write amplification at all times</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The foreground contract is satisfied once the write is durable in the WAL and visible in the memtable. SSTable creation is a later background state transition, not the initial commit boundary.</p>
+<p><strong>2. C</strong>: Flush serializes one frozen memtable into a new SSTable and then installs metadata that makes the file part of the active database version. It does not globally merge the database or rewrite disk pages in place.</p>
+<p><strong>3. A</strong>: The burst was cheap because work was deferred. Reads pay for that deferral until flush and later compaction reduce the number of places the engine must search for the newest version.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="015.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>B-Tree Insert, Split, and Merge Maintenance</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="017.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>LSM Compaction Strategies and Amplification</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

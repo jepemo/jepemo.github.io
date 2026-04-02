@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Raft Log Compaction and Snapshot Installation - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Raft Log Compaction and Snapshot Installation</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 041 | Lesson ID: 440
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 440: Raft Log Compaction and Snapshot Installation</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Raft can discard old log entries only after it has captured the replicated state machine at a specific <code>(lastIncludedIndex, lastIncludedTerm)</code>; snapshot installation is the protocol that lets a lagging follower rejoin from that proof point instead of replaying history the leader no longer stores.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="040.html">040.md</a>, Harbor Point replaced the suspected voter <code>ny-db-3</code> with learner <code>sg-db-1</code> for shard <code>184</code>. That solved the quorum problem, but it created a new one immediately: <code>sg-db-1</code> starts far behind the leader. If the leader had to replay every command ever committed for that shard, catch-up time would grow without bound and the log would become an accidental archive instead of a coordination structure.</p>
+<p>Raft's answer is not "throw old entries away when disk gets full." The safe answer is narrower. Once the state machine has durably captured the effects of a committed log prefix, the system can replace that prefix with a snapshot plus two pieces of log identity: the last included index and the term at that index. Those fields are what let the cluster keep its log-matching guarantees even after most of the old history has been compacted away.</p>
+<p>That is why snapshot installation is a consensus mechanism, not just a storage optimization. When <code>sg-db-1</code> asks for entries the leader no longer has, the leader is not sending a convenient backup. It is sending a compact proof of "the replicated state up through this exact log point." Once the learner accepts that proof, ordinary append replication can resume from the next index. In the next lesson, <a href="042.md">042.md</a>, that same mechanism will start to look different depending on where replicas live and which failure domains carry the snapshot traffic.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p>Harbor Point's Maryland leader <code>md-db-4</code> has committed entries through index <code>12880</code> for shard <code>184</code>. During the failure-handling sequence from the previous lesson, it already snapshotted the state machine through index <code>9240</code> and compacted away entries <code>1..9240</code>. When learner <code>sg-db-1</code> joins from an empty disk, it cannot ask for "the whole log" because that history no longer exists on the leader. If the only recovery path were replay, adding a new replica after a network incident would become slower every week the system stayed in service.</p>
+<p>The production risk cuts both ways. Without compaction, logs grow until restart time, disk cost, and recovery bandwidth become unacceptable. With sloppy compaction, a leader can discard entries that are still needed to prove ordering, followers can install stale state, and a returning node can re-enter the cluster with the wrong configuration epoch. The feature that keeps recovery bounded is also sitting directly on the consensus safety boundary.</p>
+<p>This is why mature Raft systems treat snapshots as part of normal operation rather than a once-in-a-while maintenance task. Snapshot cadence affects disk I/O, learner promotion time, leader bandwidth, and how much history a stalled follower can miss before it needs a full state transfer instead of ordinary replication.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what information a Raft snapshot must preserve</strong> - Show why compacting a prefix is safe only after the state machine and boundary metadata are durable.</li>
+<li><strong>Trace snapshot installation from leader to lagging follower</strong> - Follow how a learner moves from "missing old entries" to "ready for normal AppendEntries replication."</li>
+<li><strong>Evaluate production trade-offs around compaction policy</strong> - Reason about snapshot frequency, install cost, leader load, and failure recovery time in a real cluster.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Log compaction works only because the snapshot preserves the committed prefix's identity</h3>
+<p>Raft's log is both a command history and a proof structure. Harbor Point cannot just serialize the reservation shard's key-value state and delete the old prefix whenever it feels convenient, because the cluster still needs a way to agree on where the snapshot fits into the replicated history. That is why a real snapshot carries the application state plus metadata such as <code>lastIncludedIndex</code>, <code>lastIncludedTerm</code>, and the latest committed cluster configuration available at that point.</p>
+<p>For shard <code>184</code>, suppose <code>md-db-4</code> has applied entries through <code>9240</code> to the state machine and written a durable snapshot for that exact prefix. Only then may it compact away entries <code>1..9240</code>. The snapshot is saying: "Everything these commands would have produced is now encoded here, and the last command represented by this snapshot came from index <code>9240</code> in term <code>318</code>." That boundary matters because later log entries still have to attach to a known, agreed-upon prefix.</p>
+<div class="codehilite"><pre><span></span><code>before compaction
+log: [1 ........................................ 9240][9241 .......... 12880]
+
+after compaction
+snapshot: state@9240, lastIncludedTerm=318, config_epoch=84
+log:                         [9241 .............. 12880]
+</code></pre></div>
+
+<p>If the leader crashed after deleting the prefix but before the snapshot became durable, it would have destroyed committed history. If the snapshot omitted the last included term, a follower could not safely verify continuity at the truncation boundary. The invariant is strict: compaction is safe only when the discarded log prefix has been replaced by an equally durable and uniquely identified snapshot boundary.</p>
+<p>The trade-off is operational, not conceptual. Frequent snapshots keep replay windows short and make recovery cheaper, but they spend disk bandwidth and can stall foreground work if snapshot generation contends with writes. Infrequent snapshots are cheaper in the steady state, but they allow the retained log to grow and increase the chance that a recovering replica must replay an enormous tail before it becomes useful.</p>
+<h3>Concept 2: Snapshot installation is the fallback replication path for followers that are too far behind</h3>
+<p>After <code>sg-db-1</code> joins as a learner, the leader initially tries ordinary log replication. In Raft terms, it starts with a <code>nextIndex</code> for that follower and attempts to send <code>AppendEntries</code>. The problem is that <code>sg-db-1</code> needs entries earlier than <code>9241</code>, while the leader's compacted log now begins at <code>9241</code>. At that point the leader has no sequence of retained entries that can bridge the gap, so it switches from append replication to <code>InstallSnapshot</code>.</p>
+<p>The mechanism is deliberately careful. The leader streams the snapshot in chunks so it does not need one giant RPC, and each chunk is tied to the leader's current term and the snapshot boundary. The follower writes those chunks to temporary durable storage rather than exposing partially received state to the running state machine. Only after the final chunk arrives and term checks still succeed does the follower atomically install the snapshot, update its local snapshot metadata, and move its durable state forward.</p>
+<p>Harbor Point's flow looks like this:</p>
+<div class="codehilite"><pre><span></span><code>1. sg-db-1 joins shard 184 as learner in configuration epoch 84
+2. md-db-4 tries AppendEntries starting below 9241
+3. md-db-4 detects that requested entries were compacted
+4. md-db-4 sends InstallSnapshot for state through index 9240, term 318
+5. sg-db-1 persists snapshot, installs it atomically, records epoch 84
+6. md-db-4 sets nextIndex for sg-db-1 to 9241
+7. ordinary AppendEntries resumes for 9241..12880 and beyond
+</code></pre></div>
+
+<p>One subtle rule is easy to miss. If the follower already has a log entry at <code>lastIncludedIndex</code> whose term matches the snapshot's <code>lastIncludedTerm</code>, it may keep any later suffix that follows that entry. If not, it must discard the conflicting log and trust the snapshot as the new base. That is how Raft preserves log matching even when the follower arrives with stale or divergent local history.</p>
+<p>This is also where the previous lesson's membership story meets actual bytes on disk. <code>sg-db-1</code> cannot be promoted safely just because a new configuration was committed. It becomes a useful future voter only after snapshot installation plus trailing-log catch-up put it on the same committed state as the rest of the group.</p>
+<h3>Concept 3: Production snapshot policy is a balance between recovery speed and foreground cost</h3>
+<p>Harbor Point wants learner catch-up to be quick during trading hours, but it cannot afford for every snapshot to freeze the leader's storage engine. That forces a policy decision: how much retained log should the cluster keep, how often should each replica snapshot, and how much bandwidth may snapshot installation consume before it starts harming live traffic?</p>
+<p>Too-aggressive compaction creates its own pathology. If the leader snapshots every few seconds and trims the log immediately, a slow learner may repeatedly fall behind the compaction horizon and get forced into another full snapshot transfer instead of cheaper incremental appends. Too-conservative compaction pushes the pain elsewhere: restart time grows, snapshot restores take longer because the remaining tail is larger, and disk pressure can turn routine recovery into an emergency.</p>
+<p>Good implementations separate snapshot creation from the critical write path as much as possible. Storage engines often use copy-on-write checkpoints, background file copying, or throttled chunk streaming so that snapshot work does not monopolize the same I/O queues that commit latency depends on. The system still needs observability to know whether the policy is working. For Harbor Point, the useful signals are "applied index minus snapshot index," snapshot build duration, install throughput per follower, compaction pause time, and how often a recovering node needs a full snapshot instead of the log tail alone.</p>
+<p>This is where the lesson starts leaning toward <a href="042.md">042.md</a>. Once you understand the local mechanism, the next question is placement: if the only up-to-date leader for shard <code>184</code> is in Maryland and the replacement learner is in Singapore, the snapshot path now crosses an ocean. Replication topology and failure domains determine whether that recovery traffic is merely expensive or whether it shares the same weak links that caused the recovery in the first place.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: A learner never finishes catching up and keeps receiving full snapshots.</p>
+<ul>
+<li><strong>Why it happens</strong>: Compaction is moving the retention boundary faster than the learner can apply the trailing log, so every retry lands behind the snapshot horizon again.</li>
+<li><strong>Clarification / Fix</strong>: Slow the compaction policy, throttle leader-side snapshot fan-out less aggressively, or give the learner enough bandwidth and I/O budget to consume the trailing log before the next compaction cycle.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Leader commit latency spikes whenever a snapshot is created.</p>
+<ul>
+<li><strong>Why it happens</strong>: Snapshot generation is contending with foreground fsyncs, page cache, or storage-engine compaction on the same hot path as live writes.</li>
+<li><strong>Clarification / Fix</strong>: Build snapshots from a stable checkpoint or copy-on-write view, run transfer work on background limits, and measure snapshot pause time separately from ordinary append latency.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: A returning node installs a snapshot but still behaves as if it belongs to the old cluster configuration.</p>
+<ul>
+<li><strong>Why it happens</strong>: The node restored application state without restoring or enforcing the membership metadata that was committed at the snapshot boundary.</li>
+<li><strong>Clarification / Fix</strong>: Persist configuration state with the snapshot, fence all RPCs and client routing by current term and configuration epoch, and treat snapshot restore as both data recovery and consensus-state recovery.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="040.html">040.md</a> committed the safe membership change; this lesson explains how the new member actually becomes current</h3>
+<p>The previous lesson established that Harbor Point could not promote <code>sg-db-1</code> until the cluster committed a new configuration. This lesson fills in the missing operational step: safe reconfiguration still needs a bounded, durable way to transfer the committed state to the replacement member.</p>
+<h3>Connection 2: <a href="042.md">042.md</a> turns snapshot traffic into a topology question</h3>
+<p>Snapshot installation is the same protocol whether the learner is one rack away or on another continent, but its cost profile is not the same. The next lesson uses that fact to compare replication layouts by blast radius, recovery bandwidth, and which failure domains the catch-up path depends on.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Extended Version)</a><ul>
+<li>Focus: Read Section 7 on log compaction and the <code>InstallSnapshot</code> RPC details; notice how <code>lastIncludedIndex</code> and <code>lastIncludedTerm</code> preserve log identity after truncation.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.6/op-guide/runtime-reconf-design/">Runtime Reconfiguration Design</a><ul>
+<li>Focus: Connect the learner-promotion workflow from the previous lesson with the catch-up cost that snapshot installation is meant to bound.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/op-guide/recovery/">Disaster recovery</a><ul>
+<li>Focus: Pay attention to snapshot restore semantics and why old member identity and cluster metadata cannot be reused casually after recovery.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/manage/scale">Recommendations for operating Consul servers at scale</a><ul>
+<li>Focus: Look for how a production Raft system talks about snapshot transfer, log retention, and the cost of bringing a new server into sync.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A snapshot replaces history only when it preserves the exact boundary of that history</strong> - <code>lastIncludedIndex</code> and <code>lastIncludedTerm</code> are what make truncation safe rather than approximate.</li>
+<li><strong>InstallSnapshot is a replication protocol, not a backup convenience</strong> - It is the mechanism that lets a lagging follower re-enter the log at a known committed point.</li>
+<li><strong>Compaction policy is a recovery policy</strong> - Every choice about snapshot cadence and retention changes how expensive failover, replacement, and long-tail lag will be in production.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can't <code>md-db-4</code> simply delete entries <code>1..9240</code> after applying them to the state machine?</strong></p>
+<ul>
+<li>A) Because Raft requires every historical log entry to remain forever on the leader</li>
+<li>B) Because the prefix can be removed only after a durable snapshot preserves both the resulting state and the boundary metadata that identifies that prefix</li>
+<li>C) Because learners are never allowed to catch up from snapshots</li>
+</ul>
+</li>
+<li>
+<p><strong>What does <code>InstallSnapshot</code> accomplish for learner <code>sg-db-1</code>?</strong></p>
+<ul>
+<li>A) It gives the learner a durable state-machine image through a known log boundary so append replication can continue from the next index</li>
+<li>B) It lets the learner vote immediately without any further replication</li>
+<li>C) It allows the leader to skip term checks during recovery</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main downside of snapshotting too aggressively in production?</strong></p>
+<ul>
+<li>A) The cluster stops needing normal log replication</li>
+<li>B) Snapshot work can consume I/O and network budget, and slow followers may repeatedly fall behind the compaction horizon instead of catching up incrementally</li>
+<li>C) Followers can no longer validate configuration epochs</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Applying commands is not enough by itself. The cluster also needs a durable snapshot boundary so later replicas can prove where the compacted prefix ended and how the remaining log attaches to it.</p>
+<p><strong>2. A</strong>: Snapshot installation advances the learner to a known committed state through index <code>9240</code>; only then can ordinary append replication continue from <code>9241</code> onward.</p>
+<p><strong>3. B</strong>: Frequent snapshots shrink retained history, but they also cost storage and bandwidth. If the policy is too aggressive, recovery traffic becomes more expensive and slow replicas may get forced into repeated full snapshot transfers.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="040.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Failure Detectors and Membership Changes</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

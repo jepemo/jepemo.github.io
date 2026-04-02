@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Systems of Record vs Derived Data - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Systems of Record vs Derived Data</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+        </p>
+        <p>
+          Sequence: 014 | Lesson ID: 462
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 462: Systems of Record vs Derived Data</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A system of record is the place where the business is allowed to decide what happened; derived data exists to make that decision searchable, analyzable, or faster to consume without acquiring the right to redefine it.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="013.html">Polyglot Persistence and Data Integration</a>, <code>PayLedger</code> split one workload across PostgreSQL, Elasticsearch, and a warehouse because each store serves a different access pattern. That lesson answered the "why do we have multiple stores?" question. This lesson answers the more dangerous follow-up: when those stores disagree, which one is allowed to settle the argument?</p>
+<p>The distinction matters because real incidents rarely begin with a database engine crash. They begin when a support agent sees <code>processing</code> in search while the settlement service already committed <code>settled</code> in PostgreSQL, or when finance notices a warehouse dashboard that still reflects an older fee calculation after a replay. The operational pain is not merely "lag exists." The pain is that teams often have not defined whether the stale copy is an inconvenience, a bug, or a reason to stop a business workflow.</p>
+<p>For <code>PayLedger</code>, the recurring rule is simple but non-negotiable: payout state transitions become authoritative only when they commit in PostgreSQL. Elasticsearch may expose those states faster to human operators, and the warehouse may aggregate them better for finance, but neither store gets to invent or override settlement truth. Once that line is explicit, the architecture becomes easier to reason about. Without it, every projection quietly becomes a second decision-maker.</p>
+<h2>Why This Matters</h2>
+<p>Production systems accumulate copies of the same facts for good reasons. Search indexes exist because support needs fast filtering. Warehouses exist because analysts need long scans and aggregations. Caches exist because hot reads should not hit the transactional database for every page load. None of those copies are inherently dangerous. They become dangerous when a product flow starts acting on them as if they were all equally authoritative.</p>
+<p><code>PayLedger</code> feels this most sharply during payroll settlement cutoffs. A payroll coordinator approves a batch, support investigates failed transfers, and finance prepares end-of-day reporting from the same underlying payouts. If the UI, background jobs, and reporting stack all assume their local copy is "the truth," disagreements turn into duplicate retries, inconsistent customer messaging, or manual spreadsheet reconciliation. That is exactly how derived data leaks back into the write path and corrupts the system the team thought it was merely observing.</p>
+<p>The practical shift is from "where can I read this fact?" to "where is this fact decided, and what are other stores allowed to do with it?" Once that question is answered, freshness budgets, repair workflows, and user-facing disclaimers become engineering details instead of philosophical debates.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what makes a store authoritative</strong> - Distinguish between the system that commits business state and the stores that only project it.</li>
+<li><strong>Analyze how derived data is built and repaired</strong> - Trace how search, analytics, and cache views inherit lag, replay behavior, and reconciliation rules.</li>
+<li><strong>Apply authority boundaries to product workflows</strong> - Decide which reads can use projections and which actions must confirm against the system of record.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A system of record is defined by mutation rights and business accountability</h3>
+<p>In <code>PayLedger</code>, a payout moves through <code>draft</code>, <code>approved</code>, <code>processing</code>, and <code>settled</code>. Those transitions affect real money movement, audit trails, and customer commitments, so the team cannot let any component update them casually. PostgreSQL is the system of record not because relational databases are morally superior, but because that is where the platform accepts the authoritative write, enforces constraints, and stores the audit trail that other services trust.</p>
+<p>That authority has three operational consequences. First, writes that change payout truth must pass through the source system's validation rules, transaction boundary, and concurrency controls. Second, identifiers and versions created there become the canonical handles that every derived store must carry forward. Third, when a disagreement appears, the platform resolves it by consulting the authoritative store rather than averaging across copies or trusting whichever surface updated last.</p>
+<p>This is why "system of record" is not just a naming convention. If support changes payout status directly in Elasticsearch to make a dashboard look fresh, Elasticsearch is no longer a projection; it is now a second write authority with no proper transaction model for the business workflow. If analysts patch warehouse rows manually to fix a report without reconciling the source record, the warehouse starts to drift from the business ledger it is supposed to explain.</p>
+<p>The easiest mental test is to ask, "If auditors or downstream automation challenge this fact tomorrow, which store is allowed to defend it?" In <code>PayLedger</code>, the answer for payout state, transfer references, and approval history is PostgreSQL. That answer drives design decisions everywhere else.</p>
+<h3>Concept 2: Derived data is a projection with an explicit freshness and rebuild contract</h3>
+<p>Once PostgreSQL commits a payout update, <code>PayLedger</code> publishes a durable change stream. Elasticsearch consumes that stream to power operational search. The warehouse consumes it to build daily and monthly finance models. A Redis cache may materialize the most recent payout summaries for dashboard speed. All three are derived data because they exist downstream of the authoritative write and can, in principle, be rebuilt from the source plus retained history.</p>
+<p>The mechanism matters more than the label:</p>
+<div class="codehilite"><pre><span></span><code>authoritative transaction
+        |
+        v
+  source tables + outbox
+        |
+        v
+   CDC / event stream
+     /      |       \
+    v       v        v
+search   warehouse   cache
+</code></pre></div>
+
+<p>Each projection chooses a different trade-off. Search favors inverted indexes and near-real-time refresh. The warehouse favors append-heavy ingestion and wide scans. The cache favors latency over durability. What they share is a lack of final authority. Their job is to improve access, not to redefine the state they represent.</p>
+<p>That has two implications that teams often skip. First, every derived store needs an explicit freshness promise. Search might lag by seconds, warehouse models by minutes or hours, cache entries until invalidation or TTL expiry. Second, every derived store needs a rebuild story. If an index mapping changes, <code>PayLedger</code> should be able to reindex from the event log or source snapshot. If a warehouse transformation is wrong, finance should rerun the model from durable inputs instead of hand-editing output tables.</p>
+<p>This is where the previous lesson's integration architecture becomes concrete. Polyglot persistence tells you why multiple stores exist. The systems-of-record distinction tells you which of those stores are safe to delete and recompute, and which one must never be treated as disposable.</p>
+<h3>Concept 3: When source and projection disagree, product behavior must follow authority boundaries</h3>
+<p>The hardest part is not stating the rule. The hardest part is enforcing it in user-facing workflows. Suppose a support agent searches for payout <code>po_98421</code> and sees status <code>processing</code> in Elasticsearch, but the payout detail page fetched from PostgreSQL shows <code>settled</code>. If the support tool lets the agent retry the transfer directly from the search result, the product has turned a stale projection into an action surface. That is how "read model lag" becomes a duplicate-payment incident.</p>
+<p><code>PayLedger</code> solves this by separating browse paths from decision paths. Search results are good enough to narrow a case quickly, but any irreversible action such as retrying a settlement, refunding a fee, or escalating a compliance hold must confirm against PostgreSQL before execution. Finance dashboards can rely on warehouse models for trends, but end-of-period close procedures run completeness checks against source exports before numbers become official. Derived systems remain useful, but only within the authority envelope they were designed for.</p>
+<p>This also changes observability. The team does not just monitor API latency and database CPU. It monitors projection lag, version skew, reconciliation mismatches, and the number of workflows that had to fall back to the source of record because projections were stale. Those signals reveal whether derived data is behaving like a helpful read model or drifting toward an ungoverned second truth.</p>
+<p>The next lesson, <a href="015.html">Storage Engines: Log-Structured vs Page-Oriented</a>, goes down one layer and asks why different databases behave so differently once you assign them authoritative or derived roles. That question matters because engine internals shape write amplification, scan efficiency, compaction, and therefore which system is a good home for record-keeping versus projection-heavy workloads.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Support sees one payout status in search and a different status on the detail page.</p>
+<p><strong>Why it happens / is confusing</strong>: Elasticsearch is a derived near-real-time projection, not the authoritative write path. Refresh delay, consumer lag, or a temporarily failed projector can leave search behind even when PostgreSQL is already correct.</p>
+<p><strong>Clarification / Fix</strong>: Treat search as a discovery surface. When a workflow is about to trigger a business action, re-read the payout from the system of record and expose projection lag metrics so operators can tell staleness from source corruption.</p>
+<p><strong>Issue</strong>: Finance totals change after a warehouse backfill, and stakeholders assume the warehouse is unreliable.</p>
+<p><strong>Why it happens / is confusing</strong>: Warehouse tables often contain derived models rather than immutable source facts. A corrected transformation, late-arriving event, or replay can legitimately change a report even when the source ledger was always correct.</p>
+<p><strong>Clarification / Fix</strong>: Separate raw landed facts from transformed reporting tables, document the acceptable revision window, and keep a reproducible rebuild path so changes are explainable instead of mysterious.</p>
+<p><strong>Issue</strong>: Teams start adding "temporary" direct writes into a cache or search index to reduce user-visible lag.</p>
+<p><strong>Why it happens / is confusing</strong>: The stale read is visible, while the authority boundary is abstract. Under pressure, engineers optimize for local freshness and quietly create an unsupported second mutation path.</p>
+<p><strong>Clarification / Fix</strong>: Keep mutation rights exclusive to the system of record. If freshness targets are too loose, improve projection latency, invalidation design, or UI messaging rather than bypassing the authoritative commit path.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="013.html">Polyglot Persistence and Data Integration</a> explains why multiple stores exist; this lesson explains how they stay governable</h3>
+<p>The previous lesson introduced specialized stores and replayable change propagation. This lesson adds the decision rule that keeps that topology safe: only one store gets to own business truth for a given fact, and every projection must be understood as a consumer of that truth rather than a peer.</p>
+<h3>Connection 2: CQRS and materialized views formalize the same split between command authority and read optimization</h3>
+<p>Command Query Responsibility Segregation is often over-marketed, but its useful core is exactly the distinction in this lesson. Commands mutate the authoritative model; queries often hit denormalized or asynchronously updated views. Systems like event-sourced ledgers, Elasticsearch-backed support consoles, and warehouse-fed BI stacks all depend on that separation being explicit rather than implied.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Chapters on data models, derived data, and stream-based materialization provide the conceptual frame for source systems, projections, and rebuildability.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html">Debezium Outbox Event Router</a><ul>
+<li>Focus: A concrete pattern for emitting committed source-of-record changes into downstream pipelines without reintroducing dual writes.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html">Near real-time search</a><ul>
+<li>Focus: Why search projections are usually fresh within seconds rather than transactionally current at the instant of source commit.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://martinfowler.com/bliki/CQRS.html">CQRS</a><ul>
+<li>Focus: The architectural split between write authority and read-optimized models, including when the complexity is justified.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Authority is a property of who may decide and mutate a fact</strong> - A system of record is the store that can defend the business state under audit, retries, and conflicting copies.</li>
+<li><strong>Derived data exists to optimize access, not to redefine truth</strong> - Search indexes, caches, and warehouses are valuable precisely because they can lag, replay, and rebuild without becoming the canonical write path.</li>
+<li><strong>User workflows must respect the same boundary the storage design does</strong> - Irreversible actions should confirm against the authoritative source even when browsing and analytics run on projections.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Which condition most clearly makes PostgreSQL the system of record for <code>PayLedger</code> payout state?</strong></p>
+<ul>
+<li>A) It answers support searches faster than Elasticsearch</li>
+<li>B) It is the place where payout transitions are validated, committed, and audited</li>
+<li>C) It stores more rows than the warehouse</li>
+</ul>
+</li>
+<li>
+<p><strong>Why is a warehouse table usually considered derived data in this lesson's model?</strong></p>
+<ul>
+<li>A) Because it is downstream of the authoritative commit and can be rebuilt from durable source inputs</li>
+<li>B) Because warehouses are not allowed to store historical records</li>
+<li>C) Because analysts never use warehouse data for important decisions</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the safest product behavior when a search result and the source ledger disagree about payout status?</strong></p>
+<ul>
+<li>A) Trust the search result because it is optimized for user experience</li>
+<li>B) Merge both values and show whichever seems most recent</li>
+<li>C) Confirm against the system of record before taking any irreversible action</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: A system of record is defined by authoritative mutation and accountability, not by query speed or raw size. PostgreSQL owns the commit boundary and audit trail for payout state.</p>
+<p><strong>2. A</strong>: The warehouse is useful because it reshapes data for analytics, but it remains downstream of the authoritative event or table state and should be reproducible from durable inputs.</p>
+<p><strong>3. C</strong>: Search is a projection that may lag. Any action that changes money movement, customer state, or compliance posture should consult the authoritative ledger before execution.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="013.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Polyglot Persistence and Data Integration</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="015.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Storage Engines: Log-Structured vs Page-Oriented</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

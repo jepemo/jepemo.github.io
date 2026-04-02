@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Consistent Hashing & Distributed Cache Coordination - Ring Algorithm - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Consistent Hashing & Distributed Cache Coordination - Ring Algorithm</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a>
+        </p>
+        <p>
+          Sequence: 019 | Lesson ID: 247
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 247: Consistent Hashing &amp; Distributed Cache Coordination - Ring Algorithm</h1>
+<blockquote>
+<p><strong>Consistent hashing matters because adding one cache node should not feel like invalidating the whole fleet.</strong></p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><strong>The insight</strong>: The hard part of a distributed cache is not only storing objects on several machines. It is keeping routing stable when the fleet changes. Consistent hashing is the classic answer because it minimizes how many keys must move when nodes join or leave.</p>
+<p><strong>Why this matters</strong>: A naive hash like <code>hash(key) % N</code> looks fine until <code>N</code> changes. Then almost every key remaps, which behaves like a giant fleet-wide cache miss event. In production, that means origin overload, warmup storms, and bad tail latency exactly when the system is already changing shape.</p>
+<p><strong>The universal pattern</strong>: stable routing under changing membership -&gt; minimize remapping -&gt; reduce avoidable misses and warmup cost.</p>
+<p><strong>Concrete anchor</strong>: Imagine a Redis-backed cache fleet with 20 nodes. If one node is added during a traffic increase, you want only a slice of keys to move, not 95% of the hot set.</p>
+<p><strong>How to recognize when this applies</strong>:</p>
+<ul>
+<li>The cache tier has more than one node.</li>
+<li>Fleet size changes over time because of scaling, failure, or maintenance.</li>
+<li>Cache misses caused by routing instability would be expensive to refill.</li>
+</ul>
+<p><strong>Common misconceptions</strong>:</p>
+<ul>
+<li>[INCORRECT] "Consistent hashing balances everything automatically."</li>
+<li>[INCORRECT] "If only a few keys move, the distributed cache problem is solved."</li>
+<li>[CORRECT] <strong>The truth</strong>: Consistent hashing mainly stabilizes key placement. Load skew, hot keys, replication, and membership agreement are still separate problems.</li>
+</ul>
+<p><strong>Real-world examples</strong>:</p>
+<ol>
+<li><strong>Memcached/Redis client sharding</strong>: Stable key placement prevents the cache tier from thrashing on resize.</li>
+<li><strong>Storage and partitioned systems</strong>: The same pattern appears anywhere ownership of keys must survive membership changes gracefully.</li>
+</ol>
+<hr />
+<h2>Why This Matters</h2>
+<p><strong>The problem</strong>: A distributed cache only helps if the right request reaches the same node often enough for reuse to matter. If node changes reshuffle too many keys, the cache pays refill cost instead of delivering locality.</p>
+<p><strong>Before</strong>:</p>
+<ul>
+<li>Routing is tied directly to node count.</li>
+<li>Scaling events trigger widespread cold misses.</li>
+<li>Cache warmup behaves like an outage multiplier.</li>
+</ul>
+<p><strong>After</strong>:</p>
+<ul>
+<li>Fleet changes move only a fraction of keys.</li>
+<li>Existing warm nodes keep serving most of their previous keyspace.</li>
+<li>Rebalancing becomes incremental instead of catastrophic.</li>
+</ul>
+<p><strong>Real-world impact</strong>: Consistent hashing protects cache hit rate during autoscaling, failure recovery, and maintenance. It reduces origin spikes and makes distributed caching behave more like one stable system instead of a constantly reshuffled set of boxes.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why consistent hashing exists</strong> - Connect fleet membership changes to cache miss amplification.</li>
+<li><strong>Describe how ring-based placement works</strong> - Use hash space, clockwise ownership, and virtual nodes to reason about routing.</li>
+<li><strong>Evaluate practical trade-offs</strong> - Recognize what consistent hashing solves well and what coordination problems it does not solve by itself.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Naive Hashing Fails Because Membership Changes Remap Almost Everything</h3>
+<p>Suppose a distributed cache has <code>N</code> nodes and routes keys like this:</p>
+<div class="codehilite"><pre><span></span><code>owner = hash(key) % N
+</code></pre></div>
+
+<p>This looks simple and balanced while <code>N</code> stays fixed. But if one node is added or removed, the modulo changes for almost every key.</p>
+<p>That means:</p>
+<ul>
+<li>most keys now point somewhere else</li>
+<li>the old node's warm data is no longer useful for those requests</li>
+<li>the new routing behaves like a massive cold-start event</li>
+</ul>
+<p>For a cache, this is especially painful because a routing change is not only a metadata change. It turns into:</p>
+<ul>
+<li>cache misses</li>
+<li>refills from origin</li>
+<li>extra backend load</li>
+<li>latency spikes</li>
+</ul>
+<p>So the design goal is not just "spread keys across nodes." It is:</p>
+<div class="codehilite"><pre><span></span><code>spread keys across nodes
+while minimizing movement when the fleet changes
+</code></pre></div>
+
+<p>That is the core reason consistent hashing exists.</p>
+<p>The trade-off starts here:</p>
+<ul>
+<li><strong>simple modulo hashing is easy</strong></li>
+<li><strong>but it couples routing too tightly to fleet size</strong></li>
+</ul>
+<p>Consistent hashing weakens that coupling so topology changes do not look like system-wide invalidation.</p>
+<h3>Concept 2: Ring-Based Consistent Hashing Makes Node Changes Local Instead of Global</h3>
+<p>The classic picture is a ring of hash space.</p>
+<p>Both nodes and keys are hashed into the same circular space:</p>
+<div class="codehilite"><pre><span></span><code>0 --------------------------------------&gt; max
+ \______________________________________/
+                ring
+</code></pre></div>
+
+<p>Routing works like this:</p>
+<ol>
+<li>Hash the key into the ring.</li>
+<li>Walk clockwise until you find the first node token.</li>
+<li>That node owns the key.</li>
+</ol>
+<p>This small change has a big effect:</p>
+<ul>
+<li>if a node is added, only the keys in the interval it steals from its clockwise neighbor move</li>
+<li>if a node disappears, only the keys that mapped to it need reassignment</li>
+</ul>
+<p>That is why consistent hashing is "consistent": it preserves most existing assignments across membership changes.</p>
+<p>A second practical improvement is <strong>virtual nodes</strong>.</p>
+<p>Without them, one physical node might own a large or awkwardly distributed region of the ring. With virtual nodes:</p>
+<ul>
+<li>each physical node is represented by multiple positions on the ring</li>
+<li>ownership becomes more evenly spread</li>
+<li>adding or removing one machine perturbs the system more smoothly</li>
+</ul>
+<p>This helps because real fleets are rarely perfectly symmetric. Virtual nodes reduce variance and make distribution less fragile to unlucky token placement.</p>
+<p>The key systems idea is:</p>
+<ul>
+<li><strong>the ring turns membership change into local interval reassignment</strong></li>
+<li><strong>virtual nodes turn coarse physical placement into finer-grained load distribution</strong></li>
+</ul>
+<h3>Concept 3: Consistent Hashing Solves Placement Stability, Not the Whole Coordination Problem</h3>
+<p>Consistent hashing is powerful, but it is easy to over-credit it.</p>
+<p>What it solves well:</p>
+<ul>
+<li>stable key ownership under membership change</li>
+<li>reduced remapping relative to modulo hashing</li>
+<li>a simple mental model for sharded cache fleets</li>
+</ul>
+<p>What it does <strong>not</strong> solve by itself:</p>
+<ul>
+<li>hot-key imbalance</li>
+<li>unequal node capacity</li>
+<li>replication strategy</li>
+<li>disagreement about membership</li>
+<li>request retries after failure</li>
+</ul>
+<p>For example:</p>
+<p><strong>Hot keys</strong></p>
+<p>One extremely popular key can overload its owner even if the rest of the distribution is perfectly balanced.</p>
+<p><strong>Weighted capacity</strong></p>
+<p>If some nodes are larger than others, the ring needs weighted tokens or another capacity-aware mechanism.</p>
+<p><strong>Membership agreement</strong></p>
+<p>All routers must have a sufficiently consistent view of which nodes are in the ring. If different clients see different rings, cache behavior becomes erratic.</p>
+<p><strong>Replication</strong></p>
+<p>Many systems assign not just one owner but several successors on the ring to provide redundancy or faster failover.</p>
+<p>This is why the title includes <strong>distributed cache coordination</strong>, not only the ring algorithm. Once the fleet is real, the problem becomes:</p>
+<ul>
+<li>who is in the ring?</li>
+<li>who is healthy?</li>
+<li>how fast do routing tables update?</li>
+<li>how do we fail over without remapping chaos?</li>
+</ul>
+<p>So the mature view is:</p>
+<ul>
+<li><strong>consistent hashing is the foundation of stable placement</strong></li>
+<li><strong>but the fleet still needs coordination around health, membership, capacity, and replication</strong></li>
+</ul>
+<p>That is also why later lessons on invalidation and CDN behavior remain connected. Stable placement is only one part of making copies useful at scale.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: "We use consistent hashing, but one node is still overloaded."</p>
+<p><strong>Why it happens / is confusing</strong>: Stable placement is mistaken for perfect load balance.</p>
+<p><strong>Clarification / Fix</strong>: Check for hot keys, unequal token distribution, or capacity mismatch. Consistent hashing minimizes remapping; it does not guarantee uniform traffic.</p>
+<p><strong>Issue</strong>: "Adding a node still caused a huge miss storm."</p>
+<p><strong>Why it happens / is confusing</strong>: Only some keys moved, but those keys may have been disproportionately hot or expensive to refill.</p>
+<p><strong>Clarification / Fix</strong>: Measure not just key count moved, but hotness and refill cost. Warmup strategy and traffic shape still matter even when placement is mathematically stable.</p>
+<p><strong>Issue</strong>: "The ring is correct, so clients should behave consistently."</p>
+<p><strong>Why it happens / is confusing</strong>: The algorithm is assumed to imply membership agreement.</p>
+<p><strong>Clarification / Fix</strong>: The ring only works if routers share a sufficiently consistent node view. Membership propagation and health awareness are separate operational responsibilities.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Consistent Hashing &lt;-&gt; Cache Invalidation and Warmup</h3>
+<p><strong>The parallel</strong>: A routing change is a kind of synthetic invalidation event. Even if values are still valid, they become unreachable on the old node once ownership moves.</p>
+<p><strong>Real-world case</strong>: Autoscaling a cache fleet can look like a freshness problem to the origin because many keys suddenly refill from new owners.</p>
+<h3>Connection 2: Consistent Hashing &lt;-&gt; Distributed Systems Membership</h3>
+<p><strong>The parallel</strong>: Key placement depends on a shared enough view of who is in the cluster. Stable placement and stable membership are tightly coupled.</p>
+<p><strong>Real-world case</strong>: A cache client library, service mesh, or control plane that updates node views too slowly can make an otherwise good ring algorithm behave poorly in production.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] Consistent Hashing and Random Trees<ul>
+<li>Link: <a href="https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf">https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf</a></li>
+<li>Focus: Read the original framing of why minimal remapping matters when distributed caches grow and change.</li>
+</ul>
+</li>
+<li>[PAPER] Dynamo: Amazon's Highly Available Key-value Store<ul>
+<li>Link: <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf</a></li>
+<li>Focus: Use it to see how ring-based partitioning grows into a full production system with replication and membership concerns.</li>
+</ul>
+</li>
+<li>[DOCS] libketama<ul>
+<li>Link: <a href="https://github.com/RJ/ketama">https://github.com/RJ/ketama</a></li>
+<li>Focus: Treat it as a practical example of client-side consistent hashing in cache fleets.</li>
+</ul>
+</li>
+<li>[DOCS] OpenStack Swift ring background<ul>
+<li>Link: <a href="https://docs.openstack.org/swift/latest/ring_background.html">https://docs.openstack.org/swift/latest/ring_background.html</a></li>
+<li>Focus: Read it for a clear operational explanation of why placement stability matters in large distributed systems.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Consistent hashing exists to stabilize placement</strong> - The point is not only to distribute keys, but to avoid remapping almost everything when membership changes.</li>
+<li><strong>The ring is only the beginning</strong> - Virtual nodes, weighting, replication, and health-aware membership are what turn the basic algorithm into a usable fleet design.</li>
+<li><strong>Stable placement does not guarantee balanced load</strong> - Hot keys, uneven capacity, and coordination lag can still dominate the system even when the ring math is correct.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is <code>hash(key) % N</code> a bad fit for a changing cache fleet?</strong></p>
+<ul>
+<li>A) Because modulo is illegal in distributed systems.</li>
+<li>B) Because changing <code>N</code> remaps most keys and behaves like a fleet-wide cold start.</li>
+<li>C) Because hashing should never be used for routing.</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main purpose of virtual nodes in a consistent hashing ring?</strong></p>
+<ul>
+<li>A) To make each physical node appear in multiple ring positions and smooth distribution.</li>
+<li>B) To remove the need for hashing keys.</li>
+<li>C) To guarantee that hot keys disappear.</li>
+</ul>
+</li>
+<li>
+<p><strong>What important problem does consistent hashing not solve by itself?</strong></p>
+<ul>
+<li>A) Stable key placement under node changes.</li>
+<li>B) Minimizing movement compared with naive modulo hashing.</li>
+<li>C) Membership agreement and hot-key imbalance.</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The modulo approach ties placement to fleet size too tightly, so even small membership changes remap a large fraction of keys.</p>
+<p><strong>2. A</strong>: Virtual nodes make placement finer-grained so one machine does not own one awkwardly large region of the ring.</p>
+<p><strong>3. C</strong>: The ring stabilizes placement, but membership propagation, capacity weighting, replication, and hot-key handling still require separate design decisions.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="018.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Memory Allocators in Production - jemalloc, Arenas & Fragmentation</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="020.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Cache Invalidation Patterns - Write Strategies & Consistency</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/caching-workers-and-performance.html">← Back to Caching, Workers, and Performance</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

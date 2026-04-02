@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Transactions and Two-Phase Commit - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Distributed Transactions and Two-Phase Commit</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 024 | Lesson ID: 423
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 423: Distributed Transactions and Two-Phase Commit</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Two-phase commit lets one logical transaction span multiple shards by separating "can you commit?" from "commit now," but that atomic outcome costs durable coordination, held locks, and blocking whenever the coordinator cannot finish the decision.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="023.html">06.md</a>, Harbor Point learned how to move shard ownership without creating two writers for the same bucket. That solved the placement problem. It did not solve the business-operation problem. A reservation for <code>CA-MUNI-77</code> still has to do two writes that live on different shards: decrement available inventory on bucket <code>CA/3</code>, and increment the desk's aggregate exposure on shard <code>GLOBAL-RISK</code>. If only one write lands, the platform either oversells inventory or rejects later trades against a risk number that never actually became true.</p>
+<p>The tempting implementation is "write shard A, then write shard B, and retry if the second call fails." That is not atomicity. It is wishful sequencing. Once Harbor Point commits the first write, the system has already exposed a partial outcome that other readers and writers can build on. Retries help with transient communication failures, but they do not erase the fact that one shard may already have committed durable state while another has not.</p>
+<p>Two-phase commit changes the shape of the problem. The important event is not the final <code>COMMIT</code> message. The important event is that each participant durably records a prepared state saying, in effect, "I have validated this transaction, reserved the resources it touches, and I promise not to contradict this outcome unless I later hear the global decision." The coordinator only announces <code>COMMIT</code> after every participant has made that promise. That is why 2PC can deliver an all-or-nothing outcome across shards, and also why it can leave the system waiting if the coordinator disappears at exactly the wrong moment.</p>
+<p>That trade-off is the bridge to the next lesson, <a href="025.html">08.md</a>. When Harbor Point needs strict atomicity inside a tightly controlled data system, 2PC can be the right tool. When the workflow stretches across looser service boundaries or external side effects, the blocking cost becomes the main design constraint and the system usually reaches for sagas or an outbox instead.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation engine is not doing distributed transactions for elegance. It is doing them because the product exposes invariants that cross shard boundaries. A reservation is valid only if inventory and risk move together. If a trader sees inventory drop but risk not increase, the next decision is made against a lie. If risk increases but inventory does not drop, desks start getting blocked by phantom exposure. In both directions, the bug is not merely technical inconsistency. It changes the trading behavior of the whole platform.</p>
+<p>Two-phase commit matters because local ACID stops at the shard boundary. Each shard can protect its own rows with a normal transaction, but no shard can unilaterally promise what the other shard will do. The platform therefore needs a coordination protocol that answers one concrete question: can these participants either all commit this business change, or all back away from it, even if failures happen between messages?</p>
+<p>This lesson sits directly after rebalancing for a reason. <a href="023.html">06.md</a> established that each logical bucket needs one clear owner at a time. 2PC assumes that ownership discipline already exists, then adds a second layer: once the coordinator chooses the participants for a transaction, they must hold enough state and lock enough data to honor one global decision. The gain is stronger cross-shard correctness. The cost is longer-lived locks, more operational recovery work, and reduced availability whenever one participant or the coordinator is unhealthy.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why local transactions are insufficient for Harbor Point's cross-shard reservation flow</strong> - Show exactly where partial commit appears when one business operation touches <code>CA/3</code> and <code>GLOBAL-RISK</code>.</li>
+<li><strong>Trace the internal 2PC state machine</strong> - Follow coordinator and participant behavior through prepare, durable decision logging, final commit or abort, and recovery.</li>
+<li><strong>Evaluate when 2PC is worth its operational cost</strong> - Reason about blocking, coordinator failure, lock hold time, and why many systems restrict 2PC to narrow, high-value invariants.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Cross-shard invariants need one commit decision, not two unrelated local commits</h3>
+<p>Harbor Point's reservation request for <code>CA-MUNI-77</code> looks simple from the API edge: reserve <code>$2M</code> of inventory for desk <code>ALPHA</code>. Under the hood it touches two different authorities. Bucket <code>CA/3</code> owns the issuer-level inventory rows. Shard <code>GLOBAL-RISK</code> owns the desk's aggregate exposure rows. Each shard can run a normal transaction over its own data, but neither shard can see the other's locks, WAL records, or post-commit outcome.</p>
+<p>If Harbor Point updates <code>CA/3</code> first and <code>GLOBAL-RISK</code> second, the failure window is obvious. Suppose the inventory shard commits, then the coordinator process crashes before the risk shard even receives its write. The system wakes back up with inventory reduced and desk exposure unchanged. A retry may double-apply the second step, or an operator may need a manual repair job to discover which reservations are half-finished. The same bug appears in reverse if risk commits and inventory does not.</p>
+<p>The key point is that "both shards support transactions" does not mean "the combined workflow is transactional." Local ACID protects one storage engine's write set. A distributed transaction appears the moment one invariant spans multiple independent commit logs. Harbor Point therefore needs a component that speaks to both shards, assigns one transaction identifier, and refuses to let either shard finalize early.</p>
+<p>That component is the transaction coordinator. Before it starts, it resolves the participating shard owners under one placement epoch. This is where the previous lesson still matters: if <code>CA/3</code> is in the middle of a rebalance, Harbor Point should either pin the transaction to the current owner set or abort and retry against fresh metadata. 2PC assumes the coordinator knows which participants are authoritative for the full lifetime of the transaction.</p>
+<p>The trade-off begins right here. One global decision prevents split business state, but it also couples the liveness of the transaction to every participant. The reservation cannot finish faster than the slowest shard that must vote on it.</p>
+<h3>Concept 2: The prepare phase works because participants turn intent into a durable promise</h3>
+<p>For Harbor Point's reservation, the coordinator sends a <code>PREPARE(txn-8841)</code> request to both <code>CA/3</code> and <code>GLOBAL-RISK</code>. Each message includes the exact mutation the participant would perform if the transaction commits: reduce available inventory by <code>$2M</code> on one shard, increase desk exposure by <code>$2M</code> on the other. The participant does not commit yet. It first checks that the mutation is valid against current state and that no conflicting transaction already holds the same rows.</p>
+<p>If validation succeeds, the participant writes a prepared record to durable storage before replying <code>YES</code>. That record contains enough information to either commit or abort after a crash. The participant also keeps the affected rows or keys locked so some other transaction cannot sneak in and change the premise underneath the coordinator. Once Harbor Point has voted <code>YES</code>, it is no longer free to forget the transaction just because the coordinator becomes slow. The durable prepared record is the promise that makes a later global commit possible.</p>
+<div class="codehilite"><pre><span></span><code>client
+  |
+  v
+coordinator
+  |-- PREPARE txn-8841 --&gt; CA/3
+  |-- PREPARE txn-8841 --&gt; GLOBAL-RISK
+
+CA/3:
+  validate inventory &gt;= 2M
+  write PREPARED(txn-8841, redo/undo)
+  lock issuer row
+  reply YES
+
+GLOBAL-RISK:
+  validate limit not exceeded
+  write PREPARED(txn-8841, redo/undo)
+  lock desk exposure row
+  reply YES
+</code></pre></div>
+
+<p>Only after every participant replies <code>YES</code> does the coordinator make the global decision. It writes <code>COMMIT(txn-8841)</code> to its own durable log, then sends <code>COMMIT</code> to each participant. If any participant votes <code>NO</code>, the coordinator durably records <code>ABORT</code> and tells everyone to roll back. The important ordering is subtle but critical: the coordinator must persist its final decision before it tells participants to act on that decision. Otherwise a crash can erase the only authoritative answer to "was this transaction committed?"</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">prepare_participant</span><span class="p">(</span><span class="n">txn</span><span class="p">):</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">constraints_hold</span><span class="p">(</span><span class="n">txn</span><span class="p">)</span> <span class="ow">or</span> <span class="n">has_conflict</span><span class="p">(</span><span class="n">txn</span><span class="p">):</span>
+        <span class="n">log</span><span class="o">.</span><span class="n">write</span><span class="p">((</span><span class="s2">&quot;vote_no&quot;</span><span class="p">,</span> <span class="n">txn</span><span class="o">.</span><span class="n">id</span><span class="p">))</span>
+        <span class="k">return</span> <span class="s2">&quot;NO&quot;</span>
+    <span class="n">lock_keys</span><span class="p">(</span><span class="n">txn</span><span class="o">.</span><span class="n">write_set</span><span class="p">)</span>
+    <span class="n">log</span><span class="o">.</span><span class="n">write</span><span class="p">((</span><span class="s2">&quot;prepared&quot;</span><span class="p">,</span> <span class="n">txn</span><span class="o">.</span><span class="n">id</span><span class="p">,</span> <span class="n">txn</span><span class="o">.</span><span class="n">redo</span><span class="p">,</span> <span class="n">txn</span><span class="o">.</span><span class="n">undo</span><span class="p">))</span>
+    <span class="k">return</span> <span class="s2">&quot;YES&quot;</span>
+</code></pre></div>
+
+<p>After a participant receives <code>COMMIT</code>, it applies the change, writes a commit record, releases locks, and acknowledges completion. If it receives <code>ABORT</code>, it discards the prepared intent and releases locks without making the mutation visible. The mechanism is boring by design: durable intent first, one durable decision second, visible effects last. That ordering is what converts two local storage engines into one all-or-nothing commit path.</p>
+<h3>Concept 3: 2PC is valuable precisely where its blocking behavior is acceptable</h3>
+<p>The happy path is not the reason engineers fear 2PC. The difficult path is the one where every participant voted <code>YES</code>, but the coordinator crashes before some participants learn the final answer. Those participants are now in doubt. They have promised to honor a future global decision, so they cannot safely commit on their own, and they cannot safely abort on their own either. Until Harbor Point recovers the coordinator log or learns the decision from a surviving replica of that log, the locked rows may remain unavailable to other work.</p>
+<p>This is why 2PC is often described as a blocking protocol. The problem is not that the messages are slow in the normal case. The problem is that progress depends on the decision record staying recoverable. If the coordinator is backed by one fragile process and one local disk, Harbor Point has turned a cross-shard invariant into a single-point-of-waiting. If the coordinator state is replicated more robustly, the system reduces that risk, but it has moved closer to a consensus-backed transaction manager with all the operational complexity that implies.</p>
+<p>The protocol also stretches lock hold time. <code>CA/3</code> and <code>GLOBAL-RISK</code> keep resources reserved from <code>PREPARE</code> until they learn the outcome. Under bursty load, that can inflate tail latency or create deadlock pressure even when every transaction eventually succeeds. Harbor Point therefore should use 2PC where the invariant is genuinely atomic and the participant set is small, predictable, and inside infrastructure the team controls closely.</p>
+<p>That is also why the next lesson exists. The moment Harbor Point wants the same workflow to include email notifications, third-party settlement rails, or loosely coupled microservices that cannot stay prepared for long, 2PC becomes the wrong abstraction. The system usually shifts to local commits plus compensation, accepting that "eventually repaired" is a different contract from "never partially committed."</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Prepared transactions accumulate and block new reservations on <code>CA/3</code> even though CPU usage looks normal.</p>
+<p><strong>Why it happens / is confusing</strong>: The expensive part of 2PC is often not compute. It is time spent waiting for a final decision while locks remain held. A coordinator stall or a slow participant can make the system feel idle and stuck at the same time.</p>
+<p><strong>Clarification / Fix</strong>: Monitor prepared-transaction age, lock wait time, and count of in-doubt transactions. Recovery alerts should trigger on long-lived prepared state, not only on process death.</p>
+<p><strong>Issue</strong>: The client times out, retries the reservation, and the desk exposure is incremented twice.</p>
+<p><strong>Why it happens / is confusing</strong>: A timeout at the client does not tell you whether the coordinator already committed. Without a transaction identifier that survives retries, Harbor Point cannot distinguish "same transaction retry" from "new reservation request."</p>
+<p><strong>Clarification / Fix</strong>: Make the coordinator idempotent on a stable transaction key. Client retries should ask for the outcome of <code>txn-8841</code>, not start a new anonymous transaction.</p>
+<p><strong>Issue</strong>: A rebalance starts while a distributed transaction is preparing, and one participant rejects the final commit as stale.</p>
+<p><strong>Why it happens / is confusing</strong>: The coordinator chose participants from one placement epoch, but ownership changed before the transaction finished. The transaction is now trying to complete against a shard that no longer believes it is authoritative.</p>
+<p><strong>Clarification / Fix</strong>: Pin routing to a placement epoch for the duration of the transaction or abort and retry when ownership changes. Rebalancing and distributed transactions must share the same authority model.</p>
+<p><strong>Issue</strong>: The team tries to include email delivery or a card network call inside the 2PC workflow.</p>
+<p><strong>Why it happens / is confusing</strong>: 2PC works best when every participant can hold prepared state durably and follow the same recovery protocol. External side effects usually cannot do that, and some of them are irreversible once observed.</p>
+<p><strong>Clarification / Fix</strong>: Keep the atomic core inside storage boundaries you control, then publish downstream work through an outbox or saga-style flow. That is the transition into <a href="025.html">08.md</a>.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="023.html">06.md</a> defines who owns the shard; 2PC assumes that ownership is stable long enough to coordinate across shards</h3>
+<p>Rebalancing introduced placement epochs so Harbor Point could transfer authority for <code>CA/3</code> safely. A distributed transaction depends on the same idea. The coordinator cannot ask one owner to prepare and another owner to commit. Stable shard ownership is therefore a prerequisite for atomic cross-shard coordination, not an unrelated storage concern.</p>
+<h3>Connection 2: <a href="025.html">08.md</a> addresses the cases where atomic prepare state is too expensive to hold</h3>
+<p>Two-phase commit resolves failure before state becomes visible. Sagas and the outbox pattern resolve failure after some local state has already committed. That difference is the central design choice for cross-service consistency: wait for one global decision now, or allow partial progress and compensate later.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Chapter 9 gives the clearest systems-level explanation of atomic commit, prepared state, and why 2PC blocks under coordinator failure.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/two-phase.html">PostgreSQL Documentation: Two-Phase Transactions</a><ul>
+<li>Focus: Shows how a production database exposes <code>PREPARE TRANSACTION</code> and why prepared transactions must be managed carefully in operations.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/xa.html">MySQL 8.0 Reference Manual: XA Transactions</a><ul>
+<li>Focus: Provides a concrete SQL interface for distributed commit across resource managers and makes the prepare/commit split explicit.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://www.microsoft.com/en-us/research/publication/consensus-on-transaction-commit/">Consensus on Transaction Commit</a><ul>
+<li>Focus: Explains the relationship between transaction commit and consensus, including why stronger coordinator fault tolerance changes the protocol design.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A distributed transaction starts when one invariant spans multiple commit logs</strong> - Local transactions do not compose into atomicity just because each shard is ACID on its own.</li>
+<li><strong>Prepared state is the heart of 2PC</strong> - Participants must durably promise a future outcome before the coordinator can safely choose one global decision.</li>
+<li><strong>2PC spends availability and lock time to buy atomicity</strong> - It is the right tool for narrow, high-value invariants, not a default workflow pattern for every cross-service action.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why is Harbor Point's reservation for <code>CA-MUNI-77</code> not safe if the system simply commits <code>CA/3</code> first and <code>GLOBAL-RISK</code> second?</strong></p>
+<ul>
+<li>A) Because two local commits can leave inventory and exposure out of sync if a crash happens between them</li>
+<li>B) Because a shard can never commit without first asking every other shard in the cluster</li>
+<li>C) Because risk calculations are always eventually consistent by design</li>
+</ul>
+</li>
+<li>
+<p><strong>What does a participant promise when it votes <code>YES</code> during the prepare phase?</strong></p>
+<ul>
+<li>A) That it has already made the change visible to readers</li>
+<li>B) That it has durably recorded the transaction, locked the affected data, and can later honor the final commit or abort decision</li>
+<li>C) That it can safely decide to commit on its own if the coordinator disappears</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can 2PC become a blocking protocol in production?</strong></p>
+<ul>
+<li>A) Because participants that are prepared cannot safely finalize on their own until they recover the coordinator's durable decision</li>
+<li>B) Because the network requires all messages to be delivered in one round trip</li>
+<li>C) Because every distributed transaction must include an external side effect such as email or settlement</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: If the first shard commits and the second does not, Harbor Point has already published a partial business outcome. Option B is false because 2PC only involves the transaction's participants, and option C is false because the whole point of this invariant is that eventual repair is not good enough for the reservation core.</p>
+<p><strong>2. B</strong>: A <code>YES</code> vote means the participant has entered durable prepared state and is holding the resources needed to obey the future decision. Option A describes post-commit visibility, and option C is false because unilateral completion would break the atomic contract.</p>
+<p><strong>3. A</strong>: Prepared participants are stuck until they recover the global outcome, which is why coordinator durability and recovery discipline matter so much. Option B is nonsense, and option C describes a design mistake rather than an inherent requirement of 2PC.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="023.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Rebalancing and Consistent Hashing</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="025.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Sagas and Outbox for Cross-Service Consistency</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

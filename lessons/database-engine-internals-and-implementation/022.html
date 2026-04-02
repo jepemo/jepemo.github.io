@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fsync, Group Commit, and Durable Latency - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>fsync, Group Commit, and Durable Latency</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 022 | Lesson ID: 399
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 399: fsync, Group Commit, and Durable Latency</h1>
+<blockquote>
+<p><strong>The core idea</strong>: <code>fsync</code> is the point where a commit stops depending on volatile memory and starts surviving power loss, while group commit raises throughput by letting many transactions share that flush boundary instead of paying for it one by one.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="021.html">14.md</a>, Harbor Point recovered its municipal-bond trading database after a power loss by replaying only the WAL that had actually reached durable storage. The next morning the same system hits a different problem. Market-open traffic drives commit latency from sub-millisecond to several milliseconds, and someone suggests acknowledging quote updates as soon as the commit record is written to the OS page cache. That sounds harmless because the log record already "exists," but it would change the recovery contract immediately: a second power loss could erase transactions that traders were already told had committed.</p>
+<p>That is the first important distinction in this lesson. A transaction can be appended to an in-memory WAL buffer, copied into the kernel's page cache, and even handed to the storage device, yet still not be durable enough for an acknowledged commit. Recovery only trusts the WAL prefix that the engine considers flushed to stable storage. If the engine returns success before that point, then "committed" really means "probably committed unless the machine loses power first."</p>
+<p>Group commit does not weaken that durability rule. It changes who pays for it. Instead of forcing every quote update to issue its own expensive flush, the engine lets a set of concurrent transactions queue behind one flush leader. When that leader makes the WAL durable through the highest waiting LSN, every transaction at or below that LSN can be released together. Throughput improves because the storage barrier is shared. Tail latency becomes a queueing problem because each transaction now waits not only for device flush time, but also for batch formation and wake-up. That is the bridge into <a href="023.html">16.md</a>: when you design even a minimal storage engine, the commit path is one of the first places where correctness and performance become inseparable.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's trading desk does not experience "durability tuning" as an abstract database topic. It experiences it as one of three very concrete outcomes: acknowledged quote corrections survive a crash, commits slow down enough to affect market-open execution, or the system appears fast until the next reboot reveals that the latest acknowledged work was never truly durable. The commit path decides which of those three worlds the team is living in.</p>
+<p>This matters because the expensive part of durable commit is usually not the bytes. A commit record is tiny. The cost comes from the ordering barrier that says, "everything up to this WAL position must survive power loss before I can acknowledge the transaction." On fast NVMe that barrier may be well under a millisecond most of the time. On cloud-attached storage or a busy filesystem it may be several milliseconds, and the tail can be worse during checkpoints or cache flushes. If every transaction pays that full cost alone, throughput collapses long before the CPU or buffer pool is exhausted.</p>
+<p>Group commit is how engines avoid that collapse without lying about durability. It amortizes one flush across many transactions, but it also means commit latency is shaped by queue depth, scheduler wake-ups, and batch policy rather than by device speed alone. If you understand that mechanism, you can reason cleanly about why <code>fsync=off</code> is a contract change, why a fixed batch delay may help one workload and hurt another, and why the previous lesson's recovery story depends on this lesson's flush boundary being correct.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what <code>fsync</code> protects in a WAL commit path</strong> - Distinguish log append, log write, and durable flush, and show why only the last one makes an acknowledged commit crash-safe.</li>
+<li><strong>Trace how group commit releases multiple transactions after one flush</strong> - Follow commit LSN assignment, waiter batching, and durable-LSN advancement through a realistic storage-engine sequence.</li>
+<li><strong>Evaluate durable-latency tuning as a production trade-off</strong> - Connect batch size, flush frequency, tail latency, and loss tolerance to concrete system-of-record decisions.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: <code>fsync</code> defines the durable LSN boundary, not the moment the log record is written</h3>
+<p>At Harbor Point, a trader corrects a quote for a thinly traded municipal bond. The engine appends an update record and then a commit record to the WAL. Suppose the commit record ends at LSN <code>8/3FA0900</code>. The foreground thread can usually copy those bytes into the WAL buffer quickly, and a background writer may issue a <code>write()</code> to move them into the kernel's page cache almost immediately. None of that is yet enough to say the quote correction survives a sudden power cut.</p>
+<p>The reason is that the storage stack has several layers of volatility:</p>
+<div class="codehilite"><pre><span></span><code>client transaction
+    -&gt; engine WAL buffer
+    -&gt; kernel page cache
+    -&gt; device/controller cache
+    -&gt; stable storage
+</code></pre></div>
+
+<p>The engine needs a boundary that recovery can trust after all volatile state is gone. In a WAL design, that boundary is usually tracked as a durable or flushed LSN. The commit is safe to acknowledge only when the engine believes <code>durable_lsn &gt;= commit_lsn</code>. <code>fsync</code> is the system call most people name for that step, though real engines may use variants such as <code>fdatasync</code> or platform-specific sync methods. The semantic question stays the same: has the log prefix containing this commit reached persistent storage strongly enough that crash recovery may rely on it?</p>
+<p>This is why the data pages themselves can still be dirty in memory when commit returns. Harbor Point does not need to flush the modified B-tree leaf and heap page before acknowledging the quote correction. It only needs the WAL records durable first. If the server crashes, the previous lesson's redo phase can reconstruct the data pages from the durable WAL prefix. The trade-off is straightforward: strict synchronous durability keeps acknowledged commits trustworthy, but every flush barrier pulls foreground latency closer to the storage device's worst moments.</p>
+<h3>Concept 2: Group commit amortizes one flush across many committers without changing the durability contract</h3>
+<p>Now assume three quote updates arrive almost together:</p>
+<div class="codehilite"><pre><span></span><code>T801 commit_lsn = 8/3FA0820
+T802 commit_lsn = 8/3FA0888
+T803 commit_lsn = 8/3FA0900
+</code></pre></div>
+
+<p>If each transaction called <code>fsync</code> independently, Harbor Point would pay three near-identical storage barriers in a row. Group commit replaces that with a shared wait. One thread or WAL writer becomes the flush leader, ensures WAL is written through at least <code>8/3FA0900</code>, performs the sync, and then advances <code>durable_lsn</code> to that point. At that moment all three transactions become safely releasable because each one asked for durability at or below the flushed boundary.</p>
+<p>An implementation sketch looks like this:</p>
+<div class="codehilite"><pre><span></span><code>committers append WAL and join flush queue
+leader chooses target_lsn = max(waiting commit_lsn)
+leader writes WAL through target_lsn
+leader issues sync
+durable_lsn = target_lsn
+wake all waiters with commit_lsn &lt;= durable_lsn
+</code></pre></div>
+
+<p>The crucial misconception to avoid is that group commit is the same as asynchronous commit. It is not. With group commit, followers still wait for durability; they simply share the wait behind one sync. With asynchronous commit, the engine acknowledges before the durable boundary is crossed and accepts that a crash may lose recently acknowledged transactions. Those are different products with different failure semantics.</p>
+<p>Operationally, group commit buys Harbor Point much higher commit throughput because one expensive barrier now covers a batch of quote corrections. The cost is that latency becomes partly a queueing problem. If arrival rate is high, the batch often forms naturally and the added wait is small relative to the sync cost saved. If arrival rate is low, an explicit batching delay may add pure latency for little gain. The same mechanism that saves flushes can also lengthen lock hold time and increase p99 response time for individual transactions.</p>
+<h3>Concept 3: Durable latency is a distribution shaped by queueing, storage flushes, and interference from the rest of the engine</h3>
+<p>Teams often talk about "<code>fsync</code> latency" as if it were one number. In production it is closer to a small equation:</p>
+<div class="codehilite"><pre><span></span><code>durable_commit_latency
+  ~= WAL insertion wait
+   + batch formation wait
+   + sync time
+   + wake-up / scheduler delay
+</code></pre></div>
+
+<p>Harbor Point sees this clearly across the trading day. At 09:30, many committers arrive together, so natural group commit produces batches of 16 to 32 transactions. The shared sync cost is efficient, but queue depth and wake-up bursts make p99 commit latency noticeably higher than p50. At 13:00, arrival rate is lower. A fixed <code>commit_delay</code> that helped the morning rush now just adds 2 ms to almost every commit because there are not enough peers to amortize the barrier. The workload changed, so the same setting changed meaning.</p>
+<p>This is why durable-latency tuning has to be measured with mechanism-aware metrics. Harbor Point should look at sync time histograms, average and p99 group size, the gap between written and durable WAL positions, and whether checkpoint or background writeback activity shares the same storage path. If sync spikes line up with checkpointer bursts, the problem is not "group commit is bad"; it is that WAL flushes are contending with data-page flushes or volatile cache drains. If the queue is usually size one, explicit delay is unlikely to help. If the queue is deep but throughput is still poor, the device barrier itself may be the real bottleneck.</p>
+<p>The production trade-off is therefore not "durable or fast." It is which workload can accept which durability contract. For a system of record such as Harbor Point's quote database, turning off <code>fsync</code> or using asynchronous commit during peak hours is not a clever performance trick. It is a decision to risk losing the newest acknowledged trades or corrections after a crash. That can be acceptable for telemetry, caches, or rebuildable derived data. It is rarely acceptable for the source of truth that the rest of the system reconciles against.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The database loses recently acknowledged transactions after a power event, even though WAL records for those transactions appeared in logs before the crash.</p>
+<p><strong>Why it happens / is confusing</strong>: Seeing a WAL write in logs often means the bytes reached memory or the OS page cache, not that the durable boundary crossed the transactions' commit LSNs. A second possibility is that the engine was configured for asynchronous commit or ran with <code>fsync</code> disabled. A third is that the storage stack acknowledged flushes too early because of unsafe cache settings.</p>
+<p><strong>Clarification / Fix</strong>: Check the engine's durability mode first, then inspect whether commit acknowledgement is tied to a durable-LSN advance rather than merely a WAL write. If the software contract is correct, validate the storage path's write-cache and barrier behavior before trusting the device.</p>
+<p><strong>Issue</strong>: Throughput improves after enabling a commit delay, but p99 latency and lock waits become much worse.</p>
+<p><strong>Why it happens / is confusing</strong>: Batching reduces per-transaction flush cost only when enough peers arrive close together. When concurrency is modest, the explicit wait window becomes mostly extra delay, and transactions may hold locks until the shared flush completes.</p>
+<p><strong>Clarification / Fix</strong>: Measure natural batch size before adding delay. If most flushes already include multiple committers, a large explicit delay is unnecessary. Tune against p95 and p99 commit latency, not just throughput, and watch whether lock hold times grow with the batch window.</p>
+<p><strong>Issue</strong>: <code>fsync</code> times spike during checkpoints even though the WAL device normally looks fast.</p>
+<p><strong>Why it happens / is confusing</strong>: The expensive step is often the cache flush and ordering barrier, not raw sequential bandwidth. Checkpoint writeback, filesystem journal activity, or shared-device cache pressure can make the barrier slower even when average throughput graphs look healthy.</p>
+<p><strong>Clarification / Fix</strong>: Correlate sync latency with checkpoint timing, background write volume, and the gap between written WAL and durable WAL. If they move together, isolate WAL I/O better, smooth checkpoint writeback, or revisit how much flush interference the storage device can absorb.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Group commit ↔ filesystem journal commits</h3>
+<p>Journaling filesystems batch many metadata updates behind one journal commit for the same reason Harbor Point batches transaction commits: the costly step is the ordering barrier that makes the journal durable, not the size of each individual update. The pattern is the same in ext-family journals, database WAL, and other log-structured control paths. Once you can see the barrier cost clearly, batching stops looking like a trick and starts looking like a direct response to physical storage behavior.</p>
+<h3>Connection 2: Local durable commit ↔ synchronous replication</h3>
+<p>A local <code>fsync</code> protects Harbor Point against process failure, kernel panic, or host power loss as long as the local storage contract holds. Synchronous replication moves the durability boundary outward: commit may wait not only for local flush, but also for a replica to confirm receipt or apply of the same WAL. The mechanism is different, but the design question is parallel. You are always asking, "which failures must an acknowledged commit survive, and what extra latency buys that guarantee?"</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/runtime-config-wal.html">PostgreSQL Documentation: Write Ahead Log Configuration</a><ul>
+<li>Focus: Read the sections on <code>commit_delay</code>, <code>commit_siblings</code>, and <code>wal_sync_method</code> to see how a production engine exposes group-commit and flush behavior.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-async-commit.html">PostgreSQL Documentation: Asynchronous Commit</a><ul>
+<li>Focus: Compare the latency savings from early acknowledgement with the explicit risk of losing recently acknowledged transactions after a crash.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://sqlite.org/atomiccommit.html">SQLite Documentation: Atomic Commit In SQLite</a><ul>
+<li>Focus: Follow the journal flush sequence to see why "written" and "durable" are different states in a real storage engine.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A commit is not durable when the WAL is merely written</strong> - The contract becomes crash-safe only when the storage engine's durable LSN crosses the transaction's commit LSN.</li>
+<li><strong>Group commit shares the flush cost, not the durability risk</strong> - Multiple transactions can wait behind one sync without changing the rule that acknowledged commits must already be in durable WAL.</li>
+<li><strong>Durable latency is a queueing problem as much as a device problem</strong> - Batch policy, wake-up behavior, and checkpoint interference shape tail latency alongside raw storage speed.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why is a transaction still not safely acknowledged after its commit record has been copied into the OS page cache?</strong></p>
+<ul>
+<li>A) Because the data pages have not been flushed yet, and data-page flush must happen before WAL durability</li>
+<li>B) Because the WAL bytes may still reside in volatile layers, so crash recovery cannot trust them yet</li>
+<li>C) Because a transaction is durable only after a checkpoint record is written</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main correctness difference between group commit and asynchronous commit?</strong></p>
+<ul>
+<li>A) Group commit releases transactions before the flush, while asynchronous commit waits for the flush leader</li>
+<li>B) Group commit makes commits durable in batch before acknowledgement, while asynchronous commit may acknowledge before the durable boundary is crossed</li>
+<li>C) There is no correctness difference; they are two names for the same optimization</li>
+</ul>
+</li>
+<li>
+<p><strong>When is an explicit commit-delay window most likely to hurt more than it helps?</strong></p>
+<ul>
+<li>A) When the workload already forms large natural batches and the storage barrier is cheap enough that extra waiting is mostly wasted</li>
+<li>B) When the workload uses WAL at all, because WAL is incompatible with batching</li>
+<li>C) When the system stores only derived data and can tolerate some loss</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The OS page cache is still volatile, so a power loss can erase the WAL even though <code>write()</code> returned. Option A is wrong because data-page flush can lag behind commit in a WAL engine. Option C is wrong because checkpoints bound recovery work, not per-transaction durability.</p>
+<p><strong>2. B</strong>: Group commit preserves synchronous durability by letting several transactions wait for the same flush. Asynchronous commit changes the contract by allowing acknowledgement before that flush is durable.</p>
+<p><strong>3. A</strong>: If natural batching is already good, or the storage barrier is relatively cheap, a fixed extra wait window mainly inflates commit latency and lock hold time. Options B and C misunderstand the question; WAL works with batching, and loss tolerance may justify weaker durability rather than justify a harmful delay.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="021.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Crash Recovery Walkthrough: Analysis, Redo, Undo</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="023.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Monthly Capstone: Design a Minimal Storage Engine</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

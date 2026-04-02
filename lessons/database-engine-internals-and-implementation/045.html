@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Multi-Tenant Isolation in Shared Clusters - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Multi-Tenant Isolation in Shared Clusters</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 045 | Lesson ID: 446
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 446: Multi-Tenant Isolation in Shared Clusters</h1>
+<blockquote>
+<p><strong>The core idea</strong>: In a shared database cluster, "tenant" has to be a real internal scheduling and accounting unit, not just an authentication label. Separate schemas protect names, but tenant-aware keyspaces, queues, memory budgets, and maintenance limits are what stop one customer's workload from silently spending another customer's latency budget.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="044.html">044.md</a>, Harbor Point taught its shared SQL cluster to treat trader commits, desk reports, and overnight backfills as different workload classes. That improved life inside one organization. The next step is harsher: Harbor Point now offers the same reservations engine to three municipal-bond dealers, <code>NorthPier</code>, <code>CedarHarbor</code>, and <code>BeaconStreet</code>, on one physical cluster. At 09:31, <code>NorthPier</code> is submitting latency-sensitive reservation commits while <code>CedarHarbor</code> launches a historical reconciliation scan and <code>BeaconStreet</code> starts importing a month of corrections. If the engine only separates tenants at login time, the cluster is still effectively one shared pool once CPU, memory grants, WAL bandwidth, cache residency, and compaction workers come under pressure.</p>
+<p>That is the key realization for multi-tenant isolation. It is not mainly about whether <code>SELECT * FROM reservations</code> resolves to the right schema. It is about whether tenant identity survives all the way down the engine so the system can answer questions like "whose memory grant is this?", "which tenant should absorb this compaction debt?", and "which requests may borrow idle capacity without endangering another tenant's commit SLO?" A shared cluster with weak answers to those questions is just a noisy-neighbor machine wearing a nicer catalog.</p>
+<p>This corrects a common misconception. Multi-tenancy is often described as if row filters, separate databases, or API keys solve the hard part. They solve visibility. They do not solve interference. Harbor Point's problem is not merely keeping <code>CedarHarbor</code> from reading <code>NorthPier</code> data. It is preventing <code>CedarHarbor</code>'s perfectly legal workload from turning <code>NorthPier</code>'s reservation commits into a timeout incident.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point wants the economics of a shared cluster for a good reason. Three tenants with different time-of-day demand curves fit more efficiently on one fleet than on three mostly idle fleets. Shared replicas simplify upgrades, capacity planning, and disaster recovery. The product promise is appealing: each dealer gets its own logical database, but Harbor Point operates one engine.</p>
+<p>The danger is that shared economics can collapse into shared pain. Suppose <code>NorthPier</code> pays for a 15 ms p99 commit SLO on its booking path, <code>CedarHarbor</code> runs a large end-of-day correction job, and <code>BeaconStreet</code> is experimenting with broad ad hoc analytics. If all three ultimately compete in one undifferentiated set of run queues, memory grants, buffer pages, and maintenance workers, then Harbor Point has not built tenant isolation. It has only hidden the shared cluster behind per-tenant credentials.</p>
+<p>Good multi-tenant isolation changes the shape of failure. A burst from one tenant may still be slowed, queued, or rejected, but it does so against that tenant's own entitlement and burst policy rather than by unexpectedly degrading everyone else's. That makes SLOs, pricing tiers, and operational debugging line up with the engine's actual mechanics. It also prepares the ground for the next lesson: once the system can isolate tenants during ordinary traffic, it still has to preserve that isolation during heavy maintenance such as online reindexing.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why visibility isolation is not enough in a shared database cluster</strong> - Distinguish catalog separation from the deeper resource and maintenance controls that protect tenant SLOs.</li>
+<li><strong>Trace how tenant identity propagates through the engine</strong> - Follow a request from authentication to key routing, admission control, execution, and background maintenance accounting.</li>
+<li><strong>Evaluate multi-tenant isolation trade-offs in production</strong> - Compare hard reservations, burst borrowing, and tenant-aware maintenance policies for a cluster serving multiple customers at once.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Tenant identity has to survive from SQL session down to keys, locks, and background state</h3>
+<p>At Harbor Point, each dealer has a <code>reservations</code> table, an <code>issuer_limits</code> table, and its own reporting queries. A beginner-friendly design would stop at catalog isolation: authenticate the session, attach it to the right database, and prevent direct reads across tenant boundaries. That is necessary, but it is not the full engine design. The cluster still needs to know, internally, which tenant owns each piece of state it is touching.</p>
+<p>In a real shared engine, tenant identity usually becomes part of multiple internal structures at once. Catalog resolution is scoped by tenant so <code>NorthPier.reservations</code> and <code>CedarHarbor.reservations</code> never collide. Storage keys are logically prefixed or partitioned so ranges, SSTables, or pages can be attributed to one tenant instead of living in an undifferentiated global heap. Lock table entries, table statistics, temporary spill files, query fingerprints, and quota ledgers also need that same tenant handle. If those structures are global without ownership, Harbor Point can tell who logged in but not who is consuming the cluster.</p>
+<p>One useful way to visualize the path is:</p>
+<div class="codehilite"><pre><span></span><code>session token
+  -&gt; tenant descriptor
+  -&gt; tenant-scoped catalog lookup
+  -&gt; plan + tenant_id
+  -&gt; key/range selection with tenant prefix
+  -&gt; execution, locks, temp files, metrics tagged by tenant_id
+</code></pre></div>
+
+<p>The practical payoff is not just security hygiene. Once the engine can attribute internal state correctly, it can make correct policy decisions later. A cache entry can be charged to <code>CedarHarbor</code>. A large spill file can count against <code>BeaconStreet</code>'s temp-space budget. A range split can be explained as <code>NorthPier</code> growth rather than mysterious cluster churn. The trade-off is that shared-cluster simplicity disappears quickly: metadata becomes richer, some global scans become harder, and moving a tenant between service tiers is no longer just a billing change. But without this internal ownership model, the rest of multi-tenant isolation has nothing solid to attach to.</p>
+<h3>Concept 2: Real isolation is a hierarchy of budgets across CPU, memory, I/O, and background work</h3>
+<p>Once tenant identity is explicit, Harbor Point still has to decide how much of the cluster each tenant may consume and how borrowing works when capacity is idle. This is the same governance problem as <a href="044.html">044.md</a>, but with a stronger outer boundary. The cluster now classifies work twice: first by tenant entitlement, then by workload class inside that tenant. <code>NorthPier</code> might have a larger reserved share for foreground commits than <code>BeaconStreet</code>, while each tenant separately distinguishes booking traffic from analytical scans and maintenance.</p>
+<p>That produces a path more like this:</p>
+<div class="codehilite"><pre><span></span><code>tenant request
+  -&gt; classify tenant and workload class
+  -&gt; check reserved share + burst credits
+  -&gt; reserve CPU slots, memory grant, and IO/WAL tokens
+  -&gt; admit now | queue briefly | shed or defer
+</code></pre></div>
+
+<p>The key design detail is that the budgets must cover more than query concurrency. CPU slots matter, but so do memory grants for joins and sorts, temp spill space, buffer-pool residency, WAL flush bandwidth, compaction or vacuum workers, and storage queue depth. Harbor Point can set a per-tenant query limit and still fail badly if one tenant is allowed to accumulate huge hash tables, flood the WAL with dual writes, or monopolize compaction workers cleaning up its own backfill. Strong isolation therefore mixes engine-level scheduling with lower-level controls such as cgroups or container limits. Host controls stop the node from collapsing. Database controls stop one tenant from turning shared engine internals into a private resource pool.</p>
+<p>The trade-off is utilization versus predictability. Hard reservations make Harbor Point's gold-tier tenants safer, but idle reservations can strand capacity. Soft borrowing improves cluster efficiency, but only if the engine can reclaim borrowed budget quickly when <code>NorthPier</code>'s market-open burst arrives. Borrowing without fast clawback is just delayed interference. That is why the observability surface has to be tenant-specific: admission wait time, memory granted, spill bytes, WAL bytes, cache hit rate, compaction debt, and rejection rate need tenant labels, or operators will only discover bleed-over after a customer reports it.</p>
+<h3>Concept 3: Maintenance and failure handling are where fake isolation is exposed</h3>
+<p>Foreground query governance is the easy part to demo. The harder test arrives when a tenant starts doing maintenance-heavy work. Suppose <code>CedarHarbor</code> adds a new secondary index to support an audit query, while <code>BeaconStreet</code> bulk-loads corrected trade history from the previous month. The cluster now faces a multi-tenant isolation question that is not visible in simple query benchmarks: who pays for the extra WAL traffic, range splits, compaction debt, cache churn, and validation scans that these operations create?</p>
+<p>If Harbor Point's maintenance subsystems are global and oblivious to tenant ownership, background work becomes a loophole through every foreground budget the team just designed. <code>NorthPier</code> may have protected commit slots and fair CPU scheduling, yet still suffer because another tenant's reindex or bulk ingest saturates storage queues and pushes compaction far behind. That is why mature shared systems make maintenance tenant-aware too. Index builds, backfills, vacuum debt, checkpoint pressure, and repair traffic should be pausable, rate-limited, and attributable per tenant rather than treated as one benevolent cluster background.</p>
+<p>This is also where the limits of shared clusters become obvious. Some failure domains remain shared no matter how elegant the logical isolation is: the control plane, node kernel, storage devices, and sometimes metadata services or replication queues. For many SaaS-style workloads that is acceptable because the economics are strong and the SLOs can be enforced statistically. It is not always acceptable for tenants with strict regulatory isolation, custom extensions, hard real-time latency commitments, or highly skewed working sets. Harbor Point therefore needs an explicit graduation rule: when a tenant's steady-state demand, maintenance profile, or risk posture stops fitting the shared-cluster contract, move that tenant to dedicated hardware or a separate cluster instead of pretending policies can fix every mismatch.</p>
+<p>That decision is the bridge to <a href="046.html">046.md</a>. Online reindexing sounds like a maintenance problem, but in a multi-tenant cluster it is also an isolation problem. A shadow index build and catch-up phase must consume the owning tenant's budget, not free cluster magic. Otherwise one customer's schema change becomes another customer's outage.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: <code>NorthPier</code>'s p99 commit latency spikes even though its own query volume is flat.</p>
+<p><strong>Why it happens / is confusing</strong>: The bottleneck may be a shared subsystem that Harbor Point is not measuring per tenant, such as WAL flush bandwidth, compaction workers, or buffer-pool residency. Tenant-local dashboards can look calm while another tenant is consuming the actual scarce resource.</p>
+<p><strong>Clarification / Fix</strong>: Break down shared bottlenecks by tenant ownership, not just by node totals. If commit latency rises with another tenant's WAL or maintenance surge, the isolation policy is incomplete even if SQL-level access control is correct.</p>
+<p><strong>Issue</strong>: Per-tenant CPU quotas look healthy, but one tenant can still trigger memory pressure and temp spill explosions.</p>
+<p><strong>Why it happens / is confusing</strong>: CPU fairness does not automatically imply memory fairness. Large joins, sorts, and spill files often bypass simple concurrency caps unless the engine tracks memory grants and temporary storage by tenant.</p>
+<p><strong>Clarification / Fix</strong>: Add tenant-scoped memory accounting, spill quotas, and queue admission tied to predicted memory cost. A shared cluster without tenant-aware memory control will usually fail in the allocator before it fails in the scheduler.</p>
+<p><strong>Issue</strong>: Foreground workloads are isolated correctly, yet schema changes or cleanup jobs still create noisy-neighbor incidents.</p>
+<p><strong>Why it happens / is confusing</strong>: Background work is often scheduled "for the cluster" rather than "for the tenant that caused it." That makes reindexing, backfills, vacuum, or compaction an isolation escape hatch.</p>
+<p><strong>Clarification / Fix</strong>: Charge maintenance to the owning tenant, make it pausable and rate-limited, and graph tenant-specific maintenance debt. If Harbor Point cannot explain who generated the background load, it cannot isolate it reliably.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="044.html">044.md</a> teaches workload governance inside one business; this lesson turns it into an explicit customer boundary</h3>
+<p>The previous lesson protected commits from reports and backfills by classifying work inside Harbor Point's own workload mix. Multi-tenant isolation adds a stronger outer ring: first protect each tenant's entitlement, then schedule workload classes within that entitlement. The mechanics are similar, but the contract is sharper because a customer-facing SLO and pricing tier now depend on it.</p>
+<h3>Connection 2: <a href="046.html">046.md</a> asks whether online maintenance obeys the same tenant boundaries as foreground traffic</h3>
+<p>Online reindexing introduces shadow structures, catch-up writes, and cutover work that can generate large bursts of read and write amplification. In a shared cluster, those costs are not just maintenance details. They are another test of whether the engine can keep one tenant's operational debt from spilling into another tenant's serving path.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] CockroachDB Docs: Admission Control<ul>
+<li>Link: <a href="https://www.cockroachlabs.com/docs/stable/architecture/admission-control">https://www.cockroachlabs.com/docs/stable/architecture/admission-control</a></li>
+<li>Focus: See how a production SQL engine protects foreground work with per-resource tokens and queueing discipline, then map those ideas to per-tenant budgets instead of only per-workload control.</li>
+</ul>
+</li>
+<li>[DOC] Trino Docs: Resource Groups<ul>
+<li>Link: <a href="https://trino.io/docs/current/admin/resource-groups.html">https://trino.io/docs/current/admin/resource-groups.html</a></li>
+<li>Focus: Study how a shared query engine encodes hierarchy, concurrency caps, and queue limits for different tenants and workloads on the same cluster.</li>
+</ul>
+</li>
+<li>[DOC] Linux Kernel cgroup v2 Documentation<ul>
+<li>Link: <a href="https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html">https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html</a></li>
+<li>Focus: Read the CPU, memory, and IO controller sections as the host-level isolation floor underneath the database's own tenant-aware accounting.</li>
+</ul>
+</li>
+<li>[DOC] Resource Management for Pods and Containers - Kubernetes<ul>
+<li>Link: <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/</a></li>
+<li>Focus: Compare scheduler requests and limits with database-level quotas to see why node isolation and engine isolation solve different layers of the noisy-neighbor problem.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a><ul>
+<li>Link: <a href="https://research.google/pubs/pub39966/">https://research.google/pubs/pub39966/</a></li>
+<li>Focus: Use the paper to think about how a large shared data service turns placement, resource control, and operational boundaries into architectural concerns rather than afterthoughts.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Tenant isolation is deeper than catalog isolation</strong> - Separate schemas and auth protect visibility, but shared-cluster safety depends on whether tenant ownership reaches keys, locks, caches, queues, and maintenance subsystems.</li>
+<li><strong>Isolation only works when budgets cover every scarce resource that matters</strong> - CPU fairness alone is insufficient if memory grants, WAL bandwidth, temp spill space, or compaction workers remain globally first-come, first-served.</li>
+<li><strong>Background work is the real honesty test</strong> - If index builds, bulk ingest, vacuum, or compaction are not charged and limited per tenant, the system still has a noisy-neighbor escape hatch.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why are separate databases or schemas not sufficient by themselves for strong multi-tenant isolation in Harbor Point's shared cluster?</strong></p>
+<ul>
+<li>A) Because SQL namespaces do not automatically control shared CPU, memory grants, WAL bandwidth, cache residency, and maintenance workers</li>
+<li>B) Because schemas make query planning impossible</li>
+<li>C) Because tenant isolation only matters when every tenant uses a different SQL dialect</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main reason Harbor Point allows burst borrowing only with fast clawback?</strong></p>
+<ul>
+<li>A) So idle capacity can improve utilization without letting a quiet tenant's reservation disappear when its real spike arrives</li>
+<li>B) Because hard quotas always increase total throughput</li>
+<li>C) Because borrowing is only useful for storage encryption keys</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does this lesson naturally lead into online reindexing and maintenance at scale?</strong></p>
+<ul>
+<li>A) Because maintenance traffic is free once tenant auth is correct</li>
+<li>B) Because a shadow index build and catch-up phase must obey the same tenant budgets or one tenant's schema change can degrade another tenant's serving path</li>
+<li>C) Because multi-tenant isolation matters only for foreground reads</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: Visibility controls solve only part of the problem. A shared cluster is still unsafe if its schedulers, caches, WAL path, and maintenance subsystems are effectively global first-come, first-served. Options B and C are unrelated.</p>
+<p><strong>2. A</strong>: Borrowing is valuable because otherwise hard reservations strand idle capacity, but it is safe only when the engine can quickly return that capacity to the tenant that owns the reservation. Options B and C miss the utilization-versus-protection trade-off.</p>
+<p><strong>3. B</strong>: Online reindexing adds heavy background reads, writes, and catch-up work. In a shared cluster those costs must still be attributed and limited by tenant, or maintenance becomes another noisy-neighbor path. Options A and C ignore the central production risk.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="044.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Admission Control and Workload Governance</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="046.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Online Reindexing and Maintenance at Scale</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

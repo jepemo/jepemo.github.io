@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Admission Control and Workload Governance - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Admission Control and Workload Governance</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 044 | Lesson ID: 445
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 445: Admission Control and Workload Governance</h1>
+<blockquote>
+<p><strong>The core idea</strong>: After a database engine gets good at executing individual queries efficiently, the harder problem is deciding which work is allowed to consume shared CPU, memory, WAL, and lock capacity at all. Admission control protects the system by refusing or delaying the wrong work before overload turns into a correctness or latency incident.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="043.html">043.md</a>, Harbor Point made its morning exposure report much more CPU-efficient by switching the hot path to vectorized execution. That looked like a pure win until the next market-open spike. Analysts launched several copies of the exposure report, the overnight backfill was still scanning historical reservations, autovacuum was catching up on version cleanup, and traders were simultaneously trying to commit new reservations with a tight latency SLO. No single query was obviously broken. The cluster still fell behind anyway.</p>
+<p>The important realization is that overload in a database is usually not caused by "too many connections" in the abstract. It happens because too much admitted work starts competing for the same internal choke points: runnable CPU slots, memory grants for joins and sorts, WAL flush bandwidth, lock-manager attention, buffer-pool residency, compaction or vacuum workers, and storage queue depth. Once a low-priority scan has already claimed those resources, the engine is no longer choosing policy. It is just suffering the consequences.</p>
+<p>Admission control is the layer that turns business priority into an engine decision. Harbor Point should be able to say, concretely, that a trader commit, a desk dashboard query, and a historical reconciliation scan are not equivalent requests. They may all be valid SQL, but they do not deserve the same right to consume scarce internal capacity at the same moment. Workload governance is how the engine enforces that distinction under pressure.</p>
+<p>That corrects a common misconception. Database admission control is not just a nicer spelling of rate limiting. A generic rate limiter counts requests. A database governor reasons about the specific resources each request will strain, how long it can wait, and what higher-priority work must stay protected even if that means rejecting useful lower-priority work.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's core booking path writes to <code>reservations</code>, updates issuer exposure state, and waits for a durable commit before the trader sees success. The same cluster also serves intraday compliance analytics and overnight backfills. If the database admits all of that work indiscriminately, the failure mode is rarely a clean "server full" message. Instead, commit latency stretches from a few milliseconds to hundreds, lock holders remain active longer, analytical scans accumulate in queues they cannot drain, and background maintenance falls further behind. By the time operators notice the incident, the engine is already carrying a backlog in several subsystems at once.</p>
+<p>Good workload governance changes that shape of failure. The database may still refuse some work during a spike, but it refuses it deliberately and early. Harbor Point can reserve admission budget for foreground commits, cap concurrent analytical scans, pause or slow backfill jobs, and keep enough maintenance capacity available that the cluster remains recoverable after the spike. The system becomes less "maximally busy" and more predictable, which is the trade-off that matters in production.</p>
+<p>This is also where engine internals and product policy meet. If leadership promises that trade booking stays fast during market open while reports may lag, that promise is not fulfilled by dashboards or customer messaging. It is fulfilled by concrete admission rules inside the engine. Without those rules, "priority" remains a slide-deck concept with no mechanical force.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what admission control is protecting inside a database engine</strong> - Distinguish user-visible request volume from the internal resources that actually collapse first under mixed workloads.</li>
+<li><strong>Trace the path from query classification to admit, queue, or reject decisions</strong> - Follow how Harbor Point turns workload intent into bounded concurrency and queueing behavior.</li>
+<li><strong>Evaluate governance trade-offs in production</strong> - Compare reserved capacity, elastic borrowing, shedding, and fairness policies for a database serving OLTP, analytics, and maintenance work together.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Admission control starts by modeling protected resources, not by counting sessions</h3>
+<p>At Harbor Point, opening ten extra SQL sessions is not inherently dangerous. What matters is what those sessions are trying to do. A short point lookup on <code>reservation_id</code> and a cluster-wide exposure scan do not place the same demands on the engine, even if both appear as one "query" to the connection pool. That is why connection limits are only a blunt outer guardrail. Real admission control begins deeper in the stack by identifying which resources must stay bounded.</p>
+<p>For Harbor Point's morning workload, the protected set is concrete. Trader commits need WAL progress and lock-manager responsiveness. Exposure reports need CPU, memory grants for hash aggregation, and stable buffer-pool residency for hot pages. The overnight backfill wants long sequential scans and can easily dominate storage queues if left unchecked. Autovacuum and checkpoint work are not user-facing, but they are still critical because starving them now creates worse recovery and bloat problems later.</p>
+<p>The engine therefore classifies requests before it lets them join the runnable workload. A simplified view looks like this:</p>
+<div class="codehilite"><pre><span></span><code>SQL request
+  -&gt; classifier (role, statement tag, tables touched, plan shape)
+  -&gt; workload class (trader_commit / desk_report / backfill / maintenance)
+  -&gt; resource budget checks (CPU slots, memory grant, IO tokens, queue budget)
+  -&gt; admit now | queue briefly | reject or defer
+</code></pre></div>
+
+<p>The classifier can use several signals. Some systems trust explicit query tags or application names. Others incorporate optimizer estimates such as scanned rows, expected memory, or whether the plan includes a large repartition or sort. The estimates are imperfect, but they are still more useful than pretending every statement costs the same. Harbor Point does not need a perfect oracle. It needs a model that is directionally accurate enough to keep expensive work from overwhelming critical paths.</p>
+<p>The trade-off is that finer-grained modeling increases both power and complexity. A single "analytical" bucket is easy to reason about but can be unfair when a tiny dashboard query gets lumped together with a two-hour reconciliation scan. Richer classes and multi-resource budgets improve isolation, yet they also create more knobs, more ways to misclassify work, and more operational tuning burden.</p>
+<h3>Concept 2: Bounded queues and feedback loops keep overload from turning into a self-amplifying backlog</h3>
+<p>Classification alone does not solve overload. Harbor Point also needs a policy for what happens when the desired work exceeds the current budget. The critical design rule is that queues must stay bounded. An unbounded wait list feels kinder than rejection in the moment, but in a database it often makes the incident worse: clients keep timing out late, locks stay held longer, memory remains pinned by in-flight operators, and operators lose the ability to tell whether the system is recovering or merely accumulating debt.</p>
+<p>Suppose the exposure-report class is allowed four concurrent scans and a queue of eight waiting requests. The ninth arriving report should not quietly sit for minutes while trader commits suffer. It should be rejected or redirected early, because the point of governance is to contain harm, not to preserve the illusion that every request was accepted. Low-priority work that cannot finish inside its latency budget is usually better shed than queued indefinitely.</p>
+<p>That logic is clearer in pseudocode:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">now</span><span class="p">):</span>
+    <span class="bp">cls</span> <span class="o">=</span> <span class="n">classify</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+    <span class="n">cost</span> <span class="o">=</span> <span class="n">estimate_cost</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+    <span class="n">budget</span> <span class="o">=</span> <span class="n">budgets</span><span class="p">[</span><span class="bp">cls</span><span class="p">]</span>
+
+    <span class="k">if</span> <span class="n">budget</span><span class="o">.</span><span class="n">can_run</span><span class="p">(</span><span class="n">cost</span><span class="p">):</span>
+        <span class="n">budget</span><span class="o">.</span><span class="n">reserve</span><span class="p">(</span><span class="n">cost</span><span class="p">)</span>
+        <span class="k">return</span> <span class="s2">&quot;admit&quot;</span>
+
+    <span class="k">if</span> <span class="n">budget</span><span class="o">.</span><span class="n">queue_has_room</span><span class="p">()</span> <span class="ow">and</span> <span class="n">request</span><span class="o">.</span><span class="n">deadline</span> <span class="o">&gt;</span> <span class="n">now</span> <span class="o">+</span> <span class="n">budget</span><span class="o">.</span><span class="n">predicted_wait</span><span class="p">():</span>
+        <span class="n">budget</span><span class="o">.</span><span class="n">enqueue</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">cost</span><span class="p">)</span>
+        <span class="k">return</span> <span class="s2">&quot;queue&quot;</span>
+
+    <span class="k">return</span> <span class="s2">&quot;reject&quot;</span>
+</code></pre></div>
+
+<p>Real engines add another layer: feedback from live system state. Harbor Point may temporarily reduce analytical admission when commit latency rises, when WAL flush lag widens, when LSM compaction debt grows, or when autovacuum falls behind on <code>reservations</code>. This is the governance part of workload governance. The engine is not only following static limits; it is adapting class budgets based on whether important subsystems are entering danger.</p>
+<p>The trade-off is responsiveness versus stability. If the controller reacts too slowly, the cluster admits damaging work for too long. If it reacts too aggressively, budgets oscillate and workloads thrash between open and closed states. Production systems therefore use damping, hysteresis, or separate trigger and release thresholds so a brief spike does not cause constant policy flapping.</p>
+<h3>Concept 3: Workload governance encodes business priority, fairness, and recoverability as engine policy</h3>
+<p>Once Harbor Point accepts that not all work is equal, it still has to decide what "better" means. Protecting trader commits above all else is obvious during market open, but even that statement hides choices. Should backfill jobs stop completely or just slow down? Can desk reports borrow unused foreground capacity, and if so, how quickly must they give it back? Does maintenance get a hard reservation so vacuum and checkpoint progress never stalls, or is it allowed to compete for leftovers?</p>
+<p>A practical governance policy usually mixes three ideas. First, reserve some non-borrowable capacity for the workloads that define correctness or the main product promise, such as commit paths and essential maintenance. Second, allow elastic borrowing when the cluster is calm so expensive resources do not sit idle. Third, define explicit shedding rules for work that is valuable but deferrable, such as ad hoc scans or historical backfills. Harbor Point is not trying to maximize theoretical throughput. It is trying to ensure that the wrong class of work never becomes the reason the booking path misses its SLO.</p>
+<p>This is also where fairness enters. If one risk team launches twelve large reports, should another desk's smaller report wait behind all twelve? If a backfill job retries automatically, should it be allowed to refill the entire queue after each rejection? Governance policies answer those questions with quotas, per-class queue caps, tenant-aware weights, and retry discipline. The next lesson extends this same problem from workload classes to explicit multi-tenant isolation boundaries.</p>
+<p>The trade-off is utilization versus predictability. Hard reservations make latency behavior easier to reason about but can strand capacity during quiet periods. Fully shared pools raise utilization but invite bleed-over, where a surge in one class steals the headroom another class silently depended on. Strong systems make that choice explicit and observable. Harbor Point should be able to graph admission wait time, queue depth, rejection rate, effective concurrency, WAL lag, and maintenance debt per class. If governance is invisible, it cannot be tuned before the next spike.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point sees long admission waits for reports even though CPU utilization is only moderate.</p>
+<p><strong>Why it happens / is confusing</strong>: The exhausted budget may be memory grants, WAL bandwidth, or storage tokens rather than CPU. Overall node utilization can look healthy while one protected resource is already saturated.</p>
+<p><strong>Clarification / Fix</strong>: Inspect per-resource admission metrics instead of a single "load" number. Separate queueing by CPU, memory, and storage pressure so operators can see which subsystem is forcing the wait.</p>
+<p><strong>Issue</strong>: Low-priority scans still damage trader commit latency even after a connection cap was added.</p>
+<p><strong>Why it happens / is confusing</strong>: Connection caps limit session count, not the internal footprint of admitted work. A small number of expensive scans can still monopolize memory grants, cache residency, or I/O bandwidth.</p>
+<p><strong>Clarification / Fix</strong>: Classify and budget by workload type, not just by session. Reserve foreground capacity for commit-critical paths and cap concurrent analytical operators independently from the global connection pool.</p>
+<p><strong>Issue</strong>: The governor rejects work for too long after a transient spike, so the cluster looks underutilized during recovery.</p>
+<p><strong>Why it happens / is confusing</strong>: Feedback thresholds may be tied to slow-moving signals such as compaction debt or smoothed latency averages, causing the controller to stay in a defensive state after the immediate bottleneck is gone.</p>
+<p><strong>Clarification / Fix</strong>: Use damped but separate open/close thresholds, and distinguish "protect immediately" signals from "relax gradually" signals. Recovery policy should be conservative without becoming sticky.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="043.html">043.md</a> improves per-query CPU efficiency; this lesson decides how many efficient queries may run together</h3>
+<p>Vectorized execution made Harbor Point's exposure report cheaper on one worker, but it did not make shared caches, memory bandwidth, or WAL progress infinite. Admission control is what turns local execution efficiency into a safe cluster-level operating point instead of letting many improved queries overwhelm one another.</p>
+<h3>Connection 2: Workload governance becomes tenant isolation once the competing workloads belong to different customers or desks</h3>
+<p>A managed SQL platform faces the same mechanics Harbor Point sees internally, but the policy boundary is sharper. CPU slots, memory grants, and storage bandwidth have to be apportioned not just by query class but by tenant entitlement. That is why workload governance is the direct precursor to multi-tenant isolation.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] CockroachDB Docs: Admission Control<ul>
+<li>Link: <a href="https://www.cockroachlabs.com/docs/stable/architecture/admission-control">https://www.cockroachlabs.com/docs/stable/architecture/admission-control</a></li>
+<li>Focus: See how a production SQL engine uses per-resource tokens and elastic CPU scheduling to protect foreground work under overload.</li>
+</ul>
+</li>
+<li>[DOC] Trino Docs: Resource Groups<ul>
+<li>Link: <a href="https://trino.io/docs/current/admin/resource-groups.html">https://trino.io/docs/current/admin/resource-groups.html</a></li>
+<li>Focus: Study how queue limits, concurrency caps, and hierarchical groups encode workload policy rather than leaving all queries in one shared pool.</li>
+</ul>
+</li>
+<li>[DOC] Amazon Redshift Database Developer Guide: Workload Management<ul>
+<li>Link: <a href="https://docs.aws.amazon.com/redshift/latest/dg/cm-c-defining-query-queues.html">https://docs.aws.amazon.com/redshift/latest/dg/cm-c-defining-query-queues.html</a></li>
+<li>Focus: Compare query queues, priorities, and memory allocation in an analytical warehouse to the mixed-workload governance described in this lesson.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Admission control protects internal choke points, not just request counts</strong> - CPU slots, memory grants, WAL progress, maintenance bandwidth, and queue budgets are the real resources that determine whether overload stays bounded.</li>
+<li><strong>Bounded refusal is often healthier than optimistic waiting</strong> - A rejected low-priority query is painful, but an unbounded queue usually creates a wider incident by stretching latency, pinning resources, and hiding true backlog depth.</li>
+<li><strong>Workload governance is where business priority becomes executable policy</strong> - SLO promises only matter when the engine can reserve, borrow, and shed capacity in ways that match the actual product contract.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why is a global connection limit not sufficient as Harbor Point's main admission-control mechanism?</strong></p>
+<ul>
+<li>A) Because overload is driven by internal resources such as memory grants, WAL bandwidth, and CPU slots, and different queries consume those resources very differently</li>
+<li>B) Because databases never need any connection limits at all</li>
+<li>C) Because every SQL statement has the same runtime footprint once it is parsed</li>
+</ul>
+</li>
+<li>
+<p><strong>When Harbor Point's analytical queue is already full, what is usually the healthiest action for the next low-priority report request?</strong></p>
+<ul>
+<li>A) Admit it anyway so the user is not rejected</li>
+<li>B) Queue it without any deadline because fairness matters more than bounded latency</li>
+<li>C) Reject or defer it early so the backlog stays bounded and foreground work remains protected</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does this lesson naturally lead into multi-tenant isolation?</strong></p>
+<ul>
+<li>A) Because tenant isolation removes the need for workload classes</li>
+<li>B) Because the same admission machinery used to separate commits, reports, and backfills can be extended to enforce fairness and quotas across tenants</li>
+<li>C) Because admission control only matters in single-tenant systems</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: Connection counts are only a rough outer bound. The real risk comes from the specific engine resources each admitted query claims. Options B and C ignore the mixed-workload reality this lesson focuses on.</p>
+<p><strong>2. C</strong>: Once the queue is full, optimistic waiting usually worsens the incident by increasing hidden backlog and delaying the point where clients know they need to retry or fall back. Admitting or unboundedly queuing the work defeats the purpose of governance.</p>
+<p><strong>3. B</strong>: Multi-tenant isolation is workload governance with a stronger policy boundary. The same core machinery, classification, budgeting, queueing, and shedding, is reused to keep one tenant's demand from consuming another tenant's entitlement.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="043.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Vectorized Execution and CPU Cache Efficiency</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="045.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Multi-Tenant Isolation in Shared Clusters</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

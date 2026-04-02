@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inference Optimization - 10x Faster LLM Inference - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Inference Optimization - 10x Faster LLM Inference</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/llm-training-alignment-and-serving.html">LLM Training, Alignment, and Serving</a>
+        </p>
+        <p>
+          Sequence: 015 | Lesson ID: 319
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 319: Inference Optimization - 10x Faster LLM Inference</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Inference optimization is not one trick that magically makes LLMs fast. It is the systems problem of turning a numerically correct model into a serving pipeline that meets latency, throughput, and cost targets under real traffic, real context lengths, and real concurrency.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><strong>The insight</strong>: Most large serving gains come from treating LLM inference as a queueing and memory-management problem, not just as "run matrix multiplications faster."</p>
+<p><strong>Why this matters</strong>: Once models are large, serving speed depends on more than raw FLOPs:</p>
+<ul>
+<li>how requests are batched</li>
+<li>how KV cache is stored and reused</li>
+<li>how prefill and decode phases behave</li>
+<li>how the scheduler shares hardware across competing requests</li>
+</ul>
+<p><strong>Concrete anchor</strong>: A team may quantize a model and still see poor user latency because the scheduler fragments batches, KV cache spills, or long prompts block short ones. The model is compressed, but the serving system is still inefficient.</p>
+<p><strong>Keep this mental hook in view</strong>: Inference speed comes from the serving stack, not just from the model weights.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p><a href="014.html"><code>20/14.md</code></a> showed that quantization improves the economics of serving by shrinking memory footprint and bandwidth pressure.</p>
+<p>This lesson extends that idea:</p>
+<ul>
+<li>even with a good quantized model, you can still leave most performance on the table if scheduling, batching, and cache management are poor</li>
+</ul>
+<p>That is why "10x faster inference" usually does not come from a single low-level kernel. It comes from combining several layers of optimization:</p>
+<ul>
+<li>model representation</li>
+<li>kernel efficiency</li>
+<li>request scheduling</li>
+<li>KV cache handling</li>
+<li>batching strategy</li>
+</ul>
+<p>This is also the last big bridge before deployment and serving architecture in <a href="016.html"><code>20/16.md</code></a>.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you should be able to:</p>
+<ol>
+<li><strong>Explain why prefill and decode are different inference phases with different bottlenecks</strong>.</li>
+<li><strong>Describe the major serving optimizations</strong>: continuous batching, KV cache management, paged attention, fused kernels, and speculative decoding.</li>
+<li><strong>Evaluate inference optimizations against the real metrics that matter</strong>: tail latency, throughput, memory pressure, and cost per request.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: LLM Inference Has Two Distinct Phases, and They Behave Differently</h3>
+<p>For example, a user sends a long prompt and asks for a short answer. Another user sends a short prompt and expects a long completion. Even if both requests touch the same model, they stress the system differently.</p>
+<p>At a high level, LLM serving is usually easiest to reason about when separated into:</p>
+<ul>
+<li><strong>prefill</strong><ul>
+<li>process the input prompt and build the KV cache</li>
+</ul>
+</li>
+<li><strong>decode</strong><ul>
+<li>generate tokens one step at a time using the accumulated cache</li>
+</ul>
+</li>
+</ul>
+<p>These phases have different performance characteristics.</p>
+<p>Mechanically: Prefill tends to:</p>
+<ul>
+<li>use large matrix operations</li>
+<li>benefit strongly from batching</li>
+<li>be sensitive to prompt length</li>
+</ul>
+<p>Decode tends to:</p>
+<ul>
+<li>run repeatedly token by token</li>
+<li>be dominated by memory access and cache reuse</li>
+<li>be sensitive to scheduler decisions and concurrency</li>
+</ul>
+<p>This distinction matters because an optimization that helps prefill may do little for decode, and vice versa.</p>
+<p>In practice:</p>
+<ul>
+<li>long prompts can dominate latency even if generation is short</li>
+<li>high token throughput does not guarantee good first-token latency</li>
+<li>system tuning should separate TTFT and decode speed rather than treating "latency" as one number</li>
+</ul>
+<p>The trade-off is clear: Optimizing the system for long batched prefills can hurt interactive responsiveness, while optimizing for low-latency decode can reduce total throughput.</p>
+<p>A useful mental model is: Prefill is the cost of loading context into the model's working memory. Decode is the repeated cost of thinking one token at a time.</p>
+<p>Use this lens when:</p>
+<ul>
+<li>Best fit: diagnosing whether latency problems come from prompt ingestion or token generation.</li>
+<li>Misuse pattern: comparing serving systems on one blended throughput number only.</li>
+</ul>
+<h3>Concept 2: Big Serving Gains Come from Scheduler and Memory Design as Much as from Math Kernels</h3>
+<p>For example, a naive server batches requests statically and allocates KV cache contiguously. Under mixed workloads, short requests wait behind long ones and memory becomes fragmented. Another server uses continuous batching and paged cache management, so tokens from many requests can be interleaved efficiently.</p>
+<p>At a high level, At scale, inference optimization is about how well the runtime keeps the accelerator busy without wasting memory or starving interactive requests.</p>
+<p>Mechanically: Major optimizations include:</p>
+<ul>
+<li><strong>continuous batching</strong><ul>
+<li>admit new requests into decode batches as older requests finish</li>
+<li>improves utilization over fixed batch boundaries</li>
+</ul>
+</li>
+<li><strong>KV cache optimization</strong><ul>
+<li>reuse and place attention state efficiently</li>
+<li>often one of the dominant memory problems in long-context serving</li>
+</ul>
+</li>
+<li><strong>paged attention / paged KV management</strong><ul>
+<li>reduces fragmentation and makes cache allocation more flexible</li>
+</ul>
+</li>
+<li><strong>kernel fusion and specialized runtimes</strong><ul>
+<li>reduce overhead between operations</li>
+<li>improve arithmetic and memory efficiency</li>
+</ul>
+</li>
+<li><strong>speculative decoding</strong><ul>
+<li>draft tokens with a smaller model or auxiliary mechanism, then verify with the main model</li>
+<li>can accelerate generation when acceptance rate is good</li>
+</ul>
+</li>
+</ul>
+<p>Each helps for a different reason. Together they change the utilization profile of the serving system.</p>
+<p>In practice:</p>
+<ul>
+<li>a "faster model" may still serve poorly without a strong runtime</li>
+<li>runtime choice can change hardware requirements dramatically</li>
+<li>queueing policy and fairness matter just as much as raw kernel speed for user experience</li>
+</ul>
+<p>The trade-off is clear: More advanced serving runtimes can dramatically improve efficiency, but they increase operational complexity, hardware assumptions, and debugging difficulty.</p>
+<p>A useful mental model is: The model is the engine. The scheduler, cache manager, and kernels are the transmission, cooling, and gearbox that determine how much of that engine you can actually use.</p>
+<p>Use this lens when:</p>
+<ul>
+<li>Best fit: comparing serving frameworks or explaining why vLLM- or TensorRT-style runtimes outperform naive loops.</li>
+<li>Misuse pattern: assuming kernel-level optimization alone explains production latency.</li>
+</ul>
+<h3>Concept 3: "Faster Inference" Only Counts If the Right SLOs Improve</h3>
+<p>For example, a new runtime improves aggregate tokens/sec by 30%, but p95 first-token latency worsens, short requests queue behind long requests, and cost per successful conversation barely changes. The benchmark says "faster"; the product says "not better."</p>
+<p>At a high level, Inference optimization should be judged by service objectives, not by one flattering metric.</p>
+<p>Mechanically: Useful serving metrics often include:</p>
+<ul>
+<li><strong>TTFT</strong> (time to first token)</li>
+<li><strong>tokens/sec during decode</strong></li>
+<li><strong>p95 / p99 latency</strong></li>
+<li><strong>throughput under concurrency</strong></li>
+<li><strong>GPU memory utilization</strong></li>
+<li><strong>cost per request or per generated token</strong></li>
+<li><strong>quality regressions after runtime tricks</strong></li>
+</ul>
+<p>The key is that these metrics interact:</p>
+<ul>
+<li>bigger batches improve utilization but may hurt interactivity</li>
+<li>more cache reuse helps throughput but raises memory footprint</li>
+<li>speculative decoding may help only on certain prompt and model distributions</li>
+</ul>
+<p>So the goal is not maximum speed in isolation. It is a serving profile that matches the product.</p>
+<p>In practice:</p>
+<ul>
+<li>chat systems often prioritize TTFT and tail latency</li>
+<li>offline batch generation may prioritize throughput</li>
+<li>agent systems may care about long-context stability and tool-call overhead</li>
+</ul>
+<p>The trade-off is clear: The serving profile that is best for one workload can be wrong for another, even on the same model.</p>
+<p>A useful mental model is: Inference optimization is SLO tuning for a generative system, not a single contest for highest tokens/sec.</p>
+<p>Use this lens when:</p>
+<ul>
+<li>Best fit: deciding which optimizations to ship for a specific product surface.</li>
+<li>Misuse pattern: treating leaderboard-style speed numbers as universal truth.</li>
+</ul>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: "We quantized the model, but latency barely improved."</p>
+<p><strong>Why it happens / is confusing</strong>: Smaller weights help, but serving may still be limited by batching policy, prompt length distribution, KV cache behavior, or runtime overhead.</p>
+<p><strong>Clarification / Fix</strong>: Measure prefill separately from decode, inspect memory utilization and queueing, and verify whether the runtime is actually using the optimized kernels for your setup.</p>
+<p><strong>Issue</strong>: "Our throughput looks great, but users say the system feels slower."</p>
+<p><strong>Why it happens / is confusing</strong>: Aggregate throughput can improve while first-token latency or tail latency gets worse.</p>
+<p><strong>Clarification / Fix</strong>: Track TTFT, p95, and fairness across short vs long requests. A serving system can be efficient overall and still feel bad interactively.</p>
+<p><strong>Issue</strong>: "Speculative decoding should always help."</p>
+<p><strong>Why it happens / is confusing</strong>: More tokens per verification step sounds universally better.</p>
+<p><strong>Clarification / Fix</strong>: It depends on acceptance rate, draft-model overhead, and workload shape. If verification rejects too many drafts, the complexity may not pay off.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Inference Optimization &lt;-&gt; Quantization</h3>
+<p><a href="014.html"><code>20/14.md</code></a> addressed model-side serving efficiency through lower precision.</p>
+<p>This lesson expands to runtime-side efficiency:</p>
+<ul>
+<li>cache layout</li>
+<li>batching</li>
+<li>scheduling</li>
+<li>decoding strategy</li>
+</ul>
+<p>Quantization helps, but it is only one part of the serving stack.</p>
+<h3>Connection 2: Inference Optimization &lt;-&gt; Deployment &amp; Serving</h3>
+<p>This lesson sets up <a href="016.html"><code>20/16.md</code></a>.</p>
+<p>Once you optimize inference, you still need to answer deployment questions:</p>
+<ul>
+<li>how many replicas?</li>
+<li>how to autoscale?</li>
+<li>how to route long vs short requests?</li>
+<li>how to isolate expensive tenants?</li>
+</ul>
+<p>So optimization naturally flows into production serving architecture.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>
+<p>[PAPER] <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></p>
+<ul>
+<li>Focus: Why KV cache allocation and continuous batching are central to modern high-throughput LLM serving.</li>
+</ul>
+</li>
+<li>
+<p>[PAPER] <a href="https://arxiv.org/abs/2302.01318">Accelerating Large Language Model Decoding with Speculative Sampling</a></p>
+<ul>
+<li>Focus: The core idea behind speculative decoding and when draft-and-verify can improve generation speed.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://docs.vllm.ai/">vLLM Documentation</a></p>
+<ul>
+<li>Focus: Practical serving concepts around paged attention, batching, and scalable LLM inference.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://nvidia.github.io/TensorRT-LLM/">TensorRT-LLM Documentation</a></p>
+<ul>
+<li>Focus: Kernel- and runtime-level optimization patterns for production LLM serving.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Inference optimization starts with understanding prefill and decode as different phases</strong> - each has different bottlenecks and different optimization levers.</li>
+<li><strong>Serving speed comes from the runtime stack as much as from the model</strong> - batching, KV cache management, schedulers, and kernels are where many of the biggest gains appear.</li>
+<li><strong>The right optimization is the one that improves the product SLOs that matter</strong> - tokens/sec alone is not enough.</li>
+</ol>
+<hr />
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why is it useful to separate prefill from decode when analyzing LLM serving?</strong></p>
+<ul>
+<li>A) Because only prefill uses the model.</li>
+<li>B) Because they have different performance profiles and often need different optimizations.</li>
+<li>C) Because decode does not depend on KV cache.</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the main value of continuous batching and paged KV management?</strong></p>
+<ul>
+<li>A) They make the model more accurate.</li>
+<li>B) They improve accelerator utilization and reduce memory waste under real mixed workloads.</li>
+<li>C) They eliminate the need for evaluation.</li>
+</ul>
+</li>
+<li>
+<p><strong>Why can a system with better throughput still feel worse to users?</strong></p>
+<ul>
+<li>A) Because throughput and interactive latency are different objectives.</li>
+<li>B) Because faster systems always hallucinate more.</li>
+<li>C) Because TTFT is unrelated to inference optimization.</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Prefill and decode stress the serving system differently, so treating them separately leads to better diagnosis and tuning.</p>
+<p><strong>2. B</strong>: Those optimizations improve how requests share hardware and memory, which is often the real performance bottleneck.</p>
+<p><strong>3. A</strong>: Aggregate speed can improve while first-token latency or tail latency gets worse, which is what users actually feel.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="014.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Quantization - Make Your LLM 4x Smaller and Faster</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="016.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Deployment & Serving - Production LLM Infrastructure</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/llm-training-alignment-and-serving.html">← Back to LLM Training, Alignment, and Serving</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

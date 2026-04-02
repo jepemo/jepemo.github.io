@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vacuum and Garbage Collection of Old Versions - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Vacuum and Garbage Collection of Old Versions</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 036 | Lesson ID: 413
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 413: Vacuum and Garbage Collection of Old Versions</h1>
+<blockquote>
+<p><strong>The core idea</strong>: An old MVCC version is reclaimable only after the oldest snapshot that could still see it has moved past it, so vacuum is really visibility-horizon management plus background storage cleanup.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="035.html">12.md</a>, Harbor Point fixed a bad market-open query by refreshing planner statistics and modeling skew more accurately. The estimate improved, but the query was still slower than it had been a week earlier. <code>EXPLAIN ANALYZE</code> now looked reasonable, yet the index scan on <code>reservations</code> touched far more heap pages than expected, and the table kept growing even though the number of live rows was nearly flat.</p>
+<p>The missing piece was old-version cleanup. Harbor Point's matching workflow updates each reservation several times in a short burst: <code>open</code>, then <code>routed</code>, then <code>partially_filled</code>, then <code>filled</code> or <code>canceled</code>. In an MVCC engine, those updates do not overwrite one row in place from every reader's perspective. They create a new visible version while older versions remain part of history for any snapshot that started earlier. During a long-running risk report, one old snapshot stayed open for twenty minutes, so autovacuum could see obsolete versions piling up but could not yet reclaim many of them.</p>
+<p>That is the shift for this lesson: vacuum is not janitorial work that runs "when the database has time." It is a correctness-constrained mechanism that asks a strict question for every old version: can any active snapshot still legally read this? If the answer is yes, reclaiming it would break snapshot semantics. If the answer is no, leaving it around inflates the heap, bloats indexes, and drags more cold pages into the working set. Cleanup policy therefore sits directly between concurrency control and storage efficiency.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's <code>reservations</code> table is not unusual by OLTP standards: heavy updates, short read queries, and occasional long analytics sessions that want a stable historical view. That combination is exactly where MVCC shines for readers and exactly where old-version debt becomes operationally expensive. A planner can have accurate statistics and a well-designed index, yet the real query still slows down because the engine is scanning through dead tuple versions, following stale index pointers, and caching pages whose only current purpose is to preserve history for one lingering snapshot.</p>
+<p>Understanding vacuum changes the diagnosis. Before, storage growth and rising latency look like vague "database slowness." After, you can distinguish between live-data growth, dead-version backlog, and file-level bloat that persists even after tuples become reusable. You can also reason about why a replica with an old read view, an idle transaction, or an underpowered background worker can quietly hold the reclaim horizon in place.</p>
+<p>That matters for correctness as well as performance. MVCC engines must eventually retire transaction metadata safely, or they risk wraparound-style failure modes where visibility information itself becomes ambiguous. Vacuum is therefore not optional polish. It is part of the mechanism that keeps old history readable long enough, then proves when it is safe to forget it.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain when an old row version becomes safe to reclaim</strong> - Connect tuple visibility to the oldest active snapshot rather than to the moment an update commits.</li>
+<li><strong>Trace what vacuum or purge work actually does inside the engine</strong> - Follow how the system identifies dead versions, cleans indexes or undo state, and returns space to reuse.</li>
+<li><strong>Diagnose production symptoms of cleanup debt</strong> - Separate horizon blockers, reusable free space, and true relation or index bloat when performance degrades.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A version is dead only relative to every active snapshot, not just to the newest writer</h3>
+<p>Harbor Point updates reservation <code>R-18422</code> three times in quick succession during market open. From the application's point of view, there is one reservation whose status changed. Inside an MVCC engine, the history is closer to this:</p>
+<div class="codehilite"><pre><span></span><code>time ----&gt;
+
+v1: status=open           xmin=8401 xmax=8408
+v2: status=routed         xmin=8408 xmax=8412
+v3: status=partially_fill xmin=8412 xmax=inf
+
+snapshot S_old starts before 8408  -&gt; can still see v1
+snapshot S_mid starts before 8412  -&gt; can still see v2
+new snapshot starts after 8412     -&gt; sees v3
+</code></pre></div>
+
+<p>The key invariant is that each reader gets a consistent snapshot. A reader that started before transaction <code>8408</code> committed must still be able to read <code>v1</code> even after <code>v2</code> and <code>v3</code> exist. That is why old versions cannot be reclaimed at commit time. The engine needs a global visibility horizon, usually expressed as the oldest transaction ID or oldest read view that any active session still needs. Only versions older than that horizon, and already superseded from every relevant snapshot, are candidates for cleanup.</p>
+<p>PostgreSQL and InnoDB package the details differently, but the rule is the same. PostgreSQL stores version metadata with heap tuples and decides visibility from <code>xmin</code> and <code>xmax</code>. InnoDB keeps prior versions in undo records and exposes them through read views. The implementation differs; the correctness boundary does not. Garbage collection is blocked by the oldest snapshot that still makes an old version reachable.</p>
+<p>This is the fundamental trade-off of MVCC. Readers avoid blocking writers because they can walk historical versions instead of waiting for in-place overwrites to finish. The cost is deferred cleanup. Cheap, nonblocking reads are financed by background work that must later discover which history is still needed and which history can finally disappear.</p>
+<h3>Concept 2: Vacuum is a pipeline of classification, cleanup, and reuse metadata, not a single "delete old rows" step</h3>
+<p>When Harbor Point's autovacuum worker visits <code>reservations</code>, it is not simply erasing rows marked old. It has to inspect pages, classify tuple versions by visibility, and decide what kind of cleanup is safe now. In a PostgreSQL-like heap, the sequence is roughly:</p>
+<div class="codehilite"><pre><span></span><code>scan page
+  -&gt; determine which tuple versions are live, dead, or still potentially visible
+  -&gt; remove or mark removable index references for versions that are definitely dead
+  -&gt; mark heap space reusable
+  -&gt; refresh free-space / visibility metadata
+  -&gt; freeze very old transaction IDs when needed
+</code></pre></div>
+
+<p>Each stage serves a different purpose. Identifying a tuple as dead is about correctness. Cleaning an index entry is about preventing future probes from landing on a version no query can use. Updating free-space metadata is about helping later inserts and updates reuse holes instead of extending the file. Freezing very old transaction IDs is about keeping visibility checks well-defined as transaction counters age.</p>
+<p>Two production nuances matter here. First, vacuum often makes space reusable inside the relation long before the operating system sees a smaller file. If dead tuples are scattered across many pages, the engine can reuse those holes for future writes without being able to truncate the file tail. Second, a vacuum pass can do real work and still leave a table looking bloated if one old snapshot prevents many versions from crossing the reclaim horizon. "Vacuum ran" is therefore not the same statement as "cleanup succeeded."</p>
+<p>InnoDB expresses the same idea with different structures. Purge threads retire undo records and remove delete-marked records only after no read view can need them. Again, the important lesson is the mechanism: old-version cleanup touches both the history structure and the live access paths. It is not just housekeeping at the edge of the system; it changes read amplification for future transactions.</p>
+<h3>Concept 3: Vacuum debt becomes performance debt by inflating scans, indexes, and the working set</h3>
+<p>Harbor Point first noticed the problem in query latency, not in a vacuum dashboard. The live row count stayed near twelve million, but the heap and its hot indexes expanded well past that footprint because every burst of reservation updates created more dead versions than cleanup could reclaim. As the backlog grew, ordered index scans had to traverse more stale pointers, more heap pages lost their all-visible status, and cache residency shifted from currently tradable reservations toward pages that mostly existed to preserve old history.</p>
+<p>That is why vacuum tuning is not merely a storage-admin chore. It directly affects the size of the active working set. A dead version that remains on a frequently touched page can force extra visibility checks and deny index-only scans. A dead version on a cold page can keep the table file larger than it needs to be, increasing checkpoint and backup work. If the backlog becomes extreme, the engine may need emergency anti-wraparound cleanup that is far more disruptive than steady routine maintenance would have been.</p>
+<p>The operational levers map cleanly to the mechanism. If the horizon is pinned by a long transaction, fix the transaction lifecycle or the replica feedback policy. If cleanup simply cannot keep pace with write churn, adjust autovacuum or purge capacity and thresholds so maintenance starts earlier. If the workload creates avoidable version churn, redesign the table or update path so hot rows generate fewer non-HOT updates, or partition old data so the newest, most frequently updated slice stays compact. Those choices all cost something: more background I/O, more planning around transaction lifetimes, or more schema complexity.</p>
+<p>This also sets up <a href="037.html">14.md</a>. Hot and cold data tiering is much easier to reason about once you see that dead versions are a hidden kind of cold data occupying hot storage. If garbage collection lags, the engine's working set expands with pages that no current transaction actually wants.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: <code>VACUUM</code> completed, but the table file on disk barely shrank.</p>
+<p><strong>Why it happens / is confusing</strong>: Standard vacuum usually returns space to the relation's own free-space pool first. If free bytes are spread across the file instead of concentrated at the end, the engine can reuse them later without being able to truncate the file immediately.</p>
+<p><strong>Clarification / Fix</strong>: Check whether live-row count is stable while free space inside the relation is increasing. If the real problem is file-level bloat rather than reuse debt, you may need a rewrite-style operation, partition rotation, or reindexing in addition to routine vacuum.</p>
+<p><strong>Issue</strong>: Autovacuum keeps visiting a table, but dead tuples remain high for hours.</p>
+<p><strong>Why it happens / is confusing</strong>: The worker may be blocked by the visibility horizon rather than by lack of effort. A long transaction, an idle session left open in a transaction block, or a replica holding an old snapshot can make many versions ineligible for reclamation.</p>
+<p><strong>Clarification / Fix</strong>: Find the oldest active snapshot or read view before tuning worker cost limits. Removing the blocker usually releases more reclaimable space than simply making vacuum scan faster.</p>
+<p><strong>Issue</strong>: Query plans look reasonable again after <a href="035.html">12.md</a>, but index scans are still getting slower over time.</p>
+<p><strong>Why it happens / is confusing</strong>: Statistics quality and version cleanup solve different problems. The planner may now estimate row counts correctly while the physical access path still pays for dead index entries, wider heap footprint, and lost visibility-map coverage.</p>
+<p><strong>Clarification / Fix</strong>: Measure dead tuples, index bloat, and long-lived transactions alongside <code>EXPLAIN ANALYZE</code>. If estimates are accurate but page reads and heap fetches keep climbing, the bottleneck has shifted from planning error to cleanup debt.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="035.html">12.md</a> and this lesson share the same maintenance budget</h3>
+<p>Yesterday's lesson showed how stale or underspecified statistics cause cardinality errors. Today's lesson shows a different maintenance failure mode: even with fresh statistics, old-version debt can make the chosen plan more expensive to execute than its logical shape suggests. In production, analyze work and garbage collection often compete for the same background I/O and scheduling attention, so plan quality and cleanup quality frequently drift together.</p>
+<h3>Connection 2: <a href="037.html">14.md</a> turns cleanup lag into a working-set design problem</h3>
+<p>Vacuum debt is not only about wasted bytes. It decides which pages stay in active circulation and which indexes remain slim enough for cache-friendly access. The next lesson broadens that idea from tuple history to the full storage hierarchy: once you know dead versions can pollute the hot set, hot/cold tiering becomes an extension of the same control problem.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PostgreSQL Documentation: Routine Vacuuming</a><ul>
+<li>Focus: The operational model for ordinary vacuum, autovacuum thresholds, and why old snapshots or wraparound pressure change cleanup behavior.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/sql-vacuum.html">PostgreSQL Documentation: VACUUM</a><ul>
+<li>Focus: What the command actually does, including index cleanup, freezing, and the difference between routine vacuuming and more aggressive rewrite-style operations.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-vm.html">PostgreSQL Documentation: Visibility Map</a><ul>
+<li>Focus: Why page-level visibility metadata matters for vacuum efficiency and index-only scans.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html">MySQL 8.4 Reference Manual: InnoDB Multi-Versioning</a><ul>
+<li>Focus: A second engine's explanation of read views and old-version access, useful for seeing which MVCC cleanup ideas are general rather than PostgreSQL-specific.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-purge-configuration.html">MySQL 8.4 Reference Manual: Purge Configuration</a><ul>
+<li>Focus: How InnoDB's purge threads retire obsolete history and what tuning knobs exist when cleanup lags behind write workload.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Old versions disappear only after the oldest snapshot releases them</strong> - The reclaim boundary is a visibility rule, not a timer that starts when an update commits.</li>
+<li><strong>Vacuum changes future read cost, not just past storage usage</strong> - Cleaning heap history, index entries, and visibility metadata reduces the amount of dead state that later queries must step around.</li>
+<li><strong>Cleanup debt is both performance debt and correctness debt</strong> - If background reclamation falls behind, scans bloat first and transaction-ID safety problems arrive later.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why could Harbor Point's autovacuum see many obsolete reservation versions and still be unable to reclaim them yet?</strong></p>
+<ul>
+<li>A) Because MVCC allows vacuum to remove versions only after the oldest active snapshot or read view no longer needs them</li>
+<li>B) Because autovacuum can reclaim rows only when the table is fully idle</li>
+<li>C) Because index scans automatically preserve all historical versions forever</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the most accurate explanation for a successful routine vacuum that does not noticeably shrink the table file on disk?</strong></p>
+<ul>
+<li>A) Vacuum failed silently and did no useful work</li>
+<li>B) Vacuum often returns scattered free space to internal reuse before the engine can truncate file pages at the end</li>
+<li>C) Vacuum never affects space usage, only transaction visibility</li>
+</ul>
+</li>
+<li>
+<p><strong>Harbor Point fixed row-estimation errors, but ordered index scans still get slower each day. Which diagnosis best matches this lesson?</strong></p>
+<ul>
+<li>A) The only remaining cause can be a broken SQL parser</li>
+<li>B) The planner must always prefer a sequential scan after statistics are refreshed</li>
+<li>C) Cleanup debt is increasing physical read amplification even though logical plan choice has improved</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: An old version remains part of valid history until no active snapshot can still see it. Vacuum can discover obsolete-looking versions before it is legally allowed to reclaim them.</p>
+<p><strong>2. B</strong>: Routine vacuum usually makes space reusable inside the relation first. File shrink requires enough free space at the end of the relation, or a more invasive rewrite/truncation path.</p>
+<p><strong>3. C</strong>: Statistics and garbage collection address different layers. Better estimates can fix plan choice while dead versions, stale index entries, and a wider heap still make execution more expensive.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="035.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Statistics, Histograms, and Cardinality Errors</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="037.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Hot/Cold Data Tiering and Working Set Control</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

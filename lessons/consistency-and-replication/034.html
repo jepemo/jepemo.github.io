@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cluster Metadata Services and Control Plane State - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Cluster Metadata Services and Control Plane State</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 034 | Lesson ID: 433
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 433: Cluster Metadata Services and Control Plane State</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A shard is only "owned" if every router, replica, and failover procedure can point to the same authoritative metadata record and the same generation number.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="033.html">033.md</a>, Harbor Point designed a geo-distributed reservation database around one crucial rule: each issuer shard has one region that is allowed to order writes at a time. That solved the data-plane question, but it immediately creates a control-plane question. When a Madrid API gateway receives a reservation for issuer <code>MUNI-77</code>, what system tells it that shard <code>184</code> currently belongs to New York leader <code>ny-db-3</code> at generation <code>41</code> instead of to yesterday's owner?</p>
+<p>The answer cannot be "a config file somewhere" or "whatever the old leader still believes." Metadata about shard placement, leader generation, replica membership, and schema rollout state is not background bookkeeping. It is the system of record for decisions that determine whether a write goes to the right place, whether a failover is safe, and whether a stale coordinator can still damage correctness after the cluster has moved on.</p>
+<p>That is the mental shift for this lesson. User rows live in the data plane, but routing truth lives in the control plane. The control plane is smaller in bytes and lower in request volume, yet it carries outsized risk because one stale metadata answer can redirect many correct requests into the wrong history. The point of a cluster metadata service is therefore not convenience. It is to make topology changes durable, ordered, and fenceable.</p>
+<p>Once you see the metadata service that way, the next lesson in <a href="035.html">035.md</a> becomes easier to frame. Leader election is not just about picking a winner quickly. It is about deciding exactly when the metadata service is allowed to advance the generation and publish a new owner without creating two believable leaders at once.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point now has two regions, multiple shard groups, follower replicas, and an explicit failover target. Every one of those moving parts depends on shared control-plane state: which nodes are members of shard <code>184</code>, which replica is leader, which configuration generation routers should trust, which replica is being drained, and which schema version the shard must understand before serving traffic.</p>
+<p>If that state is vague or weakly managed, the incident pattern is ugly. Routers cache stale ownership and keep writing to a demoted leader. A node that missed a failover still accepts traffic because nothing fences it. Rebalancing looks complete in one dashboard and incomplete in another because different components observed different versions of the cluster map. None of those failures show up as "metadata corruption" in a user-facing alert. They show up as duplicate writes, lost availability, or unexplained stale reads in the data plane.</p>
+<p>A well-designed metadata service gives the rest of the database something precise to stand on. Operators can change placement through one replicated log. Routers can watch for versioned updates instead of polling random instances. Storage nodes can reject commands from stale generations. Recovery procedures have an audit trail that explains not only what the cluster does now, but which topology changes were committed in which order.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why cluster metadata is a correctness surface</strong> - Distinguish control-plane state from user data and explain why shard maps, replica membership, and epochs need stronger guarantees than ordinary cached configuration.</li>
+<li><strong>Trace a safe metadata update end to end</strong> - Follow how a placement or failover change is committed, propagated to watchers, and enforced by generation checks in the data plane.</li>
+<li><strong>Evaluate the operational trade-offs</strong> - Judge when centralizing topology truth improves safety and when it can become a bottleneck, an availability dependency, or a source of bootstrap complexity.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Control-plane state is small, but it decides which history counts</h3>
+<p>Harbor Point's metadata service does not store reservations. It stores the facts that let the rest of the system interpret reservation traffic correctly. For shard <code>184</code>, that means records such as the shard key range, the current replica set, the leader replica, the leader generation, whether the shard is draining for rebalance, and the minimum schema version required before a node can serve it. Those records are tiny compared with the WAL, but they are high leverage because every router and replica consults them before acting.</p>
+<p>That is why metadata needs stronger semantics than a best-effort cache. If two gateways get different answers for the same shard ownership question, the cluster does not merely become inconsistent in theory. It can send one reservation to the old leader and the next reservation to the new leader, creating concurrent histories for the same issuer limit. The data replicas may each be internally correct relative to the commands they saw, but the cluster-level contract is already broken because the routing truth forked first.</p>
+<p>In practice, teams solve this by treating metadata as a replicated state machine with linearizable updates. A leader or operator proposes "shard <code>184</code> moves from generation <code>41</code> to <code>42</code>, new leader <code>md-db-2</code>, old leader fenced," and that proposal only becomes visible after a quorum commits it. The metadata store is not special because it is more magical than the data plane. It is special because other parts of the system need one authoritative answer to "what topology is real right now?"</p>
+<p>For Harbor Point, a useful sketch looks like this:</p>
+<div class="codehilite"><pre><span></span><code>shard_id: 184
+issuer_range: MUNI-70..MUNI-99
+generation: 42
+leader: md-db-2
+replicas: [md-db-2, md-db-4, ny-db-3]
+write_status: writable
+min_schema_version: 7
+</code></pre></div>
+
+<p>The trade-off is immediate. A strongly consistent metadata service gives the cluster a trustworthy map, but every topology change now depends on that service's quorum and write path. That cost is usually worth paying because topology changes are rare and correctness-sensitive, while ordinary reservation traffic should stay on the data path once the latest metadata has been learned.</p>
+<h3>Concept 2: Safe metadata changes require both durable publication and data-plane fencing</h3>
+<p>Suppose New York is degraded and Harbor Point decides to fail shard <code>184</code> over to Madrid. The safe version of that operation is not "flip a pointer and hope caches converge." It is a staged update in which the control plane publishes a new generation and the data plane refuses to honor commands from the old one.</p>
+<p>The sequence looks like this:</p>
+<div class="codehilite"><pre><span></span><code>1. Metadata leader proposes generation 42 for shard 184.
+2. Metadata quorum commits:
+   leader = md-db-2
+   replicas = [md-db-2, md-db-4, ny-db-3]
+   old leader ny-db-3 is fenced
+3. Routers and replicas receive the watch event for generation 42.
+4. New writes carry generation 42 in the request metadata.
+5. Any node still on generation 41 rejects the command as stale.
+</code></pre></div>
+
+<p>Two mechanisms matter here. The first is versioned publication. Routers should consume metadata through a watch stream or incremental snapshot feed keyed by monotonic version, not through ad hoc polling that can skip or reorder updates. That lets Harbor Point answer operational questions such as "which gateways have observed generation <code>42</code>?" and "how far behind is this replica's view of the shard map?"</p>
+<p>The second mechanism is fencing at the data plane boundary. Even if the watch stream is reliable, some component will always lag or partition. That means a request must carry the generation it believes, and the recipient must compare it against local truth before serving the operation. The basic guard is simple:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">handle_write</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">local_generation</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">generation</span> <span class="o">!=</span> <span class="n">local_generation</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">StaleRouteError</span><span class="p">()</span>
+    <span class="n">apply_reservation</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Without that generation check, the metadata service can be perfectly correct and still fail to protect the cluster. A stale gateway could continue sending traffic to <code>ny-db-3</code>, and <code>ny-db-3</code> could keep accepting it because nothing in the data plane proves that its authority expired. Fencing turns metadata from a dashboard fact into an enforceable boundary.</p>
+<p>The trade-off is that every write path now depends on carrying and checking extra control information. That adds protocol surface area, but it buys Harbor Point something much more valuable: the ability to tolerate delayed watches, old caches, and replayed client retries without silently reviving a dead leader.</p>
+<h3>Concept 3: The metadata service should be authoritative for change, not a hot-path dependency for every request</h3>
+<p>A common mistake is to build the control plane correctly and then place it in the middle of every ordinary read and write. If every reservation request must synchronously round-trip to the metadata quorum just to confirm that shard <code>184</code> still belongs to generation <code>42</code>, the cluster has traded one correctness problem for a latency and availability problem. The control plane becomes the bottleneck even when nothing is changing.</p>
+<p>Harbor Point avoids that by separating steady-state routing from topology updates. Gateways keep an in-memory shard map, refresh it through watches, and treat the metadata quorum as the source of truth when versions advance or caches are cold. Storage nodes hold their current assignment and lease locally. The metadata service is therefore on the critical path for configuration changes, failovers, and node joins, but not for each reservation once the cluster is stable.</p>
+<p>That design still requires discipline. Cached metadata must expire. Watch lag must be measured. Operators need a recovery path for the bootstrap case where the metadata cluster itself loses quorum. Many systems solve the bootstrap problem by keeping the metadata cluster small, separate from heavy data nodes, and replicated with the same consensus principles it uses to manage the rest of the fleet. In other words, the control plane also needs its own well-defined failure model.</p>
+<p>This is where production trade-offs become clear. Centralizing topology truth makes incidents debuggable and failovers auditable, but it also creates a high-value service whose outage can block reconfiguration. The right response is not to weaken the metadata guarantees. It is to limit the metadata surface to information that truly changes cluster behavior, keep the objects compact, and design the data plane so that stable traffic can continue briefly from cached state while the team repairs the control plane.</p>
+<h2>Troubleshooting</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: Routers keep sending writes to the old shard leader for several seconds after failover.</p>
+<ul>
+<li><strong>Why it happens</strong>: The watch stream or route cache is behind, and the old leader is still willing to accept commands.</li>
+<li><strong>Clarification / Fix</strong>: Carry the shard generation with every request and make replicas reject stale generations. Fixing propagation alone is not enough if old owners are not fenced.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Rebalancing a few shards suddenly causes metadata quorum CPU spikes and write latency for unrelated topology changes.</p>
+<ul>
+<li><strong>Why it happens</strong>: The metadata service is being used as a per-request lookup or is storing large, noisy objects that churn on every minor event.</li>
+<li><strong>Clarification / Fix</strong>: Keep metadata entries compact, serve steady-state routing from cached snapshots plus watches, and reserve quorum writes for true topology transitions.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: A metadata quorum outage freezes the whole platform even though current shard leaders are healthy.</p>
+<ul>
+<li><strong>Why it happens</strong>: The data plane was designed to synchronously consult the control plane for normal traffic instead of only for configuration changes and stale-cache recovery.</li>
+<li><strong>Clarification / Fix</strong>: Allow stable leaders and gateways to continue from already-committed metadata for a bounded period, but block new reconfiguration until the quorum is back so the cluster does not invent uncommitted topology.</li>
+</ul>
+</li>
+</ul>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="033.html">033.md</a> defined the shard contract; this lesson defines the registry that makes the contract operable</h3>
+<p>The geo-distributed capstone chose one-writer shards, bounded-lag followers, and explicit failover promises. A metadata service is what turns those design choices into live routing decisions, audited generation changes, and a source of truth that every region can observe.</p>
+<h3>Connection 2: <a href="035.html">035.md</a> will zoom in on the timing problem hidden inside every metadata update</h3>
+<p>This lesson treated leader changes as committed facts with generation numbers. The next lesson focuses on the timeline underneath that fact: failure detection, election, lease expiry, and the exact moment a cluster may safely publish a new owner without risking two leaders.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby lock service for loosely-coupled distributed systems</a><ul>
+<li>Focus: Read how Google built a small, highly trusted control-plane service whose correctness mattered more than raw throughput.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://www.usenix.org/conference/atc10/zookeeper-wait-free-coordination-internet-scale-systems">ZooKeeper: Wait-free coordination for internet-scale systems</a><ul>
+<li>Focus: Study watches, versioned znodes, and why coordination state needs ordered updates and client-visible versions.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/learning/api_guarantees/">etcd API guarantees</a><ul>
+<li>Focus: Compare Harbor Point's needs with etcd's guarantees around linearizable reads, watches, and monotonic revision numbers.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/op-guide/runtime-configuration/">etcd runtime reconfiguration</a><ul>
+<li>Focus: See how membership and topology changes are handled as explicit consensus operations instead of ad hoc instance-local edits.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Control-plane state decides which data-plane history is authoritative</strong> - A shard leader is only real if the rest of the cluster can converge on the same versioned ownership record.</li>
+<li><strong>Metadata updates are safe only when publication and fencing work together</strong> - Watches spread the new generation, but generation checks at the replicas stop stale components from continuing to act.</li>
+<li><strong>The control plane should be authoritative without becoming the hot path</strong> - Cache steady-state topology locally, but force all topology changes through one replicated source of truth.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point treat shard ownership metadata as a strongly consistent state machine instead of as an eventually consistent cache?</strong></p>
+<ul>
+<li>A) Because metadata objects are small enough that consistency is free</li>
+<li>B) Because conflicting ownership views can send correct requests into two different histories for the same shard</li>
+<li>C) Because strongly consistent metadata removes the need for fencing in the data plane</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the purpose of carrying a shard generation number on each write request after a failover?</strong></p>
+<ul>
+<li>A) To let replicas reject commands routed by stale metadata</li>
+<li>B) To avoid storing shard maps in the metadata service</li>
+<li>C) To make watch propagation unnecessary</li>
+</ul>
+</li>
+<li>
+<p><strong>Which design best keeps the metadata service from becoming an unnecessary throughput bottleneck?</strong></p>
+<ul>
+<li>A) Require every reservation request to synchronously confirm shard ownership with the metadata quorum</li>
+<li>B) Store only topology-changing state in the metadata service and distribute it to gateways through cached snapshots plus watches</li>
+<li>C) Let each region edit shard ownership locally and reconcile differences later</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: If two components believe different owners for the same shard, the cluster can fork routing truth before any data replica does anything obviously wrong. Option A mistakes small state for easy correctness, and option C is false because even perfect metadata publication still needs stale requests to be rejected.</p>
+<p><strong>2. A</strong>: The generation number lets the data plane enforce the control-plane decision. Option B confuses request fencing with metadata storage, and option C is false because watches are still how most components learn the new configuration efficiently.</p>
+<p><strong>3. B</strong>: The metadata quorum should serialize topology changes, not answer every steady-state request. Option A turns rare control-plane work into a constant latency tax, and option C recreates the split-brain problem the metadata service exists to prevent.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="033.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Monthly Capstone: Geo-Distributed Database Service</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="035.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Leader Election Timelines and Failover Path</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

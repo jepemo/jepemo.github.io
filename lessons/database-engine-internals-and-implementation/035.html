@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Statistics, Histograms, and Cardinality Errors - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Statistics, Histograms, and Cardinality Errors</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 035 | Lesson ID: 412
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 412: Statistics, Histograms, and Cardinality Errors</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A planner does not count matching rows while it is choosing a plan; it predicts them from compact statistical summaries, and any missing skew or correlation can turn a reasonable cost model into a bad production decision.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="034.html">11.md</a>, Harbor Point learned to read a cost-based plan as a tree of estimated work. The next morning, that lesson became painfully concrete. The market-open dashboard query for <code>issuer = 'MUNI-77'</code> was estimated at a few dozen qualifying rows, but <code>EXPLAIN ANALYZE</code> showed a few thousand. The planner picked a nested-loop shape that looked cheap on paper, then spent seconds doing repeated index probes and heap fetches while traders waited on the screen.</p>
+<p>The cost model had not suddenly become irrational. Its inputs were wrong. The engine knew something about <code>issuer</code>, something about <code>status</code>, and something about <code>submitted_at</code>, but those summaries were mostly independent, one-dimensional sketches. They did not capture the fact that for this issuer, during the first minutes after market open, almost every new reservation is also <code>status = 'open'</code> and concentrated in the newest time range. The planner multiplied several reasonable single-column guesses and produced an unreasonable combined guess.</p>
+<p>That is the shift for this lesson: histograms and related statistics are not side metadata. They are the planner's model of reality. If that model is too coarse, cardinality errors propagate upward into join order, memory budgeting, sort choice, and index usage. Once you see which summary failed, the fix stops being mystical. You can ask whether the issue is stale sampling, a missing hot value, an unmodeled column dependency, or a workload whose newest slice no longer looks like the table as a whole.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's dashboard query is interactive, parameterized, and highly sensitive to market-open skew. When the planner estimates thirty rows and gets two thousand, the damage is not limited to one scan node. A join that should have been a hash join becomes a nested loop, a top-N sort that should have stayed in memory spills, and an index designed in <a href="033.html">10.md</a> looks ineffective even though the real failure is estimation rather than structure.</p>
+<p>That is why statistics quality is a production concern rather than a DBA footnote. Teams that understand where row estimates come from can separate three very different problems: a missing access path, a stale or underspecified statistical model, and a query whose value distribution changes so sharply that one generic estimate is no longer safe. Without that distinction, people reach for hints, disable plan types, or add redundant indexes that hide the symptom while leaving the underlying cardinality error intact.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what planner statistics actually summarize</strong> - Describe the roles of row counts, most-common-values lists, histograms, and distinct-value estimates.</li>
+<li><strong>Trace how selectivity estimates become cardinality errors</strong> - Follow how equality, range, and join predicates are combined and why correlation breaks naive multiplication.</li>
+<li><strong>Choose a production fix that matches the failure mode</strong> - Distinguish between stale stats, insufficient resolution, and missing cross-column information.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Planner statistics are compressed models of the table, not exact counts</h3>
+<p>Harbor Point's <code>reservations</code> table is too large and too active for the optimizer to scan in full every time it plans a query. Instead, background <code>ANALYZE</code> work samples the table and stores summaries that are cheap to consult during planning. The point is not precision at any cost; the point is to build a small model that is good enough to rank plan alternatives quickly.</p>
+<p>For the dashboard workload, the most relevant summaries look roughly like this:</p>
+<div class="codehilite"><pre><span></span><code>table row count (reltuples): 12,000,000
+
+issuer:
+  n_distinct ~= 1,800
+  MCVs: MUNI-77=0.006, ALPHA-01=0.005, ZETA-88=0.005
+
+status:
+  MCVs: settled=0.72, open=0.05, routed=0.18
+
+submitted_at:
+  histogram bounds:
+    09:30 | 09:41 | 09:52 | 10:04 | 10:17 | ...
+</code></pre></div>
+
+<p>Each piece answers a different planning question. <code>reltuples</code> gives the base size of the relation. Most-common-values lists let the planner treat hot discrete values specially instead of pretending every issuer or status is equally likely. Histograms summarize the long tail and support range predicates such as "last fifteen minutes." Distinct-value estimates help with join fan-out and the expected selectivity of equality conditions. Some engines also track correlation between a column and physical row order, which influences whether an index walk is likely to touch scattered heap pages or mostly sequential ones.</p>
+<p>The trade-off is deliberate. A statistics target with a handful of histogram buckets and MCV entries is cheap to maintain and fast to consult, but it cannot perfectly represent a table whose shape changes by time of day or by combinations of columns. If <code>MUNI-77</code> becomes unusually active only during market open, a compact sample may capture its overall frequency while missing the fact that its recent rows are overwhelmingly concentrated in the newest tail of <code>submitted_at</code>.</p>
+<h3>Concept 2: Cardinality estimation combines those summaries with formulas that assume more independence than production data usually has</h3>
+<p>Return to Harbor Point's dashboard query:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">reservation_id</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">account_id</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">quantity</span><span class="p">,</span><span class="w"> </span><span class="n">rl</span><span class="p">.</span><span class="n">max_notional</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">reservations</span><span class="w"> </span><span class="n">r</span>
+<span class="k">JOIN</span><span class="w"> </span><span class="n">risk_limits</span><span class="w"> </span><span class="n">rl</span>
+<span class="w">  </span><span class="k">ON</span><span class="w"> </span><span class="n">rl</span><span class="p">.</span><span class="n">account_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">account_id</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">issuer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;MUNI-77&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">submitted_at</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nb">interval</span><span class="w"> </span><span class="s1">&#39;15 minutes&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">submitted_at</span><span class="w"> </span><span class="k">DESC</span>
+<span class="k">LIMIT</span><span class="w"> </span><span class="mi">50</span><span class="p">;</span>
+</code></pre></div>
+
+<p>At a high level, the planner estimates qualifying rows like this:</p>
+<div class="codehilite"><pre><span></span><code>estimated_rows
+  = table_rows
+  * sel(issuer = &#39;MUNI-77&#39;)
+  * sel(status = &#39;open&#39;)
+  * sel(submitted_at &gt;= now() - 15 min)
+</code></pre></div>
+
+<p>If the stored summaries say <code>sel(issuer)</code> is <code>0.006</code>, <code>sel(status)</code> is <code>0.05</code>, and the histogram says the last fifteen minutes represent <code>0.008</code> of the table, the estimate becomes:</p>
+<div class="codehilite"><pre><span></span><code>12,000,000 * 0.006 * 0.05 * 0.008 ~= 29 rows
+</code></pre></div>
+
+<p>That looks tidy and disastrously wrong. During market open, the actual result might be closer to 2,300 rows because the predicates are not independent. For this issuer, recent rows are far more likely to be open than the global table average suggests, and recent activity is concentrated into the newest histogram bucket. The planner may know each marginal distribution reasonably well while still missing the joint distribution that matters to the query.</p>
+<p>Once the scan estimate is wrong, everything above it is priced on fiction. A nested loop into <code>risk_limits</code> looks inexpensive because the planner expects only a few dozen probes. The <code>ORDER BY ... LIMIT 50</code> path looks almost free because it expects to stop after a tiny number of ordered tuples. In reality the engine churns through thousands of recent rows, performs thousands of join lookups, and may spill or thrash caches. The key lesson is that cardinality errors are multiplicative: each extra predicate and join compounds uncertainty unless the engine has statistics that model the dependency directly.</p>
+<h3>Concept 3: Production fixes work when they add the missing information, not when they merely force a different plan</h3>
+<p>When Harbor Point sees estimated rows off by two orders of magnitude, the first move is not to disable nested loops or pin a plan with hints. Those tactics may suppress today's symptom while making tomorrow's workload worse. The disciplined move is to ask which fact the planner failed to know.</p>
+<p>If the hot issuer or status value is too important to be averaged into the long tail, the fix is more resolution: raise the per-column statistics target so the MCV list and histogram have room to represent it. If <code>issuer</code> and <code>status</code> are strongly dependent, the fix is cross-column statistics such as functional-dependency or multivariate MCV summaries. If the trouble appears right after an overnight load or a morning burst, the issue may be freshness: the sample still reflects yesterday's distribution, so <code>ANALYZE</code> needs to run sooner or more often on the hot partition.</p>
+<p>Some workloads outgrow global table summaries altogether. If Harbor Point's newest fifteen minutes behave nothing like the rest of the table, partition-level statistics or a physically separate recent-data path can give the planner a model that matches the operational reality. Those fixes cost something: more background work, larger catalogs, longer planning, or more physical design complexity. But that trade-off is honest. You are paying to make the planner's model better, not simply hiding evidence that the model is wrong.</p>
+<p>This also prepares the ground for <a href="036.html">13.md</a>. In MVCC engines, the same maintenance machinery that keeps statistics fresh often shares budget and scheduling pressure with old-version cleanup. Heavy write churn can therefore hurt plan quality in two ways at once: it changes the live distribution quickly and it creates background maintenance debt.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: <code>EXPLAIN ANALYZE</code> shows an estimate of tens of rows for a query that actually returns thousands during market open.</p>
+<p><strong>Why it happens / is confusing</strong>: Single-column statistics can each look reasonable while their combination is catastrophically wrong. The missing piece is usually correlation between predicates such as <code>issuer</code>, <code>status</code>, and a recent time range.</p>
+<p><strong>Clarification / Fix</strong>: Compare estimated versus actual rows at the first scan node that goes wrong. If the error appears before joins, add or refine statistics on the filtered columns, especially multivariate statistics for the correlated predicates.</p>
+<p><strong>Issue</strong>: A manual <code>ANALYZE</code> fixes the plan for a few hours, then the bad plan returns the next trading day.</p>
+<p><strong>Why it happens / is confusing</strong>: The workload is changing faster than automatic statistics refresh thresholds expect. The planner keeps falling back to a sample that reflects yesterday's distribution rather than the current burst.</p>
+<p><strong>Clarification / Fix</strong>: Lower analyze thresholds or schedule targeted statistics refreshes for the hot table or partition after major ingest windows. Validate the change with representative morning parameters, not just midday traffic.</p>
+<p><strong>Issue</strong>: The planner still misses the top-N index path even though statistics are fresh.</p>
+<p><strong>Why it happens / is confusing</strong>: Fresh does not always mean expressive enough. A coarse histogram may know that recent rows are rare globally while still missing that one issuer dominates that recent slice, so the ordered index path remains underpriced or overpriced.</p>
+<p><strong>Clarification / Fix</strong>: Increase statistics resolution, add extended statistics on the correlated columns, or isolate the recent working set with partitioning if the newest data behaves unlike the table as a whole.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="034.html">11.md</a> explains the arithmetic; this lesson explains the inputs</h3>
+<p>Cost-based planning only looks intelligent when its row estimates are directionally right. Yesterday's lesson showed how the planner compares scan, join, and sort alternatives. Today's lesson shows why a perfectly consistent cost model can still choose the wrong tree: the cardinality inputs came from a compressed statistical model that failed to capture the query's real data shape.</p>
+<h3>Connection 2: <a href="036.html">13.md</a> turns statistics freshness into a maintenance problem</h3>
+<p>Statistics are not maintained in isolation. In engines with MVCC, analyze work and old-version cleanup often compete for the same background maintenance window. Understanding cardinality errors first makes the next lesson easier: stale statistics and dead-tuple buildup are different symptoms of the same underlying operational truth that data maintenance is part of query performance.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/planner-stats.html">PostgreSQL Documentation: Planner Statistics</a><ul>
+<li>Focus: What <code>ANALYZE</code> stores, including distinct counts, most-common-values lists, histograms, and extended statistics.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/row-estimation-examples.html">PostgreSQL Documentation: Row Estimation Examples</a><ul>
+<li>Focus: Worked examples of equality and range selectivity using histogram buckets and MCV data.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/sql-createstatistics.html">PostgreSQL Documentation: CREATE STATISTICS</a><ul>
+<li>Focus: How to model cross-column dependencies when multiplying single-column selectivities is not good enough.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://dl.acm.org/doi/10.1145/582095.582099">Access Path Selection in a Relational Database Management System</a><ul>
+<li>Focus: The System R paper that established the classical relationship between cardinality estimation and optimizer cost choices.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Statistics are the planner's model of the data</strong> - Histograms, MCV lists, and distinct counts are compact summaries that stand in for full table knowledge during planning.</li>
+<li><strong>Cardinality errors usually come from missing structure, not bad arithmetic</strong> - The common failure mode is unmodeled skew or dependency between predicates, not an inability to multiply selectivities.</li>
+<li><strong>The right fix adds information to the planner</strong> - Better sampling, extended statistics, fresher maintenance, or narrower physical scope are more durable than forcing one plan shape.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can a planner still badly underestimate a query even when its single-column statistics for <code>issuer</code>, <code>status</code>, and <code>submitted_at</code> are each individually reasonable?</strong></p>
+<ul>
+<li>A) Because histograms are only used for joins, not filters</li>
+<li>B) Because multiplying independent selectivities misses cross-column correlation and hot recent slices</li>
+<li>C) Because <code>LIMIT 50</code> disables cardinality estimation</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the practical difference between a most-common-values list and a histogram?</strong></p>
+<ul>
+<li>A) The MCV list models hot discrete values explicitly, while the histogram approximates the remaining value distribution for range and non-MCV estimates</li>
+<li>B) The MCV list is used only after execution starts, while the histogram is used only during <code>ANALYZE</code></li>
+<li>C) They are two names for the same structure in different databases</li>
+</ul>
+</li>
+<li>
+<p><strong>Harbor Point finds that bad estimates return every morning after a burst load, but a manual statistics refresh temporarily fixes the plan. What is the most direct diagnosis?</strong></p>
+<ul>
+<li>A) The cost model is fundamentally unusable and should be replaced with forced hints</li>
+<li>B) The index from <a href="033.html">10.md</a> is invalid and must be dropped</li>
+<li>C) Statistics freshness is lagging behind workload change, so analyze timing or thresholds need adjustment</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Single-column summaries capture marginal distributions, not the way those predicates interact. When <code>issuer</code>, <code>status</code>, and recency are correlated, naive multiplication can be off by orders of magnitude.</p>
+<p><strong>2. A</strong>: The MCV list gives named high-frequency values their own selectivity, while the histogram describes the remaining spread of values so the planner can interpolate range and non-MCV estimates.</p>
+<p><strong>3. C</strong>: If a fresh <code>ANALYZE</code> fixes the plan and the error later returns, the planner's model is aging out faster than maintenance refreshes it. That points to stale statistics, not a permanently broken access path.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="034.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Cost-Based Query Planning Internals</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="036.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Vacuum and Garbage Collection of Old Versions</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

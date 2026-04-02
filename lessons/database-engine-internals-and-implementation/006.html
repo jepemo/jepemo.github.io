@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Query Execution Pipelines and Operator Costs - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Query Execution Pipelines and Operator Costs</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 006 | Lesson ID: 278
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 278: Query Execution Pipelines and Operator Costs</h1>
+<blockquote>
+<p><strong>The core idea</strong>: a query plan is not "SQL magic." It is a pipeline of concrete operators, and total performance depends on how much data each operator must touch, hold, reorder, or emit.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><strong>The insight</strong>: Most slow queries are not slow because SQL is high-level. They are slow because one or two operators in the physical plan are processing far more rows, pages, or intermediate state than the developer expected.</p>
+<p><strong>Why this matters</strong>: Once you stop seeing queries as one opaque statement and start seeing them as a pipeline, performance tuning becomes much more systematic.</p>
+<p><strong>Concrete anchor</strong>: A dashboard query joins <code>orders</code>, <code>customers</code>, and <code>payments</code>, filters on a time range, sorts by recent activity, and returns the top 100 rows. The real question is not "is the SQL elegant?" It is: which operators read the data, where is intermediate state created, and which stage dominates the cost?</p>
+<p><strong>The practical sentence to remember</strong>:<br />
+<strong>A query runs one operator at a time, but performance is decided by the most expensive operator and by how much data reaches it.</strong></p>
+<hr />
+<h2>Why This Matters</h2>
+<p><strong>The problem</strong>: After storage layout, indexes, and WAL, the next question is how the engine actually turns a logical query into work. That work is not uniform. Some operators stream rows cheaply. Others block, materialize, sort, hash, spill, or repeatedly probe storage.</p>
+<p><strong>Without this model</strong>:</p>
+<ul>
+<li>Teams blame "the database" instead of one bad scan, join, or sort.</li>
+<li>Execution plans look like cryptic trees instead of concrete work.</li>
+<li>Query tuning focuses on syntax changes instead of row counts and operator choice.</li>
+</ul>
+<p><strong>With this model</strong>:</p>
+<ul>
+<li>You can explain where time, memory, and I/O go.</li>
+<li>You can predict why the optimizer prefers one plan over another.</li>
+<li>You can spot why cardinality mistakes propagate into expensive joins and spills.</li>
+</ul>
+<p><strong>Operational payoff</strong>: Better query reviews, better use of indexes, fewer accidental full scans, and clearer reasoning about when a plan is CPU-bound, memory-bound, or I/O-bound.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this lesson, you should be able to:</p>
+<ol>
+<li><strong>Explain how a query becomes a physical pipeline</strong> of operators like scan, filter, join, sort, and aggregate.</li>
+<li><strong>Describe the main cost drivers</strong> behind those operators, especially cardinality, memory usage, and data movement.</li>
+<li><strong>Reason about plan quality</strong> by identifying blocking operators, bad row-count estimates, and expensive intermediate results.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: From Logical Query to Physical Plan</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A query asks for "the total revenue per customer for the last 30 days, ordered by highest total first."</p>
+<p><strong>Intuition</strong>: SQL describes <em>what</em> result you want. The execution engine must decide <em>how</em> to produce it. That "how" becomes a physical plan made of operators.</p>
+<p><strong>Typical operator building blocks</strong>:</p>
+<ul>
+<li><strong>Scan</strong>: read table or index data</li>
+<li><strong>Filter</strong>: discard rows that do not satisfy predicates</li>
+<li><strong>Project</strong>: keep only needed columns or compute expressions</li>
+<li><strong>Join</strong>: combine rows from multiple sources</li>
+<li><strong>Aggregate</strong>: group and summarize</li>
+<li><strong>Sort</strong>: reorder rows</li>
+<li><strong>Limit</strong>: stop after enough rows are produced</li>
+</ul>
+<p><strong>How it works mechanically</strong>:</p>
+<ol>
+<li>The parser builds a logical representation of the query.</li>
+<li>The optimizer rewrites equivalent forms and considers candidate plans.</li>
+<li>It picks physical operators and an order for them.</li>
+<li>The executor runs those operators and moves tuples, batches, or vectors through the plan.</li>
+</ol>
+<p><strong>Important distinction</strong>:</p>
+<ul>
+<li>The <strong>logical plan</strong> captures semantics.</li>
+<li>The <strong>physical plan</strong> captures work.</li>
+</ul>
+<p>Two queries with similar semantics can have very different physical cost if one plan touches ten pages and the other touches ten million rows.</p>
+<p><strong>Connection to earlier lessons</strong>: Storage structures like B-Trees or LSM tables matter because scans and lookups are the input cost for later operators.</p>
+<hr />
+<h3>Concept 2: Operator Costs Are Not Symmetric</h3>
+<p><strong>Concrete example / mini-scenario</strong>: Two versions of the same query return the same result. One uses an index seek plus nested-loop join; the other performs a large scan followed by a hash join and sort.</p>
+<p><strong>Intuition</strong>: Not all operators cost the same, and the same operator can be cheap or catastrophic depending on input size.</p>
+<p><strong>Major cost dimensions</strong>:</p>
+<ol>
+<li>
+<p><strong>I/O cost</strong></p>
+<ul>
+<li>Reading pages from storage or buffer cache</li>
+<li>Sequential scans versus random lookups</li>
+</ul>
+</li>
+<li>
+<p><strong>CPU cost</strong></p>
+<ul>
+<li>Predicate evaluation</li>
+<li>Hashing, comparisons, expression evaluation, decompression</li>
+</ul>
+</li>
+<li>
+<p><strong>Memory cost</strong></p>
+<ul>
+<li>Hash tables for joins or aggregates</li>
+<li>Sort buffers</li>
+<li>Intermediate row materialization</li>
+</ul>
+</li>
+<li>
+<p><strong>Data movement cost</strong></p>
+<ul>
+<li>Copying rows between operators</li>
+<li>Reordering, repartitioning, or spilling to disk</li>
+</ul>
+</li>
+</ol>
+<p><strong>Streaming vs blocking operators</strong>:</p>
+<ul>
+<li><strong>Streaming operators</strong> can emit output as they read input.<ul>
+<li>Examples: simple filter, projection, many scans</li>
+</ul>
+</li>
+<li><strong>Blocking operators</strong> often need to see a large fraction of the input before emitting results.<ul>
+<li>Examples: sort, hash aggregate, some hash joins</li>
+</ul>
+</li>
+</ul>
+<p>This matters because blocking operators increase latency, memory pressure, and spill risk.</p>
+<p><strong>Mental model</strong>:<br />
+A query plan is like a factory line. Some stations lightly inspect items as they pass. Others must pile items into a warehouse, reorganize them, and only then continue.</p>
+<hr />
+<h3>Concept 3: Cardinality Is the Hidden Multiplier</h3>
+<p><strong>Concrete example / mini-scenario</strong>: The optimizer expects a filter to keep 1,000 rows, but in reality it keeps 10 million. The rest of the plan now builds far larger hash tables, sorts much more data, and maybe spills to disk.</p>
+<p><strong>Intuition</strong>: Many operator choices are only good if the row-count estimate is roughly right.</p>
+<p><strong>Why cardinality matters so much</strong>:</p>
+<ul>
+<li>It decides whether an index lookup is cheaper than a scan.</li>
+<li>It affects join ordering.</li>
+<li>It influences whether a hash table fits in memory.</li>
+<li>It determines whether sorting is cheap or painful.</li>
+</ul>
+<p><strong>How bad estimates hurt</strong>:</p>
+<ul>
+<li>Wrong join order</li>
+<li>Wrong join algorithm</li>
+<li>Unnecessary materialization</li>
+<li>Sort and hash spills</li>
+<li>Huge intermediate results that were never intended</li>
+</ul>
+<p><strong>This is why "the query plan changed after data growth" is normal</strong>:</p>
+<ul>
+<li>Data distribution changes</li>
+<li>Statistics age out</li>
+<li>Correlations between columns are missed</li>
+<li>Skew makes averages misleading</li>
+</ul>
+<p><strong>Practical consequence</strong>: Often the real performance problem is not the final operator. It is an earlier plan mistake that lets too many rows survive into later expensive stages.</p>
+<p><strong>Rule of thumb</strong>:<br />
+The earlier you reduce rows, the cheaper the rest of the pipeline usually becomes.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The query seems simple, but it suddenly became slow after the table grew.</p>
+<p><strong>Why it happens</strong>: The same physical plan may stop being appropriate as row counts, selectivity, and cache behavior change.</p>
+<p><strong>Clarification / Fix</strong>: Inspect the execution plan, compare estimated rows versus actual rows, and look for an operator whose input exploded.</p>
+<p><strong>Issue</strong>: A sort or hash aggregate is causing large latency spikes.</p>
+<p><strong>Why it happens</strong>: Blocking operators are sensitive to memory pressure. Once they spill, their cost changes sharply.</p>
+<p><strong>Clarification / Fix</strong>: Reduce input cardinality earlier, improve access paths, or tune memory and work buffers if appropriate.</p>
+<p><strong>Issue</strong>: The query uses an index but is still slow.</p>
+<p><strong>Why it happens</strong>: An index lookup is not always cheaper than a scan. Too many random lookups, poor selectivity, or repeated probes inside a nested loop can dominate.</p>
+<p><strong>Clarification / Fix</strong>: Measure whether the access pattern is really selective enough. Sometimes a scan plus a better downstream operator wins.</p>
+<p><strong>Issue</strong>: The plan keeps changing between runs or environments.</p>
+<p><strong>Why it happens</strong>: Statistics, data skew, cache warmth, and row-count estimates may differ.</p>
+<p><strong>Clarification / Fix</strong>: Compare actual execution plans, not just SQL text. Stable performance usually requires stable estimates and stable data shape assumptions.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Query Pipelines &lt;-&gt; Buffer Pools</h3>
+<p><strong>The parallel</strong>: Operator cost is not purely logical. It depends heavily on whether the required pages are already hot in memory or must be fetched from storage.</p>
+<p><strong>Why this matters</strong>: This is why the next lesson on buffer pools and I/O scheduling matters immediately after this one. The same physical plan can behave very differently under cold-cache versus warm-cache conditions.</p>
+<h3>Connection 2: Query Pipelines &lt;-&gt; Distributed Data Systems</h3>
+<p><strong>The parallel</strong>: In distributed engines, operators may also repartition data across nodes, which adds network movement to the cost model.</p>
+<p><strong>Why this matters</strong>: Once you understand single-node operator pipelines, distributed query execution looks like the same problem plus another layer of movement and skew.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Suggested Resources</h3>
+<ul>
+<li>[DOC] PostgreSQL <code>EXPLAIN</code> Documentation - <a href="https://www.postgresql.org/docs/current/using-explain.html">Documentation</a><br />
+  Focus: how to read plans, row estimates, and operator costs in a production-grade engine.</li>
+<li>[DOC] DuckDB Query Processing Internals - <a href="https://duckdb.org/docs/stable/internals/overview.html">Documentation</a><br />
+  Focus: a readable modern view of operators, vectorized execution, and engine internals.</li>
+<li>[BOOK] <em>Database Internals</em> - <a href="https://www.databass.dev/">Book site</a><br />
+  Focus: strong mental models for execution engines, operators, and storage interactions.</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A query is a pipeline of operators, not one indivisible action</strong>.</li>
+<li><strong>Operator cost depends on input size, memory pressure, and access pattern, not just query text</strong>.</li>
+<li><strong>Bad cardinality estimates are often the root cause of bad plans</strong> because they poison operator choice and join ordering.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>What is a physical query plan?</strong></p>
+<ul>
+<li>A) The SQL string after formatting</li>
+<li>B) The concrete operator pipeline the engine will execute</li>
+<li>C) The network route to the database server</li>
+</ul>
+</li>
+<li>
+<p><strong>Why are sorts and hash aggregates often riskier than simple filters?</strong></p>
+<ul>
+<li>A) Because they are always implemented in user space</li>
+<li>B) Because they are often blocking operators that need memory and may spill</li>
+<li>C) Because they bypass indexes completely in every engine</li>
+</ul>
+</li>
+<li>
+<p><strong>Why is cardinality estimation so important?</strong></p>
+<ul>
+<li>A) It tells the optimizer how many rows are likely to flow through each stage</li>
+<li>B) It only affects final formatting of results</li>
+<li>C) It is mainly used for replication</li>
+</ul>
+</li>
+<li>
+<p><strong>What is usually the best first step when a query becomes unexpectedly slow?</strong></p>
+<ul>
+<li>A) Rewrite the whole schema immediately</li>
+<li>B) Read the actual execution plan and compare estimated versus actual row counts</li>
+<li>C) Disable the optimizer</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The physical plan is the real execution pipeline of scans, joins, filters, sorts, and other operators.</p>
+<p><strong>2. B</strong>: Blocking operators often need to materialize large state before they can emit output, which makes them sensitive to memory pressure and spills.</p>
+<p><strong>3. A</strong>: Cardinality estimates drive operator choice, join order, and expectations about memory and I/O cost.</p>
+<p><strong>4. B</strong>: Execution plans reveal where work actually goes and whether the optimizer's assumptions were wrong.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="005.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Write-Ahead Logging and Crash Recovery Mechanics</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="007.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Buffer Pools, Caching, and I/O Scheduling</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

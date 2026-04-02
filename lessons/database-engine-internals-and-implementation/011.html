@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Buffer Pool Internals and Replacement Policies - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Buffer Pool Internals and Replacement Policies</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 011 | Lesson ID: 388
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 388: Buffer Pool Internals and Replacement Policies</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A buffer pool is a transaction-aware page cache: every hit, miss, pin, and eviction decision trades memory efficiency against concurrency, writeback cost, and recovery safety.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="010.html">03.md</a>, Harbor Point's <code>municipal_quotes</code> rows became physically wider whenever traders attached longer desk notes or vendor payloads. That change did not just affect page layout. It changed how many logical quotes fit on each 8 KB page, which means the same "show me the last 10,000 quotes" request now needs more physical pages to stay warm. The next bottleneck is therefore not the tuple format itself, but the memory system deciding which of those pages deserve to remain resident.</p>
+<p>That is the real job of the buffer pool. It is not a generic "cache some disk blocks" layer. It is the place where the database remembers which page already has an in-memory frame, whether a query is actively using that frame, whether the page has been modified, and whether evicting it would violate recovery rules. A replacement policy only makes sense inside that machinery. "Least recently used" is not enough if the page is pinned by an active scan, or if its dirty contents cannot be written yet because the corresponding log records are not durable.</p>
+<p>The common misconception is that buffer management is mostly about maximizing hit ratio. Hit ratio matters, but a production engine is really balancing three questions at once: which pages are worth keeping, which pages are currently unsafe to evict, and which evictions will create write stalls later. That is why this lesson sits naturally between <a href="010.html">03.md</a> and <a href="012.html">05.md</a>: page shape determines the memory footprint, and the write path determines when dirty pages can leave memory safely.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point has two storage-heavy jobs running through the same market-open window. The quote ingester keeps updating the latest B-tree leaf pages and heap pages as new municipal prices arrive. At the same time, the risk dashboard repeatedly asks for the newest quotes by issuer, and a compliance batch occasionally sweeps a much larger historical range. If the buffer pool does its job well, the root pages, recent leaf pages, and hottest heap pages stay resident, so the dashboard mostly runs against memory. If the pool does its job poorly, a one-off scan can flush out those hot pages, writers start waiting for dirty victims to be cleaned, and tail latency jumps even though the SQL text has not changed.</p>
+<p>This is exactly the kind of failure that teams misdiagnose. They add RAM when the real problem is scan pollution. They blame disks when the real bottleneck is latch contention on buffer metadata. They blame the query planner when the engine is actually stalling on dirty-page eviction because write-ahead logging has fallen behind. Once you understand the buffer pool mechanically, "database slowdown" becomes a much narrower and more testable question.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain the core data structures inside a buffer pool</strong> - Describe how frames, page tables, pin counts, dirty flags, and usage metadata let the engine manage resident pages safely.</li>
+<li><strong>Trace the page lifecycle on hits, misses, and evictions</strong> - Follow what happens when a request needs a page that is absent, busy, or dirty.</li>
+<li><strong>Compare replacement policies using workload behavior</strong> - Reason about when LRU-like recency is enough, when scan resistance matters, and how writeback pressure changes the best choice.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The buffer pool is an addressable page cache with database-specific metadata</h3>
+<p>Return to Harbor Point's morning workload. The dashboard wants a narrow slice of recent quotes, which repeatedly touches a small set of upper B-tree pages plus the newest quote pages. The compliance sweep touches many more pages, but each one only briefly. A database cannot manage that workload with "some memory and a map" alone. It needs a stable in-memory structure that says which page currently owns each frame and what state that frame is in.</p>
+<p>Most engines therefore build the buffer pool around two linked structures. The first is an array of frames that hold page bytes. The second is a page table, usually a hash table, that maps a page identifier such as <code>(relation, fork, block number)</code> to the frame currently containing it. Each frame also carries metadata: a pin count so the engine knows whether an operator is still using the page, a dirty bit so writeback knows whether disk is stale, and some replacement metadata such as a usage counter, clock bit, or queue position.</p>
+<div class="codehilite"><pre><span></span><code>page id (municipal_quotes, block 8142)
+        |
+        v
+   buffer hash table
+        |
+        v
+      frame 118
+   +-----------------------------+
+   | page bytes                  |
+   | pin_count = 3               |
+   | dirty = yes                 |
+   | usage_count = 4             |
+   | page_lsn = 9A/7C440120      |
+   +-----------------------------+
+</code></pre></div>
+
+<p>That metadata is what makes the buffer pool different from the operating system's page cache. The OS can cache file blocks, but it does not know that an executor node has promised not to let a page disappear mid-scan, or that flushing a dirty page before the corresponding WAL record reaches stable storage would break crash recovery. The database keeps its own residency metadata because it needs policy that is tied to transactions, latches, checkpoints, and recovery, not just file I/O.</p>
+<p>The trade-off is straightforward. Owning the cache lets the engine make database-aware decisions, but it also means the engine must maintain extra shared-memory state and protect it under concurrency. At small scale that seems like overhead. At production scale it is what keeps "recent quotes are hot" from degenerating into "every request rereads the same pages from storage."</p>
+<h3>Concept 2: A page miss is a controlled state transition, not just a disk read</h3>
+<p>Suppose the risk dashboard asks for a quote page that is not resident. The engine does not immediately read the page into arbitrary memory. It runs a page-lifecycle protocol. First it checks the page table for an existing frame. If the page is present, the engine increments the pin count, updates the replacement metadata, and returns the frame. If the page is absent, it must acquire a free frame or choose a victim. That victim selection is already constrained: pinned frames are off limits because some active operator still depends on them.</p>
+<p>Once a candidate victim exists, correctness rules tighten further. If the victim frame is dirty, the engine cannot simply write it whenever convenient. The page contains changes whose redo records must already be durable in the log before the data page itself is flushed. Many engines track this through a page LSN or an equivalent recovery watermark. If the log has not been flushed far enough, eviction pauses until it is safe, or background cleaners are asked to catch up. Only then can the victim page be written, its old mapping removed, and the requested page read into the reclaimed frame.</p>
+<p>The lifecycle looks roughly like this:</p>
+<div class="codehilite"><pre><span></span><code>request page P
+   -&gt; lookup P in page table
+   -&gt; hit: pin frame, update usage, return page
+   -&gt; miss: choose free frame or victim
+   -&gt; skip any pinned victims
+   -&gt; if victim is dirty, ensure WAL &gt;= page_lsn and flush page
+   -&gt; read P into frame
+   -&gt; install mapping for P
+   -&gt; pin frame and return page
+</code></pre></div>
+
+<p>Two distinctions matter here. A pin count is not the same as a page latch. Pins answer "may this frame be evicted?" Latches answer "who may read or modify these bytes right now?" Mixing those concepts leads to bad mental models and bad debugging. The other key distinction is that replacement and cleaning are related but not identical. Good engines try to clean dirty pages in the background so foreground misses do not pay the full eviction cost.</p>
+<p>This is where the next lesson begins to peek through. Dirty eviction is only safe because the engine already has a durable append-only log telling recovery how to reconstruct committed state. Without that write path, the buffer pool would have to choose between unsafe eviction and painfully synchronous in-place writes.</p>
+<h3>Concept 3: Replacement policy decides which workload gets memory and which workload gets I/O</h3>
+<p>Now consider Harbor Point's worst mixed workload. The dashboard repeatedly reuses a compact hot set of pages for the latest quotes, while a compliance job streams through thousands of older pages exactly once. A naive LRU policy often does the wrong thing here. The historical scan touches many pages in perfect recency order, so it can evict the hot pages that the dashboard will need again moments later. The hit ratio drop is not random; it is a policy choice that treated one-time recency as more important than repeated reuse.</p>
+<p>That is why production engines rarely use textbook LRU exactly as written. PostgreSQL uses a clock-sweep style policy because it is cheaper under concurrency and approximates recency without maintaining a central doubly linked list on every access. InnoDB combines LRU-like behavior with midpoint insertion so that one-off scans enter an "old" region and must prove their value before displacing the hottest working set. Research policies such as LRU-K go even further by measuring reuse distance: pages referenced repeatedly across time should outrank pages touched once during a large scan.</p>
+<p>The replacement decision is also entangled with write behavior. Evicting a clean but moderately useful page may be cheaper than evicting a dirty page that will trigger WAL-dependent writeback and future rereads. Some engines therefore separate "which page looks cold" from "which dirty pages should be flushed next," using background writers and flush lists to shape the write workload before eviction pressure becomes urgent. If you tune only for hit ratio, you can still end up with ugly checkpoint stalls and long write bursts.</p>
+<p>The previous lesson makes this trade-off sharper. When Harbor Point's quote rows widen, each page carries fewer useful rows, so evicting one page discards a larger fraction of the hot working set. The same replacement policy can look acceptable on narrow rows and terrible on wide ones because the logical value of a frame has changed. That is why buffer-pool tuning is never just about cache size. It is about access pattern, page density, dirty-page backlog, and how the engine implements its replacement approximation.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Buffer hit ratio looks healthy, but p99 latency spikes whenever the compliance sweep starts.</p>
+<p><strong>Why it happens / is confusing</strong>: A single global hit ratio hides scan pollution and metadata waits. The dashboard may still hit often enough to keep the average high while the scan forces repeated eviction of the exact index or heap pages that dominate tail latency.</p>
+<p><strong>Clarification / Fix</strong>: Look at per-workload page reuse, buffer-contention metrics, and whether the engine has scan-resistant behavior enabled. A ring buffer, midpoint insertion, or throttled scan can protect the hot OLTP set much better than simply increasing cache size.</p>
+<p><strong>Issue</strong>: Foreground queries stall on page misses even though storage bandwidth is not saturated.</p>
+<p><strong>Why it happens / is confusing</strong>: The miss path may be waiting on dirty-victim cleanup, WAL flush progress, or a shortage of reclaimable frames rather than raw device throughput.</p>
+<p><strong>Clarification / Fix</strong>: Check dirty-page percentages, background writer activity, checkpoint timing, and any page LSN versus flushed-LSN lag. If eviction is blocked on recovery invariants, the fix lives in cleaning and log flush policy, not just faster reads.</p>
+<p><strong>Issue</strong>: Memory usage is large, but the engine still reports too few available buffers under load.</p>
+<p><strong>Why it happens / is confusing</strong>: Long-running scans, slow transactions, or maintenance tasks can keep many pages pinned. A pinned frame counts as resident memory, but it is not immediately reusable by replacement.</p>
+<p><strong>Clarification / Fix</strong>: Inspect long-lived operators and pin-heavy code paths. The question is not only "how many pages are cached?" but also "how many cached pages are actually eligible victims right now?"</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: Buffer pools &lt;-&gt; operating-system page caches</h3>
+<p>Both systems decide which pages should stay in fast memory, but a DBMS has stricter semantics. PostgreSQL's shared buffers and InnoDB's buffer pool both track pins, dirtiness, and database-specific access patterns that the OS cannot infer from file descriptors alone. That is why database engines keep reinventing "page cache" in a more constrained and more informed form.</p>
+<h3>Connection 2: Buffer pools &lt;-&gt; write-ahead logging and checkpoints</h3>
+<p>Replacement policy looks like a read-side topic until dirty pages enter the picture. In PostgreSQL and InnoDB alike, a dirty page cannot be treated as a disposable cache entry because eviction is constrained by recovery order. Checkpoints, background writers, and WAL flushing therefore shape replacement behavior indirectly by deciding which victims are cheap or expensive to reclaim.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-buffer-pool.html">MySQL 8.0 Reference Manual: The InnoDB Buffer Pool</a><ul>
+<li>Focus: See how a production engine organizes residency, scan resistance, and background flushing around the buffer pool.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/postgres/postgres/blob/master/src/backend/storage/buffer/README">PostgreSQL Buffer Manager README</a><ul>
+<li>Focus: Map buffer descriptors, pin counts, clock-sweep replacement, and shared-buffer bookkeeping to the mechanisms in this lesson.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">Architecture of a Database System</a><ul>
+<li>Focus: Place the buffer manager in context with query execution, recovery, and storage-layer contracts.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://www.cs.cmu.edu/~natassa/courses/15-721/papers/p297-o_neil.pdf">The LRU-K Page Replacement Algorithm for Database Disk Buffering</a><ul>
+<li>Focus: Study why reuse distance often predicts page value better than simple recency on mixed database workloads.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A buffer pool is not just memory; it is page ownership plus invariants</strong> - The engine needs frame metadata such as pins, dirty state, and usage history before replacement decisions mean anything.</li>
+<li><strong>Eviction is a recovery-sensitive workflow</strong> - A dirty victim may require WAL progress and writeback before the frame can be reused, so page misses are partly about correctness, not just I/O.</li>
+<li><strong>Replacement policy chooses winners and losers across workloads</strong> - Scan-heavy jobs, hot index pages, wide rows, and dirty-page backlog all change which policy behaves well in production.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can a database not rely on the operating system's file cache alone for buffer-pool behavior?</strong></p>
+<ul>
+<li>A) Because database pages are larger than operating-system pages</li>
+<li>B) Because the database must track pins, dirty state, and recovery ordering that the OS does not understand</li>
+<li>C) Because the operating system cannot cache files opened by a database</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the key safety check before evicting a dirty page frame?</strong></p>
+<ul>
+<li>A) The page must have been read at least twice</li>
+<li>B) The replacement queue must be empty</li>
+<li>C) The log records needed to recover that page must already be durable</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does a large one-time historical scan often hurt a hot dashboard workload under naive LRU?</strong></p>
+<ul>
+<li>A) Because LRU treats recent one-off touches as valuable and may evict pages that the dashboard reuses constantly</li>
+<li>B) Because LRU automatically pins every scanned page</li>
+<li>C) Because scans bypass the buffer pool entirely</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The operating system can cache file blocks, but it cannot enforce database-specific rules about pins, dirty pages, or WAL-aware flushing. The DBMS needs that metadata to make safe replacement decisions.</p>
+<p><strong>2. C</strong>: A dirty page may contain updates whose redo records are still only in memory. The engine must not flush the page first, because recovery would then be unable to replay the authoritative change history correctly after a crash.</p>
+<p><strong>3. A</strong>: Naive LRU overvalues immediate recency. A large scan can therefore push out a smaller hot working set even when those hot pages will be needed again almost immediately.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="010.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Record Formats and Variable-Length Columns</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="012.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Write Path Fundamentals and Append-Only Logging</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MVCC Snapshots and Visibility Rules - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>MVCC Snapshots and Visibility Rules</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 028 | Lesson ID: 405
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 405: MVCC Snapshots and Visibility Rules</h1>
+<blockquote>
+<p><strong>The core idea</strong>: MVCC lets a reader decide "which version is real for me?" from snapshot rules instead of waiting on every concurrent writer, but that concurrency win only works if version metadata, commit state, and cleanup horizons stay correct.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="027.html">04.md</a>, Harbor Point saw the cost of making correctness depend on waiting: once transactions queue on locks, some waits are productive and some become deadlocks. The desk's next pressure point is different. At 09:30, traders are approving and amending municipal-bond reservations for issuer <code>MUNI-77</code>, while a risk dashboard is also reading issuer exposure every few seconds. If every dashboard query had to stand behind the writer holding the hot row, the desk would trade one class of anomaly for a constant stream of read latency spikes.</p>
+<p>MVCC changes that bargain. When trader transaction <code>T7109</code> updates <code>issuer_exposure['MUNI-77']</code> from <code>9.6M</code> to <code>9.9M</code>, the engine does not force every reader to interpret an in-flight overwrite. It keeps enough version history that a report transaction can still read the older committed value if its snapshot says <code>T7109</code> was not part of the world yet. A later query, started after <code>T7109</code> commits, can read the newer version. The row is not "current" in one universal sense; it is visible or invisible relative to a specific snapshot.</p>
+<p>That is the mechanism to keep in view for the rest of the lesson. A snapshot is not a copy of the database, and MVCC is not free non-blocking magic. The engine still has to stamp versions with creator and deleter metadata, consult commit status, walk version chains, and eventually reclaim versions that no active snapshot can still see. If those visibility rules are wrong, readers return impossible histories. If cleanup falls behind, the system stays correct and becomes operationally expensive.</p>
+<p>This lesson sits exactly between locking and optimistic schemes. MVCC removes many reader-writer waits that <a href="026.html">03.md</a> and <a href="027.html">04.md</a> made visible. <a href="029.html">06.md</a> then asks a different question: when you are not relying on lock queues for the whole story, how else can the engine impose a serial order on concurrent work?</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's desk needs two things at once during the market-open burst. The approval path must keep moving because traders are reserving risk in real time, and the risk dashboard must show a coherent number rather than half of one transaction and half of another. A lock-only design can preserve correctness, but it often does so by making read traffic queue behind writes on hot rows or predicates. That is tolerable for short control transactions and painful for read-heavy operational views.</p>
+<p>MVCC gives the engine a more selective rule. Readers no longer ask "is someone writing this row right now?" first. They ask "which committed version of this row belongs in my snapshot?" That changes the production surface immediately. Many read paths stop blocking. Long-running reports become safer from lock storms. But the cost moves into version churn, tuple-header checks, undo or vacuum work, and new classes of confusion when teams expect "latest committed" and actually requested "visible in my snapshot."</p>
+<p>The operational payoff is precision. When Harbor Point's dashboard shows <code>9.6M</code> even though a trade just committed <code>9.9M</code>, the team can tell the difference between a stale cache bug, replica lag, and a legitimate snapshot boundary. When storage bloat grows, they can tie it back to long-lived transactions pinning old versions rather than treating autovacuum as mysterious background noise.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what a database snapshot really contains</strong> - Describe how Harbor Point's readers decide which transactions belong to their view of <code>MUNI-77</code>.</li>
+<li><strong>Apply tuple visibility rules to concrete version chains</strong> - Determine which row version a transaction should read from <code>xmin</code>/<code>xmax</code>-style metadata and commit state.</li>
+<li><strong>Reason about the production trade-offs of MVCC</strong> - Connect reduced reader blocking to cleanup pressure, long-transaction risk, and isolation-level behavior.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: A snapshot is a visibility boundary, not a physical copy</h3>
+<p>When Harbor Point opens a dashboard query at <code>09:30:02</code>, the engine does not materialize a second database just for that query. It records enough information to answer one narrower question later: which transactions count as already committed from this reader's point of view? In PostgreSQL terms, that snapshot includes a high-water mark such as <code>xmax</code> plus the set of transaction IDs that were still in progress when the snapshot was taken. Other engines encode the same idea differently, but the contract is the same: the reader gets a rule for classifying versions, not a byte-for-byte clone.</p>
+<p>Suppose the dashboard transaction starts while trader transaction <code>T7109</code> is still updating <code>issuer_exposure['MUNI-77']</code>. The snapshot might say, informally, "every committed transaction with ID lower than <code>7112</code> is visible except the ones that were still active when I started, including <code>7109</code>." If <code>T7109</code> commits a millisecond later, that does not retroactively change what this snapshot means. For this reader, <code>T7109</code> is still outside the visible world. A different query that starts after the commit can get a different answer without either query being wrong.</p>
+<p>That detail is why isolation-level names matter. Under <code>READ COMMITTED</code>, Harbor Point may get a fresh snapshot for each statement, so two <code>SELECT</code> statements inside one transaction can legitimately see different committed versions. Under <code>REPEATABLE READ</code> or snapshot isolation, the transaction keeps one snapshot for its whole lifetime, so it sees a more stable past even as the rest of the desk keeps trading. MVCC is therefore not one behavior but a family of behaviors built on the same visibility machinery.</p>
+<p>The trade-off begins here. A stable snapshot makes reasoning easier for readers, but it also means the engine must preserve any version that some active snapshot might still need. The reader avoids waiting now by claiming a right to some slice of recent history, and the storage engine has to honor that claim until the snapshot ends.</p>
+<h3>Concept 2: Visibility is a per-version decision based on metadata and commit state</h3>
+<p>Once the snapshot exists, each row read becomes a visibility test. Harbor Point's hot issuer row might look like this after <code>T7109</code> updates it:</p>
+<div class="codehilite"><pre><span></span><code>logical row: issuer_exposure[&#39;MUNI-77&#39;]
+
+version V1: amount = 9.6M   xmin = 7004   xmax = 7109
+version V2: amount = 9.9M   xmin = 7109   xmax = -
+</code></pre></div>
+
+<p><code>V1</code> is the older version created by transaction <code>7004</code> and later superseded by <code>7109</code>. <code>V2</code> is the newer version created by <code>7109</code>. A reader cannot simply take the physically newest version, because <code>7109</code> may still be running, may abort, or may have committed after the reader's snapshot boundary. The engine has to test each version against both transaction state and snapshot contents.</p>
+<p>A PostgreSQL-style rule set looks like this:</p>
+<div class="codehilite"><pre><span></span><code>visible(version, snapshot):
+  1. creator xid must be committed
+  2. creator xid must be visible in the snapshot
+  3. if xmax is empty, version is still live
+  4. if xmax belongs to an aborted or invisible transaction, version is still visible
+  5. if xmax belongs to a committed transaction visible in the snapshot, this version is obsolete
+</code></pre></div>
+
+<p>If Harbor Point's report snapshot was taken while <code>T7109</code> was active, then <code>V2</code> fails rule 2 because its creator is outside the snapshot. <code>V1</code> passes because its creator committed long ago and its deleter <code>7109</code> is not yet visible to this snapshot. A later query, started after <code>T7109</code> commits and after the snapshot boundary moves forward, will instead reject <code>V1</code> and accept <code>V2</code>.</p>
+<p>This is also where engine implementations diverge while preserving the same semantics. PostgreSQL stores <code>xmin</code> and <code>xmax</code> in heap tuple headers and may chase HOT chains in the heap. InnoDB stores hidden transaction metadata plus undo records so it can reconstruct an older version if the newest record is too new for the reader. Different data structures, same job: evaluate a candidate version against one snapshot and find the first version that is legally visible.</p>
+<p>MVCC does not erase all locking, which matters after the previous lesson. Harbor Point's writers still need coordination when they update the same logical row, and locking reads such as <code>SELECT ... FOR UPDATE</code> still enter the wait graph. MVCC mostly removes unnecessary reader-writer blocking; it does not make write-write conflicts or metadata conflicts disappear.</p>
+<h3>Concept 3: MVCC turns concurrency gains into cleanup and horizon management work</h3>
+<p>The Harbor Point dashboard wins because it can read <code>V1</code> without waiting for <code>T7109</code>. The hidden bill arrives later. <code>V1</code> cannot be reclaimed just because <code>V2</code> exists; the engine must know that no active snapshot still considers <code>V1</code> visible. If a long-running analytics session started before <code>T7109</code> committed and is still open fifteen minutes later, then <code>V1</code> may remain protected long after it stopped being the newest value for everyone else.</p>
+<p>That is why MVCC has a global horizon problem. Vacuum, purge, or garbage collection can only remove versions older than the oldest snapshot that still matters. One forgotten transaction in a connection pool, one idle reporting session, or one replication slot retaining history can pin that horizon and make version churn accumulate on hot tables. Harbor Point then sees dead tuples, longer version chains, more heap fetches, and background cleanup work competing with foreground queries. Nothing is logically corrupt; the engine is paying the debt created by preserving history.</p>
+<p>The trade-off is therefore sharper than "reads do not block writes." MVCC improves mixed-workload throughput because readers often avoid wait queues, but it spends disk, cache, CPU, and operational attention on version management. On a read-heavy dashboard path, that is often an excellent bargain. On a table with intense update churn and many long-lived snapshots, it can become the dominant performance problem.</p>
+<p>This is also the bridge to <a href="029.html">06.md</a>. Snapshot visibility tells a reader which version of <code>MUNI-77</code> it may observe. It does not, by itself, guarantee that every combination of concurrent reads and writes has a serial explanation. Serializable MVCC, timestamp ordering, and optimistic validation are the next layer: they decide what to do when two transactions each saw a legal snapshot and still produced a dangerous cycle together.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Harbor Point's dashboard shows <code>9.6M</code> right after a trader committed <code>9.9M</code>, and operators assume replication lag.</p>
+<p><strong>Why it happens / is confusing</strong>: Under MVCC, a query can legitimately read an older committed version if its snapshot began before the writer committed. "Not latest" is not the same as "wrong."</p>
+<p><strong>Clarification / Fix</strong>: Check the transaction boundary and isolation level first. If the query is inside a long transaction or using a stable snapshot, the older value may be expected. Only after that should you investigate caches or replicas.</p>
+<p><strong>Issue</strong>: Autovacuum is running, but bloat on <code>issuer_exposure</code> and related indexes keeps growing.</p>
+<p><strong>Why it happens / is confusing</strong>: Cleanup cannot remove versions that some active snapshot might still need. A single long-lived transaction can pin the oldest visible horizon for the whole table.</p>
+<p><strong>Clarification / Fix</strong>: Identify old transactions, idle sessions in transaction, or replication retention that keeps the horizon from advancing. Vacuum tuning helps only after the blocking snapshot is gone.</p>
+<p><strong>Issue</strong>: Engineers expected MVCC to eliminate lock waits, but some read paths still block.</p>
+<p><strong>Why it happens / is confusing</strong>: MVCC relaxes ordinary snapshot reads. It does not remove explicit locking reads, schema locks, index-page latches, or write-write conflicts on the same logical row.</p>
+<p><strong>Clarification / Fix</strong>: Separate logical row visibility from physical coordination. Inspect whether the query uses <code>FOR UPDATE</code>, whether DDL is running, or whether contention is actually between writers rather than readers and writers.</p>
+<p><strong>Issue</strong>: Two statements inside one API request return different counts for open reservations, and the team suspects a race in application code.</p>
+<p><strong>Why it happens / is confusing</strong>: At <code>READ COMMITTED</code>, each statement may get a fresh snapshot. Both counts can be correct relative to their own statement start times.</p>
+<p><strong>Clarification / Fix</strong>: If the request needs one stable view across multiple statements, use an isolation level with transaction-wide snapshots or restructure the work into one statement that captures the invariant explicitly.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: MVCC visibility rules ↔ lock management and deadlocks</h3>
+<p>MVCC is easiest to appreciate right after <a href="027.html">04.md</a> because it explains which waits simply disappear. A plain dashboard <code>SELECT</code> no longer has to sit in the lock queue behind Harbor Point's <code>MUNI-77</code> update if the older version is still visible. That shrinks the wait-for graph and reduces one source of deadlock pressure. But the lock manager still matters for writers, locking reads, catalog changes, and physical latching inside the engine. MVCC changes the conflict surface; it does not abolish coordination.</p>
+<h3>Connection 2: MVCC visibility rules ↔ optimistic and timestamp-based control</h3>
+<p>MVCC answers the read-side question early: which committed version belongs in my snapshot? Optimistic concurrency and timestamp ordering answer a later question about serial order: if overlapping transactions each did work against some snapshot, which ones are allowed to commit together? That is why <a href="029.html">06.md</a> follows naturally. Once readers are no longer waiting on every writer, the database still needs a policy for the conflicts that remain.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/mvcc-intro.html">PostgreSQL Documentation: Introduction to MVCC</a><ul>
+<li>Focus: PostgreSQL's version of snapshot-based visibility, why MVCC exists, and how it changes reader-writer interaction.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Documentation: Transaction Isolation</a><ul>
+<li>Focus: How statement-level and transaction-level snapshots affect what a session can observe.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-multi-versioning.html">MySQL 8.0 Reference Manual: InnoDB Multi-Versioning</a><ul>
+<li>Focus: Compare PostgreSQL-style tuple visibility with InnoDB's undo-based reconstruction of older versions.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Broader transaction, isolation, and MVCC trade-offs across storage engines.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A snapshot is a rule set, not a copy</strong> - The engine records which transactions count as visible and applies that rule repeatedly during reads.</li>
+<li><strong>MVCC visibility is evaluated per version</strong> - <code>xmin</code>/<code>xmax</code>-style metadata plus commit status decide whether a reader sees the old <code>MUNI-77</code> value or the new one.</li>
+<li><strong>Reduced blocking is purchased with retained history</strong> - The concurrency benefit of MVCC becomes vacuum, purge, and horizon-management work that production teams have to monitor explicitly.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can Harbor Point's dashboard legally read <code>9.6M</code> after trader transaction <code>T7109</code> has already committed <code>9.9M</code>?</strong></p>
+<ul>
+<li>A) Because MVCC always prefers the physically oldest row version</li>
+<li>B) Because the dashboard's snapshot may have started before <code>T7109</code> became visible to that reader</li>
+<li>C) Because writer commits are invisible until vacuum finishes</li>
+</ul>
+</li>
+<li>
+<p><strong>Which condition makes an old row version reclaimable under MVCC?</strong></p>
+<ul>
+<li>A) A newer version exists for the same logical row</li>
+<li>B) The creating transaction committed successfully</li>
+<li>C) No active snapshot, replica-retention rule, or other visibility horizon can still require that version</li>
+</ul>
+</li>
+<li>
+<p><strong>What kind of contention does MVCC most directly reduce?</strong></p>
+<ul>
+<li>A) Reader-writer conflicts where a snapshot reader can use an older committed version</li>
+<li>B) All write-write conflicts on the same row</li>
+<li>C) Every catalog and metadata lock inside the engine</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: Visibility is determined by the reader's snapshot, not by one universal "latest committed" value. If the snapshot began before <code>T7109</code> entered the visible set, the older committed version is still the correct answer for that query.</p>
+<p><strong>2. C</strong>: MVCC cleanup has to respect the oldest visibility horizon that still matters. A newer version alone is not enough if some active snapshot can still legally see the old one.</p>
+<p><strong>3. A</strong>: MVCC mainly helps readers avoid waiting on concurrent writers when an older committed version is still valid for their snapshot. Writers and explicit locking paths still need separate coordination.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="027.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Deadlock Detection, Timeout, and Avoidance</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="029.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Timestamp Ordering and Optimistic Concurrency</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

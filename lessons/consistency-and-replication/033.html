@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monthly Capstone: Geo-Distributed Database Service - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Monthly Capstone: Geo-Distributed Database Service</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 033 | Lesson ID: 432
+        </p>
+        <p>
+          Difficulty: advanced | Kind: capstone
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 432: Monthly Capstone: Geo-Distributed Database Service</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A geo-distributed database is not "one writable database everywhere." It is a contract about shard ownership, read guarantees, and failover. If those three choices do not agree, extra regions only multiply the ways the service can be wrong.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="032.html">15.md</a>, Harbor Point learned how to test a distributed database the hard way: not by admiring a clean failover demo, but by reconstructing the history of real reservation requests and checking whether the cluster kept its promises. The capstone question is what architecture is worth testing in the first place now that the reservation platform is expanding beyond one region.</p>
+<p>The tempting answer is "put writable replicas in Madrid and New York so every desk can write locally." For Harbor Point's workload, that is the wrong instinct. A reservation is not an append-only social post. Each approval also updates the issuer's remaining exposure. If Madrid and New York can independently approve reservations for issuer <code>MUNI-77</code>, the system has to reconcile not just rows, but a financial limit that may already have been oversold. After two desks have both been told "confirmed," there is no harmless merge strategy.</p>
+<p>The right design move is to place the invariant before placing the replicas. Harbor Point shards by issuer, keeps <code>issuer_exposure</code> and the issuer's live reservations on the same shard, and gives each shard one home region with one leader at a time. Madrid and New York can both serve the product globally, but they do not both invent the order of writes for the same issuer. Remote replicas, CDC-fed read models, and failover procedures exist to extend visibility and resilience around that ordered write path, not to replace it.</p>
+<p>That is the capstone insight for the whole month. Replication, quorums, sharding, read replicas, CDC, backups, observability, and Jepsen-style validation are not separate tricks. They are pieces of one service contract. Once Harbor Point makes that contract explicit, the next lesson, <a href="034.html">../28/01.md</a>, becomes inevitable: some metadata service has to publish which region owns each shard and which leader generation is currently authoritative.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point is launching follow-the-sun reservation intake for bond desks in Madrid and New York. Traders in both cities need fast confirmations. Support needs to look up any reservation globally. Compliance wants a cross-region search surface within seconds, not hours. Operations also wants a credible story for a regional outage. Those are all reasonable requirements until they are forced into the same database design.</p>
+<p>If Harbor Point solves the problem with a single slogan, the service will fail in production. "Strong consistency everywhere" turns every write and many reads into cross-ocean coordination, which pushes ordinary p99 latency into the product budget. "Local writes in every region" preserves latency, but it breaks the issuer-exposure invariant unless the business accepts conflicts that can no longer be repaired after confirmation. "Just use read replicas" helps dashboards and does nothing for shard ownership or disaster recovery.</p>
+<p>The capstone is therefore about choosing a design that is explicit about what is local, what is global, and what is allowed to lag. A geo-distributed database becomes workable only when those categories are tied to specific endpoints, replication paths, and failure runbooks.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Choose a shard-placement strategy from the real invariant</strong> - Explain why Harbor Point homes each issuer shard in one region instead of allowing the same issuer to be written independently in multiple regions.</li>
+<li><strong>Separate read paths by guarantee level</strong> - Map confirmations, trader dashboards, and global compliance search onto different data paths with different freshness contracts.</li>
+<li><strong>Defend a failover design with concrete budgets</strong> - Reason about RPO, RTO, idempotency, and validation gates instead of treating "multi-region" as automatic safety.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Put the invariant on one shard and give that shard one region of authority</h3>
+<p>Harbor Point's critical transaction is still the one from earlier in the month: lock <code>issuer_exposure</code>, check remaining headroom, insert the new reservation, and commit. The capstone decision is that those rows must stay together physically. If the system shards by trader region, client office, or random hash unrelated to the issuer, the approval path turns into a cross-shard transaction exactly where the business can least afford it. The issuer limit would then depend on 2PC or asynchronous compensation in the hot path of every reservation.</p>
+<p>Instead, Harbor Point shards by issuer and assigns each shard a home region based on the book that owns the issuer. EU issuers are homed in Madrid. US issuers are homed in New York. Both regions can accept API traffic, but a router first looks up the shard map and forwards the write to the shard leader in its home region. That keeps the approval invariant local to one Raft group or leader-based replication group at a time.</p>
+<p>The normal path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>client in Madrid or New York
+          |
+          v
+regional API gateway
+          |
+          v
+metadata lookup: issuer MUNI-77 -&gt; shard 184 -&gt; home region New York
+          |
+          v
+shard leader in New York
+          |
+          +--&gt; sync replica in New York AZ-2
+          |
+          +--&gt; async replica in Madrid
+</code></pre></div>
+
+<p>The important point is not the city names. The important point is that only one place is allowed to order writes for shard 184. A Madrid trader reserving a US issuer pays the WAN hop to New York because that hop is cheaper than making the issuer-limit invariant ambiguous. Harbor Point is explicitly choosing single-writer shards over active-active conflict resolution for the OLTP system of record.</p>
+<p>That choice also defines the trade-off. Local writers for home-region issuers get predictable commit latency because the acknowledgment depends on local WAL durability plus a synchronous replica in another availability zone, not on a global quorum. Cross-region writers pay extra latency. Regional failover is possible, but it is not zero-cost magic because the remote replica is not in the commit quorum. Harbor Point accepts that trade because the business already has an upstream order journal and can tolerate a tightly bounded RPO more easily than a permanently inflated write path.</p>
+<h3>Concept 2: Use different data paths for different questions instead of one impossible promise</h3>
+<p>Once shard ownership is clear, Harbor Point stops pretending every endpoint needs the same consistency contract. The reservation system actually serves three different questions.</p>
+<p>The first question is transactional: "did reservation <code>R-88421</code> commit?" That path must hit the shard leader or a read path that is provably at least as fresh as the caller's last acknowledged write. Harbor Point therefore returns a session token containing the commit LSN or log index with every successful write. If the client later reads from its local region and the replica has not replayed that token yet, the gateway routes the read back to the leader instead of serving a stale answer.</p>
+<p>The second question is operational: "show me the newest open reservations for this issuer." That dashboard can tolerate a small lag as long as the contract is explicit. Harbor Point serves it from a region-local follower when replay lag is under two seconds; otherwise it falls back to the leader or marks the view as stale. This uses the read-replica mechanics from <a href="028.html">11.md</a> without lying about read-your-writes.</p>
+<p>The third question is global and analytical: "search all reservations matching a compliance filter across regions." Harbor Point should not answer that with a synchronous fan-out query across every shard leader. Instead it streams CDC from each shard's WAL into a global <code>reservation_search</code> index and a same-day compliance view in both regions. That view is seconds behind by design, but it avoids coupling every compliance search to the OLTP commit path.</p>
+<p>One way to summarize the service is:</p>
+<div class="codehilite"><pre><span></span><code>question                               source of truth                    contract
+confirmation / token status            shard leader                       linearizable for that shard
+issuer dashboard                       regional follower or leader        bounded staleness + session fallback
+global compliance search               CDC-fed search/index service       eventual, usually within seconds
+</code></pre></div>
+
+<p>This is the architectural payoff of <a href="026.html">09.md</a>, <a href="027.html">10.md</a>, <a href="028.html">11.md</a>, and <a href="029.html">12.md</a>. CDC, materialized views, follower reads, and global indexes are not separate features to bolt on later. They are how Harbor Point avoids forcing a single "strong everywhere" contract onto endpoints that do not need it. The trade-off is operational clarity: APIs and dashboards have to expose which read mode they use, or developers will accidentally depend on freshness that the system never promised.</p>
+<h3>Concept 3: A geo-distributed service is only real when failover, lag budgets, and uncertain writes are all specified</h3>
+<p>Harbor Point's design deliberately does not put the remote region in the synchronous write quorum. That keeps the normal path fast, but it means the service must declare a real disaster-recovery contract. The production target is explicit: per-shard RPO of at most five seconds, RTO of under ten minutes, and no silent duplicate reservations after failover.</p>
+<p>Those numbers are enforced operationally, not by wishful thinking. The gateway watches remote replay lag and WAL archive age for each shard. If the remote copy falls more than five seconds behind, Harbor Point stops accepting new reservations for that shard and returns a retryable failure rather than allowing the recovery promise to drift invisibly. This is the same lesson as <a href="031.html">14.md</a>: internal state, not API latency, defines whether the storage contract is still true.</p>
+<p>Every write also carries a client-generated <code>reservation_token</code>. That token is the bridge between the OLTP path and the failover runbook. If a regional outage happens after a client saw a timeout or even after it saw success during the uncertain replication window, the client can ask the promoted shard whether that token committed. The system never resolves ambiguity by replaying the business action blindly. It resolves ambiguity by turning idempotency into an addressable record.</p>
+<p>The failover sequence is therefore mechanical:</p>
+<div class="codehilite"><pre><span></span><code>1. Freeze routing for shard 184 at configuration generation N.
+2. Promote the remote replica only up to its last durable replayed position.
+3. Publish generation N+1 in the metadata service.
+4. Resume writes through the new leader.
+5. Reconcile tokens that clients reported during the outage window.
+</code></pre></div>
+
+<p>This is exactly where <a href="032.html">15.md</a> matters. Harbor Point can and should inject partitions between regions, pause the old leader, delay replication, and verify that one token never becomes two committed reservations. The team should also test that stale followers are never allowed to serve a "strong" read and that routing changes happen once per generation, not in split-brain fashion. A geo-distributed database design is production-ready only when those tests pass repeatedly.</p>
+<p>The final trade-off is honesty. Harbor Point is not claiming the same thing as a system that synchronously replicates a write quorum across continents. If the business later requires zero-RPO regional loss for the reservation path, this architecture is no longer sufficient. The team would need to move remote replicas into the commit rule and accept the latency cost directly. The capstone answer is not universal. It is correct because it matches Harbor Point's stated workload, failure budget, and operational maturity.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A trader submits a reservation in Madrid, gets success, then immediately refreshes the local dashboard and does not see the reservation.</p>
+<p><strong>Why it happens / is confusing</strong>: The dashboard is reading from a regional follower whose replay position is behind the writer's commit token. The write is valid, but the read path is weaker than the user assumes.</p>
+<p><strong>Clarification / Fix</strong>: Carry the last-seen commit token through the session. If the local follower has not reached that position, route the read to the shard leader or label the view as stale instead of pretending the reservation disappeared.</p>
+<p><strong>Issue</strong>: A regional failover completes, but support cannot tell whether a just-submitted reservation committed before the outage.</p>
+<p><strong>Why it happens / is confusing</strong>: The system acknowledged writes from the home region's local quorum, while the promoted remote replica only knows its own replayed prefix. Without an idempotency token, the operator has no reliable way to separate "reply lost" from "write never committed remotely."</p>
+<p><strong>Clarification / Fix</strong>: Require a durable client token for every reservation and make token-status lookup part of the public contract. During failover, resolve uncertainty by token status, not by replaying the business request manually.</p>
+<p><strong>Issue</strong>: Compliance search disagrees with the OLTP record for several seconds after a burst of writes.</p>
+<p><strong>Why it happens / is confusing</strong>: The search surface is CDC-fed derived state, not the transactional source of truth. WAL shipping or CDC apply can lag temporarily under burst load even while the shard leader remains current.</p>
+<p><strong>Clarification / Fix</strong>: Publish the freshness contract for the search index explicitly, monitor CDC lag as a first-class SLI, and send investigators to the leader-backed path when they need authoritative status during an incident.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="032.html">15.md</a> tells Harbor Point how to validate this architecture instead of trusting the diagram</h3>
+<p>The capstone chooses one-writer shards, bounded-lag followers, and token-based failover reconciliation. Jepsen-style validation is what proves those choices actually preserve the business contract under partitions, delayed replication, and leader changes rather than merely sounding disciplined in a design document.</p>
+<h3>Connection 2: <a href="034.html">../28/01.md</a> starts where this capstone leaves off: the metadata plane becomes a system of record too</h3>
+<p>Once each issuer shard has a home region, leader generation, and failover state, Harbor Point needs a durable place to publish that mapping. The data plane can no longer be understood without the control plane that tells routers which shard owner is authoritative at any given moment.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[PAPER] <a href="https://research.google/pubs/spanner-googles-globally-distributed-database/">Spanner: Google's Globally-Distributed Database</a><ul>
+<li>Focus: Study a system that does choose synchronous cross-region replication, then compare its guarantees and costs with Harbor Point's lower-latency single-writer shard design.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/topology-patterns">Topology Patterns Overview</a><ul>
+<li>Focus: Compare geo-partitioned low-latency placement with multi-region topologies that trade more latency for stronger regional resilience.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.cloud.google.com/spanner/docs/true-time-external-consistency">Spanner: TrueTime and external consistency</a><ul>
+<li>Focus: Understand why a "strong everywhere" database needs an explicit ordering model for reads and writes across regions.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a><ul>
+<li>Focus: Read real failure reports and map them to the split-brain, stale-read, and lost-acknowledgment cases Harbor Point must rule out.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the chapters on partitioning, replication, and derived data with this capstone architecture in mind.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Geo-distribution starts with shard authority, not with replica count</strong> - If the invariant does not have one place that orders it, every additional region increases the chance of unrecoverable conflicts.</li>
+<li><strong>Different questions deserve different read paths</strong> - Confirmations, dashboards, and compliance search should not all pay for the same consistency contract.</li>
+<li><strong>Failover is part of the product contract</strong> - RPO, RTO, replica lag gates, and token-based uncertainty handling must be designed before the service can truthfully call itself multi-region.</li>
+</ol>
+<h2>Knowledge Check (Test Questions)</h2>
+<ol>
+<li>
+<p><strong>Why does Harbor Point shard by issuer and home each shard in one region instead of allowing every region to write the same issuer locally?</strong></p>
+<ul>
+<li>A) Because issuer-level exposure is the real invariant, and keeping that transaction on one shard avoids turning every approval into cross-region conflict resolution</li>
+<li>B) Because geo-distributed systems cannot route writes across regions</li>
+<li>C) Because home-region sharding automatically provides zero-RPO failover</li>
+</ul>
+</li>
+<li>
+<p><strong>Which path is the best fit for Harbor Point's global compliance search?</strong></p>
+<ul>
+<li>A) A leader-backed linearizable query across every shard for each search request</li>
+<li>B) A CDC-fed global search/index service with an explicit seconds-level freshness contract</li>
+<li>C) A random regional follower chosen by the load balancer</li>
+</ul>
+</li>
+<li>
+<p><strong>What should Harbor Point do if the remote replica for a shard falls beyond the declared five-second RPO budget?</strong></p>
+<ul>
+<li>A) Keep accepting writes silently because the local quorum is still healthy</li>
+<li>B) Stop or degrade new writes for that shard until the remote copy catches up, because otherwise the documented failover contract is already false</li>
+<li>C) Promote the stale replica immediately to reduce the lag number</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. A</strong>: The issuer limit is the business rule that cannot be merged safely after the fact. Harbor Point therefore keeps the approval transaction on one shard with one writer at a time. Option B is false because cross-region routing is exactly what the gateway does, and option C is false because this design still has a bounded async recovery window.</p>
+<p><strong>2. B</strong>: Compliance search needs broad coverage more than per-request linearizability. A CDC-fed derived view gives Harbor Point global search without putting every OLTP shard in the critical path of each query. Option A is too expensive for routine searches, and option C ignores freshness and completeness entirely.</p>
+<p><strong>3. B</strong>: Once remote lag exceeds the published RPO, the service can no longer claim the recovery contract that justified the architecture. Harbor Point should shed or queue new writes rather than let the hidden risk grow. Option A hides the problem, and option C promotes a replica that is known to be behind.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="032.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Failure Testing and Jepsen-Style Validation</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="034.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Cluster Metadata Services and Control Plane State</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

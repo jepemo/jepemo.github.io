@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LSM Trees, SSTables, and Compaction Trade-offs - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>LSM Trees, SSTables, and Compaction Trade-offs</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 004 | Lesson ID: 276
+        </p>
+        <p>
+          Difficulty: intermediate | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 276: LSM Trees, SSTables, and Compaction Trade-offs</h1>
+<blockquote>
+<p><strong>The core idea</strong>: an LSM tree makes writes cheap by delaying part of the maintenance work that a B-Tree pays immediately. That deferred work comes back later as compaction, read amplification, and operational tuning.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p><strong>The insight</strong>: A B-Tree keeps data organized during each write. An LSM tree accepts writes quickly first, then reorganizes data later in bigger background batches.</p>
+<p><strong>Why this matters</strong>: This is not a minor implementation detail. It changes where the system pays for ordering, deduplication, deletes, and space cleanup.</p>
+<p><strong>Concrete anchor</strong>: Imagine an event ingestion system receiving a continuous stream of updates. If every write had to maintain a large on-disk sorted structure in place, write throughput would suffer. An LSM design absorbs writes fast, then merges and cleans data in the background.</p>
+<p><strong>The practical sentence to remember</strong>:<br />
+<strong>LSM trees trade cheaper writes now for compaction work later.</strong></p>
+<hr />
+<h2>Why This Matters</h2>
+<p><strong>The problem</strong>: Many modern storage engines are built around write-heavy workloads: logs, metrics, key-value updates, event ingestion, user activity streams, and large distributed stores. These systems care a lot about write throughput, sequential I/O, and predictable ingestion under load.</p>
+<p><strong>Without this model</strong>:</p>
+<ul>
+<li>Teams compare engines using only benchmark headlines.</li>
+<li>Fast writes look "free" until read latency and compaction debt appear.</li>
+<li>Deletes and updates seem simple until tombstones and stale versions accumulate.</li>
+</ul>
+<p><strong>With this model</strong>:</p>
+<ul>
+<li>You can explain why RocksDB-, LevelDB-, or Cassandra-style systems behave the way they do.</li>
+<li>You can predict when write-heavy workloads fit LSM well.</li>
+<li>You can recognize when compaction becomes the real bottleneck.</li>
+</ul>
+<p><strong>Operational payoff</strong>: Better engine choice, better tuning, and fewer surprises when a system that looked great in ingestion tests starts struggling in mixed read/write production traffic.</p>
+<hr />
+<h2>Learning Objectives</h2>
+<p>By the end of this lesson, you should be able to:</p>
+<ol>
+<li><strong>Explain why LSM trees exist</strong> as a response to the cost of maintaining on-disk order during every write.</li>
+<li><strong>Describe the write path and read path</strong> across memtables, SSTables, and immutable files.</li>
+<li><strong>Reason about compaction trade-offs</strong> in terms of write amplification, read amplification, and space amplification.</li>
+</ol>
+<hr />
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Why LSM Trees Exist</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A telemetry platform ingests millions of small writes per second. The main requirement is to accept writes reliably and continuously, even when the working set is larger than memory.</p>
+<p><strong>Intuition</strong>: In a B-Tree, each write helps preserve the global sorted structure immediately. In an LSM design, writes first land in memory, then get flushed out as immutable sorted files. The system postpones some organization work so the write path stays cheaper.</p>
+<p><strong>How it works mechanically</strong>:</p>
+<ol>
+<li>New writes go into an in-memory structure, usually a sorted memtable.</li>
+<li>When that memtable fills, it is frozen and flushed to disk as an immutable sorted file called an SSTable.</li>
+<li>Over time, many SSTables accumulate, often across multiple levels or tiers.</li>
+<li>Background compaction merges them, removes obsolete versions, and restores a healthier read shape.</li>
+</ol>
+<p><strong>Why this is attractive</strong>:</p>
+<ul>
+<li>Writes mostly become append-like or sequential work.</li>
+<li>The engine avoids a lot of small in-place on-disk mutations.</li>
+<li>High write throughput becomes easier to sustain.</li>
+</ul>
+<p><strong>The trade-off</strong>: You did not eliminate maintenance work. You moved it off the foreground write path and into later background merge work.</p>
+<p><strong>Mental model</strong>:<br />
+A B-Tree cleans the room after every new item.<br />
+An LSM tree puts items into labeled bins quickly, then schedules a later cleanup and reorganization session.</p>
+<hr />
+<h3>Concept 2: SSTables and the Read Path</h3>
+<p><strong>Concrete example / mini-scenario</strong>: A user asks for the current value of a key after that key has been updated many times over the last hour.</p>
+<p><strong>Intuition</strong>: Because LSM trees accumulate immutable files over time, the read path may need to check several places before it knows which version is current.</p>
+<p><strong>How it works mechanically</strong>:</p>
+<ul>
+<li>The engine checks the current memtable first because the newest writes may still be in memory.</li>
+<li>It may also check immutable memtables waiting to flush.</li>
+<li>Then it consults SSTables on disk, often across multiple levels.</li>
+<li>Because SSTables are sorted and immutable, the engine can use metadata such as indexes, fence pointers, and often Bloom filters to skip files that definitely do not contain the key.</li>
+</ul>
+<p><strong>Why immutability helps</strong>:</p>
+<ul>
+<li>SSTables are simple to read and safe to share.</li>
+<li>Background merges are easier because files are not being modified in place.</li>
+<li>Replication and checksumming are often simpler with immutable segments.</li>
+</ul>
+<p><strong>Why reads get harder</strong>:</p>
+<ul>
+<li>A key may exist in several files.</li>
+<li>Deletes are often represented as tombstones, not immediate erasure.</li>
+<li>Old versions may remain until compaction removes them.</li>
+</ul>
+<p><strong>Practical consequence</strong>:<br />
+An LSM tree often wins when the workload is write-heavy, but mixed workloads must be tuned carefully so reads do not drown in too many files or too much stale history.</p>
+<p><strong>Connection to the next lesson</strong>: If recent writes live in memory first, durability cannot depend on memory alone. That is why the write path is usually paired with a write-ahead log, which is the focus of the next lesson.</p>
+<hr />
+<h3>Concept 3: Compaction Is Deferred Maintenance</h3>
+<p><strong>Concrete example / mini-scenario</strong>: Your system ingests data very quickly all morning. By afternoon, disk usage rises, background I/O increases, and read latency becomes erratic.</p>
+<p><strong>Intuition</strong>: Compaction is the bill you pay for earlier write efficiency.</p>
+<p><strong>What compaction does</strong>:</p>
+<ul>
+<li>Merges SSTables into larger, cleaner structures.</li>
+<li>Drops overwritten versions that no longer matter.</li>
+<li>Removes tombstones when it is safe.</li>
+<li>Reduces the number of files the read path must touch.</li>
+</ul>
+<p><strong>Why compaction matters so much</strong>:</p>
+<ul>
+<li>Without it, reads get slower because too many files must be checked.</li>
+<li>Deletes do not reclaim space promptly.</li>
+<li>Stale versions accumulate.</li>
+</ul>
+<p><strong>The three amplifications to reason about</strong>:</p>
+<ol>
+<li><strong>Write amplification</strong>: a logical write may be rewritten several times during compaction.</li>
+<li><strong>Read amplification</strong>: a read may need to inspect several files or levels before finding the answer.</li>
+<li><strong>Space amplification</strong>: disk usage may temporarily exceed live data size because old and new versions coexist.</li>
+</ol>
+<p><strong>Important design tension</strong>:</p>
+<ul>
+<li>More aggressive compaction can improve reads and space usage.</li>
+<li>But aggressive compaction increases background I/O and CPU cost.</li>
+<li>Less aggressive compaction preserves write throughput for a while, but tends to worsen reads and leave more stale data around.</li>
+</ul>
+<p><strong>Common strategy families</strong>:</p>
+<ul>
+<li><strong>Size-tiered compaction</strong>: merge similarly sized files in batches; good write characteristics, can tolerate more overlap.</li>
+<li><strong>Leveled compaction</strong>: keep tighter structure by levels; often improves reads, but may increase rewrite cost.</li>
+</ul>
+<p>You do not need to memorize vendor defaults yet. What matters is seeing compaction as policy, not housekeeping trivia.</p>
+<hr />
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Writes benchmark well, but production read latency keeps drifting upward.</p>
+<p><strong>Why it happens</strong>: Too many SSTables, too much overlap, or too much stale history can increase read amplification.</p>
+<p><strong>Clarification / Fix</strong>: Check compaction health, file counts, per-level growth, Bloom filter effectiveness, and whether the workload now has more reads than the original design assumed.</p>
+<p><strong>Issue</strong>: Deletes do not seem to free disk space.</p>
+<p><strong>Why it happens</strong>: In LSM systems, deletes usually become tombstones first. Space is reclaimed later by compaction, not at delete time.</p>
+<p><strong>Clarification / Fix</strong>: Look for compaction backlog, retention settings, or long-lived snapshots that prevent obsolete data from being dropped.</p>
+<p><strong>Issue</strong>: Throughput is fine until compaction starts, then latency spikes.</p>
+<p><strong>Why it happens</strong>: Background merge work competes with foreground reads and writes for disk bandwidth, CPU, and cache.</p>
+<p><strong>Clarification / Fix</strong>: Tune compaction concurrency, I/O throttling, level sizes, and write buffer settings. The real fix is often policy tuning, not just more hardware.</p>
+<hr />
+<h2>Advanced Connections</h2>
+<h3>Connection 1: LSM Trees &lt;-&gt; B-Trees</h3>
+<p><strong>The contrast</strong>: A B-Tree pays more structure-maintenance cost during writes so reads stay relatively direct. An LSM tree makes writes cheaper first, then pays later through compaction and more complicated reads.</p>
+<p><strong>Why this matters</strong>: Engine choice is not "modern vs old." It is about where you want to pay the cost.</p>
+<h3>Connection 2: LSM Trees &lt;-&gt; Log-Structured Systems</h3>
+<p><strong>The parallel</strong>: Like logs and segment-based storage, LSM trees favor append-like writes and deferred cleanup. The cleanup phase is where old history is compacted away.</p>
+<p><strong>Why this matters</strong>: Once you see the pattern, storage engines, message logs, and even some cache designs start looking like variations of the same systems idea: cheap ingestion now, reconciliation later.</p>
+<hr />
+<h2>Resources</h2>
+<h3>Suggested Resources</h3>
+<ul>
+<li>[BOOK] <em>Designing Data-Intensive Applications</em> by Martin Kleppmann - <a href="https://dataintensive.net/">Official site</a><br />
+  Focus: clear explanations of storage engine trade-offs.</li>
+<li>[BOOK] <em>Database Internals</em> by Alex Petrov - <a href="https://www.databass.dev/">Book site</a><br />
+  Focus: practical engine structures, including LSM-based systems.</li>
+<li>[DOC] RocksDB Wiki - <a href="https://github.com/facebook/rocksdb/wiki">Documentation</a><br />
+  Focus: real operational details of an LSM engine used in production.</li>
+<li>[PAPER] <em>The Log-Structured Merge-Tree (LSM-Tree)</em> - <a href="https://oleksii.shmalko.com/biblio/oneil1996-log-struc-merge-tree-lsm-tree/">Reference</a><br />
+  Focus: the original design motivation and core mechanism.</li>
+</ul>
+<hr />
+<h2>Key Insights</h2>
+<ol>
+<li><strong>LSM trees do not avoid maintenance</strong> - they delay and batch it.</li>
+<li><strong>SSTables make writes and storage simpler in one dimension</strong> - but the read path and cleanup logic become more complex.</li>
+<li><strong>Compaction is the real systems trade-off</strong> - it controls how you balance write cost, read cost, and space cost over time.</li>
+</ol>
+<hr />
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why can an LSM tree accept writes efficiently under heavy ingestion?</strong></p>
+<ul>
+<li>A) Because it keeps all data permanently in memory</li>
+<li>B) Because it delays some ordering and cleanup work instead of doing all of it during each write</li>
+<li>C) Because it eliminates the need for sorting</li>
+</ul>
+</li>
+<li>
+<p><strong>What is an SSTable in this context?</strong></p>
+<ul>
+<li>A) A mutable in-memory cache of hot keys</li>
+<li>B) An immutable sorted on-disk structure used by the engine</li>
+<li>C) A lock manager for compaction threads</li>
+</ul>
+</li>
+<li>
+<p><strong>What does compaction mainly do?</strong></p>
+<ul>
+<li>A) Encrypt blocks before replication</li>
+<li>B) Merge files, remove obsolete versions, and reduce read overhead</li>
+<li>C) Turn random reads into network calls</li>
+</ul>
+</li>
+<li>
+<p><strong>Which statement best captures the core trade-off of LSM design?</strong></p>
+<ul>
+<li>A) Faster writes now, more background merge cost and read complexity later</li>
+<li>B) Slower writes now, no maintenance later</li>
+<li>C) Equal cost across all workloads</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h2>Answers</h2>
+<p><strong>1. B</strong>: LSM trees keep the foreground write path cheaper by postponing some organization work.</p>
+<p><strong>2. B</strong>: SSTables are immutable sorted files that form the durable on-disk structure of the engine.</p>
+<p><strong>3. B</strong>: Compaction merges overlapping files, drops stale versions and tombstones when safe, and reduces read amplification.</p>
+<p><strong>4. A</strong>: The design shifts cost from immediate write maintenance toward later background maintenance and more complex reads.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="003.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>B-Tree Index Internals and Access Paths</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="005.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Write-Ahead Logging and Crash Recovery Mechanics</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

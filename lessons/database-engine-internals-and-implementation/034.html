@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cost-Based Query Planning Internals - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Cost-Based Query Planning Internals</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/database-engine-internals-and-implementation.html">Database Engine Internals and Implementation</a>
+        </p>
+        <p>
+          Sequence: 034 | Lesson ID: 411
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 411: Cost-Based Query Planning Internals</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A cost-based planner does not "know" the best plan in advance; it builds a manageable set of physical alternatives, estimates how many rows and page reads each one will produce, and chooses the cheapest estimate.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="033.html">10.md</a>, Harbor Point designed a composite index so the market-open dashboard could seek directly into <code>issuer = 'MUNI-77'</code>, <code>status = 'open'</code>, and stream the newest reservations first. After rollout, the team expected the planner to use that index every time. Instead, one morning's <code>EXPLAIN</code> showed a sequential scan plus sort on <code>reservations</code>, and p95 latency for the dashboard jumped from tens of milliseconds into the multi-second range.</p>
+<p>That was not the optimizer being whimsical. The planner had priced several legal execution trees and concluded that the index path was more expensive than scanning and sorting. Its decision came from estimates: how many rows the <code>WHERE</code> clause would match, whether the index would avoid the sort, how many random heap fetches the scan would cause, and how expensive the downstream join to <code>risk_limits</code> would be. The planner was not reasoning directly about SQL syntax; it was reasoning about operator trees.</p>
+<p>The important shift is to stop asking, "Why did it ignore my index?" and start asking, "What assumptions made this other plan look cheaper?" That question turns query planning from folklore into a debuggable mechanism. It also prepares the ground for <a href="035.html">12.md</a>: if the row estimates are wrong, the cost model will make a logically consistent but operationally bad choice.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's dashboard query is interactive, parameterized, and bursty. During quiet periods, <code>issuer = 'MUNI-77'</code> might match a few dozen open reservations. At market open, the same shape of query may hit thousands of rows, and the join to <code>risk_limits</code> can amplify the work if the planner expects a tiny outer relation and instead gets a flood of tuples. When that happens, the chosen plan dictates whether the engine performs a short ordered index walk, many repeated index lookups, a bitmap pass over scattered pages, or a table scan followed by an in-memory or on-disk sort.</p>
+<p>That is why cost-based planning is operationally important even if you never touch optimizer code. A bad plan is often not a random failure and not even an indexing failure. It is usually an estimation failure that propagated upward through the plan tree. If you can read that propagation, you can decide whether the right fix is a better index, better statistics, a query rewrite, or different planner settings. If you cannot, you end up cargo-culting hints and hoping the workload never changes.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain how a cost-based planner builds candidate physical plans</strong> - Describe how scans, joins, sort orders, and limits become alternative execution trees.</li>
+<li><strong>Trace how row estimates and operator costs produce a chosen plan</strong> - Connect cardinality, I/O assumptions, and startup versus total cost to the final decision.</li>
+<li><strong>Diagnose a bad plan in production terms</strong> - Use estimated versus actual rows to decide whether the real problem is physical design, stale statistics, or a query shape mismatch.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Planning starts by turning one SQL statement into several legal operator trees</h3>
+<p>Harbor Point's dashboard query now joins the reservation stream to a small per-account risk table:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">reservation_id</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">account_id</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">quantity</span><span class="p">,</span><span class="w"> </span><span class="n">rl</span><span class="p">.</span><span class="n">max_notional</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">reservations</span><span class="w"> </span><span class="n">r</span>
+<span class="k">JOIN</span><span class="w"> </span><span class="n">risk_limits</span><span class="w"> </span><span class="n">rl</span>
+<span class="w">  </span><span class="k">ON</span><span class="w"> </span><span class="n">rl</span><span class="p">.</span><span class="n">account_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">account_id</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">issuer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;MUNI-77&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">submitted_at</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nb">interval</span><span class="w"> </span><span class="s1">&#39;15 minutes&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">submitted_at</span><span class="w"> </span><span class="k">DESC</span>
+<span class="k">LIMIT</span><span class="w"> </span><span class="mi">50</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The optimizer's first job is not to attach costs. Its first job is to enumerate legal physical shapes for this query. For <code>reservations</code>, that may include a sequential scan, a bitmap path, or an ordered index scan using the composite key introduced in <a href="033.html">10.md</a>. For <code>risk_limits</code>, it may include a primary-key index probe or building a hash table. Once those base-table paths exist, the planner can assemble them into join trees and decide whether the final order comes "for free" from an index or requires an explicit sort.</p>
+<p>For a small query, it can consider many combinations. For a large query, the search space grows explosively, so real optimizers prune aggressively. They discard obviously dominated paths, keep only certain useful orderings, and cap how much join-order exploration they are willing to do. That means the planner is already making trade-offs before any cost number appears: exhaustive search would be more complete, but it would make planning itself too slow for OLTP traffic.</p>
+<p>You can picture Harbor Point's query as a search over alternative trees:</p>
+<div class="codehilite"><pre><span></span><code>SQL
+  -&gt; scan reservations: {seq, bitmap, idx(issuer,status,submitted_at)}
+  -&gt; access risk_limits: {index probe, hash build}
+  -&gt; join: {nested loop, hash join}
+  -&gt; final order: {already ordered, explicit sort}
+  -&gt; limit: {stop early if upstream order allows it}
+</code></pre></div>
+
+<p>The key production insight is that physical design changes the search space. The composite index from the previous lesson does not merely make one scan faster. It creates a new ordered access path that the planner can price against the other options.</p>
+<h3>Concept 2: The cost model prices those trees using estimated rows, pages, CPU work, and memory-sensitive operators</h3>
+<p>Once the planner has candidate trees, it assigns each one a cost. Those costs are usually not literal milliseconds. They are relative units produced by a model that combines child costs with expected work at each node. A simplified sketch looks like this:</p>
+<div class="codehilite"><pre><span></span><code>plan_cost
+  = child_costs
+  + page_reads * page_cost
+  + rows_processed * cpu_tuple_cost
+  + operator_overheads(sort/hash/materialize)
+</code></pre></div>
+
+<p>For Harbor Point, the most important input is row estimation. If the planner believes the <code>WHERE</code> clause produces 120 rows, then an ordered index scan plus nested-loop probes into <code>risk_limits</code> can look excellent because it has low startup cost and can stop early after finding fifty rows. If it believes the same predicate produces 18,000 rows, the model may prefer a sequential scan plus hash join, because repeated random lookups and tuple-by-tuple processing now look more expensive than reading the table once and sorting the result.</p>
+<p>That is why <code>LIMIT 50</code> matters so much. Cost models usually track both startup cost and total cost. A plan that can return the first rows quickly may win for an interactive query even if its full-run total cost is worse. Harbor Point's index path benefits from that because the <code>(issuer, status, submitted_at DESC)</code> order can produce the newest rows immediately. A back-office export of all matching reservations might prefer a different plan because early-row latency no longer matters as much as total throughput.</p>
+<p>The important consequence is that row-estimate errors compound. If the scan node is wrong, the join node inherits the error, and the sort or limit decision above it is now being priced on distorted input. The planner can therefore be internally consistent and still disastrously wrong in production. That is the bridge to the next lesson: histograms, most-common-values lists, and correlation stats determine whether the planner thinks it is processing hundreds of rows or tens of thousands.</p>
+<h3>Concept 3: A cost-based planner is a controlled approximation, so diagnosis means comparing its assumptions to reality</h3>
+<p>When Harbor Point sees a bad plan, the right move is not to treat the optimizer as a black box and start toggling knobs at random. The disciplined workflow is to compare the planner's expectations with execution reality. <code>EXPLAIN</code> shows the chosen plan and its estimated costs; <code>EXPLAIN ANALYZE</code> shows how many rows each node actually produced and how much time it spent there. The gap between those two views tells you what kind of problem you have.</p>
+<p>If the chosen path is structurally impossible to make fast, the issue is physical design: perhaps there is no index that both narrows on <code>issuer</code> and preserves <code>submitted_at DESC</code>. If the path would have been fine under the planner's estimate but collapses under real row counts, the issue is estimation: stale statistics, skewed values, or predicate correlations the engine did not model well. If the plan is reasonable for one issuer and terrible for another, you may have a parameter-sensitive workload where a single generic plan is not robust enough across values.</p>
+<p>This is the main trade-off of cost-based planning. It usually beats fixed heuristics because it can adapt to data size, operator choices, and query shape. But that flexibility depends on approximate statistics and a finite search budget. Engines accept that compromise because perfect planning is impossible at runtime. Your job in production is not to demand perfection; it is to determine which approximation failed and whether the cheapest repair is better statistics, better paths, or less ambiguous SQL.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A new composite index exists, but the planner still chooses a sequential scan plus sort.</p>
+<p><strong>Why it happens / is confusing</strong>: Seeing the "right" columns in the index tempts engineers to assume the ordered index path must be cheapest. The planner may disagree if it estimates that a large fraction of the table matches, or if using the index would still require many random heap fetches.</p>
+<p><strong>Clarification / Fix</strong>: Check <code>EXPLAIN</code> and compare the estimated rows for the scan node against reality. If the estimate is wildly high or low, investigate statistics and skew before forcing a plan. If the estimate is accurate, the issue may be that the index really is the wrong physical design for this query mix.</p>
+<p><strong>Issue</strong>: The same parameterized query is fast for one issuer and slow for another.</p>
+<p><strong>Why it happens / is confusing</strong>: The optimal plan can change with data distribution. An issuer with a small active set favors an index-driven path; a very common issuer may make the same path too expensive compared with a broader scan.</p>
+<p><strong>Clarification / Fix</strong>: Compare plans and row estimates for representative parameter values. Look for places where one value yields a small outer relation and another yields a large one. That tells you whether you are dealing with skew, generic-plan reuse, or a workload that needs different indexing than the median case.</p>
+<p><strong>Issue</strong>: A plan was fine last quarter and is bad now without any code change.</p>
+<p><strong>Why it happens / is confusing</strong>: Cost-based planning is sensitive to data growth, changed value distributions, and new hot ranges. The SQL text may be identical while the planner's best estimated plan changes because the table is no longer shaped like it was when the query was first tuned.</p>
+<p><strong>Clarification / Fix</strong>: Re-run <code>EXPLAIN ANALYZE</code> on current production-like data, review fresh statistics, and verify whether the planner's assumptions about selectivity, sort size, and join fan-out still hold. Query tuning is not durable if the underlying data distribution has moved.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="033.html">10.md</a> changes what the planner is allowed to consider</h3>
+<p>Composite index design and cost-based planning are inseparable. The planner can only price paths that actually exist. When Harbor Point created <code>(issuer, status, submitted_at DESC)</code>, it did not guarantee that the index would always win, but it did create an ordered access path that can avoid a sort and support an early <code>LIMIT</code> stop.</p>
+<h3>Connection 2: <a href="035.html">12.md</a> explains why cost formulas are only as good as their inputs</h3>
+<p>Today's lesson explains how the planner turns estimated row counts into scan, join, and sort costs. The next lesson focuses on where those estimates come from: statistics, histograms, most-common-values lists, and the errors that appear when column correlations or skew are under-modeled. If you can already see the cost tree, the statistics layer has an obvious place to attach.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/using-explain.html">PostgreSQL Documentation: Using EXPLAIN</a><ul>
+<li>Focus: How PostgreSQL presents plan trees, startup and total cost, and estimated versus actual rows.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/planner-stats-details.html">PostgreSQL Documentation: How the Planner Uses Statistics</a><ul>
+<li>Focus: The row-estimation machinery that feeds the cost model and often explains bad plan choices.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.sqlite.org/queryplanner.html">SQLite Query Planning</a><ul>
+<li>Focus: A compact explanation of access-path selection, sorting, and the effect of multi-column indexes on plan choice.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/explain.html">MySQL 8.4 Reference Manual: EXPLAIN Statement</a><ul>
+<li>Focus: A second engine's view of optimizer output, including row estimates and <code>EXPLAIN ANALYZE</code>.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>The planner chooses operator trees, not favorite syntax</strong> - SQL is first translated into physical alternatives such as scans, joins, and sorts, and only then compared by estimated cost.</li>
+<li><strong>Cardinality is the lever behind most plan choices</strong> - Once row estimates drift, every upstream cost based on those rows drifts with them.</li>
+<li><strong>Cost-based planning is powerful because it is approximate</strong> - Engines search enough of the plan space to be useful at runtime, then rely on statistics to make the approximation good enough.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why might Harbor Point's planner choose a sequential scan plus sort even after the team added <code>(issuer, status, submitted_at DESC)</code>?</strong></p>
+<ul>
+<li>A) Because composite indexes cannot be used with <code>ORDER BY</code></li>
+<li>B) Because the planner may estimate that too many rows match for the ordered index path to be cheaper than scanning and sorting</li>
+<li>C) Because cost-based planners always prefer sequential scans when a join is present</li>
+</ul>
+</li>
+<li>
+<p><strong>Why does <code>LIMIT 50</code> often change the best plan for the dashboard query?</strong></p>
+<ul>
+<li>A) Because it makes SQL semantically equivalent to a primary-key lookup</li>
+<li>B) Because the planner now values low startup cost and the ability to stop early once fifty ordered rows have been found</li>
+<li>C) Because it disables hash joins entirely</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the most useful first question when a plan looks wrong in production?</strong></p>
+<ul>
+<li>A) Which estimate made the chosen plan look cheap?</li>
+<li>B) Which optimizer hint can force the index path?</li>
+<li>C) Which SQL keyword should be rewritten first, regardless of evidence?</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The planner compares estimated work, not human expectations. If it thinks the predicate matches many rows or the index path will cause too many random reads, a scan plus sort can look cheaper.</p>
+<p><strong>2. B</strong>: <code>LIMIT</code> shifts attention toward startup cost. An ordered index path can begin returning useful rows immediately and stop early, which may beat a plan with better total throughput but worse first-row latency.</p>
+<p><strong>3. A</strong>: A bad plan is usually an estimation story before it is a hinting story. Find the row-count or cost assumption that made the chosen path look rational, then fix the cause of that assumption.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="033.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Composite Index Ordering and Selectivity</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="035.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Statistics, Histograms, and Cardinality Errors</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/database-engine-internals-and-implementation.html">← Back to Database Engine Internals and Implementation</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

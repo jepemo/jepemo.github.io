@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sharding Strategies: Range, Hash, and Hybrid - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Sharding Strategies: Range, Hash, and Hybrid</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="page-kicker">LESSON</p>
+        <p>
+          Track:
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+        </p>
+        <p>
+          Sequence: 022 | Lesson ID: 421
+        </p>
+        <p>
+          Difficulty: advanced | Kind: lesson
+        </p>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 421: Sharding Strategies: Range, Hash, and Hybrid</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A sharding strategy decides which reads and writes stay inside one replica group and which ones turn into distributed work; range sharding buys locality, hash sharding buys spread, and hybrid schemes spend extra routing complexity to get both where the workload actually needs them.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="021.html">04.md</a>, Harbor Point saw that quorum math only tells you what happens inside one replica set. That leaves the scaling question that replication alone cannot answer: which records should share a replica set in the first place? Once the municipal-bond platform outgrew a single group, the team had to choose how <code>issuer_limits</code>, <code>issuer_exposure</code>, and recent reservations for issuers like <code>MUNI-77</code> would be partitioned across shards.</p>
+<p>The pressure came from a very specific production pattern. When California released a budget update at 09:30, reservation traffic for CA issuers surged, and the risk dashboard started polling every few seconds for "all California issuers above 80% of their intraday limit." If Harbor Point kept all California issuers together because that made the dashboard simple, one shard absorbed the whole event. If it hashed every issuer blindly, the write path became smoother but the dashboard turned into a scatter-gather query across the cluster.</p>
+<p>That is the mental shift for sharding strategy design. A shard key is not only a data-layout choice. It is a statement about which access patterns deserve locality and which ones are allowed to pay fan-out cost. Range sharding, hash sharding, and hybrid schemes all work, but they optimize different failure stories. The next lesson, <a href="023.html">06.md</a>, follows naturally from this one: once Harbor Point picks a strategy, it still needs a safe way to move data when shard sizes and traffic stop matching the original plan.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point cannot treat sharding as a storage-only concern because the partition boundary shapes application behavior. The reservation API needs predictable low-latency reads and writes for one issuer at a time. The risk dashboard wants bounded scans over a business grouping such as one state. Compliance wants exports and backfills that do not surprise operators by touching every node in the cluster. A poor shard layout turns one of those local operations into cross-shard coordination even when the product requirement never asked for distributed work.</p>
+<p>That is why teams get burned by apparently reasonable choices. A pure range layout often looks elegant in design review because the routing table is easy to explain and range queries stay local. Then a single hot range dominates p99 latency. A pure hash layout often looks safer because load spreads more evenly, but now every grouping query needs a coordinator, partial-failure handling, and enough headroom for the slowest shard to set the response time. The right strategy is the one that matches the real workload shape, not the one that sounds most generally scalable.</p>
+<p>This lesson sits between replication and rebalancing for a reason. Replication tells Harbor Point how a shard stays durable. Sharding tells Harbor Point which data belongs in that shard. Rebalancing, which comes next, only becomes meaningful after those boundaries are chosen.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain how range, hash, and hybrid sharding route the same workload differently</strong> - Show how the shard map changes locality, hotspot risk, and fan-out.</li>
+<li><strong>Match a shard strategy to concrete access patterns</strong> - Reason from Harbor Point's issuer updates, state-level scans, and growth profile instead of from generic rules.</li>
+<li><strong>Evaluate the operational trade-offs of a shard layout</strong> - Predict when metadata churn, rebalancing cost, and cross-shard queries will dominate the design.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Range sharding keeps neighboring keys together, which is powerful until the workload skews toward one range</h3>
+<p>Harbor Point's first instinct was to shard by business locality. The routing service kept a table of key intervals such as <code>CA/A..CA/M -&gt; shard-3</code>, <code>CA/N..CA/Z -&gt; shard-4</code>, <code>NY/* -&gt; shard-5</code>. A request for issuer <code>CA-MUNI-77</code> was routed by comparing the key to those boundaries and sending the read or write to the shard that owned that interval. The appeal is immediate: the risk dashboard query "show all California issuers above 80% of limit" touches only the California shards, and the result already arrives in key order.</p>
+<p>The internal mechanism is simple and that simplicity matters operationally. A metadata service stores the current range boundaries and their owning replica groups. The router performs a boundary lookup, then the chosen shard handles the request with whatever replication policy Harbor Point uses inside that group. When one shard grows too large, the system can split the range at a new boundary and move one half elsewhere. Because the keys are contiguous, backfills, scans, and retention jobs are predictable.</p>
+<div class="codehilite"><pre><span></span><code>Range map
+
+CA/A..CA/M  -&gt; shard-3
+CA/N..CA/Z  -&gt; shard-4
+NY/*        -&gt; shard-5
+TX/*        -&gt; shard-6
+</code></pre></div>
+
+<p>The weakness appears as soon as traffic is uneven across the keyspace. The California budget event did not produce uniform pressure on every state. It concentrated traffic on the CA range, so the CA shard's CPU, WAL volume, and quorum latency all climbed together. Range sharding is excellent when the busiest queries are also range-oriented and the ranges are not wildly imbalanced. It is much less forgiving when one range becomes the product's center of gravity or when new writes always land at one end of the keyspace.</p>
+<p>That is the real trade-off. Range sharding preserves locality for ordered scans and for business groupings that line up with the key order, but it makes hotspot management a first-class operational problem. The design is not wrong; it is only wrong when the business grouping that makes reads elegant also becomes the grouping that concentrates most writes.</p>
+<h3>Concept 2: Hash sharding spreads many keys well, but it destroys the natural neighborhood that range queries rely on</h3>
+<p>To escape the California hotspot, Harbor Point tried hashing <code>issuer_id</code> instead of routing on its lexical range. The router computed something like <code>bucket = hash(issuer_id) % 16</code>, then used that bucket to choose the shard. <code>CA-MUNI-77</code> and <code>CA-MUNI-78</code> no longer had to live together, which meant broad traffic across many issuers was much less likely to overload a single shard.</p>
+<p>Hash sharding changes the router from "find the interval" to "compute the placement function." That removes the need for carefully chosen range boundaries, and it usually produces a much flatter distribution when the key cardinality is high enough. For Harbor Point's reservation API, which mostly touches one issuer at a time, that can be a major improvement because the write load from thousands of issuers is now spread across the fleet rather than pooled by state.</p>
+<div class="codehilite"><pre><span></span><code>hash(issuer_id) % 4
+
+CA-MUNI-77 -&gt; shard-1
+CA-MUNI-78 -&gt; shard-3
+CA-MUNI-79 -&gt; shard-0
+NY-MUNI-04 -&gt; shard-1
+</code></pre></div>
+
+<p>But the dashboard problem did not disappear; it moved. The query "all California issuers above 80% of limit" no longer aligned with placement. Harbor Point now needed a coordinator to ask every shard for its CA issuers, merge the partial results, and wait for the slowest shard that still mattered. A cluster-wide fan-out is not automatically wrong, but it changes the system contract: partial failures, uneven shard lag, and tail latency now shape a query that used to be local.</p>
+<p>Hash sharding also has an important limit that teams often miss. It smooths load across many keys, but it does not split one extremely hot key. If <code>CA-MUNI-77</code> alone becomes the bottleneck because every reservation update hits that issuer, hashing <code>issuer_id</code> still routes all of that issuer's writes to one place. Hashing solves skew between keys more easily than heat inside one key. That is why hash sharding is best for workloads dominated by point operations over many independent keys, not as a universal cure for every hotspot.</p>
+<h3>Concept 3: Hybrid sharding narrows the fan-out surface by keeping one dimension local and spreading load inside that boundary</h3>
+<p>Harbor Point's eventual design was hybrid rather than pure. The team kept the state boundary because dashboards, alerting, and operational ownership were state-scoped, but it stopped putting all issuers from one state on one shard. Instead, the router first chose a state partition and then hashed <code>issuer_id</code> inside that partition. California therefore became "CA, bucket 0" through "CA, bucket 7" instead of one giant CA shard.</p>
+<p>That two-stage route looked like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">route_issuer</span><span class="p">(</span><span class="n">state_code</span><span class="p">,</span> <span class="n">issuer_id</span><span class="p">):</span>
+    <span class="n">partition</span> <span class="o">=</span> <span class="n">metadata</span><span class="o">.</span><span class="n">partition_for_state</span><span class="p">(</span><span class="n">state_code</span><span class="p">)</span>
+    <span class="n">bucket</span> <span class="o">=</span> <span class="n">murmur3</span><span class="p">(</span><span class="n">issuer_id</span><span class="p">)</span> <span class="o">%</span> <span class="n">partition</span><span class="o">.</span><span class="n">active_buckets</span>
+    <span class="k">return</span> <span class="n">partition</span><span class="o">.</span><span class="n">bucket_owner</span><span class="p">(</span><span class="n">bucket</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The operational effect was exactly what Harbor Point needed. A single-issuer reservation write stayed local to one bucket in one state partition. The CA risk dashboard still fanned out, but only across California's buckets rather than across the whole cluster. New York activity no longer shaped the tail latency of a California dashboard refresh, and a hot state could be split or rebalanced independently from the rest of the country.</p>
+<p>Hybrid schemes work because they admit that production workloads usually have more than one important dimension. Harbor Point needed business locality by state and load distribution by issuer. A time-series system might need range partitioning by day and hashing inside the current day. A SaaS database might partition first by tenant and then hash inside its largest tenants. The benefit is bounded fan-out instead of all-or-nothing locality.</p>
+<p>The cost is metadata and migration complexity. Harbor Point now has to version both the state partition map and the per-state bucket layout. A query that ignores the chosen local dimension can still touch many shards. Resharding one state must not race with clients using stale metadata. Hybrid is therefore not "best of both worlds" for free. It is a deliberate decision to spend more control-plane complexity so the hottest business dimension stays manageable without turning every analytical grouping into a full-cluster broadcast.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The California shards are saturated even though total cluster utilization looks healthy.</p>
+<p><strong>Why it happens / is confusing</strong>: Range sharding preserved the exact business grouping the dashboard uses, so the market event concentrated both writes and reads on the same narrow part of the keyspace.</p>
+<p><strong>Clarification / Fix</strong>: Split the hot range sooner, or move to a hash or hybrid design that breaks the busiest state or range into smaller independently placeable units.</p>
+<p><strong>Issue</strong>: After switching to hash sharding, the risk dashboard became slower even though writes got faster.</p>
+<p><strong>Why it happens / is confusing</strong>: The write path benefited from better spread, but the dashboard lost locality and became a scatter-gather query whose latency is now set by coordinator overhead and the slowest participating shard.</p>
+<p><strong>Clarification / Fix</strong>: Accept the fan-out explicitly, build a derived state-scoped view, or choose a hybrid layout that keeps state-level queries bounded instead of cluster-wide.</p>
+<p><strong>Issue</strong>: One issuer is still a hotspot after hashing by <code>issuer_id</code>.</p>
+<p><strong>Why it happens / is confusing</strong>: Hashing distributes different issuers across shards, but every write for the same issuer still hashes to the same target.</p>
+<p><strong>Clarification / Fix</strong>: Treat this as a single-key hotspot problem. That may require a finer-grained key, write bucketing, or an application-level redesign rather than a different hash function.</p>
+<p><strong>Issue</strong>: During shard moves, some requests briefly hit the wrong owner.</p>
+<p><strong>Why it happens / is confusing</strong>: The data move may have completed on the storage side before every router refreshed its metadata view.</p>
+<p><strong>Clarification / Fix</strong>: Version the shard map, reject stale routing epochs, and use forwarding or dual-read guards during cutover. The next lesson, <a href="023.html">06.md</a>, focuses on that migration path in detail.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="021.html">04.md</a> makes consistency a per-shard question; this lesson decides what a shard even contains</h3>
+<p>Quorum reads and writes help Harbor Point reason about freshness for one replica set. Sharding strategy decides which keys share that replica set and therefore which operations can rely on one quorum instead of cross-shard coordination. A clean quorum design can still feel bad in production if the shard boundary puts the wrong workload together.</p>
+<h3>Connection 2: <a href="023.html">06.md</a> turns static placement into live movement</h3>
+<p>Range boundaries, hash buckets, and hybrid partitions are only useful while they still match the traffic shape. Rebalancing is the mechanism that updates those placements under load. The difference between moving a contiguous range and moving a hash bucket is one of the main operational consequences of the strategy chosen here.</p>
+<h2>Resources</h2>
+<h3>Optional Deepening Resources</h3>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: The partitioning chapter explains why range partitioning, hash partitioning, and secondary-index layout create different locality and fan-out behavior.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/">MongoDB Manual: Choose a Shard Key</a><ul>
+<li>Focus: Practical criteria for cardinality, monotonic keys, and query isolation when selecting a shard key in production.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://vitess.io/docs/reference/features/vindexes/">Vitess Docs: Vindexes</a><ul>
+<li>Focus: How a production sharded SQL system routes rows with hash, lookup, and application-aware strategies instead of relying on one universal partitioning rule.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.citusdata.com/en/stable/sharding/data_modeling.html">Citus Docs: Data Modeling with Distributed Tables</a><ul>
+<li>Focus: Co-location, distribution-column choice, and the cost of cross-shard joins in a PostgreSQL-based distributed system.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Range sharding preserves neighborhood</strong> - It makes ordered scans and business-group queries efficient, but it turns skewed ranges into operational hotspots.</li>
+<li><strong>Hash sharding preserves spread</strong> - It evens out many independent keys, but it breaks the locality that range queries and grouped reports depend on.</li>
+<li><strong>Hybrid sharding is a bounded-fan-out strategy</strong> - It spends extra metadata and routing logic so the system can keep one important dimension local while still distributing load inside that boundary.</li>
+</ol>
+<h2>Knowledge Check</h2>
+<ol>
+<li>
+<p><strong>Why did Harbor Point's original range-sharded design make the California dashboard fast but risky during a California market event?</strong></p>
+<ul>
+<li>A) Because range sharding automatically replicates California data to every shard</li>
+<li>B) Because the dashboard query aligned with the California key range, so locality improved but the same range also concentrated the traffic spike</li>
+<li>C) Because range sharding only works for read-only workloads</li>
+</ul>
+</li>
+<li>
+<p><strong>What is the clearest operational downside of hashing <code>issuer_id</code> for Harbor Point's risk dashboard?</strong></p>
+<ul>
+<li>A) A state-scoped query now has to gather partial answers from many shards and merge them</li>
+<li>B) Hashing removes the need for routing metadata entirely</li>
+<li>C) Hashing guarantees that a single hot issuer is split across multiple shards</li>
+</ul>
+</li>
+<li>
+<p><strong>Why did the hybrid state-plus-hash design fit Harbor Point better than pure range or pure hash sharding?</strong></p>
+<ul>
+<li>A) It eliminated all fan-out and all metadata complexity</li>
+<li>B) It kept state-level queries bounded to one state's buckets while spreading per-issuer write load inside that state</li>
+<li>C) It allowed the team to ignore rebalancing because bucket counts never need to change</li>
+</ul>
+</li>
+</ol>
+<h2>Answers</h2>
+<p><strong>1. B</strong>: The dashboard stayed local because the query matched the range boundary, but that same locality meant the California event concentrated load on the California shard set. Option A is false because range sharding does not broadcast state automatically, and option C is false because range sharding is common in mixed read/write systems.</p>
+<p><strong>2. A</strong>: Hashing improved spread for point operations, but it destroyed the state grouping the dashboard cared about, so the query became scatter-gather. Option B is false because the system still needs metadata about bucket ownership. Option C is false because hashing one key still sends that key to one shard.</p>
+<p><strong>3. B</strong>: Hybrid routing kept California work within California's partition while avoiding one giant California hotspot. Option A promises benefits no real system gets for free, and option C is false because hybrid layouts still need rebalancing and metadata changes over time.</p>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="021.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Quorum Reads/Writes and Tunable Consistency</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="023.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Rebalancing and Consistent Hashing</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-02 18:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>
