@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Index Strategy and Selectivity Planning - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Index Strategy and Selectivity Planning</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../learning.html#data-systems">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          019
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">019</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 467: Index Strategy and Selectivity Planning</h1>
+<blockquote>
+<p><strong>The core idea</strong>: An index pays for itself only when its leading predicates cut the search space enough to beat a scan, and that depends on real selectivity, data distribution, and write cost rather than on how often a column appears in <code>WHERE</code>.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="018.html">018.md</a>, <code>PayLedger</code> split its storage responsibilities on purpose. PostgreSQL keeps the authoritative <code>payout</code> row that settlement workers mutate under strict transactional rules, while an LSM-backed event-history store absorbs the webhook and reconciliation firehose. That architectural split helps only if the team is equally disciplined about indexing. During the April 2026 cutoff window, support wants a live view of "failed or retrying payouts for tenant <code>acme-co</code> in run <code>apr-2026-same-day</code>, newest first, with processor details attached." The naive answer is to add indexes on <code>status</code>, <code>processor_code</code>, and <code>updated_at</code> everywhere the query might land.</p>
+<p>That is the wrong mental model. Index strategy starts with selectivity planning: how many rows survive each predicate, in what order, and at what maintenance cost. <code>status = 'failed'</code> sounds specific, but if the query crosses every tenant and every payroll run during an outage, it may still touch far too much data. <code>tenant_id = 'acme-co'</code> and <code>run_id = 'apr-2026-same-day'</code> are far more decisive because they define the operating slice first. Once the search space is narrowed to one tenant and one run, a status predicate and descending timestamp order can become useful instead of decorative.</p>
+<p>The production lesson is that "has an index" is not the same thing as "has a good access path." A B-tree index that leads with weak predicates taxes every write in PostgreSQL, and a secondary index in the event-history store creates another stream of SSTables that compaction must later merge. The common misconception is that indexing is a read-only optimization. In real systems it is a recurring operating cost, so the question is never "can we index this?" but "is this query selective enough to deserve an always-on physical structure?"</p>
+<h2>Why This Matters</h2>
+<p><code>PayLedger</code> runs same-day payroll for several large employers. At 15:45, the settlement workers are still claiming ready payouts, processors are returning a mix of success and retry codes, and support needs to answer a precise question within seconds: which payouts for one tenant are still unhealthy right now, and which ones are blocked on the same processor response? That query sits directly on the boundary between system-of-record access and operational diagnosis.</p>
+<p>If the team guesses wrong, the damage shows up in different places depending on the engine. In PostgreSQL, too many weak secondary indexes raise WAL volume, reduce HOT-update opportunities, and widen replica lag exactly when the cutoff window is busiest. In the LSM event-history store, secondary indexes multiply write amplification and compaction debt, so the system spends more time reorganizing data that should never have been queried there in the first place. Neither failure mode is visible from the dashboard that merely reports "index exists."</p>
+<p>A deliberate selectivity plan changes the conversation. The authoritative <code>payout</code> table gets a small number of narrow indexes that match commit-time workflows and incident-time filters that truly need fresh transactional data. Broader investigative workflows move to the derived search surface introduced in <a href="016.html">016.md</a>. That discipline is also the prerequisite for <a href="020.md">020.md</a>: caching helps when the underlying query shape is already selective and stable, but it only hides mistakes when the base access path is fundamentally too wide.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Estimate whether a predicate is selective in the place that matters</strong> - Distinguish global cardinality from the tenant-, run-, and time-local selectivity that actually drives page reads.</li>
+<li><strong>Design composite and partial indexes around query shape</strong> - Choose index order, filter predicates, and covering fields that reduce read work without taxing the write path more than the workload can afford.</li>
+<li><strong>Recognize when a query does not deserve an index on the primary store</strong> - Move exploratory or weakly selective filters into a derived system instead of forcing them onto the hot transactional or LSM ingest path.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Selectivity is about rows avoided, not columns admired</h3>
+<p>For <code>PayLedger</code>, the dangerous query is not hypothetical. Support really does ask for "all unhealthy payouts for <code>acme-co</code> in the current run, newest first." Suppose the <code>payout</code> table holds 80 million rows overall, while the active run for <code>acme-co</code> contributes 420,000 of them. Within that run, only 6,800 payouts are currently <code>failed</code> or <code>retrying</code>.</p>
+<p>The selectivity math should be done against the slice the query must traverse, not against the table in the abstract:</p>
+<div class="codehilite"><pre><span></span><code>global table size:                    80,000,000 rows
+rows for tenant acme-co:              2,900,000 rows
+rows for one payroll run:               420,000 rows
+rows with status in (failed,retrying):    6,800 rows
+</code></pre></div>
+
+<p>If the index begins with <code>status</code>, the engine still has to visit unhealthy payouts across many tenants and runs before it can isolate the relevant 6,800 rows. If it begins with <code>(tenant_id, run_id)</code>, the search space collapses to one payroll run immediately, and the remaining filter becomes cheap enough to matter. That is why column cardinality alone is a weak planning tool. A low-cardinality column can still be useful inside a narrow slice, and a seemingly specific column can be useless if skew turns one value into a huge hot spot.</p>
+<p>This is also where <code>ORDER BY</code> and <code>LIMIT</code> matter. Support does not need every historical failure first; it needs the most recent 200 rows for one run. An access path that filters correctly and returns rows in descending <code>updated_at</code> order can stop early. An access path that filters weakly or sorts late reads far more pages before it even has a chance to apply the limit. The trade-off is straightforward: more index precision lowers read work, but every extra maintained index or indexed column expands write cost.</p>
+<h3>Concept 2: Composite and partial indexes turn a query into a physical path</h3>
+<p>The hot incident query on PostgreSQL looks roughly like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">payout_id</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">processor_code</span><span class="p">,</span><span class="w"> </span><span class="n">updated_at</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">payout</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">tenant_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">1</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">run_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">2</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;failed&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;retrying&#39;</span><span class="p">)</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">updated_at</span><span class="w"> </span><span class="k">DESC</span>
+<span class="k">LIMIT</span><span class="w"> </span><span class="mi">200</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The wrong index for this query is something like <code>(status, processor_code, updated_at)</code>. It leads with columns that are attractive in a support conversation but weak as a physical boundary. PostgreSQL would still need to touch rows from many tenants and runs, then discard most of them after heap reads or bitmap filtering. That index would also be updated on every status transition, which is precisely the kind of write tax <a href="017.html">017.md</a> warned about.</p>
+<p>A better design narrows the working set first and only indexes rows the query actually cares about:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">CONCURRENTLY</span><span class="w"> </span><span class="n">idx_payout_unhealthy_recent</span>
+<span class="k">ON</span><span class="w"> </span><span class="n">payout</span><span class="w"> </span><span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span><span class="w"> </span><span class="n">run_id</span><span class="p">,</span><span class="w"> </span><span class="n">updated_at</span><span class="w"> </span><span class="k">DESC</span><span class="p">)</span>
+<span class="n">INCLUDE</span><span class="w"> </span><span class="p">(</span><span class="n">payout_id</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">processor_code</span><span class="p">)</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;failed&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;retrying&#39;</span><span class="p">);</span>
+</code></pre></div>
+
+<p>This index embodies three deliberate decisions. First, <code>tenant_id</code> and <code>run_id</code> come first because they define the operational shard the support query always uses. Second, the partial predicate keeps healthy rows out of the structure entirely, which shrinks the index and reduces write churn on settled payouts that support does not need for this workflow. Third, the descending timestamp order matches the requested output, so PostgreSQL can stop after it finds the first 200 rows instead of sorting a much larger result set.</p>
+<p>The same reasoning applies when the data lives in the LSM-backed event-history store. Adding a secondary index for <code>processor_code</code> there is not "free because reads are faster." It means every new webhook and retry note must update another index structure, generate more immutable files, and pay more compaction later. If the resulting query is still weakly selective, the extra index is a bad bargain. That is the mechanism-level connection between B-tree maintenance cost and LSM compaction debt: index structures are only justified when they carve out a genuinely narrow path through the data.</p>
+<h3>Concept 3: Selectivity planning fails when statistics and workload shape drift apart</h3>
+<p>An index can be well designed and still disappoint in production if the planner's model no longer matches the data. Imagine processor <code>R03</code> begins returning transient failures for one tenant. For two hours, <code>failed</code> and <code>retrying</code> rows spike inside <code>acme-co</code>'s active payroll run while the global table distribution still looks mostly healthy. A planner that relies on stale statistics, or that assumes <code>tenant_id</code> and <code>status</code> are independent, may badly misestimate how many rows the query will touch.</p>
+<p>That drift shows up in three concrete ways. The planner may choose a sequential scan because it thinks the partial index is too selective to matter. It may choose the index but still fetch far more heap pages than expected because the included columns are insufficient and the actual row count is much larger than estimated. Or it may continue using an old index whose column order made sense before the query became "latest unhealthy payouts for one run" instead of "all payouts by processor code."</p>
+<p>The fix is not superstition; it is instrumentation. Compare estimated rows to actual rows with <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Refresh statistics often enough for volatile tables. Add extended statistics when predicate correlation is strong. Track index size, write latency, WAL bytes, and replica lag after every new index goes live. The trade-off here is operational discipline versus accidental cost. Without disciplined statistics and plan review, a carefully designed index strategy quietly decays into folklore.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: The right-looking index exists, but PostgreSQL still chooses a sequential scan during the cutoff window.</p>
+<p><strong>Why it happens / is confusing</strong>: The index definition may be fine while the planner's row estimate is wrong. Stale statistics, tenant-specific skew, or unmodeled correlation between <code>tenant_id</code>, <code>run_id</code>, and <code>status</code> can make the scan look cheaper on paper than it is in reality.</p>
+<p><strong>Clarification / Fix</strong>: Compare estimated and actual rows with <code>EXPLAIN (ANALYZE, BUFFERS)</code>, refresh statistics, and consider extended statistics for correlated predicates. If the query shape changed, redesign the index rather than forcing the old one.</p>
+<p><strong>Issue</strong>: A new support index improved one incident query but settlement throughput and replica freshness got worse.</p>
+<p><strong>Why it happens / is confusing</strong>: The read win is real, but so is the write tax. Every status transition now updates another B-tree, writes more WAL, and may disqualify HOT updates on the primary table.</p>
+<p><strong>Clarification / Fix</strong>: Measure the write-side bill explicitly. If the query is not part of commit-time correctness and can tolerate derived freshness, move it to the search or analytics surface instead of paying for it on every transactional write.</p>
+<p><strong>Issue</strong>: Secondary indexes in the event-history store keep growing, and compaction falls behind after webhook bursts.</p>
+<p><strong>Why it happens / is confusing</strong>: LSM engines postpone structural cleanup. Every extra secondary index creates another stream of SSTables and another compaction budget, even if the indexed query remains broad and poorly selective.</p>
+<p><strong>Clarification / Fix</strong>: Keep the event-history store focused on keyed replay and narrow time-slice reads. Route exploratory predicates to a system built for broader filtering, or materialize a smaller derived projection whose primary key already matches the query.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="017.html">017.md</a> explains why every PostgreSQL index is part of the write path</h3>
+<p>This lesson uses selectivity to decide which indexes deserve that cost. The B-tree mechanics from <a href="017.html">017.md</a> are the reason weakly selective support indexes are not just clutter; they are a continuous write and WAL obligation on the authoritative system.</p>
+<h3>Connection 2: <a href="018.html">018.md</a> shows that LSM engines still need index discipline</h3>
+<p>An LSM tree changes when the bill is paid, not whether the bill exists. Secondary indexes in the event-history store are only sensible when they create a narrow, repeated access path that justifies the added compaction and space amplification.</p>
+<h3>Connection 3: <a href="020.md">020.md</a> depends on getting access paths right first</h3>
+<p>Caching an unselective query usually turns one bad database habit into a harder invalidation problem. Once the base query is selective and the index plan is stable, cache layers become a latency optimization instead of a crutch.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/indexes-multicolumn.html">PostgreSQL Multicolumn Indexes</a>
+  Focus: Review why leading-column order determines whether a composite B-tree actually narrows the search space for <code>PayLedger</code>'s tenant- and run-scoped queries.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/indexes-partial.html">PostgreSQL Partial Indexes</a>
+  Focus: Study how partial predicates shrink an index to the rows that matter, which is the key move behind indexing only unhealthy payouts.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/planner-stats.html">PostgreSQL Planner Statistics and Extended Statistics</a>
+  Focus: Use it to understand when skew and correlated predicates break row estimates and cause the planner to ignore a good index.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/using-explain.html">Using EXPLAIN</a>
+  Focus: Compare estimated versus actual row counts and buffer touches so index strategy is driven by measured access paths instead of intuition.</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Selectivity is local to the real query path</strong> - The useful question is not "how many distinct values does this column have?" but "how many rows survive after the leading predicates define the tenant, run, and time slice?"</li>
+<li><strong>Good indexes are shaped around workflows, not around nouns</strong> - Composite order, partial predicates, and covering choices should mirror the way the system actually reads data, while every extra index must justify its write or compaction cost.</li>
+<li><strong>Statistics drift can turn a correct design into a bad plan</strong> - Index strategy is not finished at <code>CREATE INDEX</code>; it stays healthy only if estimates, workload shape, and production measurements remain aligned.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="018.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>LSM Compaction and Amplification</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-05 20:49 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

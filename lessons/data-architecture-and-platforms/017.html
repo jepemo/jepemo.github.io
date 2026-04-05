@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>B-Tree Path and Maintenance Costs - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>B-Tree Path and Maintenance Costs</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../learning.html#data-systems">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          017
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">017</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 465: B-Tree Path and Maintenance Costs</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A B-tree keeps transactional reads fast by maintaining a shallow, ordered page hierarchy, but it charges for that speed on every write through page splits, index maintenance, WAL generation, and cleanup work.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="016.html">016.md</a>, <code>PayLedger</code> established PostgreSQL as the authority for same-day payroll runs and pushed search and analytics into derived systems. The next question is the one teams usually answer too casually: if PostgreSQL is the hot path, how much indexing can it afford before the write path starts paying more than the product can tolerate?</p>
+<p>The useful realization is that a B-tree is not just a "fast lookup" feature. It is a physical promise that keys stay sorted across fixed-size pages so the engine can walk from root to leaf in a small number of hops. That promise is why a payout lookup can stay fast even when the <code>payout</code> table has millions of rows. It is also why inserts, updates, and deletes must keep touching index pages, splitting them when they fill, and cleaning them up after old versions become dead.</p>
+<p>For <code>PayLedger</code>, that turns index design into a production budget. During the payroll cutoff window, every status change on a payout may touch the heap row, one or more B-tree indexes, and the WAL stream that replicas must replay. A support filter that looks harmless in staging can become an expensive write tax in production if it adds another hot secondary index to a table that already changes constantly.</p>
+<p>The common mistake is to think an index costs money only when a query uses it. In a page-oriented transactional engine, the opposite is often more important: an index is paid for continuously by the write path so that future reads can remain cheap and predictable.</p>
+<h2>Why This Matters</h2>
+<p><code>PayLedger</code> closes same-day payroll runs under a narrow cutoff. While that window is open, the platform performs point reads to fetch one payout, bounded range scans to find the next batch of work, and status updates as settlements move from <code>scheduled</code> to <code>submitted</code>, <code>settled</code>, or <code>failed</code>. Support also wants richer filtering during incidents: "show failed payouts for tenant <code>acme-co</code> in the April 2026 run with processor code <code>R03</code>."</p>
+<p>If the team treats every new filter as a reason to add another B-tree index, the read side looks better for a while and the write side quietly deteriorates. Inserts dirty more pages. Updates stop qualifying for cheap heap-only updates when indexed columns change. Page splits create extra WAL and more random I/O. Replicas replay more work. Autovacuum has more dead tuples and index pages to clean. None of that is visible in a simple query benchmark, but all of it appears when payroll traffic peaks.</p>
+<p>Understanding the path and maintenance cost of a B-tree lets the team separate queries that belong on the authoritative OLTP path from queries that belong in a derived search system. That is the operational bridge from the baseline in <a href="016.html">016.md</a> to the next lesson on <a href="018.html">018.md</a>, where the same workload will be examined under an LSM cost model instead of a page-oriented one.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain how a B-tree lookup actually runs</strong> - Trace a point lookup or range scan from root page to leaf page and identify when the heap must still be visited.</li>
+<li><strong>Analyze why writes become expensive as indexes accumulate</strong> - Connect page splits, secondary-index churn, HOT eligibility, and WAL volume to the shape of the write workload.</li>
+<li><strong>Choose where B-trees belong in a production architecture</strong> - Decide which queries justify a hot-path B-tree index and which ones should move to a derived search surface or a different storage engine.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The read path is fast because the tree stays shallow and ordered</h3>
+<p><code>PayLedger</code> keeps a composite B-tree on <code>(tenant_id, run_id, payout_id)</code> so the settlement worker can find the next payout for one payroll run without scanning unrelated tenants. Physically, that index is a hierarchy of fixed-size pages. The root page stores separators for broad key ranges, internal pages narrow the search further, and leaf pages contain the sorted index tuples that point to heap rows.</p>
+<p>For a point lookup, PostgreSQL does not inspect millions of entries one by one. It follows a short path:</p>
+<div class="codehilite"><pre><span></span><code>root page
+  -&gt; internal page for tenant_id = acme-co
+      -&gt; internal page for run_id = apr-2026-same-day
+          -&gt; leaf page with payout_id = p_842119
+              -&gt; heap tuple for the current payout row version
+</code></pre></div>
+
+<p>Because each internal page can point to many children, the fan-out is high and the tree height stays small. Upper pages are usually hot in shared buffers, so a lookup often pays only for the lower-level page reads plus the heap visit. Range scans are efficient for the same reason: once the engine reaches the first relevant leaf page, it can walk neighboring leaf pages in key order instead of jumping all over the table.</p>
+<p>That is why B-trees fit the authoritative workload chosen in <a href="016.html">016.md</a>. They are strong at equality lookups and ordered range scans over a stable key order. They are much less magical than people assume, though. If a query predicates on columns that do not match the index order, or if PostgreSQL still has to visit the heap for every row, the cost profile changes quickly. A B-tree gives structure, not unlimited query freedom.</p>
+<h3>Concept 2: The write path pays the maintenance bill immediately</h3>
+<p>Now look at the same <code>payout</code> table during the cutoff window. Each new payout insert must land in sorted order inside every relevant B-tree. If the target leaf page has space, PostgreSQL inserts the new tuple and updates the necessary page metadata. If the page is full, the engine splits it, moves some keys to a new sibling page, updates the parent page with a new separator key, and writes all of that to WAL so crash recovery and replicas can reproduce the same structure.</p>
+<p>Updates are often more expensive than teams expect. If <code>PayLedger</code> adds a secondary index on <code>(tenant_id, status, processor_code)</code> to help support, then every status transition from <code>submitted</code> to <code>failed</code> or <code>settled</code> becomes an index maintenance event. The old index entry must be invalidated and a new one must be inserted into the correct key position. If the update changes only non-indexed columns and there is room on the same heap page, PostgreSQL may be able to use a heap-only tuple update, which avoids touching secondary indexes. Once indexed columns change, or once the page no longer has room, that cheaper path disappears.</p>
+<p>This is why source indexes are a budget, not a checkbox list. A secondary B-tree does not just consume disk. It adds latch contention on hot pages, dirty-page churn in the buffer cache, more WAL for replicas to replay, and more cleanup work for vacuum when old row versions age out. Page splits are not the only cost, but they are a good visible symptom that the tree is constantly paying to preserve order under write pressure.</p>
+<p>The production trade-off is clear: B-trees keep reads predictable because they perform the sorting and maintenance work continuously. That is perfect when the system needs fresh transactional reads. It is expensive when the workload is dominated by high-churn writes or when the index set grows to support ad hoc exploration that could have lived in a derived store instead.</p>
+<h3>Concept 3: Good index design means matching the tree to the query shape and the update shape</h3>
+<p>For <code>PayLedger</code>, the hot-path B-tree set should be intentionally small. The primary key and a tenant-scoped composite index that supports payout execution are easy to justify because they sit directly on the authoritative workflow. A free-text support search over employer name, bank response text, and operator notes is not a good B-tree candidate on the transactional table, because those filters are wide, combinatorial, and not part of commit-time correctness. That is exactly the sort of workload that should move into the search projection established in <a href="016.html">016.md</a>.</p>
+<p>The key design questions are mechanical. Does the leftmost index order match the predicates the query uses first? Are the leading columns selective enough to avoid scanning large swaths of the tree? Does the query need rows in sorted order, making leaf-page traversal valuable? Will the indexed columns change frequently, turning a "read optimization" into a recurring write penalty? Those questions matter more than whether the index looks elegant on paper.</p>
+<p>Operationally, teams should watch for signs that the B-tree budget is being overspent: increasing WAL bytes per payroll run, growing replica replay lag during status transitions, rising index size relative to the table, and reduced update throughput after adding support-oriented indexes. Fillfactor tuning, periodic reindexing, and careful composite-index design can help, but they do not change the basic contract. A B-tree pays maintenance incrementally to keep data ordered now. In <a href="018.html">018.md</a>, you will see the alternative: an LSM system delays part of that cost and pays it later through compaction.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: A query that should be selective still performs many heap reads and misses its latency target.</p>
+<p><strong>Why it happens / is confusing</strong>: Reaching the correct leaf page is only part of the path. If the index does not cover the needed columns, or if PostgreSQL cannot use an index-only scan because visibility information is not sufficient, the engine still has to fetch heap tuples one by one.</p>
+<p><strong>Clarification / Fix</strong>: Check whether the predicate order matches the index definition, whether the plan is using the intended index, and whether a covering strategy is justified. Do not add columns casually; every covering choice increases maintenance cost on writes.</p>
+<p><strong>Issue</strong>: Insert and update throughput dropped sharply after adding indexes for support workflows.</p>
+<p><strong>Why it happens / is confusing</strong>: The new indexes improved a few read queries, but every payout state change now touches more B-tree pages and generates more WAL. If indexed columns are updated frequently, the table also loses opportunities for cheaper heap-only updates.</p>
+<p><strong>Clarification / Fix</strong>: Remove or narrow indexes that do not serve the authoritative workflow, and move exploratory filters into the derived search system. Keep the source-of-record index set aligned with commit-time queries, not with every troubleshooting convenience.</p>
+<p><strong>Issue</strong>: The index keeps growing and vacuum cannot seem to catch up after a period of heavy churn.</p>
+<p><strong>Why it happens / is confusing</strong>: A high-update workload leaves dead tuples behind in both the heap and its indexes. Long transactions delay cleanup, and repeated page splits can leave the on-disk structure larger and less locality-friendly than the logical row count suggests.</p>
+<p><strong>Clarification / Fix</strong>: Investigate long-running transactions, confirm autovacuum is keeping pace, and decide whether reindexing or fillfactor adjustment is justified. If churn is inherent to the workload, question whether the query truly belongs on the transactional B-tree path.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="016.html">016.md</a> defines the authority boundary; B-tree costs explain why that boundary must stay narrow</h3>
+<p>The previous lesson argued that PostgreSQL should keep only the data and indexes needed for authoritative payroll execution. This lesson provides the physical reason. Every extra B-tree index spends write-path budget inside the system of record, so the boundary around "authoritative" must be disciplined or the hot path becomes a dumping ground for read convenience.</p>
+<h3>Connection 2: <a href="018.html">018.md</a> studies the same pressure from the opposite side of the storage-engine trade-off</h3>
+<p>B-trees maintain order in place and therefore spread maintenance across every write. LSM engines accept temporarily disordered data in memory and immutable files, then recover order later through compaction. The workloads that strain a B-tree through page churn and index updates are often the same workloads that make LSM compaction debt worth considering.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/btree.html">PostgreSQL B-Tree Indexes</a><ul>
+<li>Focus: Review how PostgreSQL describes page ordering, operator classes, and the kinds of predicates B-tree indexes can satisfy efficiently.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/indexes-multicolumn.html">PostgreSQL Multicolumn Indexes</a><ul>
+<li>Focus: Use it to reason about leftmost-prefix behavior and why column order matters for <code>PayLedger</code>'s tenant-scoped composite indexes.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/indexes-index-only-scans.html">PostgreSQL Index-Only Scans and Covering Indexes</a><ul>
+<li>Focus: Connect the logical B-tree path to the practical question of when the heap still has to be visited.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/storage-hot.html">PostgreSQL Heap-Only Tuples (HOT)</a><ul>
+<li>Focus: Study why some updates avoid secondary-index churn and why frequent updates to indexed columns are especially expensive.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A B-tree lookup is cheap because the engine preserves sorted page structure continuously</strong> - The shallow path from root to leaf is the result of ongoing maintenance, not a free property of the data.</li>
+<li><strong>Every secondary index becomes part of the write path</strong> - Inserts, updates, WAL volume, replica replay, and vacuum work all scale with the indexes that must stay transactionally current.</li>
+<li><strong>Index design is really workload selection</strong> - Keep B-trees for authoritative equality and ordered-range queries, and move broad exploratory reads into systems that can afford a different cost model.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="016.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Module Capstone: Data Model and Storage Baseline</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="018.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>LSM Compaction and Amplification</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-05 20:49 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

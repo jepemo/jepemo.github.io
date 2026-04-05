@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LSM Compaction and Amplification - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>LSM Compaction and Amplification</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../learning.html#data-systems">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          018
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">018</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 466: LSM Compaction and Amplification</h1>
+<blockquote>
+<p><strong>The core idea</strong>: An LSM tree keeps foreground writes cheap by buffering updates into memory and immutable SSTables, but it repays that shortcut later through compaction work that sets the real write, read, and space amplification budget.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="017.html">017.md</a>, <code>PayLedger</code> kept PostgreSQL focused on authoritative payout rows because every extra B-tree index charged the write path immediately. That solves the transactional side of same-day payroll, but it leaves a different pressure untouched: the platform also stores every processor callback, retry decision, risk flag, and reconciliation event for later replay. During the cutoff hour, that event history arrives in bursts that would punish an in-place page structure if it had to keep every write perfectly arranged as it landed.</p>
+<p>The useful shift is to stop calling an LSM engine "write optimized" as if the work disappears. An LSM tree is really a promise to write now and reorganize later. <code>PayLedger</code> can accept a new payout event by appending to a WAL, inserting into a memtable, and eventually flushing an immutable SSTable. The foreground request stays cheap because the engine is not seeking out old pages and editing them in place. The background system is not free, though. Compaction must later merge overlapping SSTables, discard overwritten versions or tombstones when it is safe, and restore a layout that reads can traverse without touching too many files.</p>
+<p>That deferred maintenance is the trade-off. LSM engines are excellent when the workload is dominated by sustained writes, ordered scans, and "latest value by key" lookups over a disciplined key design. They become painful when teams celebrate low p50 write latency while compaction backlog, disk usage, and read amplification quietly climb underneath them. The common mistake is to think compaction is just housekeeping. In production it is the mechanism that determines whether yesterday's cheap writes are still affordable today.</p>
+<h2>Why This Matters</h2>
+<p><code>PayLedger</code> now keeps a <code>payout_event_history</code> store for replayable operational history. PostgreSQL still owns the canonical payout row from <a href="016.html">016.md</a> and <a href="017.html">017.md</a>, but the event history sees far more writes because every settlement attempt, webhook retry, operator correction, and downstream reconciliation note is recorded separately. Incident response depends on being able to read that history by tenant, by payout, and by recent time window without turning the transactional database into a general-purpose event archive.</p>
+<p>An LSM-based store fits because it turns random incoming writes into sequential log appends, in-memory sorting, and later bulk merges. That moves cost away from the request that accepts the event. The price is that the system now carries three budgets instead of one. Write amplification measures how many times bytes are rewritten during compaction. Read amplification measures how many memtables, SSTables, and tombstones a lookup has to cross before it finds the current answer. Space amplification measures how much extra disk is occupied by overlap, stale versions, and not-yet-compacted tombstones.</p>
+<p>If the team misses those budgets, the history store looks healthy right until the cutoff window gets busy. Writes still succeed, but compaction falls behind, cache efficiency drops, read latency widens, and disk alerts arrive hours after the ingest spike that caused them. Understanding compaction and amplification is what lets the team decide whether an LSM engine is the right fit, which compaction strategy to use, and which queries should stay off this store entirely. That is the bridge to <a href="019.html">019.md</a>, where index strategy and selectivity planning determine whether the read path stays narrow enough for the chosen engine.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain why an LSM write path is fast at ingest time</strong> - Trace a payout event from WAL and memtable to immutable SSTables and describe what work is deferred.</li>
+<li><strong>Quantify the three amplification budgets</strong> - Connect compaction strategy to write amplification, read amplification, and temporary disk growth in production.</li>
+<li><strong>Choose when an LSM store fits the workload</strong> - Decide which <code>PayLedger</code> queries belong in the event-history store and which ones should remain in PostgreSQL or a different derived system.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Foreground writes are cheap because LSM engines delay structural cleanup</h3>
+<p><code>PayLedger</code> keys its event-history store so the hottest read is mechanical: fetch recent events for one payout or one tenant-scoped slice of time. When processor <code>northbank</code> sends a webhook that payout <code>p_842119</code> moved from <code>submitted</code> to <code>failed</code>, the storage engine does something much closer to log shipping than to B-tree page maintenance:</p>
+<div class="codehilite"><pre><span></span><code>processor webhook
+  -&gt; WAL append for durability
+  -&gt; memtable insert/update
+  -&gt; memtable fills
+  -&gt; flush immutable SSTable into L0
+  -&gt; background compaction merges L0/L1/L2...
+</code></pre></div>
+
+<p>The critical detail is that the engine does not find an old disk page and rewrite it in place. Newer values are written to memory and then to new sorted files. Older versions can remain in earlier SSTables for a while. Deletes and TTL expiry usually behave the same way by writing tombstones instead of freeing space immediately. The store therefore accepts sustained ingest well because disk writes are mostly sequential appends and batched flushes.</p>
+<p>That is the first half of the trade-off introduced in <a href="017.html">017.md</a>. A B-tree pays to preserve order on every write. An LSM tree accepts temporary disorder across multiple immutable runs and promises to clean it up later. That is why it works well for an append-heavy operational history, but it also means the correctness of the read path depends on merge rules, tombstone handling, and a background scheduler that never quite gets to stop.</p>
+<h3>Concept 2: Compaction is where write, read, and space amplification are negotiated</h3>
+<p>Imagine <code>PayLedger</code> during the final payroll hour of the day. Tens of thousands of events arrive per second, so level 0 fills with many new SSTables that overlap in key range. A lookup for the latest events on <code>p_842119</code> may need to check the memtable, one or more recent SSTables, and possibly older levels before it knows which version is newest and whether a tombstone hides an older value. Bloom filters and per-file indexes help skip irrelevant files, but they do not remove overlap by themselves.</p>
+<p>Compaction is the process that restores order. The engine selects SSTables, merges them by key, keeps the newest surviving version, carries forward still-valid tombstones, and writes larger output files into lower levels. That is where the three amplification budgets come from:</p>
+<ul>
+<li><strong>Write amplification</strong> grows because the same logical event may be rewritten several times as it moves through levels.</li>
+<li><strong>Read amplification</strong> grows when too many overlapping files or tombstones must be consulted to answer one query.</li>
+<li><strong>Space amplification</strong> grows when old versions and duplicate key ranges remain on disk until compaction catches up.</li>
+</ul>
+<p>The compaction strategy decides which bill is smallest. Leveled compaction keeps overlap low in lower levels, so reads and disk usage stay more predictable, but each record may be rewritten many times on its way down the tree. Size-tiered compaction absorbs bursts with less immediate rewrite cost, but it tolerates more overlapping SSTables, so read amplification and temporary disk growth are usually worse. There is no universal winner. <code>PayLedger</code> has to choose whether the event-history store should favor smoother reads during incident replay or cheaper ingest during the cutoff spike.</p>
+<p>Deletes make the trade-off more visible. Suppose raw webhook payloads expire after 30 days. In an LSM engine, that policy often produces tombstones first and reclaimed disk later. Until compaction sees the tombstones and the shadowed data in the same merge, storage does not shrink and reads may still pay to step over deleted keys. TTL is therefore not a free cleanup primitive; it is a promise that compaction debt will be paid in the future.</p>
+<h3>Concept 3: Workload shape decides whether compaction debt stays bounded</h3>
+<p>For <code>PayLedger</code>, the event-history store is a good fit when the key structure matches the real queries. Fetching recent events for one payout, scanning a tenant's last few minutes of callbacks, or replaying one reconciliation stream are all LSM-friendly because they align with an ordered primary key and tolerate immutable-file compaction in the background. Maintaining one "latest event per payout" projection is also reasonable when it is keyed directly and updated as a small number of upserts.</p>
+<p>The same store is a poor fit for exploratory support filters like "show every failed payout for tenant <code>acme-co</code> where processor code is <code>R03</code>, operator note contains 'duplicate', and the settlement window is larger than two hours." Those filters demand secondary indexing, high selectivity planning, or a search surface designed for combinatorial predicates. Forcing them into the LSM history store creates more indexes to maintain, more data to compact, and more unpredictable read amplification. That is not a failure of the engine; it is a workload mismatch.</p>
+<p>This is the operational lesson. Choosing an LSM engine is not the end of storage design. Partition width, key order, TTL policy, update frequency, and secondary-index count all determine whether compaction remains background maintenance or turns into the dominant cost center. That is why the next lesson, <a href="019.html">019.md</a>, matters immediately after this one. Once the team accepts the LSM trade-off, it still has to choose index structures and predicate shapes that keep the read path selective instead of letting compaction debt leak into every query.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Issue</strong>: Write latency still looks fine, but reads suddenly slow down during the cutoff window.</p>
+<p><strong>Why it happens / is confusing</strong>: LSM engines can continue accepting writes while compaction falls behind. The front door looks healthy even as level-0 overlap, pending compaction bytes, and tombstones push up read amplification behind the scenes.</p>
+<p><strong>Clarification / Fix</strong>: Watch compaction backlog, SSTable counts per level, read amplification, and p95/p99 lookup latency together. If the backlog climbs during ingest spikes, raise compaction throughput, reduce overlapping flush pressure, or revisit whether the compaction strategy matches the burst shape.</p>
+<p><strong>Issue</strong>: Disk usage does not drop after TTL expiry or large delete jobs.</p>
+<p><strong>Why it happens / is confusing</strong>: Deletes in an LSM system usually write tombstones first. Space is reclaimed only when future compaction merges the tombstones with the shadowed data and the engine's safety rules allow the old bytes to disappear.</p>
+<p><strong>Clarification / Fix</strong>: Treat retention policy as a compaction workload, not as an instant free-space command. Align TTL windows, compaction scheduling, and tombstone-heavy deletes so disk forecasts include the temporary space amplification they create.</p>
+<p><strong>Issue</strong>: One tenant's queries time out even though cluster-wide ingest metrics look normal.</p>
+<p><strong>Why it happens / is confusing</strong>: Average write throughput can hide a bad key design. A tenant with very wide partitions or too many overlapping recent SSTables pays a local read-amplification penalty that global graphs smooth away.</p>
+<p><strong>Clarification / Fix</strong>: Inspect partition width, hottest key ranges, and per-query file touches for the affected tenant. If one partition is carrying too much history, rebucket the key, shorten retention in the hot store, or move exploratory queries into a store built for broader filtering.</p>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="017.html">017.md</a> and this lesson price opposite sides of the same storage-engine decision</h3>
+<p>The previous lesson showed why B-trees make writes expensive by preserving order immediately. This lesson shows the mirror image: LSM engines make writes cheaper up front by accepting immutable overlap and paying later through compaction. <code>PayLedger</code> needs both mental models because the canonical payout row and the replayable event history do not deserve the same physical cost profile.</p>
+<h3>Connection 2: <a href="019.html">019.md</a> turns engine choice into query-shape discipline</h3>
+<p>An LSM engine does not remove the need for good indexing and predicate design. It changes the costs of bad choices. Once <code>PayLedger</code> commits to an event-history store with compaction, the next practical question is which indexes and filters are selective enough to belong there at all. That is exactly the ground the next lesson covers.</p>
+<h2>Resources</h2>
+<ul>
+<li>[PAPER] <a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">The Log-Structured Merge-Tree (LSM-Tree)</a><ul>
+<li>Focus: Read the original description of deferred merging and compare its cost model with the page-oriented maintenance cost from <a href="017.html">017.md</a>.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/Compaction">RocksDB Compaction</a><ul>
+<li>Focus: Study how leveled, universal, and FIFO compaction strategies shift write, read, and space amplification in a production engine.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide">RocksDB Tuning Guide</a><ul>
+<li>Focus: Look for the operational metrics that reveal compaction backlog, stalled writes, and read amplification before user-facing latency moves.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://cassandra.apache.org/doc/stable/cassandra/managing/operating/compaction/overview.html">Apache Cassandra Compaction Overview</a><ul>
+<li>Focus: Compare a distributed LSM implementation's compaction choices, tombstone behavior, and operational trade-offs with the single-node engine view.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Cheap LSM writes are deferred work, not missing work</strong> - The write path is fast because ordering and cleanup move into memtable flushes and compaction.</li>
+<li><strong>Compaction strategy is a production policy choice</strong> - It decides whether the system spends more on rewrite cost, on lookup fan-out, or on temporary disk overhead.</li>
+<li><strong>LSM engines reward disciplined query shapes</strong> - They fit append-heavy histories and keyed range scans far better than broad exploratory filters with weak selectivity.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="017.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>B-Tree Path and Maintenance Costs</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="019.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Index Strategy and Selectivity Planning</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-05 20:49 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>
