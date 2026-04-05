@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Caching Layers and Invalidation Boundaries - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Caching Layers and Invalidation Boundaries</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../learning.html#data-systems">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          020
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">020</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 468: Caching Layers and Invalidation Boundaries</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A cache only improves a production system when every cached copy has an explicit authority, an explicit invalidation trigger, and an explicit freshness budget.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="019.html">019.md</a>, <code>PayLedger</code> fixed the hard part first: the support query for "unhealthy payouts in the current payroll run" became selective enough to execute directly on PostgreSQL without dragging the whole table through memory. That success created a new pressure during the 15:45 cutoff window. The support dashboard for tenant <code>acme-co</code> polls <code>GET /runs/acme-co/apr-2026-same-day/health</code> every five seconds, the payroll coordinator page asks for the same counts, and the incident bot posts the same summary into Slack. The database query is now correct and reasonably cheap, but the system is still doing the same work over and over.</p>
+<p>The tempting move is to say "put Redis in front of it" and declare victory. <code>PayLedger</code> tried exactly that, plus a small in-process cache inside the API. Median latency improved immediately, yet operators started seeing stale "retrying" counts after a payout had already succeeded. One coordinator manually retried a batch because the dashboard still showed 14 unhealthy payouts for almost half a minute. The cache did not break because Redis was slow; it broke because the team had copied data without defining which writes made each copy stale.</p>
+<p>That is the important mental shift. Caching is not a generic performance layer. It is controlled duplication of state. The authoritative <code>payout</code> row in PostgreSQL, the shared Redis summary for one payroll run, and the request-local memoized object inside the API are three different copies with three different visibility rules. If you cannot name the invalidation boundary for each copy, you are not tuning latency yet. You are inventing a second consistency model by accident.</p>
+<h2>Why This Matters</h2>
+<p>The production consequence is not abstract. <code>PayLedger</code> is used during payroll cutoff, so stale data changes human decisions. A stale support summary can trigger an unnecessary manual replay. A stale payout detail page can convince an operator that a processor callback never arrived. A stale incident bot message can send the on-call engineer toward the wrong root cause. These are not just UX blemishes; they are operational mistakes induced by incorrect visibility.</p>
+<p>This is also where the previous lesson matters. Selective indexing from <a href="019.html">019.md</a> made the base query narrow enough that caching became optional rather than a rescue mission. That is the right order. Caching an unselective query usually amplifies confusion because the team now has both a slow database path and a stale copy of the same bad result. Once the base access path is sound, the real trade-off becomes explicit: lower repeated-read latency versus the extra coordination required to keep duplicated state honest.</p>
+<p>The boundary question is therefore more important than the cache technology. Ask three things before adding any layer: what store is authoritative, what event makes this copy stale, and how stale may the caller safely tolerate? If those answers differ by consumer, then different consumers need different caches or different bypass rules. One policy for every caller is usually a sign that the freshness contract has not been thought through.</p>
+<h2>Core Walkthrough</h2>
+<h3>Where the copies live</h3>
+<p>For <code>PayLedger</code>, the authoritative data stays in PostgreSQL because payout status transitions participate in transactional rules with retries, processor response codes, and ledger-side audit rows. On top of that source of truth, the team keeps two cache layers. The first is a request-local cache inside <code>support-api</code>, used only so one HTTP request that renders several widgets does not rerun the same summary query three times. The second is a shared Redis cache for the cross-request summary of a payroll run:</p>
+<div class="codehilite"><pre><span></span><code>PostgreSQL payout rows  -&gt; authority
+support-api request cache -&gt; single-request reuse only
+Redis run summary cache   -&gt; repeated reads across users and bots
+</code></pre></div>
+
+<p>Those layers are not interchangeable. The request-local cache never outlives the request, so its invalidation boundary is trivial: it disappears when the request ends. The Redis cache is different because it spans users, workers, and time. That means it needs a durable rule for when a cached summary for one payroll run is no longer safe to serve.</p>
+<h3>What actually makes a cache entry stale</h3>
+<p>The summary cache is stale whenever a committed write changes any field that contributes to the "run health" view: <code>status</code>, <code>processor_code</code>, retry counters, or the set of payouts included in the run. The invalidation boundary is therefore not "any write to Redis" or "every 30 seconds." It is "any committed transaction that changes the run-health result for tenant X and run Y."</p>
+<p><code>PayLedger</code> encodes that rule in the write path instead of in ad hoc cache deletes:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">BEGIN</span><span class="p">;</span>
+
+<span class="k">UPDATE</span><span class="w"> </span><span class="n">payout</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;succeeded&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">updated_at</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">now</span><span class="p">()</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">payout_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">1</span><span class="p">;</span>
+
+<span class="k">UPDATE</span><span class="w"> </span><span class="n">payroll_run</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">cache_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cache_version</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">tenant_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">2</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">run_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">3</span><span class="p">;</span>
+
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">outbox</span><span class="p">(</span><span class="n">topic</span><span class="p">,</span><span class="w"> </span><span class="n">aggregate_key</span><span class="p">,</span><span class="w"> </span><span class="n">payload</span><span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(</span>
+<span class="w">  </span><span class="s1">&#39;payout-status-changed&#39;</span><span class="p">,</span>
+<span class="w">  </span><span class="err">$</span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="n">json_build_object</span><span class="p">(</span>
+<span class="w">    </span><span class="s1">&#39;tenant_id&#39;</span><span class="p">,</span><span class="w"> </span><span class="err">$</span><span class="mi">2</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;run_id&#39;</span><span class="p">,</span><span class="w"> </span><span class="err">$</span><span class="mi">3</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;payout_id&#39;</span><span class="p">,</span><span class="w"> </span><span class="err">$</span><span class="mi">1</span>
+<span class="w">  </span><span class="p">)</span>
+<span class="p">);</span>
+
+<span class="k">COMMIT</span><span class="p">;</span>
+</code></pre></div>
+
+<p>Two details matter here. First, the cache boundary is tied to the same transaction that changes authoritative state, so the system never invalidates a cache entry for a write that later rolls back. Second, the outbox event is downstream of commit, which means other services learn about the change only after PostgreSQL has made the new state durable and visible. That preserves a simple contract: invalidate because truth changed, not because a handler hopes truth is about to change.</p>
+<h3>Why versioned keys beat blind deletes</h3>
+<p>Many teams implement invalidation by deleting <code>run-health:{tenant}:{run}</code> when a payout changes. That works until readers and writers race. Suppose the key is deleted, a slow request recomputes the summary from an old replica snapshot, and then repopulates the cache after the delete. The cache is now stale again even though invalidation technically happened.</p>
+<p><code>PayLedger</code> avoids that race by versioning the cache key with the transactional <code>cache_version</code> held on <code>payroll_run</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">load_run_health</span><span class="p">(</span><span class="n">tenant_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">run_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RunHealth</span><span class="p">:</span>
+    <span class="n">version</span> <span class="o">=</span> <span class="n">load_cache_version</span><span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">run_id</span><span class="p">)</span>  <span class="c1"># commit-visible metadata</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;run-health:</span><span class="si">{</span><span class="n">tenant_id</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">run_id</span><span class="si">}</span><span class="s2">:v</span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2">&quot;</span>
+
+    <span class="n">cached</span> <span class="o">=</span> <span class="n">redis</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">cached</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">decode</span><span class="p">(</span><span class="n">cached</span><span class="p">)</span>
+
+    <span class="n">summary</span> <span class="o">=</span> <span class="n">query_authoritative_summary</span><span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">run_id</span><span class="p">)</span>
+    <span class="n">redis</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">encode</span><span class="p">(</span><span class="n">summary</span><span class="p">),</span> <span class="n">ex</span><span class="o">=</span><span class="mi">30</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">summary</span>
+</code></pre></div>
+
+<p>With versioned keys, an older reader can only repopulate an older versioned entry. New readers ask for the newer key as soon as <code>cache_version</code> advances. Old entries may linger until TTL cleanup, but they no longer compete with the fresh entry for the same logical view. This is the real job of TTL in the design: it is a garbage-collection and damage-limiting mechanism, not the primary correctness mechanism.</p>
+<h3>Choosing the right cache boundary for each caller</h3>
+<p>Once the boundary is explicit, different consumers can make deliberate choices. The support dashboard can read through Redis because a few seconds of staleness is acceptable as long as invalidation is prompt. The "retry this payout now" screen should bypass Redis and fetch fresh row-level state immediately after an operator action because a stale answer could trigger a duplicate manual intervention. The incident bot may read from Redis but annotate its message with the cache timestamp so humans know whether they are looking at a just-in-time view or a lagging summary.</p>
+<p>This is where layering becomes a design tool instead of an implementation accident. A cache layer should exist only when its freshness envelope matches a real caller. If two callers cannot tolerate the same staleness, they should not be forced through the same cached copy. The trade-off is operational complexity: more tailored layers reduce unnecessary load, but they also increase the number of boundaries you must instrument, invalidate, and explain during incidents.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<p><strong>TTL is the invalidation strategy.</strong> This is attractive because it is easy to ship and easy to diagram. It is also incomplete. TTL answers "how long can a stale entry survive if everything else fails?" It does not answer "which write made this value stale?" Use TTL as a backstop, not as the authority for correctness.</p>
+<p><strong>Delete the cache before the database commit to keep code simple.</strong> That sequence creates a window where readers observe a miss, re-query PostgreSQL, and repopulate the cache with data that the write transaction has not committed yet. The fix is commit-triggered invalidation, usually through an outbox or change-data-capture flow that only emits after durable success.</p>
+<p><strong>Any query result can be cached if the key includes all query parameters.</strong> Parameterized keys solve naming, not dependency tracking. If the cached object depends on many rows or on a join that changes shape over time, you still need a rule for which committed mutations invalidate the result. When the dependency map is too broad or too unstable, cache a smaller object or move the read model into an explicit derived projection.</p>
+<p><strong>One cache should serve every caller of the same data.</strong> That assumption hides business semantics. The support dashboard, incident bot, and operator action screen all touch payout health, but they do not have the same freshness budget. Separate consumers by tolerated staleness, not by whether they happen to call the same endpoint today.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="019.html">019.md</a> is the prerequisite: selective indexes made the underlying query cheap enough that caching could be an optimization instead of a bandage for a bad access path.</li>
+<li><a href="018.html">018.md</a> is the storage-side reminder that every extra copy of data has a maintenance bill. Cache layers avoid some hot reads, but they introduce invalidation work in the same way LSM secondary indexes introduce compaction work.</li>
+<li><a href="021.md">021.md</a> is the next step: once data is copied across cache and storage layers, size and integrity matter, so compression choices and corruption detection become part of the same production story.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the sections on derived data and caches as duplicated state, not as magical acceleration.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Transaction Isolation</a><ul>
+<li>Focus: Review why cache invalidation should be tied to commit-visible state changes rather than optimistic pre-commit deletes.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.rfc-editor.org/rfc/rfc9111">RFC 9111: HTTP Caching</a><ul>
+<li>Focus: The freshness, validation, and cache-key concepts transfer directly to service-layer caches even when the transport is not HTTP.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://redis.io/docs/latest/commands/expire/">Redis EXPIRE</a><ul>
+<li>Focus: Use it to separate expiration mechanics from correctness; expiration limits stale lifetime, but it does not tell you when a value became stale.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>A cache layer is a second copy of state, not a free latency toggle.</strong> Treat every cached value as data with its own authority and visibility contract.</li>
+<li><strong>Invalidation boundaries should be expressed in terms of committed mutations.</strong> "Any committed change that alters this result" is the right mental model; "wait for TTL" is only a fallback.</li>
+<li><strong>Versioned keys solve races that blind delete-based invalidation cannot.</strong> They let stale writers repopulate only stale versions instead of poisoning the current key.</li>
+<li><strong>Different callers deserve different freshness budgets.</strong> Shared caching works when the consumers agree on staleness; when they do not, separate the layers or provide a fresh-read path.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="019.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Index Strategy and Selectivity Planning</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-05 20:53 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>
