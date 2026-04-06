@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Search Indexes in Data Platforms - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Search Indexes in Data Platforms</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          033
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">033</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 505: Search Indexes in Data Platforms</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A search index is a derived, retrieval-optimized copy of operational data; it earns tokenization, ranking, and faceted filtering by accepting asynchronous updates, denormalized documents, and a real repair burden.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="032.html">032.md</a>, <code>PayLedger</code> split its merchant workspace into several serving patterns because one projection could not satisfy every product read shape. The first pattern that forces this issue is support search. A support agent is not asking for a payment by primary key. They are typing <code>visa dispute berlin</code>, filtering to open chargebacks in Germany, and expecting the right payment to appear near the top even if the merchant note contains a typo or the dispute reason was normalized after ingest.</p>
+<p>The tempting move is to keep stretching the transactional database: add <code>ILIKE</code>, a trigram index, maybe a replica dedicated to support. That can postpone the decision, but it does not change the query model. Ranking across fields, tokenization, typo tolerance, snippets, and facet counts are not accidental extras around a normal table lookup. They are the product behavior. A search index exists because the system needs a different physical representation of the same facts.</p>
+<p>That is the important shift: the hard problem is not "how do we make text search faster?" It is "what searchable document are we publishing, how stale can it be, and how do we prove that updates and deletes reach it safely?" Once <code>PayLedger</code> treats search as a serving layer with its own contract, the design questions get sharper and the operational surprises get smaller.</p>
+<h2>Why This Matters</h2>
+<p>Search tends to become a data-platform problem before teams admit it. Product teams add free-text search because support needs it, operations add more filters because one search box is easier than building ten bespoke screens, and suddenly the primary database is serving broad text predicates, dynamic sorting, and count-heavy drill-downs on top of transactional traffic. Even when the queries are technically correct, the workload is wrong for the store. Tail latency climbs, replicas fall behind, and the application starts hiding the mismatch with caches and ad hoc retries.</p>
+<p>Moving search into a dedicated index fixes that workload mismatch, but it introduces a deliberate trade-off. Reads become richer and more predictable, while the write side becomes more complex: documents must be built from several sources, indexing lag must be measured, deletes and redactions must propagate, and mapping changes must be handled through reindexing instead of one quick migration. The data platform owns both the retrieval surface and the machinery that keeps it honest.</p>
+<p>In production, this matters because search is often a navigation surface rather than a final answer. A search result points an operator or user toward a payment, dispute, or order; the exact canonical record can still be fetched by ID from the source system. That division of labor only works if the index is treated as a high-quality derived view rather than a silent second database.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p>Keep the <code>PayLedger</code> support console in view. The team has already built exact serving projections for balances and recent activity. Now support needs one box that can answer all of these:</p>
+<ul>
+<li>"Find chargebacks for merchant <code>m_2041</code> where the note mentions Berlin or BER."</li>
+<li>"Show open disputes in Germany above 100 EUR, newest first."</li>
+<li>"Search for the customer email fragment <code>anna.sch</code> and filter to Visa payments."</li>
+<li>"Find likely duplicates when a merchant enters the wrong order reference."</li>
+</ul>
+<p>Those requests all start from the same payment and dispute facts, but they do not behave like keyed lookups. They need one entity-centric document that flattens enough context to search well:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;payment_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;pay_9182&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;merchant_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;m_2041&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;merchant_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Berlin Bikes&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;chargeback_open&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;country&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;DE&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;currency&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;EUR&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;amount_minor&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">18500</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;customer_email&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;anna.schmidt@example.com&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;dispute_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;fraudulent card not present&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;merchant_note&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;bike rental expo booth&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2026-04-05T11:42:18Z&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;source_lsn&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">9813321</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>The shape already shows why a search index is different from a transactional table. Some fields should be analyzed as free text (<code>merchant_note</code>, <code>dispute_reason</code>). Some should remain exact-match keywords (<code>merchant_id</code>, <code>status</code>, <code>country</code>). Some should be numeric for filtering and sorting (<code>amount_minor</code>). Search quality depends on choosing the right representation for each field, not on pushing the same row format into a faster engine.</p>
+<p>The practical consequence is that search documents are product artifacts. If support searches by merchant note, the note has to be copied into the document. If the UI filters by dispute status, that field has to be normalized into a facetable value. If a field changes meaning, the document model may need a rebuild. The index is useful precisely because it is denormalized and query-shaped.</p>
+<h3>Part 2: Mechanism</h3>
+<p>Production search pipelines usually sit alongside the serving-layer patterns from the previous lesson:</p>
+<div class="codehilite"><pre><span></span><code>payments + disputes + merchant metadata
+                |
+        outbox table or CDC stream
+                |
+         search document projector
+                |
+      versioned search index writes
+                |
+        refresh / segment publication
+                |
+          support and product APIs
+</code></pre></div>
+
+<p>Three internal mechanisms matter more than the product name on the search cluster.</p>
+<p>First, the index stores an inverted view of text. Instead of "row -&gt; columns," it keeps term -&gt; document postings so queries like <code>visa dispute berlin</code> can jump directly to matching documents. That is why analyzers matter. The same raw field can be lowercased, tokenized, stemmed, or preserved exactly depending on intended use. If <code>status</code> is accidentally analyzed like prose, filtering for <code>chargeback_open</code> becomes unreliable. If <code>merchant_note</code> is stored only as a keyword, typo tolerance and token-based ranking disappear.</p>
+<p>Second, indexing is a publication pipeline, not a synchronous side effect of one request. <code>PayLedger</code> should not write to Postgres and the search engine in the same HTTP handler and hope both commits succeed. The safer pattern is to commit canonical state once, emit a durable change record through an outbox or change-data-capture stream, and let a projector build the latest search document idempotently. That projector needs a source position such as <code>source_lsn</code> so an old retry cannot overwrite a newer document.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">handle_change</span><span class="p">(</span><span class="n">event</span><span class="p">):</span>
+    <span class="n">doc</span> <span class="o">=</span> <span class="n">build_search_document</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">payment_id</span><span class="p">)</span>
+    <span class="n">version</span> <span class="o">=</span> <span class="n">doc</span><span class="p">[</span><span class="s2">&quot;source_lsn&quot;</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">doc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;deleted&quot;</span><span class="p">):</span>
+        <span class="n">search</span><span class="o">.</span><span class="n">delete</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">doc</span><span class="p">[</span><span class="s2">&quot;payment_id&quot;</span><span class="p">],</span> <span class="n">version</span><span class="o">=</span><span class="n">version</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">search</span><span class="o">.</span><span class="n">upsert</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">doc</span><span class="p">[</span><span class="s2">&quot;payment_id&quot;</span><span class="p">],</span> <span class="n">body</span><span class="o">=</span><span class="n">doc</span><span class="p">,</span> <span class="n">version</span><span class="o">=</span><span class="n">version</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Third, visibility is usually near-real-time, not transactional. Search engines often publish new segments on a refresh interval. That means a payment can be committed in the source database and still be absent from search for a short window. The system has to decide whether that lag is acceptable, expose it in metrics, and document it in user-facing flows. In <code>PayLedger</code>, the support console can tolerate a few seconds of lag, but payout eligibility cannot, so exact payout decisions continue to read canonical projections rather than the search index.</p>
+<p>This also explains why reindexing is a first-class operation. Mapping changes, analyzer fixes, or new fields often require building a new index version from canonical data and cutting traffic over with an alias. If the only plan is "update the mapping in place," the team has not designed for the real lifecycle of search.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>The main trade-off is straightforward: search indexes give far better retrieval behavior at the cost of more derived-state management. Queries become expressive and cheap to serve, but the platform now has to maintain document builders, watermark metrics, dead-letter handling, and rebuild tooling. If the index falls behind or misses deletes, users notice it immediately as missing records or misleading results.</p>
+<p>There is also a modeling trade-off. Richer documents improve ranking and reduce query-time joins, but they make reindexing heavier because more upstream fields are embedded in each document. A minimal document is cheaper to maintain, yet it often forces extra lookups after every hit and limits ranking quality. Good designs are explicit about which fields exist to support discovery and which exact values should still be fetched from the source record after the click.</p>
+<p>Finally, there is a freshness trade-off. Lower refresh intervals make new documents searchable sooner, but they can reduce indexing throughput and increase cluster work. Higher refresh intervals improve ingestion efficiency, but widen the window where support cannot find a newly updated dispute. The right choice depends on the product contract, not on a generic preference for lower latency.</p>
+<p>This lesson naturally leads into <a href="034.html">034.md</a>. Search is one concrete example of separating a specialized read workload from transactional storage; the next lesson broadens that reasoning to OLTP and OLAP isolation across the wider data platform.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"A search index is just a faster database replica."</strong> It is tempting because the index contains familiar fields, but the retrieval model is different. Tokenization, ranking, and faceting make it a specialized derived view, not a transparent copy of source tables.</li>
+<li><strong>"We can dual-write the database and the index in the request path."</strong> This looks simple until one write succeeds and the other fails. Durable outbox or CDC publication plus idempotent index updates gives a recoverable mechanism instead of an unreproducible divergence.</li>
+<li><strong>"If the document contains every field, the index can become the source of truth."</strong> Search documents are optimized for discovery, not for exact transactional semantics. Canonical reads should still come from the system that owns the record, especially for money movement, compliance, or state transitions.</li>
+<li><strong>"Analyzer choice is a tuning detail."</strong> It is really part of the schema. Exact fields, text fields, and sortable numeric fields need different treatment, and the wrong choice creates subtle bugs that look like bad relevance or missing results.</li>
+<li><strong>"Reindexing is a rare migration task."</strong> In practice it is normal maintenance. Synonym changes, new facets, and mapping fixes all force rebuilds, so alias-based cutovers and backfill capacity are part of the production design from day one.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="031.html">031.md</a> introduced incrementally maintained projections for exact product reads. Search indexes apply the same derived-data idea to discovery rather than point lookup.</li>
+<li><a href="032.html">032.md</a> framed search as one serving-layer pattern among several. This lesson makes that branch concrete by showing the document model, publication pipeline, and repair lifecycle.</li>
+<li><a href="034.html">034.md</a> generalizes the same architectural instinct: once specialized read workloads appear, isolating them from transactional storage becomes a platform concern instead of a query-optimization exercise.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the sections on derived data and indexes to connect search publication pipelines with the broader idea of maintaining query-shaped views.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html">Elasticsearch: Near Real-Time Search</a><ul>
+<li>Focus: Notice how refresh semantics create a visibility window between a successful write and a searchable document.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-reindex.html">Elasticsearch: Reindex API</a><ul>
+<li>Focus: Use this as a concrete model for analyzer or mapping changes that require rebuilding an index rather than patching it in place.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://lucene.apache.org/core/3_4_0/queryparsersyntax.html">Apache Lucene Query Parser Syntax</a><ul>
+<li>Focus: Pay attention to how full-text terms, phrases, boosts, and field-specific queries differ from ordinary relational filtering.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>A search index is a serving layer for discovery.</strong> It exists because search queries need a different data shape and storage model than transactional reads.</li>
+<li><strong>Document modeling is the real design work.</strong> Choosing analyzed text, exact facets, sortable fields, and entity boundaries determines whether the search surface feels correct.</li>
+<li><strong>Freshness and repair are part of the feature.</strong> Outbox or CDC publication, versioned updates, delete propagation, and reindex cutovers are not optional operational extras.</li>
+<li><strong>The index should guide users to truth, not replace it.</strong> Search finds candidate records quickly; exact business decisions should still rely on the canonical system of record.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="032.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Serving Layer Patterns for Product Features</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="034.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>OLTP and OLAP Workload Isolation</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 16:19 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

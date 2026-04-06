@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Materialized Views and Incremental Recompute - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Materialized Views and Incremental Recompute</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          031
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">031</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 503: Materialized Views and Incremental Recompute</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A materialized view stores the answer to an expensive query, but the production problem is not the first computation. It is keeping that answer correct as new events, late corrections, and logic changes arrive, which is why incremental recompute has to be a deterministic, replayable maintenance process instead of a series of ad hoc table updates.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="030.html">030.md</a>, <code>PayLedger</code> gave its merchant dashboard a serving table called <code>merchant_balance_current</code> so <code>/balance</code> could return in well under the product latency budget. That solved the read path, not the data problem. Every <code>capture_settled</code>, <code>refund_posted</code>, <code>chargeback_opened</code>, and reserve-policy change now has to move that row toward the same answer finance would get by replaying canonical history. The materialized view is therefore not just a precomputed table. It is a promise that fast reads and durable facts will keep converging.</p>
+<p>The non-obvious point is that incremental recompute does not mean "run the whole query more often" and it does not mean "apply deltas forever." It means the system can identify exactly which keys or partitions became invalid, recompute only that scope from trustworthy inputs, and publish the result without exposing a half-updated view. Teams get into trouble when they treat the view as a cache that can be patched manually during incidents. <code>PayLedger</code> needs the balance view to be deterministic enough that the same business logic works both event by event and during replay after a bug fix.</p>
+<h2>Why This Matters</h2>
+<p>The pressure is easy to make concrete. The merchant UI needs a balance answer on every page load, so scanning raw settlement and refund tables on demand is too slow and too expensive. Finance still needs an auditable explanation of that same balance at the end of yesterday, after late files and corrections are applied. If <code>PayLedger</code> recomputes the whole balance table every time a payment event lands, compute cost explodes. If it only issues narrow <code>UPDATE</code> statements against the serving table, the answer eventually drifts when retries, out-of-order events, or rule changes hit production.</p>
+<p>The trade-off is direct: materialization buys predictable read latency, but it pushes complexity into dependency tracking, invalidation, replay tooling, and reconciliation. That extra machinery is worth paying for only if the view can be repaired from canonical data. Otherwise the platform has traded a slow query for a fast-but-untrustworthy product surface.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p><code>PayLedger</code> maintains a materialized view keyed by <code>(merchant_id, currency)</code>. Each row contains at least <code>available_balance</code>, <code>pending_balance</code>, <code>reserve_hold</code>, <code>last_event_time</code>, and the source watermark that produced the row. The view depends on two upstream inputs:</p>
+<ul>
+<li>payment events such as captures, refunds, payouts, and chargebacks</li>
+<li>versioned reserve policies that can change by merchant segment and effective date</li>
+</ul>
+<p>That dependency mix is what makes materialized views interesting. A newly settled capture for merchant <code>m_482</code> usually affects one row and can be applied cheaply. A reserve-policy change for all high-risk marketplace merchants is different. It can invalidate thousands of rows, and those rows cannot be patched safely unless the recompute path can replay the affected history with the new policy version.</p>
+<p>The naive designs fail in opposite directions. A full refresh every minute is mechanically simple, but it repeatedly scans far more history than the change warrants. Direct row updates look efficient, but they silently encode assumptions about ordering, deduplication, and policy history. The first duplicated Kafka delivery or retroactive rule change exposes that those assumptions were never modeled explicitly.</p>
+<h3>Part 2: Mechanism</h3>
+<p>For <code>PayLedger</code>, materialized-view maintenance starts with a dependency graph:</p>
+<div class="codehilite"><pre><span></span><code>canonical payment events + policy snapshots
+                 |
+                 v
+         change classifier
+                 |
+      +----------+-----------+
+      |                      |
+      v                      v
+local delta path       scoped replay path
+      |                      |
+      +----------+-----------+
+                 v
+      versioned materialized view snapshot
+</code></pre></div>
+
+<p>The local delta path handles changes whose impact is narrow and well understood. When a <code>refund_posted</code> event arrives, the maintainer can map that event to one <code>(merchant_id, currency)</code> key, apply the balance transition, and advance the view watermark. That path is fast because the dependency surface is small and the fold function is deterministic.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_event</span><span class="p">(</span><span class="n">row</span><span class="p">,</span> <span class="n">event</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">&quot;capture_settled&quot;</span><span class="p">:</span>
+        <span class="n">row</span><span class="o">.</span><span class="n">pending_balance</span> <span class="o">+=</span> <span class="n">event</span><span class="o">.</span><span class="n">amount</span>
+    <span class="k">elif</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">&quot;refund_posted&quot;</span><span class="p">:</span>
+        <span class="n">row</span><span class="o">.</span><span class="n">available_balance</span> <span class="o">-=</span> <span class="n">event</span><span class="o">.</span><span class="n">amount</span>
+    <span class="k">elif</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">&quot;chargeback_opened&quot;</span><span class="p">:</span>
+        <span class="n">row</span><span class="o">.</span><span class="n">available_balance</span> <span class="o">-=</span> <span class="n">event</span><span class="o">.</span><span class="n">amount</span>
+        <span class="n">row</span><span class="o">.</span><span class="n">reserve_hold</span> <span class="o">+=</span> <span class="n">event</span><span class="o">.</span><span class="n">amount</span>
+    <span class="n">row</span><span class="o">.</span><span class="n">last_event_time</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">row</span><span class="o">.</span><span class="n">last_event_time</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">event_time</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">row</span>
+</code></pre></div>
+
+<p>That function is only safe if the inputs are already normalized around identity, ordering, and correction semantics. In practice <code>PayLedger</code> stores dedup keys, source offsets, and policy versions alongside the view state so a retry or failover does not double-apply a change. This is where the earlier lessons on event-time handling and checkpoint recovery matter: the view update and the consumed source position need to move forward as one atomic unit.</p>
+<p>The scoped replay path exists for invalidations that are too wide or too subtle for direct deltas. Suppose risk changes the reserve formula from 10% to 15% for a merchant segment effective three days ago. The existing rows do not retain enough intermediate detail to patch every balance safely with a simple arithmetic adjustment, because some funds have since been paid out, refunded, or already moved into hold states. The correct response is to mark the affected merchants and time range as dirty, reload canonical events plus policy snapshots from the effective boundary, fold them again, and write replacement rows to a new snapshot. Readers switch only after the replacement slice is complete.</p>
+<p>That is what incremental recompute means in practice: not a global rebuild, but a bounded replay over the exact part of the graph that lost validity. Good systems make the boundary explicit. <code>PayLedger</code> tracks which source tables and policy versions contributed to each published slice, so operators can answer a concrete question during an incident: "Which balances are stale, and what input change invalidated them?"</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>This design changes what "cheap" means. Reads become cheap because the dashboard is no longer paying the full aggregation cost. Writes and changes become more expensive because the platform now maintains lineage between inputs and view rows. Every new upstream dependency makes the serving path richer for reads and wider for recompute.</p>
+<p>The granularity of the view is the first major trade-off. A very narrow view keyed only by merchant and currency keeps the read path simple, but any rule that depends on settlement age, payout state, or fraud status forces the maintainer to recover that context during replay. A wider view with extra dimensions can make recompute more precise, but it also increases storage cost and the number of rows that must be kept consistent.</p>
+<p>The second trade-off is between pure delta maintenance and replayability. Delta application is efficient for append-only facts whose effects are local. Replay is safer when logic changes, late data lands outside the incremental window, or reference data fans out broadly. Mature teams keep both paths. If <code>PayLedger</code> can only process new events and cannot rebuild an affected slice, the materialized view eventually turns into operational debt disguised as performance optimization.</p>
+<p>Operationally, the view also needs its own correctness signals. Freshness is not only "how old is the last update?" It is also "what is the oldest dirty key?" and "which policy snapshot is this row based on?" That is why production maintenance typically includes periodic reconciliation jobs that compare a sample or partition of the materialized view against a trusted recomputation from canonical history. Exactly-once delivery reduces one failure mode; it does not prove the projection logic is still correct.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"A materialized view is just a cache."</strong> A cache can often be dropped and repopulated lazily. A balance or reserve projection needs deterministic rebuild rules, source lineage, and atomic publication because product decisions depend on its exact contents.</li>
+<li><strong>"Incremental recompute means applying deltas forever."</strong> Some invalidations are not local. Policy rewrites, schema fixes, and historical corrections often require replay over a bounded slice instead of another incremental patch.</li>
+<li><strong>"If the source tables are right, the view is right."</strong> The maintainer can still drift because of buggy folds, missing invalidations, or non-atomic cutovers. Reconciliation is part of the design, not optional cleanup.</li>
+<li><strong>"One upsert per event is enough."</strong> Retries, out-of-order delivery, and backfills force the system to reason about identity, event time, and prior source position. Without that metadata, the same event can change the view twice.</li>
+<li><strong>"Rule changes only affect future rows."</strong> Any policy with an effective date in the past can invalidate already published answers. The maintenance path has to support replay from the correct historical boundary.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="030.html">030.md</a> separated canonical history, analytical surfaces, and serving tables. This lesson explains how the serving table stays aligned with canonical facts once it exists.</li>
+<li><a href="029.html">029.md</a> introduced the idea that batch replay and streaming updates must share one semantic definition of derived state. Materialized-view maintenance is where that requirement becomes concrete row by row.</li>
+<li><a href="032.html">032.md</a> follows from this directly. Once you understand how to maintain and repair a projection, you can evaluate which serving-layer pattern is appropriate for dashboards, APIs, and feature computation.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the chapters on derived data and stream processing for the distinction between canonical facts, cached projections, and replay after corrections.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/rules-materializedviews.html">PostgreSQL Materialized Views</a><ul>
+<li>Focus: Use this as a baseline for how simple refresh-based materialization works before comparing it with incremental maintenance in streaming or hybrid systems.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub43864/">The Dataflow Model</a><ul>
+<li>Focus: Pay attention to how correctness, latency, and cost are balanced when updates arrive out of order and recomputation must stay bounded.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/fault-tolerance/checkpointing/">Apache Flink Checkpointing</a><ul>
+<li>Focus: Review how operator state and source positions are persisted together, because atomic state advancement is central to trustworthy incremental view maintenance.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.getdbt.com/docs/build/incremental-models">dbt Incremental Models</a><ul>
+<li>Focus: Contrast warehouse-style incremental table maintenance with serving-table maintenance, especially around invalidation boundaries and when a full refresh is still required.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>A materialized view is a maintenance contract, not just stored query output.</strong> The hard problem is preserving correctness as inputs and business logic change.</li>
+<li><strong>Incremental recompute is about bounded invalidation.</strong> Safe systems know which keys or partitions became stale and can replay only that scope from canonical inputs.</li>
+<li><strong>Fast reads move complexity upstream.</strong> You trade query latency for lineage, replay tooling, and reconciliation work, so the view must remain rebuildable.</li>
+<li><strong>Delta updates and replay are complementary.</strong> Event-by-event maintenance handles local change cheaply, while scoped recompute repairs the cases that simple deltas cannot model safely.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="030.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Warehouse, Lakehouse, and Serving Layers</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="032.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Serving Layer Patterns for Product Features</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 16:19 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

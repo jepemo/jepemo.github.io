@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OLTP and OLAP Workload Isolation - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>OLTP and OLAP Workload Isolation</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          034
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">034</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 506: OLTP and OLAP Workload Isolation</h1>
+<blockquote>
+<p><strong>The core idea</strong>: OLTP and OLAP workload isolation keeps short, correctness-sensitive transactions on storage optimized for row-level writes while publishing change data into analytical systems optimized for scans and aggregates; it matters because mixed workloads create replica lag, cache churn, and misleading reports long before the primary database looks obviously saturated.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="033.html">033.md</a>, <code>PayLedger</code> introduced a search index because support search was a different kind of read from a normal payment lookup. The same company now runs into a bigger version of that pattern. Finance wants hourly gross volume dashboards, risk wants merchant cohorts over the last 90 days, and product analysts keep opening BI tabs against a PostgreSQL replica that was originally meant to help with failover and a few light reports.</p>
+<p>The tempting conclusion is that this is a sizing problem: add more CPU, add another replica, maybe add a few indexes. That usually buys time, but it does not solve the underlying mismatch. OLTP traffic wants short transactions, hot B-tree indexes, stable commit latency, and predictable lock behavior. OLAP traffic wants wide scans, large joins, aggregations across millions of rows, and execution plans that are perfectly reasonable for analytics but toxic to checkout latency.</p>
+<p>Once <code>PayLedger</code> names that difference clearly, the design question changes. The problem is no longer "how do we make this report faster on Postgres?" It becomes "which decisions require transactional freshness, which questions can tolerate minutes of lag, and what data path should carry analytical queries so payment authorization is never competing with a dashboard export?" That shift is what workload isolation really means in production.</p>
+<h2>Why This Matters</h2>
+<p>Mixed OLTP and OLAP systems fail in ways that are expensive precisely because they look ambiguous at first. The primary symptom is often not 100 percent CPU. It is a replica that falls ten minutes behind after an ad hoc query, a payment table that keeps accumulating analytical indexes nobody wants to own, or a failover drill that reveals the "safe" replica is too stale to promote cleanly. By the time application latency moves, the database has usually been compensating for the mismatch for weeks.</p>
+<p>Isolation protects the transactional path by moving analytical scans into a store designed for them: a warehouse, a lakehouse table format, or another columnar engine. Analysts get broad read access without dragging row-store write performance down, and the product team gets a clearer contract about freshness. The trade-off is deliberate duplication. The platform now has to move data out of the OLTP system, define watermarks, handle backfills, and explain why one dashboard is five minutes behind while a payment-status API is exact.</p>
+<p>This matters operationally because transactional systems and analytical systems answer different kinds of truth. <code>PayLedger</code> can safely let finance ask "what was chargeback volume by country last quarter?" from an analytical store. It cannot decide whether to release a merchant payout from a dashboard table that may still be ingesting late-arriving events. Workload isolation is therefore about both performance and decision boundaries.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p>Keep <code>PayLedger</code> in view. The payment service stores authorizations, captures, refunds, and disputes in a transactional PostgreSQL cluster. Two representative queries show the mismatch:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">available_balance_minor</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">merchant_balances</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">merchant_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;m_2041&#39;</span>
+<span class="k">FOR</span><span class="w"> </span><span class="k">UPDATE</span><span class="p">;</span>
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span>
+<span class="w">  </span><span class="n">merchant_id</span><span class="p">,</span>
+<span class="w">  </span><span class="n">country</span><span class="p">,</span>
+<span class="w">  </span><span class="n">date_trunc</span><span class="p">(</span><span class="s1">&#39;hour&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">captured_at</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">hour_bucket</span><span class="p">,</span>
+<span class="w">  </span><span class="k">sum</span><span class="p">(</span><span class="n">amount_minor</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">captured_volume</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">payments</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">captured_at</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nb">interval</span><span class="w"> </span><span class="s1">&#39;90 days&#39;</span>
+<span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The first query is classic OLTP: tiny working set, exact lookup, short lock hold time, and an immediate business action attached to the result. The second query is classic OLAP: it reads a large slice of history, groups across many rows, and is valuable even if it finishes a few seconds later. A single database engine can execute both queries, but it cannot make them free for each other. Long scans evict useful pages from cache, extra analytical indexes increase write amplification, and replicas replaying the same row-oriented storage layout still pay the I/O cost of broad reporting.</p>
+<p>That is why "just run analytics on a read replica" is often a half-measure. The replica protects the primary from some read pressure, but it does not change the physical shape of the data or the query planner's goals. If the BI team launches several large joins during settlement hour, the replica lags, dashboards see stale data, and the failover target stops being trustworthy exactly when the system is already under stress.</p>
+<h3>Part 2: Mechanism</h3>
+<p>A practical isolation design gives OLTP and OLAP different storage and execution paths while keeping them tied to the same canonical events:</p>
+<div class="codehilite"><pre><span></span><code>payment APIs
+    |
+primary Postgres cluster  &lt;- short transactions, exact constraints
+    |
+WAL / CDC stream
+    |
+ingestion and normalization jobs
+    |
+warehouse or columnar serving store
+    |
+dashboards, notebooks, scheduled reports
+</code></pre></div>
+
+<p>On the OLTP side, the database is optimized for row-level mutation. MVCC keeps readers and writers from blocking each other too often, indexes help selective lookups, and the schema is shaped around application invariants such as "capture cannot exceed authorization" or "payout release must see the latest balance row." The winning pattern is many small transactions that finish quickly.</p>
+<p>On the OLAP side, the system is optimized for scanning many records cheaply. Columnar storage reads only the columns a query needs, partition pruning skips irrelevant time ranges, and vectorized execution makes aggregates efficient. Instead of asking a row store to summarize a quarter of payment history during business traffic, <code>PayLedger</code> publishes payment changes into warehouse tables such as <code>fact_payments</code> and <code>dim_merchants</code>, then lets analysts aggregate there.</p>
+<p>The handoff between the two worlds is usually a change stream, not a second application write. <code>PayLedger</code> commits canonical payment state once, captures the change from WAL or an outbox, and loads it into the analytical store with an ordering key:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_payment_change</span><span class="p">(</span><span class="n">event</span><span class="p">):</span>
+    <span class="n">warehouse</span><span class="o">.</span><span class="n">merge</span><span class="p">(</span>
+        <span class="n">table</span><span class="o">=</span><span class="s2">&quot;fact_payments&quot;</span><span class="p">,</span>
+        <span class="n">key</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;payment_id&quot;</span><span class="p">:</span> <span class="n">event</span><span class="p">[</span><span class="s2">&quot;payment_id&quot;</span><span class="p">]},</span>
+        <span class="n">values</span><span class="o">=</span><span class="n">event</span><span class="p">,</span>
+        <span class="n">source_lsn</span><span class="o">=</span><span class="n">event</span><span class="p">[</span><span class="s2">&quot;lsn&quot;</span><span class="p">],</span>
+    <span class="p">)</span>
+    <span class="n">metrics</span><span class="o">.</span><span class="n">set_gauge</span><span class="p">(</span><span class="s2">&quot;warehouse_watermark_lsn&quot;</span><span class="p">,</span> <span class="n">event</span><span class="p">[</span><span class="s2">&quot;lsn&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<p>That <code>source_lsn</code> or equivalent watermark matters. It lets the platform answer a production question that people otherwise debate vaguely: "How fresh is the analytical copy right now?" If the merchant dashboard promises data within five minutes, the platform can compare the warehouse watermark to the OLTP commit position and alert when the gap exceeds the contract.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>The first gain is straightforward: transaction latency becomes easier to protect because analytical scans no longer compete for the same buffer cache and execution slots. <code>PayLedger</code> can tune the OLTP database for short writes and exact lookups without worrying that every optimization must also serve arbitrary cohort analysis.</p>
+<p>The first cost is also straightforward: you now own another data shape. The warehouse needs schema evolution, deduplication rules, backfill jobs, and business definitions that do not silently drift from the application's meaning of "captured payment" or "active merchant." The performance benefit is real, but the trade-off is extra data movement and extra operational surface area.</p>
+<p>Freshness is the second major trade-off. Streaming CDC into the warehouse narrows the lag window but increases pipeline complexity and warehouse ingest cost. Hourly micro-batches are simpler and cheaper but may be too stale for operational dashboards. The correct answer is not "as real time as possible." It is "fresh enough for the decisions served by this dataset." In <code>PayLedger</code>, finance close reports can lag. Payout release and dispute state transitions cannot.</p>
+<p>Isolation also forces governance decisions into the architecture. The moment payment and merchant data leave the OLTP cluster, retention rules, redaction flows, and access controls must follow them. That sets up the next lesson naturally: once a data platform copies production facts into analytical systems, privacy and retention stop being policy documents and become data-path requirements.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"A read replica gives us OLAP isolation."</strong> It helps with read scaling, but it keeps the same row-store layout and replay path. Broad analytical scans still create lag, cache churn, and operational risk.</li>
+<li><strong>"We can index our way out of the problem."</strong> Extra indexes help selective predicates, not quarter-scale aggregates. Every index that speeds a dashboard also adds write cost to captures, refunds, and dispute updates.</li>
+<li><strong>"If CDC is streaming, the warehouse is safe for transactional decisions."</strong> Streaming reduces lag; it does not remove ingestion failures, late-arriving dimension updates, or semantic mismatches between source tables and analytical models.</li>
+<li><strong>"OLTP/OLAP isolation is only about performance."</strong> It is also about correctness boundaries. The system needs a clear rule for which store drives money movement and which store supports exploration and reporting.</li>
+<li><strong>"Once the warehouse exists, analysts can query anything forever."</strong> Historical freedom without retention and access controls becomes a compliance problem as soon as copied data includes personal or financial attributes.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="031.html">031.md</a> introduced incremental recomputation for derived read models. OLTP/OLAP isolation uses the same publication mindset, but at warehouse scale instead of one product-facing projection.</li>
+<li><a href="033.html">033.md</a> showed search indexes as one specialized copy of operational data. This lesson generalizes the idea from search retrieval to full analytical workloads.</li>
+<li><a href="035.md">035.md</a> follows directly from this design: once the platform creates analytical copies, deletion, retention, and access policy must propagate across every copy rather than stop at the primary database.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the chapters on storage engines, analytical systems, and derived data to see why mixed workloads need different physical designs.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/mvcc-intro.html">PostgreSQL Documentation: Introduction to MVCC</a><ul>
+<li>Focus: Notice how PostgreSQL is built around concurrent row-level transactional work, which explains why wide analytical scans are a poor fit for the same path.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://debezium.io/documentation/reference/stable/architecture.html">Debezium Architecture</a><ul>
+<li>Focus: Use this as a concrete reference for WAL- or log-based change capture feeding downstream analytical systems.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://cloud.google.com/bigquery/docs/introduction">BigQuery Introduction</a><ul>
+<li>Focus: Pay attention to the assumptions behind columnar, analytical execution and how different they are from OLTP database tuning.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>OLTP and OLAP are different workload contracts.</strong> One optimizes for short, exact, write-heavy transactions; the other optimizes for scans, joins, and aggregates across large history.</li>
+<li><strong>A replica is not the same as isolation.</strong> Real isolation usually means different storage and compute paths connected by CDC or another durable publication mechanism.</li>
+<li><strong>Freshness must be designed, not assumed.</strong> Analytical copies need explicit watermarks and decision boundaries so teams know what can lag and what cannot.</li>
+<li><strong>The architecture trade-off is bigger than speed.</strong> You gain predictable transactional performance, but you also take on duplication, governance, and lifecycle management for every analytical copy.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="033.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Search Indexes in Data Platforms</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 16:19 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

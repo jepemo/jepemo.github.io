@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Batch Processing and Throughput-Oriented Pipelines - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Batch Processing and Throughput-Oriented Pipelines</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          025
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">025</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 497: Batch Processing and Throughput-Oriented Pipelines</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A batch pipeline wins by fixing the input boundary, pushing large amounts of work through deterministic stages, and publishing one versioned result set, trading freshness for throughput, restartability, and predictable cost.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="024.html">024.md</a>, <code>PayLedger</code> learned the hard way that repeated cross-shard reads are a bad fit for interactive paths. The merchant-operations dashboard wanted an exact summary of holds, available balance, failed payouts, and reserve flags, but serving that page by fan-out made latency track the slowest shard and made availability fall with every extra shard involved. The next move was not to keep tuning the coordinator. It was to stop asking the request path to recompute the same answer over and over.</p>
+<p>That is where batch processing becomes concrete. At 01:00 UTC, <code>PayLedger</code> now launches a settlement-summary pipeline for the previous business day. The job reads a fixed snapshot of shard-local ledger entries, groups them by merchant, computes payout eligibility and reserve exposure, and publishes a versioned dataset that the dashboard and finance export both consume. The important shift is conceptual: the system is no longer trying to answer "what is the latest state right now?" on every request. It is answering "what was the reconciled state for this bounded slice of input?" once, then reusing the result many times.</p>
+<p>The misconception to remove is that batch is just "streaming, but slower" or "a cron job that scans a table." A throughput-oriented batch pipeline has a different contract. It assumes bounded input, chooses work decomposition to maximize sequential scans and parallel aggregation, and treats retries as normal rather than exceptional. If the contract is designed well, rerunning one failed task does not change the published answer. If the contract is vague, backfills double count money, partial reruns leak mixed versions, and finance stops trusting the output.</p>
+<h2>Why This Matters</h2>
+<p>Teams reach for batch when the same expensive computation has to be repeated over a large dataset and freshness measured in minutes or hours is acceptable. <code>PayLedger</code> fits that profile exactly. Merchant settlement summaries, daily reserve calculations, and end-of-day reconciliation all need global views over many shard-local facts, but none of them need millisecond freshness. Recomputing them synchronously in the request path would spend CPU and network on the same join and aggregation work thousands of times per day.</p>
+<p>Batch changes the economics by paying the coordination cost once per input slice instead of once per user request. Large sequential reads are usually cheaper than many small random reads, local aggregation before shuffle reduces network cost, and a published dataset can serve many downstream consumers. The trade-off is equally real: the answer is only as fresh as the schedule and the watermark the job used. If a support agent needs the state as of this second, a nightly dataset is the wrong tool. If finance needs a reproducible statement for yesterday's books, a versioned batch output is exactly the right one.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p><code>PayLedger</code> stores authoritative events on the shard that owns each funding account. During the day, those events drive customer-visible balance checks and payout decisions. After the business day closes, finance needs something different: one reconciled record per merchant showing net inflow, settled payouts, chargeback reserves, and any account whose replica lag or missing ledger segments make the books incomplete.</p>
+<p>The naive approach is to run a huge SQL query over the live system every night. That usually fails for boring reasons before it fails for interesting ones. It competes with foreground traffic, it mixes records written before and after the reporting cutoff, and it is hard to retry safely because the underlying data can change while the job is in progress. A real batch pipeline starts by freezing the input boundary.</p>
+<p>For <code>PayLedger</code>, the scheduler first creates an immutable manifest:</p>
+<div class="codehilite"><pre><span></span><code>settlement_date = 2026-04-05
+input_epoch = ledger-snapshot-7811
+source_partitions = shards 03, 11, 18, 27, 41
+output_dataset = merchant_settlement_summary/v7811
+</code></pre></div>
+
+<p>Every later stage refers to that manifest, not to "whatever is in the database now." That one decision turns retries and backfills from guesswork into something a production team can reason about.</p>
+<p>It also gives the team a clean answer when reality arrives late. If a bank partner sends a correction file at 03:15 UTC for a transfer that belonged to <code>2026-04-05</code>, <code>PayLedger</code> does not patch yesterday's published dataset in place. It records the correction, decides whether finance needs a backfill or an adjustment entry, and produces a new versioned output with clear lineage. Without that discipline, "rerun the batch" quietly turns into "rewrite history in ways nobody can audit."</p>
+<h3>Part 2: Mechanism</h3>
+<p>Once the manifest exists, the pipeline behaves like a bounded dataflow graph. Each stage has a narrow responsibility, and each task can be retried because its input and output contract are explicit.</p>
+<div class="codehilite"><pre><span></span><code>ledger snapshot manifest
+  -&gt; shard-local scan and validation
+  -&gt; merchant_id shuffle
+  -&gt; settlement and reserve aggregation
+  -&gt; data-quality checks
+  -&gt; atomic publish of versioned output
+</code></pre></div>
+
+<p>The shard-local scan stage is where throughput begins. Each worker reads a contiguous slice of ledger files for one shard and one settlement date, filters out incomplete segments, and emits compact intermediate rows such as <code>(merchant_id, gross_inflow, payout_total, reserve_delta, anomalies)</code>. Doing this reduction close to storage matters because shipping raw ledger events across the network would multiply shuffle volume for no benefit.</p>
+<p>The shuffle stage then repartitions those intermediate rows by <code>merchant_id</code> so one reducer sees the full settlement picture for a merchant. This is the expensive part of many batch jobs, which is why partition choice matters so much. If one merchant is disproportionately large, that reducer becomes a straggler and the whole job's wall-clock time stretches around it. Throughput-oriented design means planning for skew up front: use pre-aggregation, separate oversized merchants into dedicated partitions, and make reducers spill safely to disk instead of failing the whole run when memory pressure spikes.</p>
+<p>Correctness comes from publication discipline, not from hoping the DAG engine is magical. <code>PayLedger</code> tasks write intermediate output under attempt-specific paths, and the job publishes only after validation succeeds for every required partition:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">publish_batch_run</span><span class="p">(</span><span class="n">run</span><span class="p">):</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">run</span><span class="o">.</span><span class="n">all_required_partitions_succeeded</span><span class="p">():</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;cannot publish incomplete settlement dataset&quot;</span><span class="p">)</span>
+
+    <span class="n">version</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;v</span><span class="si">{</span><span class="n">run</span><span class="o">.</span><span class="n">input_epoch</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">write_success_marker</span><span class="p">(</span><span class="n">dataset</span><span class="o">=</span><span class="s2">&quot;merchant_settlement_summary&quot;</span><span class="p">,</span> <span class="n">version</span><span class="o">=</span><span class="n">version</span><span class="p">)</span>
+    <span class="n">move_manifest_pointer</span><span class="p">(</span><span class="n">dataset</span><span class="o">=</span><span class="s2">&quot;merchant_settlement_summary&quot;</span><span class="p">,</span> <span class="n">version</span><span class="o">=</span><span class="n">version</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Consumers read the dataset version named by the manifest pointer. They never read half-written partitions. That is the operational difference between "the batch job finished enough tasks" and "the batch output is safe to treat as canonical for this input slice."</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>The win is easy to see once the pipeline is running. The support dashboard loads yesterday's settlement summary from one published table instead of triggering a fresh cross-shard fan-out. Finance exports can be regenerated by pointing at the same versioned dataset. Backfills are possible because the system can rerun <code>2026-04-05</code> against <code>ledger-snapshot-7811</code> and compare the resulting checksum to the published version instead of arguing about which mutable source tables changed after the original close.</p>
+<p>The cost is that freshness becomes scheduled rather than continuous. If an account enters reserve review at 14:03 UTC, the nightly settlement dataset will not reflect that until the next run unless <code>PayLedger</code> also maintains a lower-latency path. Batch pipelines also concentrate failure into fewer, larger jobs. A bad schema change, a skewed partition, or a missing snapshot can delay an entire reporting cycle instead of degrading one request at a time. That trade-off is often worth it, but only when the product contract admits stale-by-design outputs and the team invests in manifests, lineage, validation, and atomic publish semantics.</p>
+<p>This also sets up the next lesson cleanly. Once the business asks for "the same derived view, but updated every few seconds" and still expects late corrections to land in the right logical window, the assumptions that make batch attractive start to break. The input is no longer bounded, scheduling overhead matters more, and event-time questions appear. That is the handoff into <a href="026.html">026.md</a>.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"Batch jobs are just slow online queries."</strong> They should not be. A proper batch pipeline runs against a fixed input boundary, uses stage-local contracts, and publishes a named output version rather than reading and writing live mutable state opportunistically.</li>
+<li><strong>"Retries guarantee correctness."</strong> Retries only help when tasks are idempotent relative to an immutable manifest. If a rerun reads a newer snapshot or appends into a shared output path, retries can create duplicates and mixed-version datasets.</li>
+<li><strong>"More workers always means higher throughput."</strong> Extra workers help only until shuffle contention, skew, or storage bandwidth becomes dominant. Beyond that point, the cluster gets more expensive without finishing earlier.</li>
+<li><strong>"Batch is fine for anything that is not strictly real time."</strong> The real question is whether the consumer can tolerate the freshness interval and whether the cost of waiting is lower than the cost of maintaining a continuous pipeline.</li>
+<li><strong>"Publishing partitions as they finish is good enough."</strong> It is good enough only if every consumer understands partial results. For canonical reporting datasets, atomic publish is what prevents half-complete runs from becoming accidental truth.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="024.html">024.md</a> explains why <code>PayLedger</code> needed this move at all. Cross-shard fan-out made the request path too expensive for repeated merchant-wide reads, so the system shifted that work into a bounded offline pipeline.</li>
+<li><a href="026.html">026.md</a> is the natural follow-on. Batch keeps the input bounded and the cost predictable; stream processing keeps the derived view fresher when the business cannot wait for the next scheduled run.</li>
+<li>Data warehouses and search indexing pipelines use the same structural pattern: freeze an input set, do as much reduction as possible before the expensive exchange step, validate aggressively, and publish a versioned output that many readers can reuse.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the chapters on batch processing, derived data, and stream processing together; they explain why bounded recomputation is often the simplest way to make large-scale data products reproducible.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/">MapReduce: Simplified Data Processing on Large Clusters</a><ul>
+<li>Focus: Pay attention to the original execution model: input splits, local map work, shuffle, and deterministic reduce output. It remains the clearest explanation of why throughput-oriented systems are organized around retries and large sequential work.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://beam.apache.org/documentation/programming-guide/">Apache Beam Programming Guide</a><ul>
+<li>Focus: Read the sections on bounded collections and windowing boundaries to see how one programming model can still distinguish batch-style bounded inputs from continuously arriving data.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html">Airflow Best Practices</a><ul>
+<li>Focus: The useful production detail is task design, not orchestration syntax. Look for the guidance on idempotency, partition-scoped tasks, and keeping DAG runs reproducible.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>Batch pipelines work by turning "compute over live state" into "compute over a named input slice."</strong> That boundary is what makes retries, audits, and backfills tractable.</li>
+<li><strong>Throughput comes from pushing reduction close to storage and treating shuffle as a scarce step.</strong> Cluster size helps only after partitioning and skew are under control.</li>
+<li><strong>The publish step is part of correctness.</strong> A versioned output plus an atomic pointer swap is what makes downstream readers see one coherent dataset instead of a half-finished run.</li>
+<li><strong>The central trade-off is throughput and reproducibility versus freshness.</strong> When freshness becomes the dominant requirement, batch gives way to streaming rather than simply scaling harder.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="024.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Cross-Shard Queries and Fan-Out Costs</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="026.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Stream Processing and Event-Time Semantics</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 16:19 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

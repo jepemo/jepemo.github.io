@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Unified Batch + Stream Architecture - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Unified Batch + Stream Architecture</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          029
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">029</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 501: Unified Batch + Stream Architecture</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A unified batch + stream architecture keeps one canonical history of facts and one semantic definition of derived state, so low-latency projections and historical recomputes converge on the same answer, trading duplicate pipelines for stricter event modeling, replay discipline, and correction workflows.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="028.html">028.md</a>, <code>PayLedger</code> made its exposure stream crash-safe by checkpointing keyed state, timers, and source positions together. That solved one class of inconsistency: a worker could fail and recover without losing or double-counting events. The next problem is broader. Finance still needs a nightly recompute of merchant exposure for audit, and risk analysts still need to replay the last 90 days after an enrichment bug or a late settlement file arrives. If the real-time job and the historical recompute are built as separate interpretations of the same business process, the system can recover perfectly from crashes and still tell the company two different stories.</p>
+<p>The non-obvious point is that "unified batch + stream" does not mean "every workload runs on one engine" and it does not mean "streaming replaces batch." It means the streaming path and the batch path derive results from the same canonical facts, with the same identity rules, time semantics, and correction model. A streaming projection gives <code>PayLedger</code> a payout decision in minutes. A batch replay gives it a repaired or backfilled answer over a larger horizon. If those answers are defined by different contracts, reconciliation becomes guesswork instead of engineering.</p>
+<h2>Why This Matters</h2>
+<p><code>PayLedger</code> uses exposure totals to decide whether a merchant can receive same-day payout. The risk service needs the latest answer now, because holding a fraudulent payout for even ten minutes matters. The finance team needs the same answer later, because merchant statements, reserve calculations, and audit trails are built from it. Those two consumers naturally pull the data platform in different directions: one wants low latency and incremental updates, the other wants wide scans, correction handling, and reproducible history.</p>
+<p>Without a unified architecture, teams usually split the problem into a speed layer and a batch layer that evolve independently. The streaming job writes a hot table keyed by <code>merchant_id</code>; the nightly warehouse job runs SQL over raw files and computes "authoritative" exposure totals. At first this feels pragmatic. Then a refund arrives 18 hours late, a schema change introduces a new event subtype, or a fraud feature backfill changes merchant risk labels for last week. The stream view, warehouse report, and downstream product behavior no longer match. The trade-off is explicit: unification reduces semantic drift and makes repairs tractable, but it forces the team to treat history, corrections, and derived tables as first-class design concerns instead of ad hoc cleanup work.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p><code>PayLedger</code> ingests four event families into Kafka and an object-store archive:</p>
+<ul>
+<li><code>authorization_created</code></li>
+<li><code>capture_settled</code></li>
+<li><code>refund_posted</code></li>
+<li><code>chargeback_opened</code></li>
+</ul>
+<p>The risk service needs a near-real-time projection called <code>merchant_exposure_current</code>. It is updated continuously and powers payout holds within two minutes of an event arriving. Finance also needs <code>merchant_exposure_daily</code>, a reproducible table for statements and reserve reports. That table must absorb late acquirer files, corrected FX rates, and fraud labels that are recomputed after the fact.</p>
+<p>The naive architecture is two separate implementations:</p>
+<div class="codehilite"><pre><span></span><code>stream path: Kafka -&gt; Flink job -&gt; operational table -&gt; risk service
+batch path: object storage -&gt; nightly Spark SQL -&gt; warehouse table -&gt; finance reports
+</code></pre></div>
+
+<p>Both paths claim to compute "merchant exposure," but they quietly disagree on key rules. The stream job deduplicates by <code>event_id</code>; the nightly SQL deduplicates by <code>(merchant_id, event_time, amount)</code> because raw files once lacked IDs. The stream job closes a 15-minute window when the watermark passes; the batch job uses file arrival time because that was easier to express in SQL. The stream job treats a corrected settlement as a compensating event; the batch job overwrites the old row in place during normalization.</p>
+<p>Now merchant <code>m_482</code> asks why yesterday's dashboard showed exposure peaking at $85,000 while finance's report shows a maximum of $67,000. Both numbers came from the same business, but not from the same model. The issue is no longer processor uptime or checkpoint frequency. It is that the platform has two truths.</p>
+<h3>Part 2: Mechanism</h3>
+<p>A unified architecture starts by declaring what the source of truth actually is. For <code>PayLedger</code>, the canonical truth is an append-only fact history plus versioned reference data:</p>
+<div class="codehilite"><pre><span></span><code>payment events + correction events + dimension snapshots
+</code></pre></div>
+
+<p>Everything else is a projection. The streaming system maintains the projection incrementally; the batch system rebuilds or repairs it by replaying history over a wider range. The crucial requirement is that both paths share semantic boundaries:</p>
+<ol>
+<li>the same event identity and dedup rule</li>
+<li>the same event-time fields and late-data policy</li>
+<li>the same interpretation of corrections, tombstones, and dimension changes</li>
+<li>the same projection definition for exposure</li>
+</ol>
+<p>In practice the flow looks like this:</p>
+<div class="codehilite"><pre><span></span><code>producers
+   |
+   v
+canonical event log -----&gt; archive / table snapshots
+   |                                |
+   |                                v
+   |                       batch replay / backfill
+   v                                |
+stream processor -------------------+
+   |
+   v
+materialized projections for serving and reporting
+</code></pre></div>
+
+<p>The real implementation can use different engines. <code>PayLedger</code> might use Flink for the incremental path, Spark for backfills, and Iceberg tables for durable snapshots. That is still unified if both engines consume the same canonical facts and apply the same semantics. The architecture is not unified if they merely happen to read similarly named data sets.</p>
+<p>One useful way to make the contract concrete is to define the state transition once and reuse it conceptually everywhere:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_exposure_event</span><span class="p">(</span><span class="n">state</span><span class="p">,</span> <span class="n">event</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">state</span><span class="o">.</span><span class="n">seen_event_ids</span><span class="o">.</span><span class="n">contains</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">event_id</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">state</span>
+
+    <span class="n">signed_delta</span> <span class="o">=</span> <span class="n">classify</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+    <span class="n">state</span><span class="o">.</span><span class="n">open_exposure</span> <span class="o">+=</span> <span class="n">signed_delta</span>
+    <span class="n">state</span><span class="o">.</span><span class="n">seen_event_ids</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">event_id</span><span class="p">)</span>
+    <span class="n">state</span><span class="o">.</span><span class="n">last_event_time</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">state</span><span class="o">.</span><span class="n">last_event_time</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">event_time</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">state</span>
+</code></pre></div>
+
+<p>The stream processor applies that transition to each new event and writes an incremental view. The batch replay applies the same transition across a historical slice to regenerate the view after a bug fix, a backfill, or a new serving table bootstrap. Unified architecture is the insistence that both computations mean the same thing even if the runtime mechanics differ.</p>
+<p>This also changes how corrections work. If an acquirer sends a repaired settlement amount, <code>PayLedger</code> appends a compensating correction event or a new versioned fact instead of mutating the original exposure table in place. That keeps replay meaningful. A backfill can reproduce the corrected result because the correction is in history, not hidden in an operational table with no lineage.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>The main benefit is not elegance. It is operational clarity. When the stream projection and the batch replay disagree, the team can ask whether the canonical facts differ, whether a projection definition changed, or whether one engine violated the shared contract. That is a tractable debugging path. In a split architecture, the same disagreement often devolves into "the dashboard is using pipeline A and finance is using pipeline B," which is not a diagnosis at all.</p>
+<p>The cost is real. Unified architectures retain more raw history, preserve event lineage longer, and require stronger schema discipline. They also force awkward business conversations. Should the product show provisional exposure immediately and accept that late corrections may revise yesterday's answer? Or should it wait for a slower authoritative layer and tolerate stale decisions? That trade-off is structural, not just UI polish.</p>
+<p>There is another trade-off between physical unification and semantic unification. A single engine can reduce code drift, but it may be poor at either large replays or low-latency serving. Separate engines can be the right choice if they share a strict semantic contract. The failure mode is not using multiple systems. The failure mode is letting each system invent its own definition of truth.</p>
+<p>For <code>PayLedger</code>, the practical policy becomes:</p>
+<ul>
+<li>projections are disposable and rebuildable</li>
+<li>canonical event history is retained long enough for replay and audit</li>
+<li>corrections enter the system as new facts, not silent rewrites</li>
+<li>reconciliation jobs compare incremental and replayed outputs before downstream consumers trust them blindly</li>
+</ul>
+<p>That is what makes batch and stream feel unified in production: not a slogan, but a repairable system boundary.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"Unified means one physical platform."</strong> It does not. Flink plus Spark plus Iceberg can be unified; two Flink jobs with different event rules are not.</li>
+<li><strong>"The nightly batch table is automatically more correct because it is slower."</strong> Slower only helps if the replay uses the same canonical facts and semantics. Otherwise it is just a different approximation.</li>
+<li><strong>"Materialized views can be patched directly during incidents."</strong> Directly editing projections hides lineage and makes future replays diverge. Fix the fact history or append an explicit correction instead.</li>
+<li><strong>"Checkpoint recovery solved correctness, so historical replay is optional."</strong> Checkpoints protect the live stream path. They do not address late data, bug fixes, bootstrap of new tables, or audit reconstruction.</li>
+<li><strong>"Dedup and event-time policy can differ by consumer."</strong> They can, but then the system is intentionally exposing different products. If both outputs claim to be the same metric, those rules must be shared and explicit.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="028.html">028.md</a> made one streaming job recover to a consistent cut after failure. This lesson widens the scope: the batch replay and the streaming projection now need to agree on what that recovered state means over long horizons.</li>
+<li><a href="030.html">030.md</a> picks up from here by separating storage and serving surfaces. Once canonical facts and projections are distinct, the next question is where warehouses, lakehouses, and serving layers each fit.</li>
+<li><a href="../consistency-and-replication/064.html">../consistency-and-replication/064.md</a> is a useful parallel from the storage side. Replicated logs preserve ordered facts; unified batch + stream architecture decides how multiple computation modes derive stable views from those facts.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the chapters on stream processing and dataflow for the difference between immutable facts, derived state, and repair through replay.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub43864/">The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing</a><ul>
+<li>Focus: Pay attention to how bounded and unbounded data are handled with one semantic model rather than as unrelated architectures.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://beam.apache.org/documentation/programming-guide/">Apache Beam Programming Guide</a><ul>
+<li>Focus: Useful for seeing how one programming model can express both replay over bounded data and incremental processing over live streams.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/">Questioning the Lambda Architecture</a><ul>
+<li>Focus: Read this as a critique of duplicating business logic across batch and speed layers; the point is not "batch is bad" but "semantic drift is expensive."</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://iceberg.apache.org/docs/latest/">Apache Iceberg Documentation</a><ul>
+<li>Focus: Look at snapshots, partition evolution, and time travel as building blocks that let replay and incremental consumption share the same table history.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>Unified architecture is about shared semantics, not a single engine.</strong> Batch replay and streaming updates can run on different systems and still converge if they derive from the same canonical facts.</li>
+<li><strong>Projections are not the source of truth.</strong> The repairable boundary is the append-only history plus explicit correction model, because that is what lets the platform recompute after bugs or late data.</li>
+<li><strong>The trade-off is semantic rigor for operational coherence.</strong> You spend more effort on schema design, lineage, and replay so incidents, backfills, and audits stop producing contradictory answers.</li>
+<li><strong>This lesson sets up the storage question next.</strong> Once facts and projections are separated cleanly, warehouses, lakehouses, and serving layers become a placement decision instead of an argument about which system owns truth.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="028.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Stateful Operators and Checkpoint Recovery</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="030.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Warehouse, Lakehouse, and Serving Layers</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 16:19 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

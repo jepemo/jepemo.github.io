@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Watermarks, Late Data, and Window Guarantees - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Watermarks, Late Data, and Window Guarantees</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          027
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">027</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 499: Watermarks, Late Data, and Window Guarantees</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A watermark is the stream processor's claim about how far event time has become complete enough to act on; the watermark policy, allowed lateness, and sink behavior together define what a window result actually guarantees in production.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="026.html">026.md</a>, <code>PayLedger</code> switched its payout-risk monitor from processing time to event time so a delayed bank message would not silently rewrite business meaning. That solved one question, "Which clock defines the truth?" It did not solve the next question from operations: "When is a 15-minute exposure window trustworthy enough to release a payout?" A reserve adjustment from the banking partner might arrive 40 seconds after the payout event it offsets. If the stream job emits the window as soon as wall-clock time passes 12:15, it is not making a principled decision. It is guessing that nothing earlier is still in flight.</p>
+<p>Watermarks are the mechanism that turns that guess into an explicit contract. A watermark is not "the current event time" and it is not a promise that no older record will ever arrive. It is a lower bound on completeness derived from observed source progress. Once <code>PayLedger</code> chooses a watermark strategy and an allowed-lateness policy, every emitted window gains a real guarantee: on-time records should already be reflected, revisions are accepted until a named cutoff, and records that miss that cutoff follow a separate correction path. The non-obvious point is that late data does not become manageable when the team tweaks latency. It becomes manageable when the team states, in advance, what the window result means and what the system will do when reality arrives late.</p>
+<h2>Why This Matters</h2>
+<p><code>PayLedger</code> uses the exposure window to decide whether same-day payouts can be released automatically for high-volume merchants. Support agents, finance analysts, and the automated payout service all read the same metric, but they use it differently. The payout service wants a fast answer. Finance wants the answer to match end-of-day replay. Support needs to explain why a merchant was held at 12:16 and released at 12:18 without sounding like the system made up numbers.</p>
+<p>That is why window guarantees matter. If the lesson stops at "use event time," downstream consumers still do not know whether a result is provisional, final, or subject to correction. A conservative watermark gives <code>PayLedger</code> fewer revisions and more stable payout decisions, but it increases latency and state retention. An aggressive watermark gives faster decisions, but it increases late updates, retractions, or drops. The production trade-off is not abstract. It decides whether the pipeline behaves like an auditable financial control or like a race between transport jitter and business logic.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p><code>PayLedger</code> keeps a rolling 15-minute exposure window per merchant. The window combines three event streams:</p>
+<ul>
+<li><code>authorization_captured</code> from the card ledger</li>
+<li><code>payout_submitted</code> from the payout service</li>
+<li><code>reserve_adjusted</code> from the banking-partner integration</li>
+</ul>
+<p>Each event has an <code>event_time</code> taken from the source-of-truth system and an <code>ingest_time</code> added when the stream job receives the record. During a quiet period the values are close together. During a partner queue backup they diverge:</p>
+<div class="codehilite"><pre><span></span><code>12:14:52  event_time   reserve_adjusted   +$40,000
+12:15:03  event_time   payout_submitted   -$35,000
+12:15:05  ingest_time  payout_submitted arrives
+12:15:41  ingest_time  reserve_adjusted arrives after partner delay
+</code></pre></div>
+
+<p>At 12:15:05 the processor has enough information to say that a payout request happened. It does not yet have enough information to say the whole <code>12:00-12:15</code> exposure window is complete. That distinction matters because the payout guardrail is attached to the window, not to an individual record. If the job closes the window too early, the merchant is held incorrectly. If it waits forever, the "real-time" product stops being useful.</p>
+<p>Watermarks provide the missing completeness frontier. <code>PayLedger</code> configures each source to emit a watermark based on how far event time has advanced relative to the most recent records seen from that source. In a simple bounded-out-of-orderness policy, the source says something like, "I have seen events through 12:15:30, and my normal disorder budget is 60 seconds, so treat 12:14:30 as the safe frontier for on-time data." The processor then combines those frontiers across active partitions and inputs, usually by taking the minimum. The minimum matters because the joined window is only as complete as its slowest input.</p>
+<h3>Part 2: Mechanism</h3>
+<p>For <code>PayLedger</code>, the operational path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>ledger events ----\
+partner reserves --- normalize timestamps -&gt; partition by merchant_id
+payout events ----/                              |
+                                                 v
+                                 event-time windows + watermark timers
+                                                 |
+                              first result, revisions, or late-event side output
+</code></pre></div>
+
+<p>Each record is assigned to a window by <code>event_time</code>, not by arrival order. The operator keeps state for that merchant and window until the engine decides the window can move through three phases:</p>
+<ol>
+<li><code>Open</code>: the watermark has not crossed the window end, so the result is still collecting on-time records.</li>
+<li><code>Emitted but revisable</code>: the watermark crossed the window end, so the first result can be published, but allowed lateness still keeps state alive for corrections.</li>
+<li><code>Expired</code>: the allowed-lateness deadline passed, state is evicted, and any further record for that window must go to a late-data side output or a backfill workflow.</li>
+</ol>
+<p>That lifecycle is the real meaning of a window guarantee. A first emission does not automatically mean "final forever." It means "complete according to the current watermark contract." If <code>PayLedger</code> allows two extra minutes for late partner adjustments, then a <code>12:00-12:15</code> window might first emit at watermark <code>12:15:00</code>, accept revisions until watermark <code>12:17:00</code>, and only become immutable after that.</p>
+<p>The logic is small enough to sketch:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">handle_event</span><span class="p">(</span><span class="n">event</span><span class="p">,</span> <span class="n">watermark</span><span class="p">):</span>
+    <span class="n">window</span> <span class="o">=</span> <span class="n">window_for</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">event_time</span><span class="p">,</span> <span class="n">minutes</span><span class="o">=</span><span class="mi">15</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">watermark</span> <span class="o">&gt;=</span> <span class="n">window</span><span class="o">.</span><span class="n">end</span> <span class="o">+</span> <span class="n">ALLOWED_LATENESS</span><span class="p">:</span>
+        <span class="n">emit_late_side_output</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+        <span class="k">return</span>
+
+    <span class="n">update_window_state</span><span class="p">(</span><span class="n">window</span><span class="p">,</span> <span class="n">event</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">watermark</span> <span class="o">&gt;=</span> <span class="n">window</span><span class="o">.</span><span class="n">end</span><span class="p">:</span>
+        <span class="n">emit_window_result</span><span class="p">(</span><span class="n">window</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">&quot;upsert&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p>This pseudocode hides the hard parts, but it captures the contract:</p>
+<ul>
+<li>the watermark decides when on-time completeness is good enough for the first publish</li>
+<li><code>ALLOWED_LATENESS</code> decides how long a published window remains revisable</li>
+<li>the sink mode decides what downstream sees when a late record changes a prior answer</li>
+</ul>
+<p>That last point is where many production bugs actually live. If the downstream store supports upserts or retractions, <code>PayLedger</code> can publish early and repair later. If the downstream sink is a one-shot alerting channel, early publication may be unacceptable because there is no clean correction path. Window guarantees are therefore not just stream-engine settings. They are part of the end-to-end product contract.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>The cleanest way to think about the trade-off is to ask what kind of mistake <code>PayLedger</code> can afford. A conservative watermark and a longer allowed-lateness period make the exposure window closer to replayed truth. That reduces false payout holds and makes finance reconciliation easier, but it increases decision latency, memory usage, checkpoint size, and operator recovery time because more window state stays live.</p>
+<p>An aggressive watermark does the opposite. <code>PayLedger</code> can release payouts faster because windows close sooner, but now the team must handle a larger stream of late revisions. Some of those corrections are operationally fine, such as a dashboard cell updating from <code>$120,000</code> to <code>$85,000</code>. Some are not, such as an already-sent "merchant blocked" notification that no downstream system can retract cleanly. The trade-off is therefore between latency and completeness, but also between repairable and non-repairable downstream effects.</p>
+<p>This is also why one slow partition can dominate the system. If the banking-partner topic goes quiet or one partition stops advancing its watermark, the minimum watermark across the joined computation stalls. Windows stop closing even if the ledger and payout streams are healthy. Production teams often misread that symptom as "the job is slow" when the real issue is "the engine no longer has evidence that event time is complete." Idle-partition handling, per-source observability, and explicit late-data channels are not polish. They are part of making the guarantee intelligible.</p>
+<p>The next lesson on <a href="028.html">028.md</a> picks up exactly here. Watermarks and allowed lateness tell the engine how long state must live and when timers should fire. Stateful operators and checkpoint recovery explain how that state survives failure without losing the guarantee you just defined.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"A watermark is just wall-clock time minus a fixed delay."</strong> That shortcut is tempting because it sounds simple, but a real watermark is tied to observed event-time progress per source or partition. The fix is to instrument source watermarks directly and treat idle inputs as a first-class condition instead of burying them in latency graphs.</li>
+<li><strong>"Once a window emits, the answer is final."</strong> That is only true if the policy sets allowed lateness to zero and the sink never accepts revisions. The corrective mental model is that a first result is often provisional. Document whether the stream emits upserts, retractions, or a single final result after a longer wait.</li>
+<li><strong>"Late data means the producer is broken."</strong> Sometimes it does, but in <code>PayLedger</code> late data is often the normal shape of partner delivery. The design response is to measure lateness distributions from production history and choose watermark lag from those measurements, not from hope.</li>
+<li><strong>"Dropping very late records is harmless because the window is already closed."</strong> Dropping them silently only hides data loss. A production pipeline needs a side output, dead-letter topic, or backfill job so the business can decide whether the missed event should repair history offline.</li>
+<li><strong>"A single slow input only affects that one source."</strong> In joined or co-grouped windows, the global watermark often follows the slowest active input. The operational fix is to monitor per-input watermark lag and decide when idle detection, source isolation, or architecture changes are required.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="026.html">026.md</a> established that event time is the clock that gives a streaming computation stable business meaning. This lesson adds the completeness frontier that tells the system when a slice of that clock is actionable.</li>
+<li><a href="028.html">028.md</a> explains the storage side of the same story: once you keep window state and timers alive for watermarks and late data, checkpointing and recovery become part of correctness, not just durability.</li>
+<li><a href="../consistency-and-replication/065.html">../consistency-and-replication/065.md</a> is the storage-oriented analog. Event logs preserve the history of facts; watermarks and window policies determine when a streaming projection is willing to treat that history as complete enough to publish.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[PAPER] <a href="https://research.google/pubs/pub43864/">The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing</a><ul>
+<li>Focus: Read the sections on watermarks, triggers, and accumulation modes as one design space. They make the latency-versus-completeness trade-off explicit.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub41378/">MillWheel: Fault-Tolerant Stream Processing at Internet Scale</a><ul>
+<li>Focus: Pay attention to low watermarks, timers, and per-key state. The paper shows how event-time progress becomes an operational mechanism.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://beam.apache.org/documentation/programming-guide/">Apache Beam Programming Guide</a><ul>
+<li>Focus: The windowing and late-data sections are useful because they separate first results, trigger behavior, and allowed lateness instead of treating "window closed" as a single event.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/">Apache Flink Event Time and Watermarks</a><ul>
+<li>Focus: Look at how Flink derives watermarks, handles idle sources, and defines the interaction between event time and timers in real jobs.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://kafka.apache.org/documentation/streams/core-concepts#streams_time">Kafka Streams Grace Period and Windowing Semantics</a><ul>
+<li>Focus: This is a good counterpoint because it makes the "how long can a window still change?" question visible in an API that many application teams use directly.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>A watermark is a completeness claim, not a timestamp oracle.</strong> It tells the engine how far event time has advanced enough to publish on-time results.</li>
+<li><strong>A window guarantee comes from three choices together.</strong> Watermark policy, allowed lateness, and sink behavior decide whether results are fast, revisable, final, or dropped.</li>
+<li><strong>Late data is a product-contract problem as much as a stream-engine problem.</strong> The right policy depends on whether downstream systems can absorb corrections cleanly.</li>
+<li><strong>State and recovery are already implicit in this lesson.</strong> The moment you keep windows open for late records, checkpointing and timer recovery become part of correctness.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="026.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Stream Processing and Event-Time Semantics</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="028.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Stateful Operators and Checkpoint Recovery</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 16:19 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>
