@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Module Capstone: Consistency and Coordination Design - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Module Capstone: Consistency and Coordination Design</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          065
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">065</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+          <span class="meta-chip">CAPSTONE</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 496: Module Capstone: Consistency and Coordination Design</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A production consistency design works when it narrows expensive coordination to the business decisions that must be final, then serves everything else from replayable logs and bounded-stale projections with explicit lag budgets.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>Suppose Harbor Point opens the last wheelchair-accessible cabin on sailing <code>HP-2026-07-14</code> to three channels at once: a Madrid agent desk, a New York call center, and the passenger self-service site. At the same time, embarkation staff need the boarding manifest to reflect cleared passport holds within seconds, and finance needs payment captures reconciled without double charging after retries.</p>
+<p>The capstone question is not "should Harbor Point use strong consistency or eventual consistency?" That is too coarse to help. The real question is where the system is willing to pay for coordination. If every read and integration waits on a global decision path, latency and availability collapse under traffic. If none of the paths coordinate, the last accessible cabin can be sold twice and no amount of projection cleanup will repair the original promise made to the customer.</p>
+<p>The design becomes defendable once Harbor Point names its invariants first and then assigns a mechanism to each one. The cabin sale is a single authoritative shard decision. Immediate user confirmation is protected by idempotency keys and leader-routed writes. Search and boarding dashboards are derived from the committed log and allowed to be slightly stale within declared budgets. The trade-off is intentional: the system pays coordination cost only where the product cannot tolerate ambiguity.</p>
+<h2>Why This Matters</h2>
+<p>Production systems do not fail because engineers forget the vocabulary of linearizability or eventual consistency. They fail because a product promise crosses paths with an architecture that never said which state is authoritative, which retries are safe, or which read paths are allowed to lag. For Harbor Point, overselling an accessible cabin is not a harmless stale-read bug. It triggers manual relocations, support escalations, and potential regulatory trouble once the passenger arrives at the port.</p>
+<p>Before the design is explicit, teams compensate with local patches. Search is refreshed more aggressively. Support is given a "fix booking" admin tool. Payment retries are tuned. None of those patches answer the core coordination question. After the design is explicit, Harbor Point can defend each path: <code>POST /holds</code> and <code>POST /bookings/confirm</code> route to the authoritative inventory owner, the payment gateway is integrated through idempotent confirmation rather than fantasy distributed transactions, and every downstream view can explain exactly how fresh it is and how it recovers from replay.</p>
+<p>The production relevance is that incidents become diagnosable by contract instead of by folklore. When a user says "I got a timeout but my card was charged," the team knows which idempotency record and commit index to inspect. When the manifest lags, the team knows whether to delay boarding or fail over to the leader-backed read path. That is what a capstone consistency design should buy: a small set of hard guarantees, a larger set of honest weaker guarantees, and clear operating rules between them.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Start with the product promises Harbor Point cannot break</h3>
+<p>Keep one flow in view: customer <code>BK-88421</code> is trying to confirm the last wheelchair-accessible cabin <code>C14</code> on sailing <code>HP-2026-07-14</code> while another agent is attempting the same sale from another region.</p>
+<p>Harbor Point writes down the contract before it chooses infrastructure:</p>
+<table>
+<thead>
+<tr>
+<th>User-facing action</th>
+<th>Required guarantee</th>
+<th>Chosen mechanism</th>
+<th>What Harbor Point is willing to pay</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /holds</code> for cabin <code>C14</code></td>
+<td>One current hold owner at a time for the inventory unit</td>
+<td>Route to the shard that owns <code>(sailing_id, cabin_id)</code> and commit through its replicated write log</td>
+<td>Cross-node coordination inside one replica group</td>
+</tr>
+<tr>
+<td><code>POST /bookings/confirm</code></td>
+<td>Success means the cabin is definitively booked once</td>
+<td>Same shard transaction validates hold, payment authorization, and idempotency key before commit</td>
+<td>Leader-routed write, retry bookkeeping, and synchronous local replica acknowledgment</td>
+</tr>
+<tr>
+<td><code>GET /bookings/BK-88421</code> right after confirm</td>
+<td>Read-your-write for the caller</td>
+<td>Return an observed commit token and route immediate reads to a caught-up replica or the leader</td>
+<td>Occasional leader reads when followers lag</td>
+</tr>
+<tr>
+<td><code>GET /search/cabins?route=BCN-JFK</code></td>
+<td>Bounded staleness, up to <code>2s</code></td>
+<td>Serve from a projection fed by committed events</td>
+<td>Slightly stale browse results, followed by decisive revalidation at hold time</td>
+</tr>
+<tr>
+<td><code>GET /manifest/HP-2026-07-14</code></td>
+<td>Near-real-time operational correctness, up to <code>5s</code> lag</td>
+<td>Consume the event log into a boarding projection with lag alarms</td>
+<td>Projection infrastructure and operational lag monitoring</td>
+</tr>
+</tbody>
+</table>
+<p>This table is the real design artifact. It prevents Harbor Point from pretending that every endpoint deserves the same consistency cost. It also prevents the opposite mistake: hiding critical user-visible decisions behind "eventual" language when the business action is irreversible.</p>
+<h3>Part 2: Keep the decisive write path narrow and explicit</h3>
+<p>Harbor Point chooses <code>inventory_id = sailing_id + cabin_id</code> as the authoritative key. That key maps to a single shard owner at any moment, and that owner is a small replica group rather than a globally coordinated cluster:</p>
+<div class="codehilite"><pre><span></span><code>gateway
+  -&gt; partition map service (generation 118)
+  -&gt; inventory shard 173
+       leader: madrid-a
+       sync follower: madrid-b
+       async follower: newyork-a
+</code></pre></div>
+
+<p>The write path for <code>BK-88421</code> looks like this:</p>
+<ol>
+<li>The self-service site asks search for available cabins and sees <code>C14</code> in a projection that may be up to <code>2s</code> old.</li>
+<li><code>POST /holds</code> routes to shard <code>173</code>, which verifies that <code>C14</code> is still free, writes hold <code>H-9917</code>, replicates to the synchronous follower, and returns hold version <code>v44</code>.</li>
+<li>The payment service obtains an external authorization and returns <code>auth_7QK2</code>.</li>
+<li><code>POST /bookings/confirm</code> sends <code>hold_id=H-9917</code>, <code>hold_version=v44</code>, <code>payment_auth=auth_7QK2</code>, and <code>idempotency_key=confirm-BK-88421</code>.</li>
+<li>The shard leader checks that the hold is still active, that the payment authorization has not already been consumed, and that the idempotency key has not been committed before. It then writes the booking, marks the hold consumed, stores the idempotency record, and emits an outbox event in the same durable commit.</li>
+<li>The response includes commit token <code>inventory:173@982441</code> so immediate follow-up reads can avoid stale replicas.</li>
+</ol>
+<p>A simplified storage routine makes the boundary concrete:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">confirm_booking</span><span class="p">(</span><span class="n">cmd</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">inventory_shard</span><span class="p">(</span><span class="n">cmd</span><span class="o">.</span><span class="n">inventory_id</span><span class="p">)</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span>
+        <span class="n">idempotency_key</span><span class="o">=</span><span class="n">cmd</span><span class="o">.</span><span class="n">idempotency_key</span><span class="p">,</span>
+        <span class="n">check</span><span class="o">=</span><span class="k">lambda</span> <span class="n">state</span><span class="p">:</span> <span class="p">(</span>
+            <span class="n">state</span><span class="o">.</span><span class="n">cabin_status</span> <span class="o">==</span> <span class="s2">&quot;held&quot;</span>
+            <span class="ow">and</span> <span class="n">state</span><span class="o">.</span><span class="n">hold_id</span> <span class="o">==</span> <span class="n">cmd</span><span class="o">.</span><span class="n">hold_id</span>
+            <span class="ow">and</span> <span class="n">state</span><span class="o">.</span><span class="n">hold_version</span> <span class="o">==</span> <span class="n">cmd</span><span class="o">.</span><span class="n">hold_version</span>
+            <span class="ow">and</span> <span class="n">state</span><span class="o">.</span><span class="n">payment_auth</span> <span class="o">==</span> <span class="n">cmd</span><span class="o">.</span><span class="n">payment_auth</span>
+        <span class="p">),</span>
+        <span class="n">writes</span><span class="o">=</span><span class="p">[</span>
+            <span class="p">(</span><span class="s2">&quot;inventory&quot;</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">inventory_id</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;cabin_status&quot;</span><span class="p">:</span> <span class="s2">&quot;booked&quot;</span><span class="p">}),</span>
+            <span class="p">(</span><span class="s2">&quot;booking&quot;</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">booking_id</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;confirmed&quot;</span><span class="p">}),</span>
+            <span class="p">(</span><span class="s2">&quot;idempotency&quot;</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">idempotency_key</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;booking_id&quot;</span><span class="p">:</span> <span class="n">cmd</span><span class="o">.</span><span class="n">booking_id</span><span class="p">}),</span>
+            <span class="p">(</span><span class="s2">&quot;outbox&quot;</span><span class="p">,</span> <span class="n">next_event</span><span class="p">(),</span> <span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;booking-confirmed&quot;</span><span class="p">,</span> <span class="s2">&quot;booking_id&quot;</span><span class="p">:</span> <span class="n">cmd</span><span class="o">.</span><span class="n">booking_id</span><span class="p">}),</span>
+        <span class="p">],</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<p>The mechanism matters more than the syntax. Harbor Point is deliberately avoiding a global transaction with the payment provider or the search index. Payment authorization happens before confirmation, but the irreversible local decision is made once, on the inventory owner, with an idempotency record that survives retries and failover. Search is advisory. Booking confirmation is authoritative.</p>
+<p>The trade-off is visible here. Harbor Point accepts extra latency and operational machinery on a tiny fraction of traffic so it can keep the critical invariant local and explainable. It refuses to pay the same coordination cost on every search query, customer history page, or boarding dashboard refresh.</p>
+<h3>Part 3: Push everything else through committed logs, projections, and control-plane rules</h3>
+<p>Once <code>BK-88421</code> commits, Harbor Point stops pretending that all consumers belong on the write path. The shard's outbox is captured into the event backbone and turned into specialized read models:</p>
+<div class="codehilite"><pre><span></span><code>inventory shard commit
+  -&gt; outbox / WAL
+  -&gt; booking-events topic
+       -&gt; search availability projector
+       -&gt; customer trips projector
+       -&gt; boarding manifest projector
+       -&gt; finance reconciliation stream
+</code></pre></div>
+
+<p>This is where <a href="064.html">064.md</a> becomes operationally central. The search index can lag by <code>2s</code> because any final sale still revalidates against the authoritative shard. The boarding manifest can lag by <code>5s</code> because port staff can fall back to a leader-backed check for edge cases during active boarding. The finance stream can be replayed because it is derived from committed events, not from side effects observed out of band. Harbor Point gains scale and failure isolation by letting each read model speak honestly about freshness instead of forcing every consumer into the critical write quorum.</p>
+<p>The control plane also needs explicit rules. The partition map is versioned, so every routed write carries a generation number. Rebalancing cabin <code>C14</code>'s shard to a new replica group requires copy, catch-up, cutover, and generation change, not an ad hoc router update. Failover promotes only the durable replicated log prefix, and ambiguous client retries are resolved through the stored idempotency key rather than by replaying the business action blindly. If the remote region was behind by three seconds at failure time, Harbor Point admits that recovery point explicitly instead of claiming imaginary zero-loss failover.</p>
+<p>That produces a complete coordination design rather than a pile of mechanisms. One narrow path decides inventory. A durable log exports committed truth. Projections materialize the views humans and neighboring systems need. The control plane governs who owns each shard and when that ownership is allowed to move. The whole design stays coherent because every part answers the same recurring scenario: what happens when two actors race for the last cabin and the system must still explain its answer after retries, lag, and failover?</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"We should make search strongly consistent with booking so users never see stale availability."</strong> That is tempting because stale search results are visible, but it spends coordination on browse traffic instead of on the decisive sale. Harbor Point accepts bounded-stale search and revalidates at hold creation, which keeps the invariant safe without putting the search index in the booking quorum.</p>
+</li>
+<li>
+<p><strong>"A confirmation timeout means the booking probably failed, so retry the whole action."</strong> Timeouts create uncertainty, not a clean rollback signal. Without an idempotency record, Harbor Point risks double booking or double charging. The operational fix is to persist the idempotency key with the authoritative commit and resolve retries against the stored outcome.</p>
+</li>
+<li>
+<p><strong>"If the manifest is wrong, operators can patch the projection directly."</strong> Direct projection edits create drift from the committed log. The durable fix is to emit the corrective event or repair and replay the projector so the derived state converges from the source of truth.</p>
+</li>
+<li>
+<p><strong>"Exactly-once delivery from the broker means downstream correctness is solved."</strong> Delivery semantics do not replace application invariants. Harbor Point still needs deduplication, checkpoint discipline, and reducers that tolerate replay, because correctness lives at the sink and the business rule, not at the transport label.</p>
+</li>
+<li>
+<p><strong>"Cross-region failover is just leader election on a replica."</strong> Promotion is only safe for the log prefix that is durably replicated and fenced by the control plane. If Harbor Point ignores lag, shard ownership generations, or ambiguous retries, failover turns a regional outage into a consistency incident.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="064.html">064.md</a> shows how Harbor Point serves search, manifest, and finance without dragging those consumers into the booking quorum</h3>
+<p>This capstone uses projections as a deliberate escape hatch from over-coordination. The log is not an implementation detail; it is the boundary that lets strong writes and weaker reads coexist honestly.</p>
+<h3>Connection 2: <a href="060.html">060.md</a> and <a href="061.html">061.md</a> explain why the booking path stores idempotency outcomes instead of trusting transport slogans</h3>
+<p>Retries, duplicates, and partial failures are normal on the authoritative path. The capstone turns those lessons into a concrete write contract that survives timeouts and failover.</p>
+<h3>Connection 3: <a href="048.html">048.md</a> and <a href="058.html">058.md</a> provide the vocabulary for the guarantees Harbor Point assigns to each endpoint</h3>
+<p>The capstone is the final assembly step for the track: endpoint semantics, shard ownership, replicated commits, retry safety, and derived views all have to agree on what "correct" means for one business action.</p>
+<h2>Resources</h2>
+<ul>
+<li>
+<p>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a></p>
+<ul>
+<li>Focus: Revisit the chapters on transactions, replication, logs, and derived data as one connected design space rather than isolated topics.</li>
+</ul>
+</li>
+<li>
+<p>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a></p>
+<ul>
+<li>Focus: Compare Harbor Point's narrow local coordination choice with a system that pays for stronger cross-region ordering directly.</li>
+</ul>
+</li>
+<li>
+<p>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Raft)</a></p>
+<ul>
+<li>Focus: Pay attention to leader ownership, log replication, and why failover safety depends on a well-defined committed prefix.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://kafka.apache.org/33/documentation/streams/core-concepts/">Apache Kafka Streams Core Concepts</a></p>
+<ul>
+<li>Focus: Study stream-table duality and replay-backed state reconstruction, which is exactly how the capstone keeps projections out of the booking quorum.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://www.postgresql.org/docs/current/logicaldecoding-explanation.html">PostgreSQL Logical Decoding Concepts</a></p>
+<ul>
+<li>Focus: Use it to ground the outbox or WAL-capture portion of the design in a concrete production implementation.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>A consistency design is not one global mode; it is a mapping from user-visible invariants to specific coordination points, lag budgets, and recovery rules.</li>
+<li>Harbor Point keeps the irreversible cabin sale on one authoritative shard with idempotent confirmation, then exports committed truth through logs and projections for everything else.</li>
+<li>Bounded-stale reads are safe only when the decisive write path revalidates against the source of truth and when each projection has explicit replay and lag semantics.</li>
+<li>Failover, rebalancing, and retries are part of the consistency contract itself, because a design is only real if it can explain ambiguous outcomes after something breaks.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="064.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Event Logs, Projections, and Stream Tables</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 13:34 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

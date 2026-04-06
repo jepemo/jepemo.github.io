@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Backpressure and Flow Control - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Backpressure and Flow Control</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          062
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">062</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 493: Backpressure and Flow Control</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Backpressure makes overload explicit. A slower stage advertises limited capacity, upstream stages reduce in-flight work, and the system trades raw peak throughput for bounded memory, stable recovery, and predictable latency.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="061.html">061.md</a>, Harbor Point made <code>manifest-projector</code> replay-safe: if Kafka redelivers <code>booking-confirmed</code> after a crash, the projector can collapse the duplicate into one row in <code>passenger_manifest</code>. That solves the semantic problem. It does not solve the load problem. On the Monday when online check-in opens for the July 14 sailing, Harbor Point sees a burst of 3,000 booking and check-in events per second, while the projector's PostgreSQL sink can only commit about 600 upserts per second because an index rebuild is still running.</p>
+<p>If the consumer keeps polling the broker at full speed, it turns the rate mismatch into hidden state. Records pile up in the broker, then in the consumer fetch buffer, then in the in-memory worker queue waiting for database connections. The service looks "busy" right up until heap usage spikes, GC pauses stretch, offset commits stall, and a pod restart forces the same backlog to be deserialized again. The non-obvious point is that overload is not just a sizing mistake; it is a control problem. A production system needs a way for the slowest useful boundary to say "stop sending me more than this."</p>
+<p>That is the difference between raw buffering and backpressure. Buffering absorbs short bursts. Backpressure propagates the fact that the burst is no longer short. Harbor Point wants the projector to slow its own polling, keep only a bounded number of manifest updates in flight, and let lag accumulate in a durable place it knows how to recover from. The trade-off is deliberate: the team accepts visible lag and sometimes throttled producers in exchange for avoiding memory blowups, retry storms, and multi-hour replay loops.</p>
+<h2>Why This Matters</h2>
+<p>Backpressure and flow control determine where excess work lives when the system cannot keep up. If Harbor Point chooses poorly, excess work lands in the least reliable place: process memory, thread pools, connection pools, or ad hoc retry loops. That is where incidents become confusing. The broker lag might look acceptable while the actual failure is a saturated database, a consumer with 80,000 deserialized records waiting in RAM, or an API tier creating even more downstream work because it cannot see the bottleneck.</p>
+<p>A good control scheme makes the failure mode legible. Small bursts are absorbed cheaply. Sustained overload turns into bounded queue growth, reduced fetch sizes, slower acknowledgment, or explicit <code>429 Too Many Requests</code> responses at the edge. Operators can then ask a real question: is the system temporarily behind, or is the sink permanently underprovisioned? Without that signal, teams tend to "fix" incidents by increasing queue sizes, worker counts, or retry rates, which often amplifies the original bottleneck.</p>
+<p>The production consequence is straightforward. Systems with working backpressure degrade into lag and admission control. Systems without it degrade into memory exhaustion, connection thrash, and replay storms. Harbor Point cares because embarkation tools, finance jobs, and guest notifications all share the same event backbone. If one slow consumer can silently pull unbounded work into memory, a localized slowdown becomes a broader reliability incident.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p>Keep one Harbor Point pipeline in view:</p>
+<div class="codehilite"><pre><span></span><code>booking-api -&gt; outbox-relay -&gt; booking-events topic
+           -&gt; manifest-projector -&gt; passenger_manifest in PostgreSQL
+           -&gt; embarkation dashboard
+</code></pre></div>
+
+<p>During a normal hour, the <code>manifest-projector</code> consumes about 500 events per second and the database keeps up. During the online check-in release window, arrivals jump to 3,000 events per second for several minutes. At the same time, a migration adds write amplification to <code>passenger_manifest</code>, so each upsert now spends longer waiting on disk and index maintenance.</p>
+<p>The mismatch is easy to quantify. If Harbor Point accepts 3,000 events per second and completes 600, the deficit is 2,400 events per second. At roughly 5 KB of deserialized state per event across objects, retries, and queue metadata, that is about 12 MB of extra heap pressure per second. Five minutes of "let it buffer" is enough to push gigabytes of extra working set into a consumer that was sized for a few hundred megabytes.</p>
+<p>None of this means Harbor Point should panic and stop consuming instantly. It means the system needs a deliberate place for the backlog to live and a rule for how fast work is allowed to move downstream. In this lesson, the durable backlog is the Kafka topic, not the consumer heap. That choice only works if the consumer can limit how much work it pulls and if slow sink commits feed back into the fetch rate.</p>
+<h3>Part 2: Mechanism</h3>
+<p>It helps to separate two related ideas.</p>
+<p><code>Flow control</code> is a local rule between two parties: how much data may be in flight before the sender must wait for more credit. TCP receive windows, HTTP/2 stream windows, and "poll at most 500 records because only 500 permits remain" are all flow-control mechanisms.</p>
+<p><code>Backpressure</code> is the larger system effect: the slow sink causes credits to return more slowly, which reduces consumption upstream, which may eventually slow producers or force admission control. Flow control is the mechanism; backpressure is the propagated consequence.</p>
+<p>Harbor Point can implement this in the projector with three decisions:</p>
+<ol>
+<li>Keep the in-memory work queue bounded.</li>
+<li>Tie broker fetch size to remaining downstream capacity.</li>
+<li>Commit offsets only after the corresponding manifest writes complete.</li>
+</ol>
+<p>A simple credit-based loop looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">MAX_IN_FLIGHT</span> <span class="o">=</span> <span class="mi">2000</span>
+<span class="n">permits</span> <span class="o">=</span> <span class="n">Semaphore</span><span class="p">(</span><span class="n">MAX_IN_FLIGHT</span><span class="p">)</span>
+
+<span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+    <span class="n">available</span> <span class="o">=</span> <span class="n">permits</span><span class="o">.</span><span class="n">available_count</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">available</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">wait_for_any_write_to_finish</span><span class="p">()</span>
+        <span class="k">continue</span>
+
+    <span class="n">batch</span> <span class="o">=</span> <span class="n">consumer</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="n">max_records</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span><span class="n">available</span><span class="p">,</span> <span class="mi">500</span><span class="p">))</span>
+    <span class="k">for</span> <span class="n">record</span> <span class="ow">in</span> <span class="n">batch</span><span class="p">:</span>
+        <span class="n">permits</span><span class="o">.</span><span class="n">acquire</span><span class="p">()</span>
+        <span class="n">submit</span><span class="p">(</span><span class="n">record</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="n">record</span><span class="p">):</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">upsert_manifest</span><span class="p">(</span><span class="n">record</span><span class="p">)</span>
+        <span class="n">commit_offset</span><span class="p">(</span><span class="n">record</span><span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="n">permits</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
+</code></pre></div>
+
+<p>The exact API differs by runtime, but the control idea is stable. The fetch loop is not allowed to ingest more records than the sink can plausibly finish soon. When PostgreSQL slows down, permits release more slowly. Smaller polls follow automatically. Lag grows in Kafka, where the backlog is durable and observable, instead of in a Python queue or JVM heap.</p>
+<p>That local mechanism is still not enough if upstream keeps generating work faster than Harbor Point can tolerate operationally. At some point, lag age threatens business freshness. The dashboard might be allowed to run two minutes behind during a burst, but not forty minutes behind before boarding closes. That is where backpressure becomes a policy question rather than only a queueing trick. Harbor Point may need to pause low-priority consumers, rate-limit new booking exports, reject optional enrichment jobs, or send <code>429 Too Many Requests</code> from non-critical APIs so the critical manifest path stays within its freshness budget.</p>
+<p>The main design choice is where each boundary should absorb pressure:</p>
+<ul>
+<li>Broker or durable log for replayable backlog</li>
+<li>Bounded in-memory buffers for short smoothing only</li>
+<li>Edge admission control when freshness SLOs would otherwise be violated</li>
+<li>Load shedding for non-essential work that is cheaper to drop than delay</li>
+</ul>
+<p>A healthy system usually uses all four. The mistake is letting any one layer pretend the others do not exist.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>Backpressure always imposes a trade-off: the system gives up some apparent throughput to protect stability. Harbor Point will process fewer concurrent manifest updates once the database slows, and upstream clients may see higher latency or explicit throttling. That can feel like "wasted capacity" to a team that only watches request acceptance. In reality, it prevents the more expensive outcome where the service accepts work optimistically, crashes under memory pressure, and replays the same backlog even later.</p>
+<p>Buffer size is the clearest example. A larger queue smooths short bursts and improves hardware utilization when slowdowns are brief. The same larger queue hides sustained overload for longer, increases tail latency, and lengthens recovery after a restart because more work sits between ingestion and durable completion. Harbor Point therefore wants buffer sizes based on burst tolerance, not on hope. "Can absorb 30 seconds at 3x load" is defensible. "Large enough that we have not seen OOM yet" is not.</p>
+<p>This also changes how the team interprets metrics. High CPU is not automatically a problem if queue depth and oldest-event age stay within budget. Low CPU is not automatically healthy if consumers are stalled on connection pools and lag is climbing. For this pipeline, the critical set is: broker lag, oldest unprocessed event age, in-flight write count, queue depth, database commit latency, offset-commit latency, and any throttle or reject rate at the edges. Those metrics tell Harbor Point whether it is absorbing a burst, falling into unstable amplification, or deliberately protecting the system by slowing intake.</p>
+<p>The payoff is that overload becomes an engineering choice instead of an accident. Harbor Point can decide that the embarkation dashboard may be 90 seconds stale but must never lose confirmed bookings or force a three-hour replay after a pod crash. Once that policy is explicit, flow-control parameters, queue bounds, and throttling rules become tools for meeting it rather than knobs turned blindly.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"A bigger queue makes the system more resilient."</strong> It only makes the first symptom arrive later. If the sink remains slower than the source, the extra queue mostly converts a throughput deficit into memory growth and longer recovery time.</p>
+</li>
+<li>
+<p><strong>"Backpressure is a stream-processing feature, not a general systems concern."</strong> The same mechanism appears in TCP windows, broker fetch sizes, worker-pool semaphores, database connection pools, and HTTP <code>429</code> responses. Any place that controls in-flight work participates in flow control.</p>
+</li>
+<li>
+<p><strong>"If consumers are idempotent, replay volume is harmless."</strong> Replay-safe code prevents duplicate effects, but it does not make duplicate or delayed work free. CPU, I/O, connection slots, and freshness budgets can still be exhausted by uncontrolled backlog.</p>
+</li>
+<li>
+<p><strong>"Autoscaling removes the need for backpressure."</strong> Scaling helps only when additional workers increase true sink capacity. If PostgreSQL, a downstream API, or a shared lock is the bottleneck, more consumers usually add contention and make tail latency worse.</p>
+</li>
+<li>
+<p><strong>"Lag is always bad, so the consumer should keep polling aggressively."</strong> Some lag is the correct outcome under bursty load. The real question is whether lag sits in a durable, observable layer with a bounded freshness impact, not whether it exists at all.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="061.html">061.md</a> made replay safe; this lesson makes replay survivable</h3>
+<p>The previous lesson ensured that a redelivered <code>booking-confirmed</code> event does not create two manifest rows. This lesson deals with the next production pressure: when thousands of safe events arrive faster than Harbor Point can apply them, the system still needs a controlled way to fall behind.</p>
+<h3>Connection 2: <a href="063.html">063.md</a> uses the same control ideas in change-data-capture pipelines</h3>
+<p>A CDC connector that reads the source database faster than downstream consumers or sinks can absorb changes creates the same instability. The next lesson turns this load-regulation problem into an integration-architecture question.</p>
+<h3>Connection 3: <a href="../networking-and-failure-models/003.html">../networking-and-failure-models/003.md</a> explains why retries can amplify overload</h3>
+<p>Timeouts and retries are reasonable local tools, but under overload they can multiply work. Backpressure is one of the main ways to keep retry behavior from turning a slow system into a collapsing one.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] Reactive Streams<ul>
+<li>Link: <a href="https://www.reactive-streams.org/">https://www.reactive-streams.org/</a></li>
+<li>Focus: Read the specification language around non-blocking backpressure to see how explicit demand signals bound publisher-consumer interaction.</li>
+</ul>
+</li>
+<li>[DOC] Apache Flink: Monitoring Back Pressure<ul>
+<li>Link: <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/monitoring/back_pressure/">https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/monitoring/back_pressure/</a></li>
+<li>Focus: Study how an actual stream processor exposes blocked operators and why upstream slowdown is often the symptom of a downstream bottleneck.</li>
+</ul>
+</li>
+<li>[DOC] Apache Kafka Documentation<ul>
+<li>Link: <a href="https://kafka.apache.org/documentation/">https://kafka.apache.org/documentation/</a></li>
+<li>Focus: Look at consumer fetch and poll configuration to see how a pull-based log lets consumers control intake instead of accepting unbounded push delivery.</li>
+</ul>
+</li>
+<li>[BOOK] Designing Data-Intensive Applications<ul>
+<li>Link: <a href="https://dataintensive.net/">https://dataintensive.net/</a></li>
+<li>Focus: Revisit the chapters on stream processing, batching, and failure handling with an eye toward where backlog is buffered and how slow consumers shape the system.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Flow control limits local in-flight work; backpressure is the system-wide propagation of that limit when a downstream stage slows.</li>
+<li>A durable broker backlog is usually safer than an unbounded consumer heap, but only if fetch size and concurrency are tied to real sink capacity.</li>
+<li>Backpressure does not eliminate overload; it chooses how overload appears, trading some throughput and freshness for stability and recoverable behavior.</li>
+<li>Once duplicate effects are made safe, the next operational question is whether the system can regulate work without turning a temporary slowdown into a replay and memory incident.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="061.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Exactly-Once Delivery Myths</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="063.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Change Data Capture as Integration Backbone</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 13:34 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

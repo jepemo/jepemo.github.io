@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Event Logs, Projections, and Stream Tables - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Event Logs, Projections, and Stream Tables</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          064
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">064</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 495: Event Logs, Projections, and Stream Tables</h1>
+<blockquote>
+<p><strong>The core idea</strong>: An event log becomes operationally useful only when deterministic projections turn ordered records into rebuildable stream tables, which gives fast queries and decoupled read paths at the cost of checkpointing, replay discipline, and carefully scoped ordering guarantees.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="063.html">063.md</a>, Harbor Point turned PostgreSQL's commit log into a durable <code>booking-changes</code> stream. That solved the integration problem of "how do downstream systems hear about committed changes?" It did not solve the serving problem. The embarkation dashboard still needs answers like "which guests for the July 14 sailing are cleared to board right now?" Reading the raw log for every page load would mean replaying thousands of records just to answer one query, while hitting the write database directly would couple operational dashboards back to transactional tables that were never shaped for those reads.</p>
+<p>This is where projections enter. A projection is a deterministic program that consumes the log in order, applies each event to derived state, and persists the result as a queryable table. Harbor Point's <code>manifest-projector</code> reads booking confirmations, cabin changes, payment holds, and accessibility notes, then maintains one row per guest per sailing in <code>boarding_manifest</code>. The non-obvious point is that a projection is not "just a cache." A cache is useful if it is warm. A projection is useful if it can crash, replay, rebuild, and still converge on the same state.</p>
+<p>That distinction matters in production because the raw log and the stream table answer different questions. The event log answers, "What happened, in what durable order?" The stream table answers, "Given everything applied up to checkpoint X, what is the current state for this key?" The trade-off is deliberate: Harbor Point gets low-latency queries and isolated read models, but it also inherits stateful consumers, recovery checkpoints, lag monitoring, and the obligation to decide exactly which ordering guarantees each projection depends on.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's write path is optimized for correctness at commit time. It stores bookings, payments, cabin assignments, and check-in holds in normalized tables. The embarkation staff, however, does not want normalized tables. They want a boarding view keyed by sailing and guest, with fields such as current cabin, payment status, wheelchair assistance, and "boardable yes/no." Finance wants a different shape: unsettled charges by sailing. Search wants another: the latest cabin inventory by itinerary. These are read problems, not write problems.</p>
+<p>Without projections, teams usually pick one of two bad options. They either query the OLTP database directly with increasingly complex joins and filters, which pushes read pressure onto the source system and leaks internal schema into every downstream tool, or they build ad hoc caches whose update logic is only half replayable. Both options become painful when a consumer crashes, when logic changes, or when an incident forces a backfill. A dashboard that depends on mystery state is hard to trust during boarding.</p>
+<p>Projections make the derived state explicit. Harbor Point can say, "<code>boarding_manifest</code> is the result of replaying approved booking and hold events through <code>manifest-projector</code> up to Kafka offset 918244." That sentence is operational gold. It gives the team a way to reason about freshness, rebuild after bugs, audit why a row looks wrong, and keep the write database focused on transactional work. The cost is that every projection now needs a recovery model, a checkpoint model, and a clear statement of whether it cares about global order, per-key order, or only eventual convergence.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p>Keep one Harbor Point flow in view:</p>
+<div class="codehilite"><pre><span></span><code>PostgreSQL -&gt; CDC / outbox -&gt; booking-events topic
+                           -&gt; hold-events topic
+                           -&gt; payment-events topic
+
+booking-events + hold-events + payment-events
+    -&gt; manifest-projector
+    -&gt; boarding_manifest stream table
+    -&gt; embarkation dashboard
+</code></pre></div>
+
+<p>Suppose booking <code>8841</code> for the July 14 sailing goes through four changes over ten minutes:</p>
+<div class="codehilite"><pre><span></span><code>offset 9101 booking-confirmed   booking_id=8841 cabin=S12
+offset 9108 payment-authorized  booking_id=8841 amount=220000
+offset 9116 hold-added          booking_id=8841 hold_code=passport-mismatch
+offset 9124 hold-cleared        booking_id=8841 hold_code=passport-mismatch
+</code></pre></div>
+
+<p>The dashboard does not want four events. It wants one answer:</p>
+<div class="codehilite"><pre><span></span><code>booking_id=8841
+sailing_id=2026-07-14
+cabin_id=S12
+payment_status=authorized
+active_holds=[]
+boardable=true
+</code></pre></div>
+
+<p>Trying to compute that row on demand from the raw log is wasteful. Trying to compute it from live transactional tables is risky because those tables are optimized for writes and source-of-truth integrity, not for every operational read pattern. Harbor Point therefore introduces a projection whose only job is to collapse the event history into current state for that specific query shape.</p>
+<p>This is also where "stream table" becomes a useful term. The source is a stream: an append-only history of immutable records. The result is table-like: the latest derived value for each key. Harbor Point is not abandoning history. It is materializing the current answer that history implies.</p>
+<h3>Part 2: Mechanism</h3>
+<p>The mechanism is straightforward in outline and unforgiving in detail.</p>
+<ol>
+<li>The projector reads ordered input records from one or more topics.</li>
+<li>It selects the key for the derived table, such as <code>(sailing_id, booking_id)</code>.</li>
+<li>It loads the current derived row and the last applied source position for that key or partition.</li>
+<li>It applies a deterministic reducer function to produce the next row state.</li>
+<li>It stores the updated row and advances its checkpoint so a restart will not reintroduce ambiguity.</li>
+</ol>
+<p>In Harbor Point's <code>manifest-projector</code>, the reducer might behave like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_manifest_event</span><span class="p">(</span><span class="n">row</span><span class="p">,</span> <span class="n">event</span><span class="p">):</span>
+    <span class="n">row</span> <span class="o">=</span> <span class="n">row</span> <span class="ow">or</span> <span class="p">{</span>
+        <span class="s2">&quot;booking_id&quot;</span><span class="p">:</span> <span class="n">event</span><span class="o">.</span><span class="n">booking_id</span><span class="p">,</span>
+        <span class="s2">&quot;sailing_id&quot;</span><span class="p">:</span> <span class="n">event</span><span class="o">.</span><span class="n">sailing_id</span><span class="p">,</span>
+        <span class="s2">&quot;cabin_id&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;payment_status&quot;</span><span class="p">:</span> <span class="s2">&quot;pending&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;active_holds&quot;</span><span class="p">:</span> <span class="p">[],</span>
+        <span class="s2">&quot;boardable&quot;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">&quot;booking-confirmed&quot;</span><span class="p">:</span>
+        <span class="n">row</span><span class="p">[</span><span class="s2">&quot;cabin_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">event</span><span class="o">.</span><span class="n">cabin_id</span>
+    <span class="k">elif</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">&quot;payment-authorized&quot;</span><span class="p">:</span>
+        <span class="n">row</span><span class="p">[</span><span class="s2">&quot;payment_status&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;authorized&quot;</span>
+    <span class="k">elif</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">&quot;hold-added&quot;</span><span class="p">:</span>
+        <span class="n">row</span><span class="p">[</span><span class="s2">&quot;active_holds&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">hold_code</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">event</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">&quot;hold-cleared&quot;</span><span class="p">:</span>
+        <span class="n">row</span><span class="p">[</span><span class="s2">&quot;active_holds&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">h</span> <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;active_holds&quot;</span><span class="p">]</span> <span class="k">if</span> <span class="n">h</span> <span class="o">!=</span> <span class="n">event</span><span class="o">.</span><span class="n">hold_code</span><span class="p">]</span>
+
+    <span class="n">row</span><span class="p">[</span><span class="s2">&quot;boardable&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;payment_status&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;authorized&quot;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;active_holds&quot;</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">row</span>
+</code></pre></div>
+
+<p>The projector then needs a durable rule for duplicates and crashes. If the process writes the updated row but crashes before it records its source position, Kafka may redeliver the event. If Harbor Point merely "tries again," a non-idempotent reducer could duplicate holds, double-count charges, or regress state. The usual fix is to persist derived state and checkpoint together, or to store enough position metadata to ignore already-applied inputs.</p>
+<p>A simplified sink transaction looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">BEGIN</span><span class="p">;</span>
+
+<span class="k">SELECT</span><span class="w"> </span><span class="n">last_offset</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">projector_checkpoint</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">projector_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;manifest-projector&#39;</span>
+<span class="k">FOR</span><span class="w"> </span><span class="k">UPDATE</span><span class="p">;</span>
+
+<span class="c1">-- If incoming offset &lt;= last_offset, ignore as duplicate.</span>
+
+<span class="n">UPSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">boarding_manifest</span><span class="w"> </span><span class="p">(...,</span><span class="w"> </span><span class="n">last_event_offset</span><span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(...,</span><span class="w"> </span><span class="mi">9124</span><span class="p">);</span>
+
+<span class="k">UPDATE</span><span class="w"> </span><span class="n">projector_checkpoint</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">last_offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9124</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">projector_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;manifest-projector&#39;</span><span class="p">;</span>
+
+<span class="k">COMMIT</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The exact storage strategy varies. Kafka Streams keeps local state stores and backs them with changelog topics. Flink checkpoints operator state. A hand-rolled consumer may use PostgreSQL tables plus explicit checkpoints. The principle is the same: the stream table must represent "the log replayed through this reducer up to this position," not "whatever happened to be in memory before the pod restarted."</p>
+<p>Ordering is where many designs quietly become wrong. Harbor Point can rely on stable order for records that share a key and a partition. It cannot assume one magical global order across every topic and partition. If a projection needs "payment and hold status for the same booking," keying by <code>booking_id</code> and aligning partitions is usually enough. If it needs a cross-booking aggregate such as "remaining cabins on a sailing," it may need repartitioning by <code>(sailing_id, cabin_id)</code> or a separate projection whose reducer is defined around that key. The system stays sane only when the derived table's key and the input ordering model match.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>The first benefit is query isolation. Harbor Point can add a new read model for check-in supervisors without touching the booking write path or burdening PostgreSQL with more operational joins. The second benefit is replayability. If the team discovers that <code>boardable</code> should also require a completed safety waiver, it can deploy <code>manifest-projector-v2</code>, replay from the beginning into <code>boarding_manifest_v2</code>, compare outputs, and cut over once the new table catches up. That is much safer than patching rows by hand and hoping future events preserve the fix.</p>
+<p>The price is operational discipline. Stream tables are disposable in principle but expensive in practice. Replaying millions of events can saturate storage, consume network bandwidth, and expose bugs that never appeared in the incremental path. Lag is not a cosmetic metric; it determines how stale the read model is. A boarding agent looking at <code>boarding_manifest</code> that is twenty minutes behind is making a different class of decision than one looking at a table that is five seconds behind.</p>
+<p>Another trade-off is semantic scope. A stream table is excellent for current keyed state, recent aggregates, and rules that can be expressed as a deterministic fold over history. It is weaker for arbitrary ad hoc queries over full history unless you also preserve the underlying log or write historical snapshots elsewhere. Harbor Point keeps the event log for audit and replay, while using stream tables for the fast operational questions. That split is healthy because it stops one storage shape from pretending to satisfy every workload.</p>
+<p>Finally, stream tables force a clean answer to "what is the source of truth?" The source of truth is still the event log or the committed system of record that feeds it. The stream table is authoritative for serving a derived query, but not for independent manual edits. If an agent flips <code>boardable</code> directly in <code>boarding_manifest</code> without emitting a corrective event, the next replay will erase that fix. Production teams do best when they treat stream tables as generated state with strict ownership and predictable rebuild paths.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"A projection is just a cache with a fancy name."</strong> A cache can be warmed from somewhere else and often tolerates silent loss. A projection is defined by replay semantics. If Harbor Point cannot rebuild <code>boarding_manifest</code> from the input log and recover to the same state, it has an opaque cache, not a trustworthy projection.</p>
+</li>
+<li>
+<p><strong>"Kafka preserves order, so my table logic can assume one total sequence."</strong> Kafka preserves order within a partition, not across all partitions or topics. Harbor Point must choose keys and partitioning that match the invariants of each derived table.</p>
+</li>
+<li>
+<p><strong>"Once the stream table exists, operators can patch it directly."</strong> Direct edits create drift from the log-derived contract. The lasting fix is to publish a corrective event, repair the reducer, or rebuild the table with new logic.</p>
+</li>
+<li>
+<p><strong>"Checkpointing only matters for disaster recovery."</strong> Checkpoints matter every time a consumer crashes between applying state and acknowledging input. Without a clear checkpoint boundary, duplicates and gaps become normal behavior rather than exceptional failures.</p>
+</li>
+<li>
+<p><strong>"Projection lag only affects freshness."</strong> Lag also affects operations. A stale <code>boarding_manifest</code> can block valid passengers, miss active holds, or show an already-reassigned cabin as available. Freshness is a business correctness issue when humans act on the table.</p>
+</li>
+<li>
+<p><strong>"A backfill should replay straight into the live table."</strong> If Harbor Point changes projection logic, replaying into the live serving table can mix old and new semantics during rebuild. A safer pattern is versioned tables plus cutover after validation.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="063.html">063.md</a> provides the durable change stream that projections consume</h3>
+<p>CDC made committed database changes available as an integration backbone. This lesson explains how Harbor Point turns that backbone into read-optimized state without pushing every dashboard back onto raw tables or raw logs.</p>
+<h3>Connection 2: <a href="061.html">061.md</a> and <a href="062.html">062.md</a> define the reliability boundaries a projection must respect</h3>
+<p>Replay-safe consumers matter here because projectors are stateful sinks. Backpressure matters because a lagging projector can make a read model stale while also creating pressure on the stream-processing path that feeds it.</p>
+<h3>Connection 3: <a href="065.html">065.md</a> asks you to choose these boundaries deliberately</h3>
+<p>The capstone that follows is where the pieces meet: source-of-truth writes, change capture, projection design, replay cost, and operator-facing consistency promises all have to fit into one defendable architecture.</p>
+<h2>Resources</h2>
+<ul>
+<li>
+<p>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a></p>
+<ul>
+<li>Focus: Revisit the chapters on data integration, logs, derived data, and materialized views to place projections in a broader systems design context.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://kafka.apache.org/33/streams/core-concepts/">Apache Kafka Streams Core Concepts</a></p>
+<ul>
+<li>Focus: Study the stream-table duality and how changelog replay reconstructs table state from ordered events.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/stateful-stream-processing/">Apache Flink: Stateful Stream Processing</a></p>
+<ul>
+<li>Focus: Pay attention to checkpoints, operator state, and why replay plus state snapshots define recovery behavior.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://docs.confluent.io/platform/current/ksqldb/concepts/materialized-views.html">ksqlDB Materialized Views</a></p>
+<ul>
+<li>Focus: See a concrete implementation of continuously maintained stream tables and how stream/table duality appears in practice.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>An event log is the durable history; a projection is the deterministic computation; a stream table is the queryable state produced by replaying that computation up to a known checkpoint.</li>
+<li>Projections are only trustworthy when ordering assumptions, reducer logic, and checkpoint boundaries are explicit enough to survive duplicates, crashes, and rebuilds.</li>
+<li>Stream tables decouple read workloads from write systems and make operational queries fast, but they introduce lag management, replay cost, and stricter rules about who is allowed to mutate derived state.</li>
+<li>The safest production posture is to treat stream tables as generated artifacts of the log, version them when logic changes, and keep the underlying event stream available for audit and rebuild.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="063.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Change Data Capture as Integration Backbone</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="065.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Module Capstone: Consistency and Coordination Design</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 13:34 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

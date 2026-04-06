@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Change Data Capture as Integration Backbone - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Change Data Capture as Integration Backbone</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          063
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">063</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+          <span class="meta-chip">CAPSTONE</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 494: Change Data Capture as Integration Backbone</h1>
+<blockquote>
+<p><strong>The core idea</strong>: CDC turns the source database's commit log into a durable feed of committed changes, which removes many dual-write races but replaces them with log-position management, schema-governance, and replay discipline.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="062.html">062.md</a>, Harbor Point made overload visible in <code>manifest-projector</code> by keeping backlog in Kafka instead of in process memory. That helped the consumer survive bursts, but it did not solve a more basic integration problem. The booking platform still updated PostgreSQL, published a Kafka event, and called the CRM API through three different code paths. When the API server crashed after committing the booking row but before publishing <code>booking-confirmed</code>, the manifest stayed correct because it read the database directly, while finance and CRM stayed stale because their trigger lived in application code that never finished.</p>
+<p>CDC changes the shape of that failure. Instead of asking every write path to remember which downstream systems need to hear about the change, Harbor Point lets PostgreSQL's write-ahead log become the one place that records "this transaction really committed." A connector tails that log, translates committed row changes into ordered records, and ships them to Kafka for downstream consumers. The non-obvious point is that CDC is not magic event-driven architecture; it is a disciplined way to reuse an existing durability boundary as an integration boundary.</p>
+<p>That distinction matters because CDC gives you facts about committed state, not automatically perfect business events. Harbor Point can trust that <code>booking_id=8841</code> changed from <code>pending</code> to <code>confirmed</code> because that happened in the transaction log. It cannot assume the raw row change explains why the upgrade happened, whether the CRM should notify the guest, or which downstream systems are allowed to react synchronously. The trade-off is attractive but real: CDC removes the classic "database write succeeded, event publish failed" race, while pushing more responsibility into schema compatibility, downstream enrichment, and replay-aware operations.</p>
+<h2>Why This Matters</h2>
+<p>Once a company has more than one downstream consumer, integration patterns become a reliability issue rather than a code-organization preference. Harbor Point's booking database feeds an embarkation dashboard, a revenue warehouse, a loyalty CRM, and a cabin-search index. If each consumer gets updates through a different path, every new feature quietly creates another dual write, another polling job, or another webhook retry loop. Each mechanism can work in isolation. Together they produce a system where nobody can answer a simple incident question: "Which committed booking changes are downstream systems still missing?"</p>
+<p>CDC makes that question answerable because it centralizes change propagation around a durable sequence of commits. A lagging connector shows up as log lag. A broken sink shows up as consumer lag. A schema change shows up as a decode failure or incompatible payload. The architecture becomes easier to operate because the source of truth for propagation is explicit.</p>
+<p>The production consequence is not just cleaner code. It is fewer silent data drifts between systems, simpler backfills, and a reusable stream that multiple consumers can replay independently. The price is that the database schema now matters outside the service boundary, transaction-log retention becomes part of capacity planning, and teams must decide when a row-level change is sufficient versus when they need a higher-level domain event. CDC is strong precisely because it narrows one class of failure while exposing others that used to be hidden.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p>Keep one Harbor Point flow in view:</p>
+<div class="codehilite"><pre><span></span><code>booking-api -&gt; PostgreSQL primary
+            -&gt; WAL / logical replication stream
+            -&gt; cdc-relay
+            -&gt; booking-changes topic
+            -&gt; manifest service / finance warehouse / CRM sync / search index
+</code></pre></div>
+
+<p>Suppose guest <code>#8841</code> confirms cabin <code>S12</code> for the July 14 sailing. The booking transaction updates three tables in one commit:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">UPDATE</span><span class="w"> </span><span class="n">bookings</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;confirmed&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">confirmed_at</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">NOW</span><span class="p">()</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">booking_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8841</span><span class="p">;</span>
+
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">payments</span><span class="w"> </span><span class="p">(</span><span class="n">booking_id</span><span class="p">,</span><span class="w"> </span><span class="n">amount_cents</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">8841</span><span class="p">,</span><span class="w"> </span><span class="mi">220000</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;authorized&#39;</span><span class="p">);</span>
+
+<span class="k">UPDATE</span><span class="w"> </span><span class="n">cabin_inventory</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">reserved</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">sailing_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;2026-07-14&#39;</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="n">cabin_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;S12&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>If Harbor Point implements integration as synchronous fan-out from <code>booking-api</code>, the write path now has to update PostgreSQL, publish a Kafka event, and maybe call the CRM before it can claim success. That increases latency and still leaves a crash window after the database commit. If it implements integration as table polling, the warehouse and CRM repeatedly query for <code>updated_at &gt; last_seen</code>, which adds load, misses deletes unless extra conventions exist, and can observe rows in a different order than the original commit stream.</p>
+<p>CDC uses a different lever. The application performs its normal database transaction and stops there. After commit, PostgreSQL advances the WAL and logical decoding exposes the committed changes as a replayable stream. The integration contract becomes: if the source transaction commits, the change will eventually appear in the CDC stream; if it does not commit, downstream consumers should never see it.</p>
+<h3>Part 2: Mechanism</h3>
+<p>The internal mechanism matters more than the label "CDC." The connector is not watching tables with ad hoc queries. It is reading the database's own durability machinery.</p>
+<ol>
+<li>Harbor Point's transaction commits on PostgreSQL.</li>
+<li>The commit generates WAL records at a specific log sequence number, or LSN.</li>
+<li>A logical decoding slot lets <code>cdc-relay</code> read those committed changes in commit order without re-querying the tables.</li>
+<li>The relay converts each committed row change into a Kafka record that carries table identity, key columns, operation type, and source position such as LSN and transaction metadata.</li>
+<li>Downstream consumers checkpoint their own offsets independently, so finance can replay a week of history without forcing the manifest service to do the same.</li>
+</ol>
+<p>That gives Harbor Point an integration backbone because the connector can survive restarts by resuming from the last durable source position it emitted. A simplified emitted record might look like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;source_table&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;bookings&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;op&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;u&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;key&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;booking_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8841</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;before&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;pending&quot;</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;after&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;confirmed&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;confirmed_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2026-04-06T09:14:22Z&quot;</span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;source_position&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;lsn&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;0/16B6A90&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;tx_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">731992</span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Two details are easy to miss in production. First, commit ordering is only as strong as the boundary you preserve. The WAL gives Harbor Point transaction order at the source database. Once the relay partitions records by key in Kafka, consumers get a stable order per partition or per key, not a single global order across the whole estate. Second, the stream contains committed state transitions, not the application-level meaning of those transitions. A row update can tell finance that the booking became confirmed; it may not tell the CRM whether the guest was auto-upgraded because of loyalty status or manually upgraded by an agent unless Harbor Point stores that meaning explicitly.</p>
+<p>Snapshots are the other half of the mechanism. When Harbor Point adds a new consumer, it usually cannot start from "events after now" because the consumer needs historical state too. CDC systems therefore combine an initial snapshot with log streaming. The hard part is avoiding a torn view where the snapshot sees one version of a row but the log stream starts too late to capture the change that happened during the snapshot. Mature connectors solve this with snapshot markers, locking strategies, or low/high watermark techniques tied to source positions. That operational detail is why CDC is more than "read some rows and then tail updates."</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>Used well, CDC removes several painful design constraints. Harbor Point no longer needs the booking service to know every consumer that cares about booking state. New integrations can subscribe to <code>booking-changes</code> without modifying the write path. Replays become normal because the source position is durable. Audit questions get easier because the team can compare source-log lag, topic lag, and sink lag instead of stitching together API logs and cron timestamps.</p>
+<p>The trade-off is that CDC also widens the blast radius of source-schema decisions. Renaming <code>bookings.status</code> to <code>booking_state</code>, splitting one table into three, or changing a column type is no longer purely local if downstream consumers deserialize those fields directly. Harbor Point needs schema versioning, compatibility checks, and consumer contracts even though the source of truth is "just the database." This is why many teams pair CDC with the outbox pattern: row-level CDC is excellent for committed fact propagation, but semantic business events often belong in an outbox table whose schema is designed for consumers rather than leaked from internal tables.</p>
+<p>Backpressure from <a href="062.html">062.md</a> also reappears here in a more dangerous place. If <code>cdc-relay</code> falls behind for hours because Kafka is unavailable or sink throughput drops, PostgreSQL may have to retain WAL segments or replication-slot state much longer than planned. The result is not merely stale downstream data; it can become source-database disk pressure. CDC therefore turns flow control into a source-side operational concern. The same mechanism that makes replays and recovery easy also means lag has to be monitored where the log is produced, not just where it is consumed.</p>
+<p>This is where CDC earns the word "backbone." It is not the only integration pattern Harbor Point needs, but it is the one that can reliably fan committed facts out to many consumers without re-embedding the same publish logic into every service. The team should choose it when the source database is authoritative and downstream systems need to react to committed state. It should reach for explicit domain events or an outbox when downstream consumers need meaning that raw table mutations do not express cleanly.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"CDC gives me exactly-once integration automatically."</strong> CDC typically gives durable source ordering and restartable positions, not end-to-end exactly-once business effects. Downstream sinks still need idempotency or transactional boundaries, which is the same lesson <a href="061.html">061.md</a> made about replay-safe consumers.</p>
+</li>
+<li>
+<p><strong>"Polling tables is basically the same thing."</strong> Polling can approximate change propagation, but it usually adds query load, weakens delete handling, and turns commit order into guesswork around <code>updated_at</code> columns. CDC reads the actual commit log instead of reconstructing history from current table state.</p>
+</li>
+<li>
+<p><strong>"A replica or connector lagging behind is only a downstream freshness problem."</strong> In many databases, slow CDC consumers can hold onto log retention through replication slots or equivalent mechanisms. That means integration lag can create storage pressure on the source system itself.</p>
+</li>
+<li>
+<p><strong>"CDC means consumers should bind directly to whatever columns exist today."</strong> That is the fastest way to make schema evolution painful. Consumers need a compatibility contract, and in many cases Harbor Point should publish normalized events from an outbox instead of leaking internal table shape.</p>
+</li>
+<li>
+<p><strong>"If CDC captures every row change, I no longer need application events."</strong> Row changes answer "what committed." They often do not answer "what business event should other systems react to?" A reservation merge, fraud-review hold, or loyalty upgrade may require an event model with clearer semantics than raw table mutations provide.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="061.html">061.md</a> defined the replay boundary; CDC reuses it for integration</h3>
+<p>Exactly-once myths disappear once you name the durable boundary. CDC works for the same reason replay-safe consumers work: the source database already has a commit log, so Harbor Point can resume from a precise position instead of guessing what changed.</p>
+<h3>Connection 2: <a href="062.html">062.md</a> explained overload as a control problem; CDC pushes that problem closer to the source</h3>
+<p>When a projector falls behind, Harbor Point risks stale read models. When a CDC connector falls behind, Harbor Point may also retain WAL and pressure the primary database. The mechanism is still backpressure, but the failure surface is broader.</p>
+<h3>Connection 3: <a href="064.html">064.md</a> turns captured changes into projections and stream tables</h3>
+<p>Once CDC provides a trustworthy change stream, the next question is how to materialize it into read models without losing ordering, dedupe discipline, or replayability. That is the job of projections and stream tables.</p>
+<h2>Resources</h2>
+<ul>
+<li>
+<p>[DOC] <a href="https://www.postgresql.org/docs/current/logicaldecoding-explanation.html">PostgreSQL Logical Decoding Concepts</a></p>
+<ul>
+<li>Focus: See how logical decoding exposes committed WAL changes and why replication slots matter for restartable consumption.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://www.postgresql.org/docs/current/logical-replication.html">PostgreSQL Logical Replication</a></p>
+<ul>
+<li>Focus: Review the publication/subscription model and the operational constraints around schema changes and replication lag.</li>
+</ul>
+</li>
+<li>
+<p>[DOC] <a href="https://debezium.io/documentation/reference/stable/">Debezium Documentation</a></p>
+<ul>
+<li>Focus: Study how a production CDC platform represents snapshots, source positions, schema history, and connector recovery.</li>
+</ul>
+</li>
+<li>
+<p>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a></p>
+<ul>
+<li>Focus: Revisit the sections on replication logs, event streams, and data integration to place CDC among outbox, stream processing, and materialized views.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>CDC works because it reuses the database's own commit log as the authoritative record of committed change, which removes many application-level dual-write races.</li>
+<li>The stream carries durable facts about state transitions, not automatically the full business meaning of those transitions, so row-level CDC and domain events solve different problems.</li>
+<li>Replayability is a feature only if source positions, snapshots, and backpressure are operated deliberately; otherwise connector lag can become source-database risk.</li>
+<li>CDC becomes an integration backbone when multiple consumers need the same committed facts, but it still requires schema governance, idempotent sinks, and clear boundaries around what the stream promises.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="062.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Backpressure and Flow Control</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="064.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Event Logs, Projections, and Stream Tables</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 13:34 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>
