@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>In-Memory Systems with Durable Backing - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>In-Memory Systems with Durable Backing</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          022
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">022</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 470: In-Memory Systems with Durable Backing</h1>
+<blockquote>
+<p><strong>The core idea</strong>: An in-memory system is only trustworthy when its write path makes a deliberate durability promise through logs, snapshots, and replica handoff.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>After <a href="021.html">021.md</a>, <code>PayLedger</code> has a solid plan for compressed historical segments and can prove archived payout bytes are intact. That helped the audit path, but it did not fix the hot path. During payroll cutoff, the <code>balance-gate</code> service must reserve funds for each payout instruction in under 5 ms so the UI can confirm or reject a transfer immediately. Querying the relational ledger on every reservation keeps durability obvious, but it pushes p99 latency high enough to stall payroll operators at exactly the worst moment.</p>
+<p>The team moves the working set into RAM instead. Each merchant's available balance, open holds, and payout sequence counters live on a single shard owner in memory. Durable backing comes from an append-only log on local SSD, a replica stream to a standby, and periodic snapshots to object storage. The easy mistake is to call this "just a cache in front of the database." Once <code>balance-gate</code> tells the caller that a hold exists, that answer changes money movement. The real question is not whether the latest bytes happen to be in memory or on disk. The real question is what durability barrier has been crossed before the system says "success."</p>
+<p>That is the useful shift. The log defines operation order. The snapshot defines restart speed. Replica acknowledgment defines the failover loss envelope. If those choices are vague, the system can be fast and still recreate already-spent balance after a crash. In-memory systems with durable backing are not fast because they ignore storage; they are fast because they reduce storage to a disciplined write-ahead and recovery path.</p>
+<h2>Why This Matters</h2>
+<p>Teams reach for memory-first systems when the working set fits comfortably in RAM and the product pays heavily for disk round-trips. Rate limiters, fraud counters, session stores, market data books, and balance reservation engines all fit this pattern. The production pressure is that the same system still needs restart recovery, replay, auditability, and controlled failover. That creates the core trade-off of the lesson: every step that tightens durability usually adds latency, write amplification, or operational complexity.</p>
+<p>For <code>PayLedger</code>, the failure is concrete. If <code>balance-gate</code> mutates RAM and returns success before its log record is durable, a node power loss can erase an approved hold and let the same funds be reserved again. If it waits for a local <code>fsync</code> on every single request, latency spikes. If it also waits for a replica to acknowledge the write, the data-loss window gets smaller, but the failover procedure must fence the old primary carefully or two owners may believe they control the same merchant shard. The right design is the one whose crash window, recovery time, and latency envelope are all stated explicitly.</p>
+<p>The previous lesson established that durable bytes are only useful if the system can detect corruption and trust recovered data. This lesson moves that same integrity model into the live state path: logs and snapshots are now the recovery substrate for state that usually lives in memory. The next lesson, <a href="023.md">023.md</a>, picks up the next pressure point. Once the hot state is fast enough, a few large merchants can dominate one shard and create hotspots.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p><code>PayLedger</code> partitions <code>balance-gate</code> by <code>merchant_id</code>. At any moment, exactly one shard owner is allowed to accept writes for a merchant. That avoids multi-writer races in the low-latency path and gives the service a deterministic command stream. A reservation request such as <code>reserve_funds(merchant_id=1842, reservation_id="run-2026-03-31-447", amount_cents=125000)</code> is routed to the owner for shard 1842, which checks the in-memory balance map and decides whether the command is admissible.</p>
+<p>The naive alternative is a dual write: update an in-memory cache for speed, then persist to a database for durability. That looks simple until one write succeeds and the other does not. A retry can then double-apply the hold, or a failover can reconstruct an older balance than the API already exposed. <code>PayLedger</code> avoids that split-brain behavior by treating the ordered command stream as the source of truth and the in-memory map as the materialized state used for fast reads.</p>
+<p>The data flow is narrow on purpose:</p>
+<div class="codehilite"><pre><span></span><code>client
+  -&gt; router
+      -&gt; shard owner
+          -&gt; in-memory balance map
+          -&gt; append-only WAL segment
+          -&gt; replica stream
+          -&gt; periodic snapshot writer
+</code></pre></div>
+
+<p>That layout tells you where the guarantees live. The RAM map makes reads cheap. The WAL is the durable history of accepted commands. The snapshot shortens replay. The replica gives a second copy for failover and recovery.</p>
+<h3>Part 2: Mechanism</h3>
+<p>On the write path, <code>PayLedger</code> treats each reservation as a command against a shard-local state machine. The owner first checks an idempotency index keyed by <code>reservation_id</code>. If the caller is retrying a timed-out request, the service must return the same answer instead of attempting a second reservation. If the request is new, the owner evaluates it against the current in-memory balance and emits a command record that includes the decision, the delta, and a monotonically increasing log sequence number (LSN).</p>
+<p>That record is appended to the WAL before the result is exposed externally. <code>PayLedger</code> uses 4 ms group commit rather than <code>fsync</code> on every request, because the extra batching keeps the hot path within budget while still giving a crisp durability point. Commands whose WAL records are flushed are considered committed. Only then does the owner publish the updated balance and return success to the caller.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">reserve_funds</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="n">shard</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">cmd</span><span class="o">.</span><span class="n">reservation_id</span> <span class="ow">in</span> <span class="n">shard</span><span class="o">.</span><span class="n">decisions</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">shard</span><span class="o">.</span><span class="n">decisions</span><span class="p">[</span><span class="n">cmd</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">]</span>
+
+    <span class="n">decision</span> <span class="o">=</span> <span class="n">evaluate</span><span class="p">(</span><span class="n">shard</span><span class="o">.</span><span class="n">state</span><span class="p">,</span> <span class="n">cmd</span><span class="p">)</span>
+    <span class="n">entry</span> <span class="o">=</span> <span class="n">wal</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">encode</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="n">decision</span><span class="p">))</span>
+    <span class="n">wal</span><span class="o">.</span><span class="n">flush_group_until</span><span class="p">(</span><span class="n">entry</span><span class="o">.</span><span class="n">lsn</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">decision</span><span class="o">.</span><span class="n">approved</span><span class="p">:</span>
+        <span class="n">shard</span><span class="o">.</span><span class="n">state</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="n">decision</span><span class="o">.</span><span class="n">delta</span><span class="p">)</span>
+
+    <span class="n">shard</span><span class="o">.</span><span class="n">decisions</span><span class="p">[</span><span class="n">cmd</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">decision</span>
+    <span class="n">replica</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="n">entry</span><span class="o">.</span><span class="n">lsn</span><span class="p">,</span> <span class="n">cmd</span><span class="p">,</span> <span class="n">decision</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">decision</span>
+</code></pre></div>
+
+<p>The exact sequence is more important than the syntax. Appending to the log before acknowledging the write means the service can recover committed commands in order after a crash. Recording the decision under the idempotency key means retries can be answered deterministically. Streaming the committed LSN to a replica means failover can be expressed as "which node has applied up to LSN N?" rather than "which node feels freshest?"</p>
+<p>Snapshots solve a different problem. A pure append-only log is enough for correctness, but recovery time grows with log length. <code>PayLedger</code> writes a snapshot of each shard every 30 seconds or every 256 MiB of committed WAL, whichever comes first. Each snapshot stores the full balance map, active holds, idempotency window, and the <code>snapshot_lsn</code> it represents. On restart, the node loads the newest verified snapshot, then replays only log records with LSNs greater than <code>snapshot_lsn</code>. If the latest snapshot is at LSN 18,240 and the crash left 746 newer committed records, recovery is seconds long. Without snapshots, replay could take millions of commands and miss the restart SLO.</p>
+<p>The previous lesson matters here because logs and snapshots are only useful when their bytes can be trusted. <code>PayLedger</code> stores checksums on WAL frames and snapshot blocks. Recovery replays until the last valid record, truncates any torn tail, and pulls missing durable data from the replica if needed. Durability is not "we have a backup somewhere." Durability is "every acknowledged command can be reconstructed in order from verified bytes."</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>Once the mechanism is explicit, the trade-offs become clear instead of ideological. A service that acknowledges after writing to RAM but before flushing the WAL gets excellent latency, but the crash window includes acknowledged writes. A service that acknowledges only after local <code>fsync</code> gives stronger single-node durability, but p99 latency rises with storage jitter. A service that waits for both local durability and replica acknowledgment shrinks the failover loss window further, but it now depends on replica lag, election rules, and fencing to avoid split brain. None of these is universally correct; the right choice depends on whether the product can tolerate a few milliseconds of extra latency more easily than it can tolerate replay gaps.</p>
+<p>Snapshot cadence has its own trade-off. Frequent snapshots reduce replay time and make failover calmer, but they add I/O load and serialization cost while the system is already busy. Sparse snapshots minimize background work, but replay becomes long and promotion can stall under pressure. The operational answer is to measure the boundary directly. <code>PayLedger</code> watches <code>wal_flush_p99_ms</code>, <code>replay_seconds</code>, <code>snapshot_age_seconds</code>, <code>replica_apply_lag</code>, and the share of traffic carried by the busiest shard. Those metrics reveal whether the next problem is storage durability, recovery time, or emerging shard hotspots.</p>
+<p>The important design consequence is that an in-memory system with durable backing is not "memory plus some backups." It is a state machine with three carefully chosen artifacts: a log for order, a snapshot for restart time, and a replication boundary for failover semantics. Once those are explicit, performance tuning becomes honest because the team can say exactly what is being traded away and what is being protected.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"If there is a database somewhere else, this layer is only a cache."</strong> That stops being true the moment the API returns success before another store has committed the same decision. Pick one authoritative write path, then make the acknowledgment point explicit.</li>
+<li><strong>"Snapshots are enough for durability."</strong> Snapshots cap replay time; they do not protect the interval between the last snapshot and the crash. Without a WAL or append-only command log, recent acknowledged changes disappear.</li>
+<li><strong>"Replica acknowledgment means zero data loss."</strong> Only if the replica has persisted the record it acknowledged and the failover process fences the old leader. Replica traffic without promotion rules is not a durability guarantee.</li>
+<li><strong>"Recovery time is mostly a hardware problem."</strong> Faster disks help, but replay time is dominated by snapshot cadence, log size, and whether the recovery path can trust checksummed bytes without manual repair.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="021.html">021.md</a> established why logs and snapshots need checksums and corruption handling; this lesson depends on that because recovery is only useful when the replay substrate is trustworthy.</li>
+<li>This lesson is the data-platform version of replicated state machines: one ordered command stream drives an in-memory state view and a durable recovery path at the same time.</li>
+<li><a href="023.md">023.md</a> is the next operational problem. Once memory-first state is partitioned by key, a handful of very busy merchants can saturate one shard's CPU, memory, and replica bandwidth.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the chapters on logs, storage engines, and stream processing together; they explain why ordered replay is the core abstraction behind durable state.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Redis Persistence</a><ul>
+<li>Focus: Compare RDB snapshots and AOF logging as two different recovery tools rather than two interchangeable "durability features."</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://redis.io/commands/wait/">Redis <code>WAIT</code> Command</a><ul>
+<li>Focus: Use it to think about what replica acknowledgment can and cannot promise after the primary has already accepted a write.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-intro.html">PostgreSQL Write-Ahead Logging (WAL)</a><ul>
+<li>Focus: The storage engine is different, but the idea is the same: make durable ordering explicit before treating an update as committed.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/op-guide/recovery/">etcd Disaster Recovery</a><ul>
+<li>Focus: Pay attention to how snapshots, logs, and restoration procedures combine into a concrete recovery contract rather than a vague backup story.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>The durability promise is the acknowledgment point.</strong> "Eventually written somewhere" is not a correctness contract.</li>
+<li><strong>Logs, snapshots, and replicas do different jobs.</strong> Logs preserve order, snapshots cap recovery time, and replicas shape the failover loss envelope.</li>
+<li><strong>Group commit is a trade-off knob, not a magic trick.</strong> It buys latency efficiency by batching durability work, but the batch boundary defines the crash window.</li>
+<li><strong>Once the mechanism is explicit, the next bottleneck is often skew.</strong> Fast in-memory shards expose hotspot problems that were previously hidden by slower storage.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="021.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Compression, Checksums, and Corruption Handling</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

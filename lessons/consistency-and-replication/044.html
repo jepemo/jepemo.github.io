@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Multi-Leader Replication and Conflict Classes - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Multi-Leader Replication and Conflict Classes</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          044
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">044</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 473: Multi-Leader Replication and Conflict Classes</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Multi-leader replication is only safe when every write type is assigned a conflict class, because the replication layer can detect concurrent writes but it cannot invent the right business rule for merging them.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="043.html">043.md</a>, Harbor Point kept reservation shard <code>184</code> behind one leader in Maryland. That made the answer to "who assigns write order?" simple: <code>md-db-4</code> did. Now Harbor Point wants travel agencies in Lisbon to confirm bookings locally even when the Atlantic link is slow, so it adds <code>lis-db-2</code> as a second writable leader for the same reservation data. Latency improves for European agents, but the old safety argument disappears the moment both regions can accept writes before they have seen each other's latest state.</p>
+<p>The non-obvious insight is that multi-leader replication is not one mechanism. It is several different mechanisms hidden under one topology. "Append a staff note to reservation <code>R-8821</code>" is a very different problem from "assign cabin <code>C14</code> to one customer" or "capture the payment for reservation <code>R-8821</code>." The first can often be merged safely. The second represents a uniqueness invariant. The third escapes the database entirely because a credit card charge cannot be "un-applied" by replaying a row winner. If all three operations share one generic policy such as last-write-wins, the system may look healthy while it is silently discarding intent or duplicating side effects.</p>
+<p>That is why conflict classes matter more than the slogan "active-active." A conflict class says what kind of invariant a write threatens, how concurrency is detected, and what the system is allowed to do when two leaders race. Once Harbor Point names those classes explicitly, it can keep low-latency multi-region writes for the operations that are mergeable and reserve stricter coordination for the ones that would otherwise double-book cabins or charge customers twice.</p>
+<h2>Why This Matters</h2>
+<p>Teams reach for multi-leader replication because the pressure is real: regional write latency drops, one region can keep taking writes during an inter-region outage, and local operations stop depending on a faraway leader election. Those benefits are valuable, especially for a booking product that serves agencies on both sides of the Atlantic. The trade-off is that write conflicts stop being an occasional anomaly and become part of the steady-state design.</p>
+<p>For Harbor Point, the dangerous failure is not "the databases disagree for a few seconds." The dangerous failure is that different kinds of disagreement have different blast radii. Losing a staff note is annoying. Letting two leaders independently reserve cabin <code>C14</code> for different travelers is revenue loss and customer trust damage. Capturing the same card twice is a financial incident. Multi-leader replication becomes production-ready only when the replication topology is paired with an explicit map of which write classes may merge, which must be rejected, and which must stay single-writer despite the multi-region deployment.</p>
+<p>That classification changes architecture decisions immediately. The team no longer asks, "Should this database be active-active?" It asks, "Which write paths are commutative enough for active-active, which need conflict detection with retries, and which still require one home region or a synchronous coordination step?" That is a much more operational question, and it leads to a system that exposes its correctness boundary instead of hoping replication eventually smooths everything over.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Define conflict classes in terms of invariants</strong> - Distinguish mergeable updates from uniqueness conflicts and external side-effect conflicts.</li>
+<li><strong>Trace how multi-leader systems detect concurrency</strong> - Explain how two leaders discover that they accepted incompatible writes before replication converged.</li>
+<li><strong>Choose where multi-leader belongs and where it does not</strong> - Use conflict classes to decide when active-active replication is worth the operational trade-off.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: Conflict classes are about business invariants, not just row differences</h3>
+<p>Harbor Point's Lisbon leader and Maryland leader both store reservation records, but not every field in those records has the same semantics. If a Lisbon agent appends "customer requested late check-in" while Maryland appends "customer prefers deck-side cabin," both updates can coexist. If Lisbon marks cabin <code>C14</code> reserved for Bruno while Maryland marks the same cabin reserved for Alicia, the rows may look superficially similar, but the invariant is completely different: only one active reservation may own that cabin at a time.</p>
+<p>That distinction is why mature multi-leader designs classify writes before they worry about timestamps or replica lag. A useful classification for Harbor Point looks like this:</p>
+<table>
+<thead>
+<tr>
+<th>Conflict class</th>
+<th>Harbor Point example</th>
+<th>What makes it safe or unsafe</th>
+<th>Typical response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Commutative or append-only</td>
+<td>Add a reservation note, append an audit event, increment loyalty points with an operation ID</td>
+<td>Operations can be replayed in any order if duplicates are suppressed</td>
+<td>Merge automatically</td>
+</tr>
+<tr>
+<td>Same-record overwrite</td>
+<td>Update guest phone number, switch reservation status from <code>pending</code> to <code>confirmed</code></td>
+<td>Two leaders may both write a new value for one field</td>
+<td>Use version checks, deterministic winner rules, or send to repair workflow</td>
+</tr>
+<tr>
+<td>Cross-record constraint</td>
+<td>Reserve cabin <code>C14</code>, assign a unique voucher code, enforce one active booking per cabin-night</td>
+<td>The invariant spans more than one field or row</td>
+<td>Avoid unconstrained active-active; use one home writer, certification, or synchronous coordination</td>
+</tr>
+<tr>
+<td>External side effect</td>
+<td>Capture payment, send supplier confirmation, issue refund</td>
+<td>The effect already happened outside the replica set</td>
+<td>Require idempotency keys, outbox processing, and compensating actions</td>
+</tr>
+</tbody>
+</table>
+<p>The production consequence is that "conflict resolution" is not one setting. Conflict class tells you whether a conflict may be merged, whether it must be rejected, or whether it should never have been allowed to race across leaders in the first place. If Harbor Point tries to make cabin allocation behave like note appends, it is not simplifying the design. It is lying about the invariant.</p>
+<h3>Concept 2: Replication can detect concurrency, but detection is not the same as safe resolution</h3>
+<p>Once Harbor Point has two writable leaders, each leader accepts a local transaction, stamps it with some concurrency metadata, and ships it to the other region. The metadata varies by system: some use origin timestamps, some use vector clocks or Lamport-like versions, and some use write-set certification to check whether concurrent transactions touched the same keys. The core question is always the same: did one write happen after observing the other, or did both leaders act independently?</p>
+<p>Suppose the system sees this timeline:</p>
+<div class="codehilite"><pre><span></span><code>09:01:03 md-db-4  accepts reserve(C14, Alicia)   version = md:881
+09:01:05 lis-db-2 accepts reserve(C14, Bruno)    version = lis:417
+09:01:07 link heals; both updates replicate
+09:01:07 each leader sees the remote write as concurrent, not ancestral
+</code></pre></div>
+
+<p>At that point the replication layer has done something important but limited. It has proven the conflict is real. It has not proven what "correct" means. If Harbor Point applies last-write-wins by wall clock, one customer silently loses the cabin. If it keeps both rows and hopes downstream reconciliation will sort it out, availability looks good right until check-in time. If it uses write-set certification and rejects whichever transaction loses certification, the user in one region gets a retry instead of silent corruption. Those outcomes are not database trivia. They are product semantics expressed as replication policy.</p>
+<p>A simplified handler makes the separation clear:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">reconcile</span><span class="p">(</span><span class="n">local_txn</span><span class="p">,</span> <span class="n">remote_txn</span><span class="p">,</span> <span class="n">conflict_class</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">conflict_class</span> <span class="o">==</span> <span class="s2">&quot;commutative&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">merge_operations</span><span class="p">(</span><span class="n">local_txn</span><span class="p">,</span> <span class="n">remote_txn</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">conflict_class</span> <span class="o">==</span> <span class="s2">&quot;overwrite&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">choose_winner_and_record_loser</span><span class="p">(</span><span class="n">local_txn</span><span class="p">,</span> <span class="n">remote_txn</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">conflict_class</span> <span class="o">==</span> <span class="s2">&quot;constraint&quot;</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">RetryOrReject</span><span class="p">(</span><span class="s2">&quot;requires single-owner or certified commit&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">conflict_class</span> <span class="o">==</span> <span class="s2">&quot;external_side_effect&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">run_compensation_workflow</span><span class="p">(</span><span class="n">local_txn</span><span class="p">,</span> <span class="n">remote_txn</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The trade-off is visible here. The more classes Harbor Point allows into true multi-leader mode, the lower its regional write latency can be during normal operation. The more it relies on certification, retries, or manual repair for those classes, the more it shifts cost onto application design, operator tooling, and user-facing retry paths. Multi-leader systems succeed when that cost is intentional instead of accidental.</p>
+<h3>Concept 3: Production designs narrow active-active scope instead of making everything writable everywhere</h3>
+<p>After classifying its writes, Harbor Point does not actually keep one uniform policy for the whole reservation domain. It chooses different write envelopes for different conflict classes:</p>
+<ul>
+<li>Reservation notes, audit events, and agency comments stay active-active because they are append-only and easy to deduplicate.</li>
+<li>Customer profile edits remain multi-leader, but only with per-field version checks and a visible repair queue when two agents change the same field concurrently.</li>
+<li>Cabin availability and confirmed reservations move back to a single home region per sailing, because the uniqueness invariant is more important than shaving a few milliseconds off every write.</li>
+<li>Payment capture leaves the database write path entirely and goes through an idempotent outbox-driven workflow so region failover cannot charge twice.</li>
+</ul>
+<p>This is the practical lesson most teams miss. Multi-leader replication is rarely a binary property of a whole product. It is a selective capability granted only to the operations whose conflict class has a safe merge or retry story. Systems that try to make every row active-active often rediscover, painfully, that some invariants are coordination problems no matter how elegant the replication layer looks.</p>
+<p>That selective approach also prepares the next design question. Once you accept that not every operation wants a single leader but not every operation can tolerate unconstrained concurrency, the next step is to reason about how read and write quorums bound visibility and staleness. That is exactly where <a href="045.html">045.md</a> picks up.</p>
+<h2>Troubleshooting</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: Last-write-wins appears to "solve" reservation conflicts, but customers report disappearing bookings.</p>
+<ul>
+<li><strong>Why it happens</strong>: The policy resolved storage divergence without preserving the business invariant that one accepted booking must produce one durable customer-visible outcome.</li>
+<li><strong>Clarification / Fix</strong>: Treat cabin assignment as a constraint conflict, not an overwrite conflict. Use certification, a home writer, or synchronous coordination instead of timestamp winners.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Conflict rates spike during an inter-region link flap, even for operations that should have been safe.</p>
+<ul>
+<li><strong>Why it happens</strong>: The system is classifying too broadly, so append-only operations and true invariant conflicts are sharing one expensive reconciliation path.</li>
+<li><strong>Clarification / Fix</strong>: Split write classes explicitly. Deduplicate append-only events by operation ID and keep stricter conflict handling only for writes that can violate invariants.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Operators can reconcile the database state after recovery, but duplicate charges or duplicate supplier notifications still happened.</p>
+<ul>
+<li><strong>Why it happens</strong>: External side effects escaped before conflict resolution completed, so database convergence did not rewind the real-world action.</li>
+<li><strong>Clarification / Fix</strong>: Put side effects behind idempotency keys and outbox processing. Reconcile state first, then run compensation or replay logic intentionally.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Support sees "please retry" errors far more often after enabling active-active writes.</p>
+<ul>
+<li><strong>Why it happens</strong>: The database is correctly rejecting certified conflicts, but the product path has no retry budget or user-facing fallback.</li>
+<li><strong>Clarification / Fix</strong>: Measure conflict rate per class, not just cluster-wide. If a path cannot tolerate retries, it may not belong in multi-leader mode.</li>
+</ul>
+</li>
+</ul>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="043.html">043.md</a> removed many of these problems by centralizing order in one leader</h3>
+<p>Leader-based replication avoided most reservation conflicts because one process assigned the shard's write order. Multi-leader replication deliberately gives up that single sequencer, so conflict classes become the replacement tool for expressing which concurrent writes are acceptable and which are not.</p>
+<h3>Connection 2: <a href="045.html">045.md</a> approaches concurrent writes through quorum overlap instead of multiple leaders</h3>
+<p>The next lesson studies leaderless replication and quorum math. That model changes the coordination mechanism, but it does not remove the need to understand conflict classes; it simply shifts the question from "which leader accepted the write?" to "which replicas overlap enough to make a read or write meaningful?"</p>
+<h3>Connection 3: CRDT-style data types solve only the mergeable end of the problem space</h3>
+<p>Counters, sets, and append-only logs can often be designed so concurrent updates converge automatically. Cabin exclusivity and payment capture are different because they encode one-winner or external-side-effect semantics, which CRDT-style convergence alone does not make safe.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the multi-leader replication chapter with attention to why write conflicts are application-specific rather than purely storage-specific.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://dl.acm.org/doi/10.1145/224056.224070">Managing Update Conflicts in Bayou, a Weakly Connected Replicated Storage System</a><ul>
+<li>Focus: Notice how Bayou separates conflict detection from application-specific merge procedures and dependency checks.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.couchdb.org/en/stable/replication/conflicts.html">Apache CouchDB Documentation: Conflicts</a><ul>
+<li>Focus: See how an eventually replicated store exposes document conflicts explicitly instead of pretending a generic merge rule fits every workload.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/group-replication-conflicts.html">MySQL 8.0 Reference Manual: Group Replication Conflict Detection and Resolution</a><ul>
+<li>Focus: Map write-set certification to the idea that some concurrent transactions should be rejected rather than merged silently.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Conflict classes describe invariants, not just data shapes</strong> - Two writes can touch similar rows while demanding completely different safety rules.</li>
+<li><strong>Concurrency detection is necessary but insufficient</strong> - A database can prove two leaders raced without knowing whether to merge, reject, or compensate.</li>
+<li><strong>Selective active-active beats universal active-active</strong> - Multi-leader replication is strongest when only mergeable or retry-tolerant write paths use it.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="043.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Leader-Based Replication Mechanics</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="045.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Leaderless Replication and Quorum Math</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Consistency Spectrum and API Semantics - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Consistency Spectrum and API Semantics</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          048
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">048</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 477: Consistency Spectrum and API Semantics</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A consistency model matters only when an API states what a caller may observe after a write, because the real trade-off is coordination cost versus which anomalies the product is willing to expose.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="047.html">047.md</a>, Harbor Point taught its reservation store how to resolve concurrent branches of hold <code>H-8821</code>. That still left support with a harder question. After a Lisbon agent extends the hold, which screen is allowed to show the old expiry time? Can the search grid lag for a second? Can the itinerary page lag after payment succeeds? Can the final booking confirmation ever lag? Those are not storage-engine questions by themselves. They are API questions.</p>
+<p>At <code>14:05:02</code>, <code>POST /holds/H-8821/extend</code> succeeds and returns version <code>918447</code>. A follow-up <code>GET /search/cabins?route=BCN-JFK</code> can tolerate a slightly stale answer because search is advisory and the booking flow revalidates inventory before commit. A follow-up <code>GET /holds/H-8821</code> for the same agent cannot safely return version <code>918442</code> without making the UI look broken. A follow-up <code>POST /bookings/confirm</code> is stricter still: it must not tell two regions that cabin <code>C14</code> is theirs just because replicas have not converged yet.</p>
+<p>The non-obvious insight is that "eventually consistent" is not a user-facing contract. It says replicas will converge at some point, but it does not tell a caller whether they will see their own write, whether reads can move backward, or whether a confirmation response represents a globally decisive check. If the API does not define those semantics explicitly, every client quietly assumes the strongest promise and discovers the weaker reality in production.</p>
+<h2>Why This Matters</h2>
+<p>By the time a system reaches Harbor Point's scale, one database label is not enough. The same replicated data set often serves at least four different jobs: browse availability quickly, show an agent the hold they just changed, sequence related side effects such as booking plus itinerary publication, and enforce a no-double-booking invariant. Treating all of those as "the consistency level of the database" forces one of two bad outcomes. Either every path pays the cost of the strongest guarantee, or some path silently inherits a weaker guarantee than the product can actually survive.</p>
+<p>Making API semantics explicit fixes that. Search can declare bounded staleness. Session-bound views can promise read-your-write and monotonic reads. Cross-service workflows can preserve causality so that if the customer sees "payment succeeded," the trip page cannot omit the booking event that caused it. Final confirmation can use linearizable or transactional coordination and admit that it may be slower or temporarily unavailable during quorum loss. The trade-off becomes visible: stronger guarantees spend coordination budget, while weaker guarantees spend anomaly budget and require compensation logic.</p>
+<p>This matters operationally because incidents rarely say "the system violated causal consistency." They show up as "I just extended the hold and the screen moved backward," "the email confirmation arrived before the itinerary page updated," or "two agents both thought cabin <code>C14</code> was still free." Good API semantics turn those complaints into designed behaviors or clear bugs instead of surprises.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Start with the user promise, not the storage slogan</h3>
+<p>Harbor Point writes down the contract for each API surface instead of assigning one adjective to the whole platform:</p>
+<table>
+<thead>
+<tr>
+<th>API surface</th>
+<th>Consistency contract</th>
+<th>What the caller is allowed to assume</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /search/cabins</code></td>
+<td>Bounded staleness up to <code>2s</code></td>
+<td>Results may lag slightly, but the booking flow will revalidate before committing</td>
+</tr>
+<tr>
+<td><code>GET /holds/H-8821</code> after the same agent wrote to it</td>
+<td>Read-your-write plus monotonic reads</td>
+<td>Once the agent sees version <code>918447</code>, later reads in that session cannot go backward</td>
+</tr>
+<tr>
+<td><code>GET /customer-trips</code> immediately after payment success</td>
+<td>Causal consistency across booking and trip projection</td>
+<td>If the caller has observed the payment-confirmed event, the trip view must include effects caused by that event</td>
+</tr>
+<tr>
+<td><code>POST /bookings/confirm</code></td>
+<td>Linearizable check-and-commit on inventory ownership</td>
+<td>The success response means Harbor Point has definitively assigned the cabin, not merely queued an eventual reconciliation</td>
+</tr>
+</tbody>
+</table>
+<p>This is the spectrum in practice. Eventual consistency is the weakest meaningful end of it: the system converges eventually, but the caller gets no bound and no session guarantee. Bounded staleness adds a limit on how old the answer may be. Session guarantees such as read-your-write and monotonic reads narrow the anomalies one caller can observe. Causal consistency preserves order for related actions across services. Linearizability makes a single operation look as if it happened at one globally agreed point in time. If Harbor Point ever needs a multi-row invariant such as "confirm cabin and decrement upgrade inventory atomically," it may need a transaction boundary stronger than a linearizable single-key read.</p>
+<p>The important point is that these are not academic labels to paste into docs. Each one answers a different product question. "Can the agent trust the hold details page right after editing?" is a session-guarantee question. "Can payment success race ahead of the itinerary projection?" is a causal-consistency question. "Can two regions both commit the same cabin?" is a linearizability or transaction-boundary question.</p>
+<h3>Part 2: The API needs mechanism, not just terminology</h3>
+<p>Once Harbor Point defines the contracts, each one needs an implementation path.</p>
+<p>For the hold-details endpoint, the server returns a session token with the successful write:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;hold_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;H-8821&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">918447</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;session_observed&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;holds&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">918447</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Later reads carry that observed version implicitly in the agent session or explicitly in a header. The read router chooses a replica only if two conditions are true:</p>
+<ol>
+<li>the replica is fresh enough for the endpoint's staleness budget, and</li>
+<li>the replica has applied at least version <code>918447</code>.</li>
+</ol>
+<p>If no nearby replica qualifies, the server must route to a fresher replica or leader. Silently serving an older version would violate the API's advertised semantics even if the database itself is healthy.</p>
+<p>For the trip view, Harbor Point does something slightly different. The itinerary page is built from a projection service fed by booking events. After <code>POST /bookings/confirm</code> succeeds, the response includes a dependency token representing the confirmed booking event. When the customer immediately requests <code>GET /customer-trips</code>, the gateway waits until the projection has applied that dependency or routes the request to a view that has. That is causal consistency operationalized: effects must not appear before their causes, and a caller who has already observed the cause must not be sent to a read model that predates it.</p>
+<p>Final confirmation uses the strongest path. Harbor Point performs a conditionally guarded write against the authoritative inventory shard:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">confirm_booking</span><span class="p">(</span><span class="n">cabin_id</span><span class="p">,</span> <span class="n">hold_id</span><span class="p">,</span> <span class="n">payment_id</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">linearizable_transaction</span><span class="p">(</span>
+        <span class="n">read_key</span><span class="o">=</span><span class="p">(</span><span class="s2">&quot;inventory&quot;</span><span class="p">,</span> <span class="n">cabin_id</span><span class="p">),</span>
+        <span class="n">assert_predicate</span><span class="o">=</span><span class="k">lambda</span> <span class="n">row</span><span class="p">:</span> <span class="n">row</span><span class="o">.</span><span class="n">hold_id</span> <span class="o">==</span> <span class="n">hold_id</span> <span class="ow">and</span> <span class="n">row</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;held&quot;</span><span class="p">,</span>
+        <span class="n">writes</span><span class="o">=</span><span class="p">[</span>
+            <span class="p">(</span><span class="s2">&quot;inventory&quot;</span><span class="p">,</span> <span class="n">cabin_id</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;booked&quot;</span><span class="p">,</span> <span class="s2">&quot;booking_payment&quot;</span><span class="p">:</span> <span class="n">payment_id</span><span class="p">}),</span>
+            <span class="p">(</span><span class="s2">&quot;bookings&quot;</span><span class="p">,</span> <span class="n">hold_id</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;confirmed&quot;</span><span class="p">}),</span>
+        <span class="p">],</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<p>That flow is slower and less available during quorum loss than a nearby stale read, but it buys the semantic guarantee Harbor Point needs: a success response means the cabin is no longer merely "likely booked once replicas catch up." It is booked.</p>
+<p>Mechanism is why API semantics must be scoped endpoint by endpoint. The same replicated storage layer can support multiple contracts, but only if routing, tokens, retries, and write paths enforce the right one each time.</p>
+<h3>Part 3: Weakening or strengthening semantics must be explicit</h3>
+<p>The easiest way to break trust is to promise one consistency level and quietly deliver another under stress. Harbor Point therefore makes degradation rules part of the API design:</p>
+<ul>
+<li>If <code>GET /search/cabins</code> has no replica inside the <code>2s</code> budget, it can either pay more latency for a fresher read or return a response marked as temporarily unavailable. It may not claim "up-to-date results" while serving older data.</li>
+<li>If <code>GET /holds/H-8821</code> cannot satisfy the session token from a nearby replica, it falls back to the home region. It does not drop the token and hope the agent will not notice.</li>
+<li>If <code>GET /customer-trips</code> cannot satisfy the dependency token yet, the system returns a <code>202 Accepted</code> style "still materializing" state instead of rendering an itinerary that contradicts the confirmation the customer already saw.</li>
+<li>If <code>POST /bookings/confirm</code> cannot get the coordination it needs, it should fail or time out explicitly. Quietly downgrading to an eventually consistent write would convert an availability problem into a correctness incident.</li>
+</ul>
+<p>This is where API semantics shape client code. Stronger contracts often need extra metadata such as <code>ETag</code>, observed-version tokens, or explicit pending states. Weaker contracts need compensating product behavior such as revalidation before commit, freshness indicators, or UI copy that frames a view as advisory. The trade-off is not only infrastructure cost. It is also how much uncertainty the product and client code must absorb.</p>
+<p>These choices are also the bridge to partitioning. In <a href="049.html">049.md</a>, Harbor Point will split data across shards. Once that happens, the cost of a strong guarantee depends heavily on whether the operation stays inside one shard or spans several. The API contracts defined here are the reason shard-key design matters in the next lesson.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Our database offers strong consistency, so every endpoint built on it is effectively strong as well."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Vendor terminology sounds global and authoritative.</li>
+<li><strong>Corrective mental model</strong>: Caches, projections, async consumers, and read-routing policy can weaken the end-to-end contract long before the data reaches the caller.</li>
+<li><strong>Operational fix</strong>: Document consistency per endpoint and test the full request path, not just the storage engine in isolation.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Eventual consistency is acceptable if the system usually converges quickly."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Median lag looks small, so teams assume users will not notice.</li>
+<li><strong>Corrective mental model</strong>: Fast convergence does not tell a caller what they may observe right after a write or during failover; missing semantics are still missing even when the common case is fast.</li>
+<li><strong>Operational fix</strong>: Replace vague "eventual" wording with a bounded staleness figure, a session guarantee, or an explicit "pending" state.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Read-your-write on one endpoint automatically gives us causal behavior everywhere."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Both ideas feel like "the user sees what they just did."</li>
+<li><strong>Corrective mental model</strong>: Session guarantees protect one caller's sequence of reads; causal consistency protects related events across services and projections.</li>
+<li><strong>Operational fix</strong>: Propagate dependency tokens or equivalent metadata across service boundaries when one response causes the next read.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "If linearizable confirmation is expensive, we can confirm optimistically and repair duplicates later."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Availability improves immediately and the happy path looks faster.</li>
+<li><strong>Corrective mental model</strong>: Some invariants, such as one cabin sold to one party, are not safely recoverable after the fact without refunds, legal exposure, and trust damage.</li>
+<li><strong>Operational fix</strong>: Keep decisive operations on the strongest path their invariant requires, and move lower-value reads to weaker contracts instead of weakening the invariant itself.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="046.html">046.md</a> gave Harbor Point a way to talk about bounded staleness</h3>
+<p>Lag budgets turned replica freshness into an explicit number. This lesson widens that idea into a full API contract: freshness bounds are only one point on the spectrum.</p>
+<h3>Connection 2: <a href="047.html">047.md</a> showed what happens when semantics are too weak for the write path</h3>
+<p>Conflict resolution exists because the system accepted concurrent branches. API semantics decide when that is an acceptable choice, when a client must retry, and when the operation must take a stronger path up front.</p>
+<h3>Connection 3: <a href="049.html">049.md</a> will make these contracts more expensive or cheaper depending on shard boundaries</h3>
+<p>Once data is partitioned, "strong enough" can no longer be discussed without asking whether the relevant read or write stays on one shard or fans out across many.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the chapters on consistency models, linearizability, and transactions with attention to what clients can and cannot assume after a write.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://vldb.org/pvldb/vol5/p776_peterbailis_vldb2012.pdf">Probabilistically Bounded Staleness for Practical Partial Quorums</a><ul>
+<li>Focus: Use this to connect bounded-staleness claims to measurable time and version lag instead of vague "eventual" language.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html">Amazon DynamoDB Developer Guide: Read Consistency</a><ul>
+<li>Focus: Compare eventually consistent and strongly consistent reads as an example of how a database exposes different API-facing semantics for the same data.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a><ul>
+<li>Focus: Pay attention to externally consistent transactions and why stronger guarantees require tighter coordination across replicas and time.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>A consistency model becomes useful only when the API says what a successful write lets the caller observe next.</li>
+<li>Different endpoints over the same replicated data can legitimately need different guarantees, from bounded staleness to causal consistency to linearizable confirmation.</li>
+<li>Tokens, routing rules, and explicit fallback behavior are the mechanisms that turn consistency vocabulary into an enforceable contract.</li>
+<li>The stronger the guarantee, the more coordination cost you pay, which is why the next step is designing shard boundaries that keep expensive guarantees local.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="047.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Conflict Resolution Policies in Distributed Stores</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="049.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Partitioning Fundamentals and Shard Keys</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

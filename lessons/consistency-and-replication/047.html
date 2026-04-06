@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Conflict Resolution Policies in Distributed Stores - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Conflict Resolution Policies in Distributed Stores</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          047
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">047</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 476: Conflict Resolution Policies in Distributed Stores</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Once a distributed store accepts concurrent writes, conflict resolution is no longer storage plumbing; it is the rule that decides which user intent survives, which intent is merged, and which must be rejected.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="046.html">046.md</a>, Harbor Point gave its Lisbon sales desk permission to read slightly stale cabin-hold data because search results could tolerate a small freshness budget. That decision pays off in latency, but it creates a follow-on problem the team cannot dodge. At <code>14:04:52</code>, a Lisbon agent extends hold <code>H-8821</code> on cabin <code>C14</code> from <code>14:10</code> to <code>14:15</code> because the customer is still on the phone. At <code>14:04:53</code>, the Baltimore payment service turns that same hold into confirmed booking <code>B-3107</code> after the card authorization clears. Both writes start from version <code>18</code> of the hold record because neither region has seen the other's update yet.</p>
+<p>When the replicas reconcile, they do not have "one newer value and one older value." They have two children of the same parent:</p>
+<div class="codehilite"><pre><span></span><code>v18  status=active, expires_at=14:10
+|- v19-lis  status=active, expires_at=14:15
+\- v19-iad  status=confirmed, booking_id=B-3107
+</code></pre></div>
+
+<p>That is the non-obvious insight: a conflict is not merely two replicas disagreeing. A conflict is the system admitting two writes that neither causally supersedes the other. From that moment on, "last write wins" is not a neutral cleanup step. It is a product decision to let timestamp order decide whether Harbor Point keeps a confirmed booking or silently falls back to an extended hold.</p>
+<p>Teams get hurt when they treat conflict resolution as an implementation detail hidden inside the database. The policy leaks straight into support load, compensation workflows, and customer trust. If the policy is wrong, the database will still converge, but it will converge to the wrong truth.</p>
+<h2>Why This Matters</h2>
+<p>Distributed stores accumulate conflicts anywhere coordination is relaxed: multi-leader replication, leaderless quorums, offline clients, CDC-fed materializations, and even async workflows that write back into the same entity from different regions. The store must eventually choose among three broad outcomes: keep one version, merge versions, or surface the conflict to a higher layer. Each option spends a different trade-off budget across latency, availability, and semantic safety.</p>
+<p>Harbor Point's hold record makes the pressure visible. Some fields can be overwritten cheaply. An agent's draft note or a UI preference can often tolerate a last-writer-wins rule because losing one intermediate value does not break the booking system. A payment-backed state transition cannot. If a conflict policy lets a later timestamp erase <code>status=confirmed</code>, the database has preserved convergence while destroying revenue and auditability.</p>
+<p>The production consequence is that conflict policy must be designed from invariants outward. Ask what property has to remain true after replicas diverge and heal. If the answer is "there can be only one confirmed owner of cabin <code>C14</code>," then a generic merge rule is not enough. If the answer is "combine the set of sales channels that touched this hold," a merge may be perfect. The important step is making that choice explicit before the incident makes it for you.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Detect concurrency before trying to resolve it</h3>
+<p>A store cannot resolve a conflict correctly if it cannot distinguish "stale write arrived late" from "two writes were concurrent." Harbor Point attaches revision metadata to each hold update. In a single-leader system, the metadata might be a log position. In a multi-leader or occasionally disconnected system, it is usually some per-entity ancestry marker such as a revision tree, vector-clock-style version, or origin-plus-counter pair that lets the store compare descendants.</p>
+<p>The comparison rule is simple:</p>
+<ul>
+<li>If the incoming version descends from the current one, the incoming write is the new truth.</li>
+<li>If the current version descends from the incoming one, the incoming write is stale and should not overwrite the newer state.</li>
+<li>If neither descends from the other, the writes are concurrent and the conflict policy must run.</li>
+</ul>
+<p>That logic looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">classify</span><span class="p">(</span><span class="n">local_version</span><span class="p">,</span> <span class="n">incoming_version</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">incoming_version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">local_version</span><span class="p">):</span>
+        <span class="k">return</span> <span class="s2">&quot;incoming-wins&quot;</span>
+    <span class="k">if</span> <span class="n">local_version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">incoming_version</span><span class="p">):</span>
+        <span class="k">return</span> <span class="s2">&quot;stale-write&quot;</span>
+    <span class="k">return</span> <span class="s2">&quot;concurrent-conflict&quot;</span>
+</code></pre></div>
+
+<p>The key point is that timestamps alone do not answer this question. Two clocks can disagree, and even perfectly synchronized clocks only tell you when an update was stamped, not whether one writer had seen the other writer's result. Harbor Point can use timestamps as one input to a resolver, but not as its entire notion of causality.</p>
+<p>This detection step matters because each downstream policy assumes different information. Last-writer-wins assumes a total order exists, even if it is synthetic. Merge functions assume the entity can be decomposed into fields or operations that combine safely. Rejection assumes the application can make progress by retrying from a newer version. If concurrency is misclassified, the store applies the wrong semantics before anyone sees the mistake.</p>
+<h3>Part 2: Match the resolution policy to the invariant, not to convenience</h3>
+<p>Harbor Point eventually uses three different policies inside the same reservation domain because the data does not all mean the same thing:</p>
+<table>
+<thead>
+<tr>
+<th>Data shape</th>
+<th>Policy</th>
+<th>Why it fits</th>
+<th>Where it fails</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent draft note on a hold</td>
+<td>Last-writer-wins</td>
+<td>The note is replaceable text, and losing an older draft is acceptable</td>
+<td>It is unsafe for payment or inventory state</td>
+</tr>
+<tr>
+<td>Set of agencies that touched the hold</td>
+<td>Merge by set union</td>
+<td>Membership is additive, so combining both branches preserves meaning</td>
+<td>It would be wrong for a single-valued field such as cabin owner</td>
+</tr>
+<tr>
+<td>Hold lifecycle state: <code>active</code>, <code>released</code>, <code>confirmed</code></td>
+<td>Domain-specific resolver with rejection paths</td>
+<td>The meaning depends on a state machine and side effects such as payment capture</td>
+<td>It requires more code, more tests, and sometimes a manual or retried path</td>
+</tr>
+</tbody>
+</table>
+<p>For hold <code>H-8821</code>, Harbor Point encodes the lifecycle rule directly:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">resolve_hold</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">left</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">right</span><span class="o">.</span><span class="n">version</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">left</span>
+    <span class="k">if</span> <span class="n">right</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">left</span><span class="o">.</span><span class="n">version</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">right</span>
+
+    <span class="n">states</span> <span class="o">=</span> <span class="p">{</span><span class="n">left</span><span class="o">.</span><span class="n">status</span><span class="p">,</span> <span class="n">right</span><span class="o">.</span><span class="n">status</span><span class="p">}</span>
+
+    <span class="k">if</span> <span class="s2">&quot;confirmed&quot;</span> <span class="ow">in</span> <span class="n">states</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">choose_confirmed_branch</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">left</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="n">right</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;active&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">branch_with_later_expiry</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">ConflictRequiresRetry</span><span class="p">([</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">])</span>
+</code></pre></div>
+
+<p>The important detail is not the exact function names. It is the semantic precedence:</p>
+<ul>
+<li><code>confirmed</code> is an absorbing state because Harbor Point has already captured payment and issued booking <code>B-3107</code>.</li>
+<li>Two concurrent <code>active</code> extensions can be merged by taking the later expiry only because both branches represent the same hold identity and the business rule allows a monotonic extension.</li>
+<li>Some combinations are not merged at all. If one branch says <code>released</code> and another says <code>active</code>, Harbor Point forces a retry or review because blindly choosing one branch could reopen a hold that another workflow intentionally ended.</li>
+</ul>
+<p>This is why last-writer-wins is often too blunt. It answers every conflict with "pick one timestamp," even when the real question is "which state transition is legally allowed after payment, release, or expiry?" A merge function can be equally dangerous if it combines fields that look composable but break the entity-level invariant. For example, taking the max of two <code>expires_at</code> values is only safe when both branches refer to the same hold and no other process has already consumed the cabin.</p>
+<h3>Part 3: Resolution policy changes APIs and operations</h3>
+<p>Conflict resolution does not stop at storage internals. It changes what the API is allowed to promise. Harbor Point exposes three write styles to make the policy visible:</p>
+<ul>
+<li>Blind overwrite endpoints are reserved for replaceable fields such as internal notes. They behave like last-writer-wins and say so clearly.</li>
+<li>Conditional writes require an <code>If-Match</code> revision for lifecycle changes. If the caller writes against version <code>18</code> but the system has already advanced to a concurrent branch, the API rejects the request and forces the client to refetch.</li>
+<li>Merge-aware commands exist only where Harbor Point has a tested domain merge, such as extending an already active hold under the same idempotency key.</li>
+</ul>
+<p>That API split is not extra ceremony. It prevents clients from assuming that every conflict is silently handled in their favor. The next lesson, <a href="048.html">048.md</a>, turns this into a broader consistency question: what exact semantic contract does an API make when it serves stale data, retries a write, or rejects a concurrent update?</p>
+<p>Operations change as well. Harbor Point no longer watches only "replication lag" and "write errors." It tracks:</p>
+<ul>
+<li>how many conflicts were auto-resolved by policy,</li>
+<li>how many were rejected back to clients,</li>
+<li>how many entered a compensation or review queue,</li>
+<li>which policies fired for each entity type, and</li>
+<li>whether timestamp-based fallbacks correlate with clock-skew alarms.</li>
+</ul>
+<p>This is the real trade-off surface. Aggressive auto-resolution keeps latency low and reduces client retries, but it can hide semantic loss until finance or support notices. Conservative rejection preserves invariants more reliably, but it pushes complexity into clients, queues, and operational workflows. Good systems choose that boundary on purpose.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Last-writer-wins is the safe default because the system always converges."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: It is simple to implement and removes sibling versions quickly.</li>
+<li><strong>Corrective mental model</strong>: Convergence only means replicas agree. It does not mean they agree on the right business outcome.</li>
+<li><strong>Operational fix</strong>: Use LWW only for state that is genuinely replaceable and harmless to overwrite.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "If a merge function composes field values, it preserves the entity invariant."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Field-level merges look elegant and eliminate retries.</li>
+<li><strong>Corrective mental model</strong>: Invariants live at the entity or workflow level. A valid merge of fields can still create an impossible state transition.</li>
+<li><strong>Operational fix</strong>: Test conflict policies against real state-machine transitions and side effects, not just against JSON shape compatibility.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Clock synchronization is enough to make timestamp ordering trustworthy."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Better NTP reduces obvious skew, so teams assume the ordering problem is solved.</li>
+<li><strong>Corrective mental model</strong>: Timestamp order is not causality. A well-synchronized clock still cannot prove one writer observed another writer's change.</li>
+<li><strong>Operational fix</strong>: Keep explicit version ancestry and use timestamps only as a narrow tiebreaker when the domain permits it.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Conflicts are rare, so manual review is fine."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Under normal traffic, concurrent branches may be uncommon.</li>
+<li><strong>Corrective mental model</strong>: Conflict bursts happen exactly when the system is stressed by retries, partitions, offline clients, or regional failover.</li>
+<li><strong>Operational fix</strong>: Design the resolver, rejection path, and review queue before the burst arrives, and instrument the rate per entity type.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="046.html">046.md</a> showed how stale reads create the preconditions for concurrent writes</h3>
+<p>Once Harbor Point allowed slightly stale regional reads for holds, two actors could make valid decisions from different snapshots. This lesson is the consequence: when both writes are accepted, the system needs an explicit rule for which intent survives.</p>
+<h3>Connection 2: <a href="044.html">044.md</a> explains why some invariants cannot be repaired by merge policy alone</h3>
+<p>Conflict resolution can decide between concurrent versions of one entity, but it cannot magically enforce "exactly one winner" for cabin ownership after independent confirmations. Some domains still need stronger coordination around the invariant itself.</p>
+<h3>Connection 3: <a href="048.html">048.md</a> turns storage policy into API semantics</h3>
+<p>A resolver is only half the story. The next lesson looks at how systems expose these choices to clients through stale-read contracts, conditional writes, and consistency levels that shape user-visible behavior.</p>
+<h2>Resources</h2>
+<ul>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
+<li>Focus: Read the sections on vector clocks, sibling versions, and application-assisted conflict resolution to see why high availability pushes semantics upward.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.couchdb.org/en/stable/replication/conflicts.html">Apache CouchDB Documentation: Conflicts</a><ul>
+<li>Focus: Study revision trees and how CouchDB surfaces conflicts instead of pretending timestamp order always captures intent.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://hal.inria.fr/inria-00609399/document">A Comprehensive Study of Convergent and Commutative Replicated Data Types</a><ul>
+<li>Focus: Use this as the reference for when merge-based resolution is mathematically sound and when CRDT-style convergence is a better fit than ad hoc field merging.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the replication chapter with attention to multi-leader conflicts, causal metadata, and why LWW is often data loss with a cleaner dashboard.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A conflict is a concurrency fact, not just a value mismatch</strong> - The store needs version ancestry to tell whether one write superseded another or whether both were accepted independently.</li>
+<li><strong>Conflict policy is domain logic in disguise</strong> - Last-writer-wins, merge functions, and rejection paths each encode a different answer about which user intent matters most.</li>
+<li><strong>Merge is only correct when it preserves the real invariant</strong> - Safe field composition does not automatically imply a safe entity state.</li>
+<li><strong>The policy must be visible above the database</strong> - APIs, retries, observability, and compensation workflows all need to know whether a write is overwritten, merged, or rejected.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="046.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Replication Lag Budgets and Read Staleness</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="048.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Consistency Spectrum and API Semantics</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

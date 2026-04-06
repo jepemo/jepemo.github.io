@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leader-Based Replication Mechanics - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Leader-Based Replication Mechanics</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          043
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">043</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 472: Leader-Based Replication Mechanics</h1>
+<blockquote>
+<p><strong>The core idea</strong>: In leader-based replication, the leader is not just the node that accepts writes first. It is the process that assigns one durable log order and proves that order has reached enough replicas before a client is told "committed."</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="042.html">042.md</a>, Harbor Point decided that reservation shard <code>184</code> would keep its voting quorum close to East Coast users: leader <code>md-db-4</code>, synchronous follower <code>md-db-2</code>, and an asynchronous disaster-recovery replica <code>sg-db-1</code>. That topology choice solved the placement question, but it immediately created a harder mechanical one. When a customer reserves cabin <code>C14</code>, what exact event lets Harbor Point say the booking is real rather than merely written on one machine?</p>
+<p>The non-obvious answer is that leader-based replication is a commit protocol disguised as a deployment pattern. The leader does not make the system safe by being "primary." It makes the system safe by assigning a single log position, tracking which followers have durably stored that position, and only then advancing the commit point. Followers are not passive copies. Their acknowledgements define whether the next leader can prove the reservation existed after a crash.</p>
+<p>That distinction corrects a common misconception. Teams often think single-leader replication removes consistency problems because there is only one writer. It removes one class of problem, namely concurrent write conflict inside one shard, but it leaves several others fully alive: follower lag, stale reads, unsafe failover, and acknowledgements that outrun durability. Those are mechanical issues, not abstract theory, and they show up first during incidents when the leader dies at the worst possible moment.</p>
+<p>This lesson stays with Harbor Point's reservation path all the way through the write, the follower acks, and the failover boundary. The next lesson, <a href="044.html">044.md</a>, can then contrast that single ordered log with multi-leader systems, where conflict classes exist precisely because there is no longer one sequencer for every write.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's reservation API handles bursts when a ferry operator opens a new weekend schedule. During those bursts, latency pressure pushes the team toward faster acknowledgements, while durability pressure pushes them toward waiting for more replicas. That trade-off is the center of leader-based replication mechanics: acknowledge too early and a crash can erase an "accepted" reservation; wait for every lagging follower and the write path becomes hostage to the slowest replica.</p>
+<p>Production incidents around primary-replica databases usually come from a fuzzy answer to one of three questions: when is a log entry durable, when is it visible to readers, and which replicas are safe to promote after the leader disappears? If different teams answer those questions differently, the system behaves coherently only on the happy path. The failure path becomes an argument about whether the database "really committed" the write.</p>
+<p>Once the mechanism is explicit, the operational consequences become measurable. Harbor Point can decide whether <code>201 Created</code> means "written to leader memory," "fsynced on the leader," or "stored on a synchronous quorum." It can publish follower-lag SLOs that mean something. It can also explain why Singapore is useful for disaster recovery without pretending it participates in every East Coast commit. Leader-based replication matters because it turns those promises into concrete storage and networking behavior.</p>
+<h2>Learning Objectives</h2>
+<p>By the end of this session, you will be able to:</p>
+<ol>
+<li><strong>Explain what the leader actually owns</strong> - Describe how ordering, commit index advancement, and follower acknowledgements produce a safe write.</li>
+<li><strong>Trace a write through the replication pipeline</strong> - Follow one reservation from client request to follower persistence, apply, and possible failover.</li>
+<li><strong>Evaluate the operational trade-off in acknowledgement policy</strong> - Reason about latency, durability, and promotion safety using observable replication state.</li>
+</ol>
+<h2>Core Concepts Explained</h2>
+<h3>Concept 1: The leader is the shard's sequencer, not just its write endpoint</h3>
+<p>Suppose a client sends <code>POST /reservations</code> for cabin <code>C14</code> to <code>md-db-4</code>. The leader first validates that the cabin is still free, then turns the change into a log entry such as "term 27, index 981244, reserve C14 for customer 5521." That index assignment is the real beginning of the replicated write. From that point on, every replica has to agree not only on the content of the entry but also on where it sits in the log relative to everything before and after it.</p>
+<p>The mechanical flow looks like this:</p>
+<div class="codehilite"><pre><span></span><code>client -&gt; md-db-4 (leader): reserve C14
+md-db-4: append log entry [term 27, index 981244]
+md-db-4 -&gt; md-db-2: replicate entry 981244
+md-db-4 -&gt; sg-db-1: send entry 981244 asynchronously
+md-db-2 -&gt; md-db-4: durable ack for 981244
+md-db-4: advance commit index to 981244
+md-db-4 -&gt; client: 201 Created
+</code></pre></div>
+
+<p>Two details matter. First, the leader may append an entry locally before it is committed. Local append means "candidate state exists," not "client-visible truth." Second, the leader should apply the reservation to the queryable state machine only after the commit index includes that entry. This separation between appended and committed state is what lets the system discard speculative entries from a failed leader without violating the log's ordering rules.</p>
+<p>The trade-off shows up immediately in acknowledgement policy. If Harbor Point returns success after local disk flush only, write latency stays low, but a leader crash can still lose the reservation if no promotable follower has the entry. If Harbor Point waits for <code>md-db-2</code> to durably acknowledge before responding, failover is safer, but the client now pays synchronous replication cost on every write. Leader-based replication is therefore not merely a routing pattern. It is an explicit bargain between durability and latency.</p>
+<h3>Concept 2: Follower progress is tracked continuously, because lag decides both throughput and failover safety</h3>
+<p>Once <code>md-db-4</code> accepts more traffic, it cannot treat all followers as equally current. It needs per-follower replication state such as "next log index to send," "highest replicated index," and "highest committed index known to that follower." In Raft terms these are often represented as <code>nextIndex</code> and <code>matchIndex</code>; in database products the names differ, but the mechanism is similar. The leader is always asking: how far behind is each replica, and which replicas are caught up enough to matter for commit or promotion?</p>
+<p>That state drives ordinary throughput as much as it drives recovery. A synchronous follower like <code>md-db-2</code> must keep pace because Harbor Point's commit point depends on it. An asynchronous follower like <code>sg-db-1</code> can lag for seconds or minutes without breaking local write availability, but that lag directly weakens the disaster-recovery position. The same leader that batches East Coast commits also has to decide when Singapore needs a snapshot instead of another long stream of incremental entries, which is exactly where <a href="041.html">041.md</a> becomes operationally relevant.</p>
+<p>A simplified replication loop looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">follower</span> <span class="ow">in</span> <span class="n">followers</span><span class="p">:</span>
+    <span class="n">send_entries</span><span class="p">(</span><span class="n">follower</span><span class="p">,</span> <span class="n">from_index</span><span class="o">=</span><span class="n">next_index</span><span class="p">[</span><span class="n">follower</span><span class="p">])</span>
+    <span class="k">if</span> <span class="n">follower</span><span class="o">.</span><span class="n">acked_index</span> <span class="o">&gt;</span> <span class="n">match_index</span><span class="p">[</span><span class="n">follower</span><span class="p">]:</span>
+        <span class="n">match_index</span><span class="p">[</span><span class="n">follower</span><span class="p">]</span> <span class="o">=</span> <span class="n">follower</span><span class="o">.</span><span class="n">acked_index</span>
+        <span class="n">next_index</span><span class="p">[</span><span class="n">follower</span><span class="p">]</span> <span class="o">=</span> <span class="n">follower</span><span class="o">.</span><span class="n">acked_index</span> <span class="o">+</span> <span class="mi">1</span>
+
+<span class="n">commit_index</span> <span class="o">=</span> <span class="n">quorum_commit</span><span class="p">(</span><span class="n">match_index</span><span class="p">,</span> <span class="n">local_index</span><span class="p">)</span>
+<span class="n">apply_entries_through</span><span class="p">(</span><span class="n">commit_index</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The production lesson is that lag is not just a dashboard number. It determines whether a follower can take over, whether a read replica can answer fresh-enough queries, and whether backpressure is needed on the leader. If Harbor Point ignores <code>sg-db-1</code> until disaster strikes, it may discover that the remote replica is so far behind that promotion meets the letter of "replica exists" but not the spirit of recovery readiness.</p>
+<h3>Concept 3: Read visibility and failover correctness come from the same commit boundary</h3>
+<p>Harbor Point initially focused on write acknowledgements, but the same mechanics govern reads. If the load balancer sends a read immediately after the <code>C14</code> reservation write to <code>sg-db-1</code>, that client may still see the cabin as available. Nothing is "wrong" with replication there; the replica is simply asynchronous. The real mistake would be promising read-after-write semantics without a read barrier, leader routing, or an explicit "read after LSN/index" token.</p>
+<p>Failover uses the same boundary from the opposite direction. Imagine <code>md-db-4</code> crashes after sending entry <code>981244</code> to <code>md-db-2</code> but before Singapore receives it. If <code>md-db-2</code> has the entry durably and the election rules require any new leader to have the most up-to-date log, the reservation survives. If an operator promotes a lagging node that never stored <code>981244</code>, the write can vanish even though the original leader believed replication was proceeding normally. Safe failover is therefore not a separate feature layered on top of replication. It is the continuation of the same log-ordering and commit rules under leader loss.</p>
+<p>This is also why leader fencing matters during partitions. A stale leader that still accepts writes after losing quorum can create two incompatible histories, even in a "single leader" system. Production systems prevent that with terms, epochs, leases, or external fencing tokens that make old leadership impossible to use once the cluster has moved on. The trade-off here is operational strictness versus convenience: the more aggressively Harbor Point fences stale leaders and restricts follower reads, the clearer its correctness envelope becomes, but the more carefully it must design around partitions and replica lag.</p>
+<h2>Troubleshooting</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: A reservation returns success, but disappears after a failover test.</p>
+<ul>
+<li><strong>Why it happens</strong>: The leader acknowledged after local persistence or after sending the entry, not after a durable synchronous quorum stored it.</li>
+<li><strong>Clarification / Fix</strong>: Define the commit point precisely in configuration and documentation. Make client success depend on the same durability condition that promotion rules assume.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: A promoted follower comes up read/write, then immediately needs rollback or reconciliation.</p>
+<ul>
+<li><strong>Why it happens</strong>: The promotion path ignored replication freshness and treated "replica is alive" as equivalent to "replica has the committed log."</li>
+<li><strong>Clarification / Fix</strong>: Gate promotion on replicated index, last durable log position, and term/epoch freshness. Surface those values directly in operator tooling instead of relying on intuition.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: Users observe stale reads right after creating or updating a reservation.</p>
+<ul>
+<li><strong>Why it happens</strong>: Reads were sent to asynchronous followers without a session guarantee or commit-position check.</li>
+<li><strong>Clarification / Fix</strong>: Route read-after-write traffic to the leader, or carry a commit token so replicas wait until they have applied at least that log position before answering.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: The leader becomes a throughput bottleneck even though follower nodes look idle.</p>
+<ul>
+<li><strong>Why it happens</strong>: One process owns log ordering, batching, flow control, and synchronous acknowledgement handling for the shard.</li>
+<li><strong>Clarification / Fix</strong>: Measure batching efficiency, fsync cost, and per-follower lag separately. Scale by partitioning the workload or changing the acknowledgement set, not by assuming replicas remove the leader's sequencing burden.</li>
+</ul>
+</li>
+</ul>
+<h2>Advanced Connections</h2>
+<h3>Connection 1: <a href="042.html">042.md</a> chose the topology; this lesson explains how that placement turns into a commit rule</h3>
+<p>The previous lesson established that Harbor Point wanted a local voting quorum and a remote asynchronous copy. This lesson makes the operational consequence explicit: East Coast durability depends on the leader plus synchronous follower, while Singapore trails behind as a recovery asset rather than a commit participant.</p>
+<h3>Connection 2: <a href="044.html">044.md</a> changes the problem by removing the single sequencer</h3>
+<p>Leader-based replication works because one node assigns a canonical order for writes on a shard. Multi-leader systems gain locality and write availability in more places, but they lose that single ordering source and must classify, detect, and resolve conflicts explicitly.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the leader-based replication chapter with attention to the difference between write acknowledgment, follower lag, and failover safety.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Raft)</a><ul>
+<li>Focus: Pay attention to log matching, leader completeness, and why committed entries survive leader change.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/runtime-config-replication.html">PostgreSQL Documentation: Replication</a><ul>
+<li>Focus: Map synchronous standby settings and WAL sender state to the abstract commit-point discussion in this lesson.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.mongodb.com/docs/manual/core/replica-set-elections/">MongoDB Replica Set Elections</a><ul>
+<li>Focus: Notice how election safety depends on replication freshness, not merely on which node is reachable first.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>A leader is valuable because it assigns one durable order</strong> - Without a shared commit order, "replicated" does not yet mean "safe to expose."</li>
+<li><strong>Follower lag is a correctness signal, not only a performance metric</strong> - The same lag number affects read freshness, promotion safety, and disaster-recovery readiness.</li>
+<li><strong>Acknowledgement policy is the core trade-off</strong> - Faster success responses reduce latency, but every step away from quorum durability increases failover risk.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="042.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Replication Topologies and Failure Domains</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="044.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Multi-Leader Replication and Conflict Classes</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

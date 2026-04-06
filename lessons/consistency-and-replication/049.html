@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Partitioning Fundamentals and Shard Keys - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Partitioning Fundamentals and Shard Keys</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          049
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">049</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 478: Partitioning Fundamentals and Shard Keys</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A shard key is not just a scaling knob. It decides which requests stay local, which invariants remain cheap to enforce, and where hotspots appear when real traffic arrives.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>Harbor Point left the last lesson with a clear API contract: <code>POST /bookings/confirm</code> must mean cabin <code>C14</code> on trip <code>TRIP-BCN-JFK-2026-07-14</code> is definitively assigned, not merely queued for eventual reconciliation. The contract is correct, but the implementation is now hitting a physical limit. Every hold, extend, release, and confirm still runs through one authoritative inventory leader. During a summer-sale spike, the queue behind that leader climbs, tail latency stretches, and the team is tempted to "just shard the table."</p>
+<p>The non-obvious part is that partitioning is not merely slicing rows into smaller piles. The shard key is a statement about what belongs together. If Harbor Point shards inventory by <code>customer_id</code>, the "my trips" page becomes convenient, but two customers racing for the same cabin now drive the decisive ownership check across shards. If the team shards by <code>route_date</code>, search for <code>BCN-JFK</code> is easy, but one popular route can pin an entire sale to a single hot shard. The right key is the one that keeps the narrowest must-decide-together state local.</p>
+<p>For Harbor Point, that narrow state is the sellable inventory unit itself: one cabin on one trip instance can be held, released, or booked exactly once. That pushes the authoritative store toward an inventory-centric key such as <code>inventory_id</code> or a compound key like <code>(trip_instance_id, cabin_id)</code>. Search results and customer history may then need separate indexes or projections. That is the trade-off: make the invariant cheap on purpose, and move convenience reads to explicitly weaker or derived paths.</p>
+<h2>Why This Matters</h2>
+<p>Partitioning and replication solve different problems. Replication copies the same partition so the system survives machine loss and can serve more reads. Partitioning spreads ownership across nodes so write throughput, storage, and coordination load can grow past one machine. If you confuse the two, you keep adding replicas to a leader that is already saturated by authoritative writes and wonder why the bottleneck does not move.</p>
+<p>This matters because the consistency promises from <a href="048.html">048.md</a> become much more expensive once data spans multiple partitions. A linearizable confirmation on one shard is often a normal leader transaction. The same confirmation across two shards becomes a distributed transaction or a compensating workflow with more latency, more failure states, and more operational risk. Shard-key design is therefore not an optimization pass after correctness. It is part of how correctness stays affordable at scale.</p>
+<p>The production shift is concrete. Before partitioning, Harbor Point has one authoritative inventory path and one obvious hotspot. After partitioning, the system can spread load, but only if the request router, partition map, and schema all agree on which state lives together. A good shard key turns "scale out" into local decisions on many shards. A bad one turns every hot path into scatter-gather traffic or cross-shard coordination.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Partitioning means assigning ownership, not just storage</h3>
+<p>Harbor Point starts by separating three ideas that teams often blur together:</p>
+<ul>
+<li>A <strong>logical partition</strong> is a slice of the keyspace, such as bucket <code>173</code> out of <code>1024</code>.</li>
+<li>A <strong>physical shard</strong> is the server or replica group currently responsible for some set of logical partitions.</li>
+<li>A <strong>replica</strong> is another copy of the same partition for failover or read distribution.</li>
+</ul>
+<p>That distinction matters because the shard key should stay stable while placement changes over time. Harbor Point does not want "shard 7" baked into its schema. It wants a deterministic function from business data to a logical partition, and then a lookup from logical partition to the shard that currently owns it.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">inventory_bucket</span><span class="p">(</span><span class="n">trip_instance_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">cabin_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="n">logical_key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">trip_instance_id</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">cabin_id</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="k">return</span> <span class="n">murmur3</span><span class="p">(</span><span class="n">logical_key</span><span class="p">)</span> <span class="o">%</span> <span class="mi">1024</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">route_request</span><span class="p">(</span><span class="n">trip_instance_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">cabin_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="n">bucket</span> <span class="o">=</span> <span class="n">inventory_bucket</span><span class="p">(</span><span class="n">trip_instance_id</span><span class="p">,</span> <span class="n">cabin_id</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">partition_map</span><span class="o">.</span><span class="n">lookup</span><span class="p">(</span><span class="n">bucket</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The key idea is simple: partition first, place later. With <code>1024</code> logical buckets spread over, say, <code>12</code> physical shards, Harbor Point can move bucket <code>173</code> from shard <code>B</code> to shard <code>F</code> later without redefining the key. That is why mature systems keep more logical partitions than physical machines.</p>
+<p>The authoritative rows that protect the booking invariant need to follow the same partitioning boundary. If the inventory row for cabin <code>C14</code> is keyed by <code>inventory_id</code>, but the hold row is keyed only by <code>hold_id</code>, then confirmation may already require two partitions. Production schemas usually keep the authoritative mutation path organized around the invariant boundary, even if that makes some reads less convenient.</p>
+<h3>Part 2: The shard key encodes which work stays local</h3>
+<p>Harbor Point evaluates candidate shard keys by asking a stricter question than "Which query is most common?" The real question is "Which state must be decided together on the strongest path?"</p>
+<table>
+<thead>
+<tr>
+<th>Candidate shard key</th>
+<th>What stays local</th>
+<th>What breaks first</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>customer_id</code></td>
+<td>Customer profile and trip history reads</td>
+<td>Two customers competing for the same cabin drive final confirmation across shards</td>
+</tr>
+<tr>
+<td><code>trip_instance_id</code></td>
+<td>Availability for one trip and route-scoped reports</td>
+<td>A flash sale on one trip can overload a single shard</td>
+</tr>
+<tr>
+<td><code>inventory_id = trip_instance_id + cabin_id</code></td>
+<td>Hold, release, and confirm for one sellable unit</td>
+<td>Search and customer-history reads need secondary indexes or projections</td>
+</tr>
+</tbody>
+</table>
+<p>The last option is usually the safest for Harbor Point's decisive write path because the invariant lives at the inventory-unit boundary. Only one owner may successfully move <code>TRIP-BCN-JFK-2026-07-14:C14</code> from <code>held</code> to <code>booked</code>. If that state lives on one shard, the strongest operation stays single-shard even while total platform load spreads out.</p>
+<p>That does not mean the rest of the product becomes free. Search for "all cabins on <code>BCN-JFK</code> next Friday" no longer maps naturally to the same key if the authoritative store hashes by inventory unit. Harbor Point accepts that and serves browse traffic from a separate projection indexed by route and departure date. The customer timeline is another projection keyed by <code>customer_id</code>. No single shard key makes every read and write local. Good production design chooses the key that protects the invariant and then builds explicit read models for other access patterns.</p>
+<p>The router and transaction path become straightforward once the key matches the invariant:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">confirm_booking</span><span class="p">(</span><span class="n">hold</span><span class="p">):</span>
+    <span class="n">shard</span> <span class="o">=</span> <span class="n">route_request</span><span class="p">(</span><span class="n">hold</span><span class="o">.</span><span class="n">trip_instance_id</span><span class="p">,</span> <span class="n">hold</span><span class="o">.</span><span class="n">cabin_id</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">shard</span><span class="o">.</span><span class="n">transaction</span><span class="p">(</span>
+        <span class="n">assert_inventory_state</span><span class="p">(</span>
+            <span class="n">inventory_id</span><span class="o">=</span><span class="n">hold</span><span class="o">.</span><span class="n">inventory_id</span><span class="p">,</span>
+            <span class="n">status</span><span class="o">=</span><span class="s2">&quot;held&quot;</span><span class="p">,</span>
+            <span class="n">hold_id</span><span class="o">=</span><span class="n">hold</span><span class="o">.</span><span class="n">hold_id</span><span class="p">,</span>
+        <span class="p">),</span>
+        <span class="n">mark_inventory_booked</span><span class="p">(</span><span class="n">inventory_id</span><span class="o">=</span><span class="n">hold</span><span class="o">.</span><span class="n">inventory_id</span><span class="p">),</span>
+        <span class="n">mark_hold_confirmed</span><span class="p">(</span>
+            <span class="n">inventory_id</span><span class="o">=</span><span class="n">hold</span><span class="o">.</span><span class="n">inventory_id</span><span class="p">,</span>
+            <span class="n">hold_id</span><span class="o">=</span><span class="n">hold</span><span class="o">.</span><span class="n">hold_id</span><span class="p">,</span>
+        <span class="p">),</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<p>The local transaction is the payoff. Harbor Point still replicates that shard for failover, but it does not need cross-shard coordination merely to decide whether one cabin is sold.</p>
+<h3>Part 3: Good shard keys trade fan-out for hotspot control in explicit ways</h3>
+<p>A useful shard key has four properties in practice:</p>
+<ol>
+<li>It is present on every authoritative write.</li>
+<li>It has enough cardinality to spread load.</li>
+<li>It stays stable for the life of the record.</li>
+<li>It matches the smallest state that must be updated atomically or under the same coordination boundary.</li>
+</ol>
+<p>That still leaves trade-offs. Hashing <code>inventory_id</code> spreads load well, but it destroys natural ordering for range scans such as "all cabins on trip <code>TRIP-BCN-JFK-2026-07-14</code>." Range partitioning by <code>trip_instance_id</code> keeps those scans local, but it makes popular trips or launch-day inventory batches much easier to hotspot. Harbor Point chooses the hash-based inventory key for the authoritative OLTP path and pays the cost of maintaining separate read models because correctness during confirmation matters more than making search local in the same store.</p>
+<p>This also changes what the team measures. Once the data is partitioned, average cluster QPS is not enough. Harbor Point watches per-shard write rate, hottest logical bucket concentration, cross-shard transaction count, scatter-gather read count, and partition-size skew. Those metrics reveal whether the chosen shard key still matches the workload or whether the system is drifting toward a future rebalancing problem.</p>
+<p>The lesson is not that one shard key is universally best. It is that shard keys are workload arguments encoded in schema. If the argument is wrong, every scale fix after that becomes more expensive: caches hide fan-out for a while, bigger boxes delay hotspots for a while, and emergency compensations paper over correctness problems for a while. None of those change the ownership boundary that the shard key already defined.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Replication already gives us scale, so more replicas solve our inventory bottleneck."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Adding replicas feels like horizontal growth and often helps read-heavy systems immediately.</li>
+<li><strong>Corrective mental model</strong>: Replicas copy the same ownership boundary. A single hot leader for authoritative writes is still one hot leader.</li>
+<li><strong>Operational fix</strong>: Partition the authoritative write path when one keyspace owner is saturated, then use replication inside each partition for durability and failover.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Choose the shard key that makes the most common query local."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Product teams naturally notice the query they run most often.</li>
+<li><strong>Corrective mental model</strong>: The strongest invariant, not the friendliest query, should usually decide the primary shard key.</li>
+<li><strong>Operational fix</strong>: Start from the must-decide-together write path, then add secondary indexes or projections for other read patterns.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Hash everything and hotspot risk disappears."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Uniform hashing smooths load in synthetic benchmarks.</li>
+<li><strong>Corrective mental model</strong>: Hashing trades range locality for distribution. It reduces some hotspots but can force fan-out for scans and aggregations.</li>
+<li><strong>Operational fix</strong>: Decide explicitly whether the authoritative store optimizes for distribution or locality, and do not assume the same choice is optimal for every consumer.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Mutable business fields make good shard keys because they are meaningful."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Keys like region, tier, or route feel intuitive in dashboards and support tools.</li>
+<li><strong>Corrective mental model</strong>: If the shard key changes, the row's ownership changes. That turns ordinary updates into data migrations.</li>
+<li><strong>Operational fix</strong>: Use stable identifiers for the primary key and expose mutable business fields through indexes, lookup tables, or derived views.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="048.html">048.md</a> defined the API semantics that the shard key now has to make affordable</h3>
+<p>Harbor Point decided that final booking confirmation needs a decisive, strong path. This lesson shows how partitioning can either preserve that as a single-shard decision or accidentally turn it into cross-shard coordination.</p>
+<h3>Connection 2: <a href="050.html">050.md</a> will use the logical-partition boundary introduced here</h3>
+<p>Once the shard key and logical buckets exist, the next operational problem is moving those buckets under live traffic without breaking routing or consistency promises.</p>
+<h3>Connection 3: Bigtable and Spanner expose the same row-key problem in different forms</h3>
+<p>Whether a system talks about tablets, splits, or shards, the underlying question is identical: which adjacent or hashed keys should one serving group own, and what workload becomes cheaper or more dangerous because of that choice?</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the partitioning and secondary-index chapters with attention to how access patterns and invariants drive primary-key choice.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub27898/">Bigtable: A Distributed Storage System for Structured Data</a><ul>
+<li>Focus: Pay attention to row-key design and tablet hotspots; the same locality-versus-distribution trade-off appears in modern shard-key decisions.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html">Amazon DynamoDB: Best practices for choosing a partition key</a><ul>
+<li>Focus: Use it as a concrete checklist for cardinality, hot partitions, and request concentration.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://cloud.google.com/spanner/docs/schema-design">Cloud Spanner schema design best practices</a><ul>
+<li>Focus: Look at primary-key ordering and hotspot guidance to see how key layout affects both transaction locality and write concentration.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Partitioning decides ownership; replication copies that ownership for resilience and read distribution.</li>
+<li>A shard key should align with the smallest invariant boundary that must be decided together, not simply the most convenient read query.</li>
+<li>No single shard key makes every access pattern local, so production systems often keep authoritative writes on one key and serve other views from indexes or projections.</li>
+<li>Many logical partitions on fewer physical shards make future rebalancing possible without redefining the data model.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="048.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Consistency Spectrum and API Semantics</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="050.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Rebalancing Partitions under Live Traffic</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

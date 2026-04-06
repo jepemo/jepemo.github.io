@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rebalancing Partitions under Live Traffic - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Rebalancing Partitions under Live Traffic</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          050
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">050</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 479: Rebalancing Partitions under Live Traffic</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Live rebalancing is an ownership handoff problem. Safe systems copy a partition, stream the delta, and cut traffic over with versioned routing so only one shard is authoritative for writes at any moment.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>After <a href="049.html">049.md</a>, Harbor Point finally has room to move. The reservation platform keeps <code>1024</code> logical buckets spread across <code>12</code> shard replica groups, which means the team can shift one hot slice of inventory without redesigning the schema. The first hard case arrives during a summer-sale burst: bucket <code>173</code>, which owns a dense slice of <code>BCN-JFK</code> cabin inventory, is driving four times the write rate of neighboring buckets. Shard <code>B</code> is saturating while shard <code>F</code> is mostly idle, but agents are still extending holds and confirming bookings in real time.</p>
+<p>The tempting plan is naive: copy bucket <code>173</code> to shard <code>F</code>, switch the routing table, and delete the old copy. That fails as soon as agent Marta extends hold <code>H-8821</code> halfway through the copy. If that write lands only on <code>B</code>, the target comes online stale. If Harbor Point lets both shards accept writes "just for safety," it now has two places that can appear authoritative for the same inventory. The hard part of rebalancing is therefore not moving bytes. It is preserving one ownership boundary while traffic keeps flowing.</p>
+<p>The useful mental shift is to treat rebalancing as a controlled partition leadership transfer. The source shard stays authoritative while the target catches up, and the cutover is gated by an explicit routing version plus a concrete catch-up marker. That is what turns rebalancing from a risky operator maneuver into a repeatable production mechanism.</p>
+<h2>Why This Matters</h2>
+<p>Partitioning only solves scale if the cluster can keep adapting after launch. Traffic patterns move. One route goes viral, a tenant lands a promotion, a node pool is retired, or a region absorbs failover traffic from somewhere else. If every load shift requires downtime or a full reshard, the system is horizontally scalable on paper and operationally rigid in production.</p>
+<p>This lesson matters because the API contract from <a href="048.html">048.md</a> still applies during maintenance. A successful <code>POST /bookings/confirm</code> must still mean one cabin is definitively assigned, even while ownership of the underlying bucket is moving. The trade-off is direct: live rebalancing reduces the need for maintenance windows, but it raises the bar for routing metadata, replay logs, cutover discipline, and migration observability.</p>
+<p>The production consequence is not abstract. Capacity expansion, hotspot relief, hardware evacuation, and zone maintenance all depend on moving partitions safely. Teams that understand the mechanism can add or drain nodes deliberately. Teams that treat rebalancing as "background copy plus hope" eventually discover that balanced storage and safe write ownership are different problems.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Start from one bucket that is hot enough to matter</h3>
+<p>Harbor Point designed the cluster with many more logical buckets than physical shards precisely so it could move a narrow slice of the keyspace under load. Bucket <code>173</code> currently maps to shard <code>B</code> in partition-map version <code>104</code>:</p>
+<div class="codehilite"><pre><span></span><code>map v104
+bucket 173 -&gt; shard B
+bucket 174 -&gt; shard F
+...
+</code></pre></div>
+
+<p>During the sale window, most of shard <code>B</code>'s pressure comes from bucket <code>173</code>. That makes the decision small and surgical: move that one bucket to shard <code>F</code> instead of revisiting the primary key or splitting the whole route catalog. The data model from <a href="049.html">049.md</a> stays the same; only placement changes.</p>
+<p>The online migration still has to answer three questions precisely:</p>
+<ol>
+<li>Which shard is authoritative for new writes right now?</li>
+<li>How does the target catch up while the source is still serving traffic?</li>
+<li>How do routers and shards agree on the instant ownership changes?</li>
+</ol>
+<p>If any of those answers are fuzzy, rebalancing turns into split-brain risk disguised as an operations task.</p>
+<h3>Part 2: Safe migration separates snapshot, catch-up, and cutover</h3>
+<p>For Harbor Point's authoritative inventory path, the source shard <code>B</code> remains the only writer during migration. The target shard <code>F</code> receives a baseline snapshot plus a stream of later changes. This is safer than dual authoritative writes because the platform never has to reconcile two live decision points for the same cabin.</p>
+<div class="codehilite"><pre><span></span><code>Phase 1: Snapshot
+router -&gt; B (owner in map v104)
+B ---- bulk copy bucket 173 ----&gt; F
+
+Phase 2: Catch-up
+router -&gt; B
+B ---- change stream seq 918443..918499 ----&gt; F
+
+Phase 3: Cutover
+pause new writes for bucket 173
+wait until F has replayed through seq 918499
+publish map v105: bucket 173 -&gt; F
+resume writes through F
+</code></pre></div>
+
+<p>The routing layer carries the partition-map version it used when it sent a request. Each shard checks that version before it accepts a write:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_booking_op</span><span class="p">(</span><span class="n">bucket_id</span><span class="p">,</span> <span class="n">map_version</span><span class="p">,</span> <span class="n">op</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">map_version</span> <span class="o">!=</span> <span class="n">partition_map</span><span class="o">.</span><span class="n">current_version</span><span class="p">(</span><span class="n">bucket_id</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="n">RetryWithFreshMap</span><span class="p">(</span><span class="n">bucket_id</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">partition_map</span><span class="o">.</span><span class="n">is_owner</span><span class="p">(</span><span class="n">bucket_id</span><span class="p">,</span> <span class="n">this_shard_id</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="n">WrongOwner</span><span class="p">(</span><span class="n">bucket_id</span><span class="p">)</span>
+
+    <span class="n">append_to_partition_log</span><span class="p">(</span><span class="n">bucket_id</span><span class="p">,</span> <span class="n">op</span><span class="p">)</span>
+    <span class="n">apply_to_local_state</span><span class="p">(</span><span class="n">bucket_id</span><span class="p">,</span> <span class="n">op</span><span class="p">)</span>
+</code></pre></div>
+
+<p>That version check is not defensive polish. It is the mechanism that prevents stale routers from writing to the old owner after cutover. If a router still believes <code>bucket 173 -&gt; shard B</code> after <code>map v105</code> is published, shard <code>B</code> rejects the write and forces a retry with fresh metadata. Harbor Point would rather surface a short retry than accept a decisive booking mutation on the wrong shard.</p>
+<p>The catch-up stream is what makes the cutover meaningful. Suppose Marta extends hold <code>H-8821</code> after the snapshot started. Shard <code>B</code> assigns that mutation log sequence <code>918487</code>, applies it locally, and streams it to <code>F</code>. At cutover time, Harbor Point does not ask "Did the copy finish?" It asks "Has the target replayed every mutation through the barrier sequence?" Only when the answer is yes does the control plane publish <code>map v105</code>.</p>
+<p>For high-value writes, Harbor Point accepts a tiny write pause on one bucket during cutover. That brief barrier keeps the ownership handoff simple: no concurrent writers, no ambiguous order, no post-hoc merge logic. The trade-off is explicit. A short and scoped availability dip is cheaper than turning a definitive booking path into a distributed reconciliation problem.</p>
+<h3>Part 3: The operational work continues after the flip</h3>
+<p>Once the new map is live, the move is not over. In-flight requests may still arrive at <code>B</code> with stale routing metadata for a few seconds. Those must be rejected or forwarded consistently. Read paths also need a policy. Harbor Point keeps advisory browse reads flexible, but it does not let <code>POST /bookings/confirm</code> take a weaker path just because a migration is running. The consistency contract from <a href="048.html">048.md</a> still governs what the target must know before it serves the critical endpoint.</p>
+<p>Harbor Point also delays deleting the source copy. First it checks parity: row counts, highest replicated log sequence, and a sample of sensitive records such as active holds and newly confirmed bookings. Only after the drain period is clean does shard <code>B</code> garbage-collect bucket <code>173</code>. Fast deletion feels efficient, but delayed cleanup preserves an audit path and a recovery option when migration bugs surface immediately after cutover.</p>
+<p>This is why live rebalancing needs dedicated observability rather than a generic "migration succeeded" metric. Harbor Point tracks source-to-target catch-up lag, stale-route reject rate, cutover barrier duration, per-bucket error rate, and latency before and after the move. Those signals reveal whether the migration is merely slow or actually unsafe. They also tell the team when the deeper fix is a different partition layout rather than repeatedly moving the same hotspot around the cluster.</p>
+<p>The broader lesson is that rebalancing is the operational continuation of shard-key design. Many logical buckets made motion possible. Versioned routing, delta replay, and disciplined cutover make that motion safe under production traffic.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Once the bulk copy finishes, the partition has moved."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: The snapshot is the visibly expensive step, so teams treat it as the whole migration.</li>
+<li><strong>Corrective mental model</strong>: The snapshot is only a starting point. Writes that landed after the snapshot must be replayed before the target can become authoritative.</li>
+<li><strong>Operational fix</strong>: Gate cutover on a concrete catch-up marker such as a replicated log sequence, not on copy completion alone.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Dual-writing to source and target is safer because both copies stay current."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Mirroring writes sounds redundant and therefore safe.</li>
+<li><strong>Corrective mental model</strong>: For authoritative inventory, dual writes create two live decision points and make ordering bugs harder to reason about.</li>
+<li><strong>Operational fix</strong>: Prefer single-owner migrations with snapshot-plus-delta replay, and reserve dual-write patterns for derived or explicitly reconcilable data.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Routers will refresh quickly enough, so owner-version checks are optional."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Metadata propagation usually looks fast in staging.</li>
+<li><strong>Corrective mental model</strong>: Even short-lived stale routes can send decisive writes to the wrong shard after cutover.</li>
+<li><strong>Operational fix</strong>: Attach partition-map versions to routed requests and make old owners reject stale writes predictably.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Delete the source copy immediately after cutover so nobody can route back."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Fast cleanup feels like a clean finish.</li>
+<li><strong>Corrective mental model</strong>: Immediate deletion removes the easiest rollback and audit path right when migration risk is highest.</li>
+<li><strong>Operational fix</strong>: Keep the old copy read-only through a drain window, verify parity, then remove it after traffic and control-plane state stabilize.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="049.html">049.md</a> created the precondition for safe motion</h3>
+<p>Logical partitions made it possible to move one bucket instead of redesigning the whole keyspace. Rebalancing is the operational proof that the shard-key strategy can survive changing traffic.</p>
+<h3>Connection 2: <a href="048.html">048.md</a> explains why cutover rules differ by endpoint</h3>
+<p>A browse query can tolerate a softer handoff than <code>POST /bookings/confirm</code>. Rebalancing has to respect each API's consistency contract instead of treating all reads and writes as equally flexible.</p>
+<h3>Connection 3: <a href="051.html">051.md</a> will turn this mechanism into a full operating plan</h3>
+<p>The capstone will combine replication, partitioning, lag budgets, and rebalancing into one scale-out design, which is how production teams justify topology changes before they execute them.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the partitioning and data-migration chapters with attention to how ownership boundaries and online change streams keep systems available during topology changes.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://vitess.io/docs/24.0/user-guides/configuration-advanced/resharding/">Vitess Resharding</a><ul>
+<li>Focus: Study how Vitess stages copy, catch-up, traffic switching, and rollback rather than treating resharding as a single bulk move.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/architecture/replication-layer">CockroachDB Replication Layer</a><ul>
+<li>Focus: Pay attention to the snapshot-plus-log-replay description of replica rebalancing; it is a concrete example of the same catch-up-before-cutover pattern.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.mongodb.com/docs/current/core/sharding-balancer-administration/">MongoDB Sharded Cluster Balancer</a><ul>
+<li>Focus: Use the balancer guidance to see the operational costs, throttling, and cleanup behavior of live range movement.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Live rebalancing is an ownership-transfer problem, not merely a file-copy problem.</li>
+<li>Safe migrations keep one authoritative writer, stream deltas after the snapshot, and cut over with versioned routing so stale owners reject writes.</li>
+<li>A brief, scoped write barrier at cutover is often a better trade-off than the complexity of dual authoritative writers.</li>
+<li>The same partitioning design that enables scale must also enable safe motion, or the cluster becomes operationally rigid as traffic shifts.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="049.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Partitioning Fundamentals and Shard Keys</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="051.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Module Capstone: Replication + Partitioning Plan</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

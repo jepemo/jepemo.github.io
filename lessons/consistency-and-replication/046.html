@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Replication Lag Budgets and Read Staleness - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Replication Lag Budgets and Read Staleness</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          046
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">046</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 475: Replication Lag Budgets and Read Staleness</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Replication lag becomes manageable only when every read path has an explicit freshness budget, because "eventually consistent" is too vague to tell the system when a nearby replica is safe and when it must pay for a fresher read.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="045.html">045.md</a>, Harbor Point put ten-minute cabin holds in a leaderless replica set so travel agencies in Lisbon did not have to wait for every availability check to cross the Atlantic. The hold write still uses <code>W=2</code>, but the UI team now wants the cabin grid to read from the nearest replica, usually <code>lis-hold-2</code>, because a quorum read on every keystroke makes the page feel sluggish during flash-sale traffic.</p>
+<p>At 14:03:11.210 UTC, an agent in Baltimore places hold <code>H-8821</code> on cabin <code>C14</code>. <code>iad-hold-1</code> and <code>fra-hold-3</code> acknowledge quickly, so the write is successful. <code>lis-hold-2</code> is busy replaying backlog and does not apply the update until 14:03:12.090. For 880 milliseconds, a Lisbon agent can still see <code>C14</code> as available if the page reads only from the local replica. The hard part is not that stale data exists; the hard part is deciding whether 880 milliseconds is acceptable for that screen.</p>
+<p>That is the non-obvious insight: read staleness is not a philosophical property of the database. It is a product contract. Harbor Point can tolerate a two-second-old cabin grid if the final hold attempt rechecks inventory. It cannot tolerate a two-second-old payment-confirmation screen, because the agent expects to see the booking that just committed. Once the team writes those numbers down, replication lag stops being a vague "ops problem" and becomes an input to routing, alerting, and API behavior.</p>
+<p>Teams often miss this and monitor only an average lag graph. That is too blunt. A mean of 150 ms says nothing about whether the <code>p99</code> of a particular shard exceeded the budget for the "extend hold" flow, or whether a user who just wrote data is allowed to read from a replica that has not yet applied the same commit. The budget must be attached to each read path, not to the database in the abstract.</p>
+<h2>Why This Matters</h2>
+<p>Replication is almost always introduced to buy something concrete: lower regional latency, better read throughput, or continued service during a failure. Those are real wins for Harbor Point. The Lisbon sales desk should not wait on Maryland for every non-critical read, and the primary reservation region should not melt because every availability card, hold detail, and audit query insists on seeing the newest byte everywhere.</p>
+<p>But cheaper reads are not free. The moment Harbor Point serves from a replica that may be behind, it has spent some freshness. A lag budget is the accounting system for that spend. It translates "stale enough to be safe" into an explicit engineering rule: which read paths may be up to <code>X</code> milliseconds behind, how the system proves a replica is within that window, and what happens when no replica can meet it. The trade-off is direct. Tighter budgets preserve user trust and reduce conflict risk, but they push more traffic to the leader or to quorum reads. Looser budgets improve latency and availability, but they let older state leak into the user experience.</p>
+<p>Production systems get into trouble when this trade-off stays implicit. Then support sees "I just placed the hold but the screen still shows the cabin," SRE sees replica lag spikes, and nobody can tell whether the behavior is within the designed envelope or a correctness bug. A written lag budget turns that confusion into a debuggable contract.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Turn user promises into freshness budgets</h3>
+<p>Harbor Point starts by listing the read paths that matter and asking what damage stale data can cause before a later recheck catches it.</p>
+<table>
+<thead>
+<tr>
+<th>Read path</th>
+<th>Budget</th>
+<th>Why this budget is acceptable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cabin search results</td>
+<td><code>2s</code></td>
+<td>Search is advisory; the hold attempt revalidates before success is returned.</td>
+</tr>
+<tr>
+<td>Hold details after the same agent just created a hold</td>
+<td><code>250ms</code> plus session token</td>
+<td>The agent expects near read-your-write behavior; short staleness is tolerable only if the replica has applied that agent's last successful write.</td>
+</tr>
+<tr>
+<td>Payment confirmation and final booking status</td>
+<td><code>0ms</code></td>
+<td>This screen is the decision point. It must reflect the committed booking record, not a nearby replica's best effort.</td>
+</tr>
+</tbody>
+</table>
+<p>The important move is that the number comes from product semantics, not from whatever lag today's dashboard happens to show. Search results can survive minor delay because the booking flow still has a decisive check later. Payment confirmation cannot. If a read path has no compensating check and drives a one-way user action, its budget usually shrinks to zero or near zero.</p>
+<p>This is also where "read-your-write" and "bounded staleness" part ways. A path can tolerate some age for other people's updates and still require monotonic visibility for the same user's prior write. After a Lisbon agent creates hold <code>H-8821</code>, Harbor Point returns the commit position with the response. Any follow-up read from that session must prove it has applied at least that position, even if the path's general budget is 250 ms.</p>
+<h3>Part 2: Measure what each replica can safely serve</h3>
+<p>A lag budget only works if the serving layer can compare "what the read requires" with "what the replica has definitely applied." The exact signal depends on the replication mechanism, but the shape is the same. In a leader-based system it may be a WAL position or GTID. In a quorum system it may be a version vector, repair watermark, or other per-partition commit marker. Harbor Point stores, for each replica, a <code>safe_read_through</code> value that advances only after the replica has durably applied the change.</p>
+<p>During the flash sale, the timeline for <code>H-8821</code> looks like this:</p>
+<div class="codehilite"><pre><span></span><code>14:03:11.210  hold H-8821 for cabin C14 commits at version 918442
+14:03:11.335  iad-hold-1 safe_read_through = 918442
+14:03:11.480  fra-hold-3 safe_read_through = 918442
+14:03:12.090  lis-hold-2 safe_read_through = 918442
+</code></pre></div>
+
+<p>At 14:03:11.700, the Lisbon UI asks for cabin availability with a <code>2s</code> budget. <code>lis-hold-2</code> is still behind by version, but it is only 490 ms behind in wall-clock time, so the read can still be acceptable for the search page if Harbor Point has decided that a two-second-old answer is honest enough for that screen. At 14:03:11.700, that same replica is not acceptable for the "show me the hold I just created" screen if the session token says the agent already observed version <code>918442</code>. The read router must reject that replica for that path and fall back to a fresher source.</p>
+<p>A simple version of the routing rule looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">choose_reader</span><span class="p">(</span><span class="n">read_budget_ms</span><span class="p">,</span> <span class="n">required_version</span><span class="p">,</span> <span class="n">now</span><span class="p">,</span> <span class="n">replicas</span><span class="p">):</span>
+    <span class="n">eligible</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">replica</span> <span class="ow">in</span> <span class="n">replicas</span><span class="p">:</span>
+        <span class="n">within_budget</span> <span class="o">=</span> <span class="n">now</span> <span class="o">-</span> <span class="n">replica</span><span class="o">.</span><span class="n">safe_read_time</span> <span class="o">&lt;=</span> <span class="n">read_budget_ms</span>
+        <span class="n">caught_up</span> <span class="o">=</span> <span class="n">replica</span><span class="o">.</span><span class="n">safe_read_through</span> <span class="o">&gt;=</span> <span class="n">required_version</span>
+        <span class="k">if</span> <span class="n">within_budget</span> <span class="ow">and</span> <span class="n">caught_up</span><span class="p">:</span>
+            <span class="n">eligible</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">replica</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">eligible</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">nearest</span><span class="p">(</span><span class="n">eligible</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="s2">&quot;quorum-or-leader&quot;</span>
+</code></pre></div>
+
+<p>The important mechanism is not the exact code. It is the separation of concerns. Time-based staleness answers "is this replica fresh enough in general?" A session or request version answers "has this replica definitely seen the state this caller already depends on?" Real systems often need both.</p>
+<p>This is why raw "seconds behind primary" graphs are not enough. They tell you something about transport delay, but they do not by themselves prove what a specific replica can safely show for a specific partition. Production read routing needs a freshness watermark that is tied to applied commits, not only a cluster-wide average.</p>
+<h3>Part 3: Decide what happens when the budget is exhausted</h3>
+<p>Budgets are only useful if the failure behavior is explicit. Harbor Point defines three responses when no local replica can satisfy the budget:</p>
+<ol>
+<li>For advisory reads such as cabin search, route to a farther replica or leader only if the extra latency stays within the page SLO; otherwise serve local stale data only when the staleness is still inside the declared <code>2s</code> envelope.</li>
+<li>For session-sensitive reads such as hold details, retry against quorum or the home region until the required version is visible.</li>
+<li>For decisive reads such as payment confirmation, skip stale replicas entirely and read from the path that gives the correct contract, even if it is slower.</li>
+</ol>
+<p>That policy makes the trade-off visible. A <code>2s</code> search budget lowers median latency and reduces load on the freshest replica, but it knowingly accepts that a cabin card can be briefly outdated. A <code>0ms</code> confirmation budget protects user trust, but it concentrates more read load on the freshest path and can increase cross-region tail latency. Neither is "best practice" in the abstract. Each is a deliberate exchange of latency, availability, and anomaly risk.</p>
+<p>The same budget discipline also changes alerting. Harbor Point no longer pages because "replica lag is above 500 ms" in the abstract. It pages because "the hold-details path has fewer than two eligible replicas within its 250 ms budget" or "payment confirmation is falling back across regions more than 5% of the time." Those are product-aligned signals. They tell operators which user promise is being threatened.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Our lag dashboard is green, so stale reads cannot explain the incident."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: A single cluster-wide lag metric looks authoritative, and averages are easy to alert on.</li>
+<li><strong>Corrective mental model</strong>: Read staleness is per read path and often per partition. Averages can hide the one hot shard or delayed replica that matters.</li>
+<li><strong>Operational fix</strong>: Track eligibility against each path's lag budget, plus per-shard replay position or watermark skew, not just one global average.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "If the path allows 250 ms of staleness, any replica within 250 ms satisfies read-your-write."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Time-based budgets feel precise, so teams assume they cover causality as well.</li>
+<li><strong>Corrective mental model</strong>: A bounded-staleness promise to the population is different from a causality promise to one caller who already observed a successful write.</li>
+<li><strong>Operational fix</strong>: Return a session token or commit position with writes and require subsequent reads to prove they have applied at least that position.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "We can make every page fast by widening the lag budget and fixing conflicts later."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Larger budgets reduce fallback traffic immediately.</li>
+<li><strong>Corrective mental model</strong>: Some stale reads are harmless hints; others trigger irreversible user actions or conflicting writes that must be rejected later.</li>
+<li><strong>Operational fix</strong>: Keep decisive flows on zero- or near-zero-staleness paths, and reserve wider budgets for advisory views with a later revalidation step.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="045.html">045.md</a> explained why quorum overlap can reveal a recent value</h3>
+<p>Quorum math answers whether a recent write can be recovered from the replica set. This lesson answers a different production question: when Harbor Point is allowed to skip that more expensive read path and still stay honest about how old the answer may be.</p>
+<h3>Connection 2: <a href="043.html">043.md</a> showed the mechanics that make follower lag observable</h3>
+<p>Leader-based replication exposes replay position directly through WAL progress. Lag budgeting turns that low-level signal into an application rule about which follower may serve which read.</p>
+<h3>Connection 3: <a href="047.html">047.md</a> picks up where stale reads become conflicting decisions</h3>
+<p>Once a system knowingly serves slightly old data, some write attempts will race or collide. The next lesson studies how distributed stores decide whether to merge, reject, or surface those conflicts when stale views lead different replicas or clients to different conclusions.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the chapters on replication, read-after-write consistency, and follower reads to connect freshness guarantees to user-visible semantics.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://vldb.org/pvldb/vol5/p776_peterbailis_vldb2012.pdf">Probabilistically Bounded Staleness for Practical Partial Quorums</a><ul>
+<li>Focus: See how partial quorums trade latency for probabilistic bounds on time- and version-based staleness.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/functions-admin.html">PostgreSQL Documentation: System Administration Functions</a><ul>
+<li>Focus: Study <code>pg_last_wal_replay_lsn()</code> and <code>pg_last_xact_replay_timestamp()</code> as concrete examples of replay-watermark signals that can drive stale-read routing.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/follower-reads">CockroachDB Documentation: Follower Reads</a><ul>
+<li>Focus: Compare exact staleness and bounded staleness follower reads to see how a database exposes an explicit freshness budget in its query interface.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Insights</h2>
+<ol>
+<li><strong>Replication lag is only actionable when it is budgeted per read path</strong> - "Eventually consistent" is too vague to tell the system when a nearby replica is acceptable.</li>
+<li><strong>A freshness budget needs a proof signal</strong> - Replica selection must be based on applied commit watermarks or equivalent version metadata, not on wishful thinking or a cluster-wide average.</li>
+<li><strong>Bounded staleness and read-your-write are different contracts</strong> - A path can allow slightly old data for the general case and still require session-aware routing after a caller's own write.</li>
+<li><strong>The trade-off is product-shaped</strong> - Wider budgets buy latency and availability; tighter budgets buy correctness and trust at the cost of more coordination.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="045.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Leaderless Replication and Quorum Math</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="047.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Conflict Resolution Policies in Distributed Stores</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 10:27 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>
