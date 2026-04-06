@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Snapshot Isolation and Anomaly Boundaries - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Snapshot Isolation and Anomaly Boundaries</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          053
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">053</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 484: Snapshot Isolation and Anomaly Boundaries</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Snapshot isolation gives each transaction a stable MVCC view and rejects direct write-write collisions, but it does not automatically protect invariants that depend on a set of rows rather than one row version.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="052.html">052.md</a>, Harbor Point finally gave <code>POST /bookings/confirm</code> a real transaction boundary. That fixed the obvious failure mode: cabin state, loyalty debit, promo decrement, and booking record now commit together instead of leaking half-finished work. Product then adds a new rule for disruption handling: every Atlantic sailing must keep at least one unsold suite in reserve until departure day so operations can reaccommodate stranded passengers.</p>
+<p>At 09:00, two agents open separate upgrade confirmations. Each transaction reads the same snapshot and sees two unsold suites, <code>S12</code> and <code>S14</code>. Agent one books <code>S12</code>; agent two books <code>S14</code>. Because the transactions write different rows, a snapshot-isolated database can let both commits succeed. No dirty reads occurred. No partial transaction leaked. Each agent saw a perfectly consistent picture. Harbor Point still broke the policy.</p>
+<p>That is the useful boundary to internalize. Snapshot isolation is not "weak" because it shows inconsistent data; it is strong at giving each transaction a coherent point-in-time view. The gap is elsewhere: it usually notices direct write-write conflicts, not every cross-row business rule. The moment an invariant sounds like "at least one," "no more than N across this set," or "none exists matching this predicate," you have to ask whether the database will create a conflict for that rule or whether two valid local decisions can still combine into an invalid global outcome.</p>
+<h2>Why This Matters</h2>
+<p>Snapshot isolation is popular because it buys a lot of concurrency for OLTP systems. Readers do not block writers the way lock-heavy schemes do, long-running reports can read a stable picture, and many hot paths stop seeing spurious non-repeatable reads. For Harbor Point, that means customer-service agents can keep confirming bookings during a flash sale without every read waiting behind unrelated updates.</p>
+<p>The production problem starts when teams confuse "transactional" with "serializable." A transactional booking flow under snapshot isolation can still violate invariants that live across multiple rows, multiple index entries, or the absence of a row. The database is honoring its contract; the team is asking it to enforce a stronger one than it promised. That mismatch usually appears only after a product rule changes from single-record correctness to set-level correctness.</p>
+<p>Knowing the anomaly boundary changes design decisions. If the rule is row-local, snapshot isolation may be the right trade-off: high concurrency, simple recovery, and predictable latency. If the rule is predicate-based, the options change: use serializable isolation, materialize a shared conflict record, take explicit locks, or redesign the invariant into escrow-like quotas. The key is to choose consciously instead of treating a missing anomaly as a lucky benchmark result.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: What snapshot isolation actually gives you</h3>
+<p>Under classic snapshot isolation, each transaction starts by selecting a visible snapshot of committed versions. Reads come from that fixed snapshot; later commits from other transactions do not suddenly appear halfway through the transaction. Writes create new versions that stay private until commit. At commit time, the engine usually applies a first-committer-wins rule for rows both transactions tried to modify.</p>
+<p>For Harbor Point, the booking database behaves roughly like this:</p>
+<div class="codehilite"><pre><span></span><code>1. T1 starts and receives snapshot S100.
+2. T2 starts and receives snapshot S101, which is still effectively the same business state.
+3. T1 reads suites S12 and S14 as available.
+4. T2 reads suites S12 and S14 as available.
+5. T1 updates S12 and commits.
+6. T2 updates S14 and commits.
+7. Both commits succeed because the write sets do not overlap.
+</code></pre></div>
+
+<p>The important detail is that snapshot isolation gives stability, not omniscience. T2 never sees a dirty intermediate write from T1. T2 also never rereads the table and notices that the world changed before commit. That fixed snapshot is precisely why analytics, long-running reads, and many request flows behave more predictably. It is also why a transaction can make a correct decision relative to an old snapshot and still help create an incorrect final state.</p>
+<p>A useful working rule is this: snapshot isolation protects you best when the invariant collapses to the same versioned object that the transaction writes. If two concurrent transactions must update the exact same cabin row, one of them will usually abort. If the invariant lives across a set of rows and each transaction can satisfy its local check while touching a different member of that set, snapshot isolation may never notice the conflict.</p>
+<h3>Part 2: The write-skew boundary in Harbor Point's reserve-suite policy</h3>
+<p>Harbor Point stores each suite as its own row:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">cabin_id</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">cabins</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">voyage_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9001</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;suite&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;available&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The application rule is simple: reject a sale if fewer than two suites are available, because booking one of the remaining two would consume the last reserve cabin. The confirmation code therefore does something like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">confirm_suite_upgrade</span><span class="p">(</span><span class="n">tx</span><span class="p">,</span> <span class="n">voyage_id</span><span class="p">,</span> <span class="n">booking_id</span><span class="p">):</span>
+    <span class="n">available</span> <span class="o">=</span> <span class="n">tx</span><span class="o">.</span><span class="n">query_available_suites</span><span class="p">(</span><span class="n">voyage_id</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">available</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">ReservePolicyViolation</span><span class="p">()</span>
+
+    <span class="n">chosen</span> <span class="o">=</span> <span class="n">choose_suite</span><span class="p">(</span><span class="n">available</span><span class="p">)</span>
+    <span class="n">tx</span><span class="o">.</span><span class="n">mark_booked</span><span class="p">(</span><span class="n">chosen</span><span class="o">.</span><span class="n">cabin_id</span><span class="p">,</span> <span class="n">booking_id</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Nothing is obviously wrong with the code. Each transaction reads a stable snapshot, checks the policy, and books one suite. The anomaly appears because both transactions read the same pre-commit snapshot and then update different rows. This is the classic write-skew shape: the dangerous dependency is through the predicate "there must remain at least one suite," not through a shared row version.</p>
+<p>That distinction is the boundary in the lesson title. Snapshot isolation usually prevents:</p>
+<ul>
+<li>dirty reads and half-committed visibility</li>
+<li>non-repeatable reads inside one transaction's snapshot</li>
+<li>many direct lost updates where two transactions overwrite the same row version</li>
+</ul>
+<p>Snapshot isolation does not automatically prevent:</p>
+<ul>
+<li>write skew on disjoint rows that jointly enforce one invariant</li>
+<li>predicate-based anomalies such as "no row matching X may exist" unless the engine turns the predicate into a real conflict</li>
+<li>stale decisions in long transactions that never revalidate business rules against newer commits</li>
+</ul>
+<p>If Harbor Point changes the schema so every suite sale must also decrement a single <code>reserve_suite_budget</code> row for that voyage, the anomaly boundary changes. Now both transactions contend on the same record and snapshot isolation will surface a direct conflict. The invariant became enforceable not because the database got smarter, but because the data model materialized the business rule into one object the concurrency control system can see.</p>
+<h3>Part 3: Choosing the right response when snapshot isolation is not enough</h3>
+<p>Once the anomaly is visible, the temptation is to say "use serializable everywhere." That can work, but it is not the only answer and it is not free. Serializable isolation closes the gap by detecting or preventing dangerous read-write cycles, which means more aborts, heavier locking or validation, and more pressure on hot predicates. For Harbor Point's busiest sailings, that may be acceptable for booking confirmation and unnecessary for back-office reporting.</p>
+<p>The practical options are narrower and more mechanical than the slogan suggests:</p>
+<ul>
+<li>keep snapshot isolation when the critical invariant is row-local and direct write conflicts are exactly the signal you want</li>
+<li>use serializable isolation when the invariant genuinely spans a predicate and the path is important enough to pay extra coordination cost</li>
+<li>materialize the invariant into a shared row or quota bucket when you want snapshot isolation's performance but need the business rule to create an explicit conflict</li>
+<li>move some checks into asynchronous reconciliation only when the product can tolerate temporary violation and repair</li>
+</ul>
+<p>The trade-off is straightforward. Snapshot isolation often gives better throughput and less blocking because it avoids turning every read into a lock negotiation. Serializable techniques reduce anomaly space, but they spend coordination budget through retries, blocking, predicate locks, or conflict tracking. Production engineering is deciding where that budget belongs. Harbor Point should spend it on the customer-visible booking promise, not on every dashboard or audit query that merely needs a stable historical view.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Snapshot isolation means transactions behave as if they ran one at a time."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Each transaction reads a clean, stable picture, so the result feels serial.</li>
+<li><strong>Corrective mental model</strong>: Snapshot isolation guarantees point-in-time visibility plus conflict checks on overlapping writes, not a single serial order for all predicates.</li>
+<li><strong>Operational fix</strong>: List the invariants that span sets of rows and test them under concurrent commits, not only under single-request correctness tests.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "If both transactions commit, the invariant must have been safe."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Commit success looks like database approval.</li>
+<li><strong>Corrective mental model</strong>: Commit only proves the schedule satisfied the isolation level the engine implements. It does not prove the schedule satisfied your business rule.</li>
+<li><strong>Operational fix</strong>: Translate critical rules into concrete conflict points or use serializable isolation where the predicate itself must be protected.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Retries solve snapshot-isolation anomalies."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Retries are the right answer for deadlocks and direct write conflicts.</li>
+<li><strong>Corrective mental model</strong>: Retrying the same predicate-based logic under snapshot isolation can recreate the same write skew if nothing about the conflict structure changes.</li>
+<li><strong>Operational fix</strong>: Change the concurrency contract by adding a shared guard row, stronger isolation, or an explicit lock on the predicate set.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "The fix is always to lock every row the query touched."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: It seems like the safest possible move.</li>
+<li><strong>Corrective mental model</strong>: Blanket locking can destroy the throughput advantage that made snapshot isolation attractive in the first place.</li>
+<li><strong>Operational fix</strong>: Lock or serialize only the part of the state that actually carries the invariant, and measure abort rate and tail latency after the change.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="052.html">052.md</a> separated transaction boundaries from side effects</h3>
+<p>The previous lesson established that Harbor Point needs one atomic commit decision for booking state. This lesson narrows the question: even with a real transaction, what concurrent histories is the database still allowed to accept?</p>
+<h3>Connection 2: <a href="051.html">051.md</a> matters because sharding only solved ownership, not anomaly shape</h3>
+<p>Keeping decisive writes inside one shard made the booking path easier to reason about, but snapshot isolation shows that a single shard can still admit invalid multi-row outcomes when the invariant is predicate-based.</p>
+<h3>Connection 3: <a href="054.html">054.md</a> is the natural next step</h3>
+<p>Once you can name write skew and other snapshot-isolation boundaries, the next design question is how real systems approximate serializable behavior without turning every workload into one global lock.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the chapters on transactions and multi-version concurrency control together; they explain why a stable snapshot is not the same thing as serial execution.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://sigmodrecord.org/?smd_process_download=1&amp;download_id=8550">A Critique of ANSI SQL Isolation Levels</a><ul>
+<li>Focus: Use it to separate named isolation levels from the actual anomaly classes they do or do not rule out.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://dl.acm.org/doi/10.1145/1620585.1620587">Making Snapshot Isolation Serializable</a><ul>
+<li>Focus: Pay attention to dangerous structures and why serializable snapshot isolation adds conflict detection instead of merely "stronger locks everywhere."</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Documentation: Transaction Isolation</a><ul>
+<li>Focus: Map the formal concepts to an engine engineers actually operate, including which anomalies PostgreSQL prevents at each level.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Snapshot isolation gives each transaction a stable committed snapshot and typically rejects direct write-write collisions, which is why it performs well on many OLTP paths.</li>
+<li>The main anomaly boundary is cross-row or predicate-based invariants: two transactions can each make a locally valid decision and still violate a global rule together.</li>
+<li>When snapshot isolation is too weak, the fix is to create a real conflict surface with serializable isolation, explicit locks, or a materialized guard record rather than relying on blind retries.</li>
+<li>The question is never "is snapshot isolation good or bad?"; it is "does this invariant map to the conflicts snapshot isolation actually knows how to see?"</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="052.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Transaction Semantics in Data-Intensive Systems</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="054.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Serializable Techniques in Practice</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cross-Shard Queries and Fan-Out Costs - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Cross-Shard Queries and Fan-Out Costs</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/data-systems.html">Data Systems</a>
+          /
+          <a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a>
+          /
+          024
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/data-architecture-and-platforms.html">Data Architecture and Platforms</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">024</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 482: Cross-Shard Queries and Fan-Out Costs</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Once data is partitioned, an apparently simple read becomes a distributed workflow whose real cost is set by target selection, snapshot semantics, and the slowest shard in the fan-out.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>After <a href="023.html">023.md</a>, <code>PayLedger</code> stopped routing every <code>Northwind Payroll</code> write to one hot shard. Payout holds now live on the shard that owns a specific funding account, which fixed the month-end hotspot. The next page load exposed the new pressure point. The merchant-operations dashboard still promises a single summary card: total available funds, pending holds, failed payouts in the last hour, and the next settlement cut. Before repartitioning, that card came from one shard. Now it requires twelve shard-local reads, a coordinator merge, and a decision about whether "current" means one shared snapshot or merely twelve recent answers.</p>
+<p>The easy misconception is that parallelism makes this nearly free. It does not. If eleven shards answer in 9 ms and one answers in 52 ms, the coordinator still waits around 52 ms before it can return an exact total. If each shard call succeeds 99.9% of the time and the query needs 20 shards, the best-case full-success rate is only about 98%. A scatter-gather path amplifies small per-shard costs into user-visible tail latency and availability loss.</p>
+<p>That is the shift this lesson needs to make concrete. A cross-shard query is not "a normal query, but across more machines." It is a small distributed system: it needs routing metadata, a policy for partial failure, a merge plan, and an explicit answer to whether the combined result must represent one moment in time or whether a slightly stale derived view is acceptable. Once those contracts are clear, fan-out can be an intentional trade-off. Without them, it becomes an unbounded tax on every high-level read.</p>
+<h2>Why This Matters</h2>
+<p>Production teams usually notice cross-shard query problems late because shard-local benchmarks look fine. Each storage node can report healthy p50 query time, acceptable CPU, and modest scan counts, while the user-facing endpoint degrades anyway. The coordinator is doing extra work to discover target shards, open connections, buffer partials, sort or aggregate them, and decide what to do when one shard times out. Meanwhile the product team still expects <code>merchant-summary</code> to behave like a single-record lookup.</p>
+<p><code>PayLedger</code> makes the trade-off concrete. The hotspot mitigation from <a href="023.html">023.md</a> was correct because the invariant lives at the funding-account level, not at the merchant level. But that better write distribution means merchant-wide reads are now derived data. If the support workflow needs an exact answer before approving a manual payout override, the system may need a shared read timestamp or a primary-only read path. If the page is operational telemetry for humans, a precomputed summary that is 15 seconds stale may be the better product contract. Cross-shard queries force that distinction into the open, which is why they sit at the boundary between schema design, query planning, and production reliability.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p><code>PayLedger</code> stores authoritative balance state by <code>(merchant_id, funding_account_id)</code>. Each shard owns the WAL, in-memory balance ledger, and idempotency window for its accounts. The merchant dashboard does not care about any single account in isolation. It needs a roll-up of total available funds, holds waiting to settle, payments that failed in the last hour, and any funding account whose replica lag makes failover unsafe.</p>
+<p>That sounds like one query, but the authoritative facts live on different shard owners. The first design mistake is broadcasting the dashboard request to every shard in the fleet. That creates predictable waste: quiet shards do no useful work, network traffic grows with cluster size rather than with merchant size, and every request becomes more fragile than the data model actually requires.</p>
+<p>The correct starting point is a directory that maps <code>merchant_id</code> to the specific funding accounts and shard owners that can answer the question. In <code>PayLedger</code>, the router already maintains this directory because writes need it during resharding. The read coordinator reuses the same metadata so a 64-shard cluster might only touch 5 shards for one merchant summary.</p>
+<div class="codehilite"><pre><span></span><code>client
+  -&gt; summary-api coordinator
+      -&gt; account-directory: merchant 1842 -&gt; shards [03, 11, 18, 27, 41]
+      -&gt; shard 03: local aggregate for accounts [A1, A4]
+      -&gt; shard 11: local aggregate for accounts [A2, A9]
+      -&gt; shard 18: local aggregate for accounts [A3, A5, A6]
+      -&gt; shard 27: local aggregate for accounts [A7, A8]
+      -&gt; shard 41: local aggregate for accounts [A10, A11, A12]
+  &lt;- merged merchant summary
+</code></pre></div>
+
+<p>This makes fan-out proportional to the actual ownership graph, not to the size of the cluster. That distinction matters because the expensive version of cross-shard querying is not "touching more than one shard." It is touching more shards than the access pattern truly requires.</p>
+<h3>Part 2: Mechanism</h3>
+<p>Once the coordinator knows the target set, the mechanics are straightforward but unforgiving. It issues shard-local work that is as small as possible, waits for required answers, and merges partials using an explicit consistency rule. The request path usually looks like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">merchant_summary</span><span class="p">(</span><span class="n">merchant_id</span><span class="p">,</span> <span class="n">as_of</span><span class="p">):</span>
+    <span class="n">route</span> <span class="o">=</span> <span class="n">account_directory</span><span class="o">.</span><span class="n">lookup</span><span class="p">(</span><span class="n">merchant_id</span><span class="p">)</span>
+    <span class="n">query</span> <span class="o">=</span> <span class="n">LocalSummaryQuery</span><span class="p">(</span><span class="n">merchant_id</span><span class="o">=</span><span class="n">merchant_id</span><span class="p">,</span> <span class="n">as_of</span><span class="o">=</span><span class="n">as_of</span><span class="p">)</span>
+
+    <span class="n">partials</span> <span class="o">=</span> <span class="k">await</span> <span class="n">scatter_gather</span><span class="p">(</span>
+        <span class="n">targets</span><span class="o">=</span><span class="n">route</span><span class="o">.</span><span class="n">shards</span><span class="p">,</span>
+        <span class="n">request</span><span class="o">=</span><span class="n">query</span><span class="p">,</span>
+        <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">75</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">partials</span><span class="o">.</span><span class="n">missing_required_shards</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">IncompleteSummary</span><span class="p">(</span><span class="s2">&quot;exact summary unavailable&quot;</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">merge_summary</span><span class="p">(</span><span class="n">partials</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The important detail is not the async code. It is what <code>as_of</code> and <code>missing_required_shards</code> mean. There are three common contracts:</p>
+<ol>
+<li>Exact and current. Every shard must answer at one shared snapshot boundary, or the query fails. This is appropriate for financial approval paths and expensive for interactive dashboards.</li>
+<li>Exact at a bounded staleness. The system chooses a read timestamp or a derived snapshot that is, say, no more than 15 seconds old. This gives consistent totals with better latency if the product can tolerate lag.</li>
+<li>Best-effort operational view. Partial results are allowed as long as the response marks itself incomplete. This can work for internal observability pages but is dangerous for business logic.</li>
+</ol>
+<p>Fan-out cost comes from more than the number of shards. A useful mental accounting model is:</p>
+<div class="codehilite"><pre><span></span><code>query cost ~= routing lookup
+           + slowest required shard
+           + merge/sort/aggregate work
+           + bytes moved across the network
+           + failure handling when one shard is slow or unavailable
+</code></pre></div>
+
+<p>Because the shard calls run in parallel, engineers often assume the total cost is approximately one shard read. In practice, it trends toward the slowest shard plus coordinator overhead, and the probability of hitting one slow or missing shard rises with every extra target. That is why local pushdown matters so much. Each shard should return a compact aggregate, top-k result, or filtered slice, not a raw row set that the coordinator has to re-scan in memory.</p>
+<p>Resharding adds another correctness edge. If the directory says merchant 1842 lives on shards <code>[03,11,18,27,41]</code> but account <code>A9</code> has just moved from 11 to 44, the coordinator can double count or miss data unless the directory lookup and shard ownership epoch are part of the query contract. Cross-shard reads are often blamed on query planners when the real bug is stale routing metadata.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>For <code>PayLedger</code>, the merchant summary endpoint ended up with two modes. The manual payout override flow uses a small exact read against the specific funding accounts named in the request. It touches few shards, runs against primary-owned state, and fails closed if any required shard cannot provide the chosen snapshot. The support dashboard takes a different path: it reads a <code>merchant_summary</code> view refreshed from shard change streams every few seconds. That view is deliberately stale, but it removes repeated fan-out from the human-facing page and avoids turning every refresh into five cross-shard RPCs.</p>
+<p>That split is the real trade-off. Exact interactive fan-out keeps the data closest to its source of truth, but it pays in tail latency, coordinator complexity, and lower end-to-end availability. Precomputed or incrementally maintained summaries make the request path cheap, but they move work into background pipelines and introduce freshness lag that the product must surface honestly. Neither path is universally correct. The right answer depends on whether the caller is making a money-moving decision, browsing an operations dashboard, or exporting a report.</p>
+<p>This is also where cross-shard query design starts leaning into the next part of the track. Once teams realize that repeated distributed reads are too expensive on the request path, they often build batch or incremental pipelines to materialize the expensive views ahead of time. That is not an admission of failure. It is the normal consequence of making fan-out costs explicit, and it is the bridge into <a href="025.md">025.md</a>.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li><strong>"Parallel fan-out makes a multi-shard read almost as cheap as a single-shard read."</strong> Parallelism hides sum-of-latencies, but it does not remove the slowest-shard effect, merge overhead, or compounded failure probability.</li>
+<li><strong>"If every shard returns correct local data, the merged result is automatically correct."</strong> The result is only correct for the contract you chose. Without a shared read timestamp or a derived snapshot, the coordinator can combine answers from different moments in time.</li>
+<li><strong>"Broadcasting to every shard is safer because you cannot miss data."</strong> It is safer only if your routing metadata is broken. In healthy systems, broadcast turns targeted reads into cluster-wide tax and makes availability worse for no business benefit.</li>
+<li><strong>"Retries are enough to repair partial fan-out failures."</strong> Retries can recover transient misses, but they also extend tail latency and can amplify load on the very shards that are already unhealthy.</li>
+<li><strong>"A secondary index removes cross-shard cost."</strong> Usually it relocates the cost. The index still has to be maintained, and the system must decide whether the indexed view is exact, stale, or eventually repaired.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="023.html">023.md</a> is the direct setup for this lesson. Narrowing the write-side contention domain fixed the hotspot, but it also turned merchant-wide reads into derived, cross-shard work.</li>
+<li><a href="025.md">025.md</a> picks up the obvious response when fan-out becomes too expensive on the request path: shift repeated aggregation into throughput-oriented pipelines and materialized outputs.</li>
+<li>Search engines and distributed SQL systems face the same coordinator problem. They win by pushing work down to shards, merging compact partials, and being explicit about when global accuracy is worth an extra phase or a staler snapshot.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Revisit the chapters on partitioning and derived data together; they explain why a query can stay logically simple while becoming operationally expensive once its source of truth is split.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub41344">F1: A Distributed SQL Database That Scales</a><ul>
+<li>Focus: Pay attention to how Google keeps relational query semantics while still acknowledging the cost of distributing data and coordination across many servers.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://vitess.io/docs/faq/sharding/advanced/can-i-use-vitess-to-do-cross-shard-joins-or/">Vitess FAQ: Can I use Vitess to do cross-shard JOINs or Transactions?</a><ul>
+<li>Focus: The practical lesson is not just "yes, you can"; it is why schema and workload design should still prefer targeted single-shard operations whenever possible.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://vitess.io/docs/23.0/user-guides/vschema-guide/sharding-guidelines/">Vitess Sharding Guidelines</a><ul>
+<li>Focus: The sections on large tenants and materialization are especially relevant because they show how cross-shard overhead often pushes teams toward alternate views instead of more synchronous scatter-gather.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://cloud.google.com/spanner/docs/timestamp-bounds">Cloud Spanner Timestamp Bounds</a><ul>
+<li>Focus: Read this for the snapshot question. It makes the latency-versus-freshness trade-off explicit instead of pretending that every distributed read can be both current and cheap.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li><strong>A cross-shard query is a distributed workflow, not a bigger local query.</strong> Routing, merge rules, and partial-failure behavior are part of the design.</li>
+<li><strong>Fan-out cost is dominated by target selection and the slowest required shard.</strong> Keeping the target set precise matters more than adding blind parallelism.</li>
+<li><strong>Merged results need an explicit snapshot contract.</strong> Exact, bounded-stale, and best-effort reads are different products, not interchangeable implementations.</li>
+<li><strong>When repeated fan-out becomes the bottleneck, precomputed views are often the right response.</strong> They trade freshness for predictable latency and lower request-path fragility.</li>
+</ul>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="023.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Hotspot Mitigation Strategies</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/data-architecture-and-platforms.html">← Back to Data Architecture and Platforms</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

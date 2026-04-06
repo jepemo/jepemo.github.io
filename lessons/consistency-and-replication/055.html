@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Transactions and 2PC Limits - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Distributed Transactions and 2PC Limits</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          055
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">055</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 486: Distributed Transactions and 2PC Limits</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Two-phase commit gives multiple transactional systems one atomic commit decision, but it does that by forcing participants into a durable prepared state that can block progress when the coordinator or network fails.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="054.html">054.md</a>, Harbor Point learned how to keep one database serializable enough to protect the "leave one suite unsold" rule. That solved a local concurrency problem. It did not solve the next production problem that arrived after the company split its system boundaries: confirming a suite upgrade now has to touch <code>booking-db</code>, which owns cabin assignment, and <code>ledger-db</code>, which owns the receivable that finance reconciles at the end of the day. If one database commits and the other does not, the company either promised a cabin without charging for it or charged a guest for an upgrade that operations never honored.</p>
+<p>The non-obvious insight is that distributed transactions are not mainly about making many systems feel like one giant database. They are about making one yes-or-no commit decision durable across several resource managers. Two-phase commit, or 2PC, works by asking each participant to do all of its local transaction work up to the edge of commit, record that prepared state durably, and then wait for the coordinator's final decision. Once a participant votes "yes," it has given up the right to decide alone.</p>
+<p>That is why 2PC feels so different from ordinary retry logic. Retries are cheap because a component is free to start over. A prepared participant is not free. It may be holding row locks, index locks, or MVCC cleanup state while it waits. The protocol buys atomicity, but the trade-off is coordination latency, operational coupling, and the possibility of blocking when the decision maker disappears at exactly the wrong moment.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point can reconcile a few inconsistent upgrades by hand during a quiet week. It cannot run that way during peak summer sailings, when the booking team is confirming hundreds of last-minute cabin changes and finance is closing revenue at the same time. If <code>booking-db</code> says suite <code>S12</code> is sold while <code>ledger-db</code> is missing the receivable entry, support has to investigate which screen the agent saw, whether the guest was promised the room, and whether a compensating charge is still legally acceptable. Those are not "eventual consistency" inconveniences. They are customer-facing and audit-facing failures.</p>
+<p>This is the moment when distributed transactions look appealing. The business invariant is concrete: either the upgrade exists in both places or it exists in neither. 2PC can enforce that invariant if both databases support prepare/commit semantics. But the production cost is equally concrete. Every successful transaction now needs an extra coordination round, every participant must fsync a prepared record before voting yes, and any slow or crashed coordinator can strand prepared work. Engineers need to recognize both sides of that bargain before they adopt it.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Why local transactions are not enough</h3>
+<p>Harbor Point's upgrade flow now crosses service ownership boundaries:</p>
+<ul>
+<li><code>booking-db</code> changes <code>cabins.status</code> from <code>available</code> to <code>booked</code></li>
+<li><code>ledger-db</code> inserts a receivable row that finance later settles</li>
+</ul>
+<p>If the application tries to do that with two unrelated local transactions, it gets a dangerous gap between the commits:</p>
+<div class="codehilite"><pre><span></span><code>1. Begin local transaction in booking-db.
+2. Mark suite S12 as booked.
+3. Commit booking-db.
+4. Begin local transaction in ledger-db.
+5. Network timeout or process crash before ledger-db commits.
+</code></pre></div>
+
+<p>After step 3, the guest may already see the upgrade in the booking portal. After step 5, finance has no matching receivable. Running each database at <code>SERIALIZABLE</code> would not fix that split. Serializability controls concurrency inside one participant; it does not create atomic commit across multiple participants.</p>
+<p>That distinction matters operationally. When Harbor Point discusses 2PC, it is not replacing local concurrency control from <a href="054.html">054.md</a>. Each participant still needs its own correct local transaction semantics. 2PC sits one layer above that and answers a narrower question: after every participant has done its local work, do they all cross the commit line together or not at all?</p>
+<h3>Part 2: What 2PC asks each participant to do</h3>
+<p>In Harbor Point's case, the coordinator is the upgrade service. It assigns a transaction id such as <code>txn-8841</code> and talks to both databases using a transaction manager or XA-capable driver.</p>
+<p>The protocol looks like this:</p>
+<div class="codehilite"><pre><span></span><code>Coordinator                  booking-db                     ledger-db
+    |                             |                             |
+    |---- PREPARE txn-8841 -----&gt; |                             |
+    |                             |-- validate + write prepare -|
+    |                             |&lt;--------- YES ------------- |
+    |---- PREPARE txn-8841 -------------------------------&gt;     |
+    |                                                           |
+    |                                      validate + write prepare
+    |&lt;------------------------------------------- YES ----------|
+    |---- durable COMMIT decision -----------------------------&gt;|
+    |---- COMMIT txn-8841 -----&gt; |                             |
+    |                             |-- make changes visible -----|
+    |&lt;--------- ACK -------------|                             |
+    |---- COMMIT txn-8841 -------------------------------&gt;     |
+    |&lt;------------------------------------------- ACK ----------|
+</code></pre></div>
+
+<p>Three details make the mechanism work.</p>
+<p>First, <code>PREPARE</code> is not a vote about intention. It is a vote backed by durable state. Before <code>booking-db</code> says yes, it has already done the local writes, checked constraints, and stored enough log information to either commit or roll back later. In PostgreSQL terms, a prepared transaction becomes visible in <code>pg_prepared_xacts</code>; its locks and transactional state survive client disconnects until <code>COMMIT PREPARED</code> or <code>ROLLBACK PREPARED</code>.</p>
+<p>Second, the coordinator must persist its own decision before telling anyone to commit. If Harbor Point's upgrade service sent <code>COMMIT</code> optimistically and crashed before durably recording that choice, recovery could not tell whether the real outcome should be commit or abort. The coordinator's decision log is therefore part of the protocol, not a convenience.</p>
+<p>Third, a "no" vote is much cheaper than a "yes" vote. If either participant rejects during prepare because of a constraint failure, timeout, or local crash, the coordinator can choose abort and tell everyone to roll back. The hard case is after both participants have said yes. At that point, neither participant can safely invent its own outcome without risking a split decision.</p>
+<h3>Part 3: Where the limits show up in production</h3>
+<p>The easiest way to understand 2PC limits is to look at the Harbor Point alert that wakes the on-call engineer: <code>prepared_transactions &gt; 0 for 10 minutes</code>. That alert means the protocol has reached the state where local work is done but the final decision has not finished propagating.</p>
+<p>The failure modes behind that alert are the real design lesson:</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>What Harbor Point observes</th>
+<th>Why it happens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Blocking after coordinator failure</td>
+<td>suite rows stay locked, agents see timeouts, finance rows remain invisible</td>
+<td>prepared participants cannot unilaterally decide commit or abort without risking disagreement</td>
+</tr>
+<tr>
+<td>Latency coupled to the slowest participant</td>
+<td>a healthy <code>booking-db</code> still waits on a slow <code>ledger-db</code> fsync</td>
+<td>prepare and final decision both require all yes-voting participants to stay in the protocol</td>
+</tr>
+<tr>
+<td>Availability drops with every required participant</td>
+<td>one unavailable database prevents the whole upgrade from committing</td>
+<td>atomicity requires all participants to reach a common decision</td>
+</tr>
+<tr>
+<td>Narrow applicability</td>
+<td>card processor calls, emails, and human approval steps do not fit</td>
+<td>those systems usually cannot hold a recoverable prepared state and wait for <code>COMMIT</code></td>
+</tr>
+</tbody>
+</table>
+<p>Blocking is the famous 2PC limitation because it is the place where engineers discover what "prepared" really means. Suppose both databases have voted yes, the coordinator has written nothing durable yet, and then a network partition isolates <code>booking-db</code>. <code>booking-db</code> cannot assume abort, because <code>ledger-db</code> might already have learned commit. It also cannot assume commit, because the coordinator might still choose abort after detecting a failure elsewhere. So it waits. That waiting is not a bug in one implementation. It is the consequence of choosing atomic commit without a fault-tolerant decision process.</p>
+<p>This is also why 2PC is a poor fit for long-running business workflows. If Harbor Point tried to include an external card processor, a fraud review, and an email confirmation in the same distributed transaction, the "prepared" window would become enormous or impossible to represent. Real payment gateways do not expose "prepare a charge and wait indefinitely for commit." They expose authorization, capture, void, and refund semantics. Those require sagas, compensating actions, or outbox-driven orchestration, not 2PC.</p>
+<p>There are still cases where 2PC is the right tool. If both participants are transactional databases inside one datacenter boundary, the invariant is financially important, and the transactions are short, 2PC may be the simplest correct choice. But that decision is defensible only if Harbor Point also budgets for coordinator recovery, prepared-transaction monitoring, timeout handling, and a clear rule that no irreversible side effect is emitted before the final commit decision is durable.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "2PC makes several services behave like one fully available database."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: The word "transaction" suggests strong correctness and familiar local-database behavior.</li>
+<li><strong>Corrective mental model</strong>: 2PC gives atomic commit, not magically high availability; it coordinates a shared decision, and that decision can block when the coordinator or network disappears.</li>
+<li><strong>Operational fix</strong>: Track coordinator health, participant prepare latency, and prepared-transaction age as first-class production signals.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "A participant that voted yes can time out and roll itself back."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Local retry habits teach engineers that timeouts usually mean "start over."</li>
+<li><strong>Corrective mental model</strong>: After <code>PREPARE</code>, the participant has promised to follow the final outcome and must preserve the option to commit later.</li>
+<li><strong>Operational fix</strong>: Make recovery procedures able to reload the coordinator's durable decision log and resolve in-doubt transactions explicitly.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "If every step is idempotent, 2PC is unnecessary."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Idempotency is a powerful tool for retries and duplicate delivery.</li>
+<li><strong>Corrective mental model</strong>: Idempotency helps when an operation repeats; it does not answer the atomicity question of whether two resource managers reached the same final decision.</li>
+<li><strong>Operational fix</strong>: Use idempotency together with 2PC for safe retries around the coordinator, or use sagas when atomic commit across participants is not required or not supported.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "2PC is fine for external APIs as long as timeouts are generous."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Longer timeouts can hide transient failures in testing.</li>
+<li><strong>Corrective mental model</strong>: The protocol assumes participants can durably prepare and later honor <code>COMMIT</code> or <code>ROLLBACK</code>; most external APIs cannot do that.</li>
+<li><strong>Operational fix</strong>: Keep 2PC limited to transactional resource managers and move external side effects to patterns such as an outbox, reservation protocol, or saga.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="054.html">054.md</a> explained local correctness; this lesson explains cross-resource atomicity</h3>
+<p>Harbor Point still needs serializable or otherwise correct local transactions inside each participant. 2PC does not prevent write skew or bad predicate handling inside <code>booking-db</code>; it only coordinates the final commit decision after local transaction logic has already run.</p>
+<h3>Connection 2: <a href="056.html">056.md</a> picks up exactly where 2PC breaks</h3>
+<p>Once you see that prepared participants block because no one can safely invent the final decision, the next question is unavoidable: what fault model would let a commit decision survive crashes and partitions without a single fragile coordinator log? That is the door into consensus and replicated decision-making.</p>
+<h3>Connection 3: <a href="../event-driven-and-streaming/003.html">../event-driven-and-streaming/003.md</a> is the alternative for workflows that cannot prepare</h3>
+<p>When Harbor Point needs to involve a payment gateway or send external notifications, the right comparison is not "2PC versus nothing." It is "2PC for XA-capable resource managers" versus "saga-style orchestration with compensations for systems that cannot join an atomic commit protocol."</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the transaction chapters together to separate local isolation, distributed atomic commit, and consensus instead of treating them as one interchangeable feature.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/two-phase.html">PostgreSQL Documentation: Two-Phase Transactions</a><ul>
+<li>Focus: Pay attention to what PostgreSQL keeps durable during <code>PREPARE TRANSACTION</code>, how prepared transactions survive disconnects, and why they need active cleanup.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/xa.html">MySQL 8.4 Reference Manual: XA Transactions</a><ul>
+<li>Focus: Use it to see how a mainstream engine exposes 2PC semantics, including <code>XA PREPARE</code>, recovery, and in-doubt transaction handling.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally Distributed Database</a><ul>
+<li>Focus: Read the transaction section to see how 2PC is often paired with replicated metadata and precise time assumptions in real distributed databases.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>2PC solves one specific problem: making several transactional participants reach the same commit or abort decision.</li>
+<li>The prepared state is the heart of the protocol and the source of its cost; once a participant votes yes, it may have to wait while holding scarce resources.</li>
+<li>Local serializability and distributed atomic commit are different layers; correct participants can still produce an inconsistent workflow if their commit decisions are not coordinated.</li>
+<li>Use 2PC only when the invariant justifies the latency and blocking trade-off and every participant can actually implement prepare/commit semantics.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="054.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Serializable Techniques in Practice</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="056.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Consensus Problem and Fault Models</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

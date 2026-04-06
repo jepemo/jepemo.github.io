@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Idempotency and Retry-Safe APIs - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Idempotency and Retry-Safe APIs</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          060
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">060</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 491: Idempotency and Retry-Safe APIs</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A retry-safe API gives one business operation one durable identity, so a client that cannot tell whether the first attempt succeeded can retry without creating a second effect.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="059.html">059.md</a>, Harbor Point learned how to place commits in a defensible global order. That solved the question "what happened first?" but it did not solve the question users actually trigger under bad networks: "did my booking go through, or should I try again?" A guest taps <code>POST /bookings</code> for cabin <code>S12</code>, the service reserves the cabin and authorizes the deposit, and then the phone drops off the network before the <code>201 Created</code> response arrives. The guest retries from the hotel Wi-Fi thirty seconds later.</p>
+<p>The non-obvious point is that idempotency is not just "drop duplicate packets." The server has to define what counts as the same intent. Harbor Point wants "book this cabin for this sailing for this guest" to execute once even if the request is delivered twice, but it does not want to block the same guest from intentionally booking a different excursion five minutes later. That means the API needs an operation identity that survives retries and a durable record that ties that identity to the original outcome.</p>
+<p>Once you see that, retries stop looking like a networking detail and start looking like part of the write contract. The booking schema, the payment call, the outbox event, and the API documentation all need to agree on the same operation boundary. The trade-off is straightforward: Harbor Point adds state, retention rules, and conflict handling to the write path so clients can retry aggressively without risking double charges or duplicate reservations.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's booking traffic is bursty and messy. Mobile clients switch between ship Wi-Fi and cellular links, the edge layer retries some upstream failures automatically, and customer-service agents sometimes resubmit a request after a timeout because the admin panel shows no confirmation. If the API treats every arrival as a fresh command, the same human action can fan out into two bookings, two payment authorizations, and two confirmation emails.</p>
+<p>Those are not cosmetic bugs. Duplicate side effects create inventory corruption, payment disputes, and support work that is hard to unwind because every subsystem can tell a different story. The booking database may show one final booking after a compensating cleanup, while the payment provider still holds two authorizations and the email system has already sent two receipts. A production team cannot paper over that with "just don't retry on POST."</p>
+<p>An idempotency contract changes the failure mode. Instead of forcing the client to guess whether the first attempt committed, the server says: if you retry the same operation with the same key, you will either get the original answer back or a clear signal that the first attempt is still in flight. That promise costs extra writes and operational care, but it is usually cheaper than teaching every client and every operator to reason correctly about ambiguous outcomes.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p>Keep one Harbor Point flow in view. The mobile app sends:</p>
+<div class="codehilite"><pre><span></span><code><span class="err">POST /bookings</span>
+<span class="err">Idempotency-Key: hp-booking-8841-s12-2026-07-14</span>
+</code></pre></div>
+
+<p>The request reaches <code>booking-api</code>, which asks <code>booking-authority</code> to reserve cabin <code>S12</code>, records a pending booking row, and calls the payment provider to authorize a deposit. All of that succeeds, but the API pod crashes before the response gets back to the guest. A retry lands on a different pod with the same header and the same JSON body.</p>
+<p>If Harbor Point generates a fresh booking ID on every attempt and has no durable idempotency record, the second pod has no evidence that the first request already crossed the commit point. It may reserve a second cabin, create a second payment authorization, or fail with a vague "duplicate" message after the business effect has already happened. None of those outcomes are retry-safe because the API boundary does not remember the first decision.</p>
+<p>A unique constraint on one table is not enough. Even if <code>bookings(cabin_id, sailing_id)</code> prevents a second booking row, the payment authorization and confirmation email may already have happened twice. Retry safety has to cover the whole operation the client thinks it is performing, not just one insert.</p>
+<h3>Part 2: Mechanism</h3>
+<p>Harbor Point needs an idempotency ledger keyed by operation identity, not by transport delivery. A practical record looks like this:</p>
+<div class="codehilite"><pre><span></span><code>(tenant, endpoint, idempotency_key) -&gt; {
+  request_hash,
+  status,          # in_progress | completed | failed_retriable
+  resource_id,
+  response_code,
+  response_body,
+  expires_at
+}
+</code></pre></div>
+
+<p>The <code>request_hash</code> matters because clients sometimes accidentally reuse keys. If the same key comes back with a different booking body, the correct answer is not "close enough." It is a client error, because the server can no longer tell which operation the key represents.</p>
+<p>The write path usually follows four steps:</p>
+<ol>
+<li>Normalize the request into the semantic payload Harbor Point cares about and hash it.</li>
+<li>Insert the idempotency record with <code>status = in_progress</code> under a unique constraint.</li>
+<li>Perform the business work and store the canonical outcome.</li>
+<li>Mark the record <code>completed</code> in the same durable boundary that commits the business result.</li>
+</ol>
+<p>That gives the second pod somewhere authoritative to look. In pseudocode:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">record</span> <span class="o">=</span> <span class="n">claim_key</span><span class="p">(</span><span class="n">scope</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">request_hash</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="n">record</span><span class="o">.</span><span class="n">state</span> <span class="o">==</span> <span class="s2">&quot;hash_mismatch&quot;</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">error</span><span class="p">(</span><span class="mi">422</span><span class="p">,</span> <span class="s2">&quot;Idempotency key reused with different payload&quot;</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">record</span><span class="o">.</span><span class="n">state</span> <span class="o">==</span> <span class="s2">&quot;completed&quot;</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">record</span><span class="o">.</span><span class="n">saved_response</span>
+<span class="k">if</span> <span class="n">record</span><span class="o">.</span><span class="n">state</span> <span class="o">==</span> <span class="s2">&quot;in_progress&quot;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">record</span><span class="o">.</span><span class="n">claimed_by_this_attempt</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">error</span><span class="p">(</span><span class="mi">409</span><span class="p">,</span> <span class="s2">&quot;Original request still running&quot;</span><span class="p">,</span> <span class="n">retry_after</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="k">with</span> <span class="n">transaction</span><span class="p">():</span>
+    <span class="n">booking</span> <span class="o">=</span> <span class="n">reserve_cabin</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">payment</span> <span class="o">=</span> <span class="n">authorize_deposit</span><span class="p">(</span><span class="n">provider_key</span><span class="o">=</span><span class="n">key</span><span class="p">)</span>
+    <span class="n">enqueue_outbox</span><span class="p">(</span><span class="n">event_id</span><span class="o">=</span><span class="n">key</span><span class="p">,</span> <span class="n">topic</span><span class="o">=</span><span class="s2">&quot;booking-confirmed&quot;</span><span class="p">,</span> <span class="n">booking_id</span><span class="o">=</span><span class="n">booking</span><span class="o">.</span><span class="n">id</span><span class="p">)</span>
+    <span class="n">save_completed_response</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">booking</span><span class="p">,</span> <span class="n">payment</span><span class="p">)</span>
+
+<span class="k">return</span> <span class="n">created</span><span class="p">(</span><span class="n">booking</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The important detail is not the syntax. It is the atomicity boundary. If Harbor Point marks the idempotency key as completed only after the booking transaction commits, then a retry after a crash can replay the saved <code>201</code> response instead of running the business logic again. If it stores the key after the side effects, the crash window stays open and duplicates slip through.</p>
+<p>External side effects need the same discipline. The payment provider should receive the same operation reference so two API attempts collapse into one authorization on the provider side as well. The confirmation email should come from an outbox event keyed by the booking operation, not from "send email now" logic inside the HTTP handler. Otherwise Harbor Point makes the HTTP layer idempotent while downstream systems still duplicate the effect.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>This design buys Harbor Point a much better client contract. Mobile apps can retry after timeouts instead of forcing the guest to call support. Edge proxies can use conservative retry policies without gambling on duplicate charges. Operators can search by idempotency key during incidents and see whether an operation is still running, finished successfully, or was rejected because the key was misused.</p>
+<p>The costs are concrete. The service now owns an extra table or key-value store, response retention policy, and cleanup process. The retention window has to outlive realistic client behavior: if Harbor Point expires keys after ten minutes but shipboard connectivity drops for an hour, a perfectly valid retry can become a second booking. The scope also matters. A key that is too narrow allows duplicates; a key that is too broad blocks legitimate repeat actions. "One key per HTTP request" is often wrong. The real unit is "one key per business intent."</p>
+<p>There is also a subtle response-design choice. Some teams store and replay the exact original HTTP body; others store the resource identifier and regenerate the response from current state. Replaying the exact body is simple and makes duplicates invisible to clients, but it couples storage to response shape. Regenerating from a resource pointer tolerates schema evolution, but only if the current representation still matches what a retry should mean. Harbor Point has to choose which trade-off fits its API stability expectations.</p>
+<p>Finally, idempotency is not the same as exactly-once execution. Harbor Point is still running on at-least-once delivery paths, crash-prone servers, and external systems with their own semantics. Idempotency makes duplicate requests converge on one logical result. It does not prove the operation only executed once in every subsystem. That distinction is what the next lesson, <a href="061.html">061.md</a>, makes explicit.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"POST cannot be retry-safe because POST is not idempotent in HTTP."</strong> HTTP method semantics and application semantics are different layers. Harbor Point is free to make <code>POST /bookings</code> retry-safe by introducing an explicit idempotency contract for that endpoint.</p>
+</li>
+<li>
+<p><strong>"A unique constraint on the booking table solves the problem."</strong> It only solves one part of the operation. Payments, emails, inventory side effects, and outbox events can still duplicate unless they share the same operation identity.</p>
+</li>
+<li>
+<p><strong>"If the key already exists, just return 200."</strong> A duplicate request needs the original outcome, not a generic success code. Clients often need the real booking ID, payment status, and error body that the first attempt produced.</p>
+</li>
+<li>
+<p><strong>"Short key retention keeps storage cheap, so it is always better."</strong> Aggressive expiry turns legitimate retries into new commands. Retention should be tied to client retry windows, offline behavior, and support workflows, not just storage convenience.</p>
+</li>
+<li>
+<p><strong>"Idempotency means the handler may safely run twice."</strong> The goal is stricter than that. The client should observe one logical booking result even if multiple deliveries happen. Achieving that usually requires concurrency control, downstream dedupe, and durable response replay.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="059.html">059.md</a> explains why retries are ambiguous in the first place</h3>
+<p>The previous lesson showed how Harbor Point decides whether a commit belongs before or after another event. Idempotency uses that ordered history at the API edge: once the first booking attempt has committed, later retries should map back to that same committed result instead of creating a new one.</p>
+<h3>Connection 2: <a href="061.html">061.md</a> separates retry safety from exactly-once claims</h3>
+<p>This lesson gives Harbor Point a practical contract for duplicate requests. The next lesson tightens the language around delivery guarantees and shows why "I added idempotency keys" is still not the same as "the system processes each event exactly once."</p>
+<h3>Connection 3: <a href="../event-driven-and-streaming/003.html">../event-driven-and-streaming/003.md</a> applies the same idea to multi-step workflows</h3>
+<p>A saga step that compensates or retries also needs a stable operation identity. The same design move appears there: durable state plus replay-safe side effects beats hoping distributed retries never collide.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] HTTP Semantics, RFC 9110<ul>
+<li>Link: <a href="https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2">https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2</a></li>
+<li>Focus: Distinguish HTTP's built-in idempotent methods from the application-level contract Harbor Point has to add for <code>POST /bookings</code>.</li>
+</ul>
+</li>
+<li>[ARTICLE] Making retries safe with idempotent APIs<ul>
+<li>Link: <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/">https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/</a></li>
+<li>Focus: Read how client request identifiers, late arrivals, and semantic equivalence shape a production API design.</li>
+</ul>
+</li>
+<li>[DOC] Stripe API: Idempotent requests<ul>
+<li>Link: <a href="https://docs.stripe.com/api/idempotent_requests">https://docs.stripe.com/api/idempotent_requests</a></li>
+<li>Focus: Notice how a public API stores request parameters, replays prior results, and rejects mismatched reuse of the same key.</li>
+</ul>
+</li>
+<li>[BOOK] Designing Data-Intensive Applications<ul>
+<li>Link: <a href="https://dataintensive.net/">https://dataintensive.net/</a></li>
+<li>Focus: Use the chapters on unreliable networks and exactly-once semantics to place idempotency inside the larger failure model of distributed systems.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Retry safety starts with a stable identity for one business intent, not with a best-effort comparison of two HTTP payloads.</li>
+<li>The idempotency record has to be durable and tied to the committed outcome, otherwise crashes leave the duplicate-execution window open.</li>
+<li>A retry-safe API is only as strong as its downstream side effects, so payment calls and outbox consumers need the same operation identity.</li>
+<li>Idempotency lets clients recover from ambiguous outcomes safely, but it does not by itself deliver exactly-once execution across the whole system.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="059.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Time, Clocks, and Global Ordering</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="061.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Exactly-Once Delivery Myths</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Consensus Problem and Fault Models - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Consensus Problem and Fault Models</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          056
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">056</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 487: Consensus Problem and Fault Models</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Consensus lets a cluster make one durable decision under failure, but the guarantee is only as strong as the fault model the protocol assumes.</p>
+</blockquote>
+<hr />
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="055.html">055.md</a>, Harbor Point learned why 2PC blocks when the coordinator disappears after participants have prepared. The next design move is not "replicate the coordinator somehow" in the abstract. It is to build a small cluster that can answer one concrete question safely: who is allowed to decide the next irreversible booking action for suite <code>S12</code> when one node crashes or a cross-region link starts dropping packets?</p>
+<p>The non-obvious insight is that consensus is not the same thing as "all replicas eventually contain the same bytes." Harbor Point already knew how to replicate state. The hard part is making sure the cluster never decides two different outcomes for the same slot in the decision log. If <code>harbor-1</code> decides "assign suite <code>S12</code> to booking <code>#8841</code>" while <code>harbor-2</code> decides the same suite belongs to booking <code>#8849</code>, replication has not helped; it has simply spread the inconsistency.</p>
+<p>That is why fault models are part of the problem statement, not background detail. A protocol that works when nodes only crash and recover with intact disks is not automatically valid when nodes can equivocate, corrupt state, or send conflicting messages. "Consensus" without an explicit failure model is as incomplete as "transaction" without an isolation level.</p>
+<hr />
+<h2>Why This Matters</h2>
+<p>For Harbor Point, the production consequence is immediate. The cluster that owns booking authority must never double-sell the last suite on a ship, and it must not allow a rebooted follower to resurrect stale leadership after a partition heals. Those are safety requirements, not mere performance goals.</p>
+<p>Consensus is the mechanism that turns "one of these replicas should probably coordinate" into a defensible contract: one ordered log, one chosen value per slot, and one current leadership term that stale nodes cannot overrule. The trade-off is equally concrete. To get that safety, Harbor Point gives up the ability for any isolated minority replica to keep taking writes, and every committed decision now depends on quorum health, durable metadata, and careful timeout handling.</p>
+<p>This is why teams use consensus sparingly. It is the right tool for cluster metadata, shard ownership, leader election, lock services, and any workflow where "there must be exactly one authoritative decision path" matters more than squeezing every write through the cheapest route. It is the wrong tool when the system can tolerate divergent local updates and reconcile later.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: What the consensus problem actually is</h3>
+<p>Harbor Point replaces the single 2PC coordinator with a three-node booking authority cluster:</p>
+<ul>
+<li><code>harbor-1</code></li>
+<li><code>harbor-2</code></li>
+<li><code>harbor-3</code></li>
+</ul>
+<p>Every booking decision becomes a proposal for the next log slot. For slot <code>812</code>, two frontends might race:</p>
+<div class="codehilite"><pre><span></span><code>proposal A: reserve suite S12 for booking #8841
+proposal B: reserve suite S12 for booking #8849
+</code></pre></div>
+
+<p>Consensus is the problem of ensuring the cluster chooses at most one of those values for slot <code>812</code>, and that every healthy replica eventually learns the same chosen value. That sounds simple until you remove the assumptions a single-process program quietly relies on:</p>
+<ul>
+<li>messages can arrive late, out of order, or not at all</li>
+<li>nodes can crash after writing some state but before replying</li>
+<li>a slow node is observationally similar to a dead node for everyone else</li>
+</ul>
+<p>From that environment come the core properties engineers care about:</p>
+<ul>
+<li><strong>Agreement</strong>: two replicas must not decide different values for the same slot</li>
+<li><strong>Validity</strong>: the chosen value must have been proposed by some client or leader</li>
+<li><strong>Integrity</strong>: a replica should not "decide twice" for one slot</li>
+<li><strong>Liveness, conditionally</strong>: once enough replicas can talk again, new proposals should start completing</li>
+</ul>
+<p>The safety properties are the reason Harbor Point can trust the cluster with suite inventory. Liveness is what keeps the booking desks moving. The important discipline is that safety is non-negotiable, while liveness is always conditional on the fault model and the current network.</p>
+<h3>Part 2: Why the fault model changes the protocol</h3>
+<p>Consensus algorithms are built around explicit assumptions about what can go wrong. Harbor Point's design review needs to name those assumptions before it argues about Raft, Paxos, or replica counts.</p>
+<table>
+<thead>
+<tr>
+<th>Fault model</th>
+<th>What it means in Harbor Point's cluster</th>
+<th>Design consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Crash-stop</td>
+<td>A node halts or becomes unreachable, but it does not fabricate messages</td>
+<td>Majority quorum protocols can tolerate <code>f</code> crashes with <code>2f + 1</code> replicas</td>
+</tr>
+<tr>
+<td>Crash-recovery</td>
+<td>A node reboots later and must not forget accepted terms or log entries</td>
+<td>Durable metadata on disk becomes part of correctness, not an optimization</td>
+</tr>
+<tr>
+<td>Network delay / partition</td>
+<td>A healthy leader may look dead to some peers for a while</td>
+<td>Timeouts can trigger elections, but they cannot be treated as proof of failure</td>
+</tr>
+<tr>
+<td>Byzantine</td>
+<td>A node may lie, equivocate, or send different messages to different peers</td>
+<td>Standard Raft/Paxos assumptions no longer hold; you need BFT protocols and more replicas</td>
+</tr>
+</tbody>
+</table>
+<p>The first three rows describe the world most production consensus systems target: crash faults in an asynchronous network that is usually stable enough for timeouts and leader elections to work. In that world, the mechanism is built around terms or ballots, durable voting state, and quorum intersection.</p>
+<p>Harbor Point can reason about one log slot like this:</p>
+<div class="codehilite"><pre><span></span><code>1. A leader for term 41 proposes &quot;reserve S12 for #8841&quot; in slot 812.
+2. A majority persists the proposal with term 41.
+3. Because any future majority overlaps with this one, a later leader cannot safely choose a conflicting value for slot 812.
+4. Once the entry is known to be chosen, replicas apply it in order to the booking state machine.
+</code></pre></div>
+
+<p>That overlap rule is the heart of crash-fault consensus. It is what lets the cluster survive leader changes without losing the one-decision property. A future leader may be slower, newer, or located in another region, but it still has to respect what an intersecting quorum already made durable.</p>
+<p>Timing assumptions matter just as much. In a fully asynchronous system, a timeout cannot distinguish "peer crashed" from "packet delayed for 30 seconds." That is why practical consensus systems promise safety always, but liveness only when the network eventually behaves well enough for one leader to gather a quorum. Timeouts are for suspicion and recovery, not for proving facts about the world.</p>
+<h3>Part 3: Production implications and trade-offs</h3>
+<p>Once Harbor Point sees consensus as "one chosen log under a defined failure model," design decisions become less mystical.</p>
+<p>The cluster can safely own:</p>
+<ul>
+<li>suite-allocation authority</li>
+<li>shard ownership for booking partitions</li>
+<li>leader election for background reconciliation jobs</li>
+<li>small but critical metadata such as current booking epoch and write fencing tokens</li>
+</ul>
+<p>The cluster should not become the path for every analytics event or every low-value write. Consensus adds a real trade-off:</p>
+<ul>
+<li><strong>What gets better</strong>: split-brain decisions become much harder, stale leaders can be fenced off, and crash recovery has a durable path back to one authority</li>
+<li><strong>What gets more expensive</strong>: writes pay quorum latency, minority partitions stop accepting new decisions, and operators must care about disk durability, quorum loss, and election storms</li>
+</ul>
+<p>This trade-off is why production systems often separate the consensus-backed control plane from the high-throughput data plane. Harbor Point uses consensus to decide who owns the shard and which booking command is authoritative. It does not run every downstream read model or customer activity stream through the same replicated decision path.</p>
+<p>That boundary also explains why consensus is the answer to the 2PC limitation from the previous lesson, but not a universal replacement for every distributed coordination problem. Consensus protects the decision log itself. The application still has to design retries, idempotency, and state-machine commands carefully on top of that log.</p>
+<hr />
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Consensus means every replica has to answer before the system can commit anything."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: The word "agreement" sounds like unanimity.</li>
+<li><strong>Corrective mental model</strong>: Crash-fault consensus relies on quorum intersection, not all-node participation. A majority is enough because future majorities overlap with past ones.</li>
+<li><strong>Operational fix</strong>: Run odd-sized clusters, measure quorum health directly, and treat the loss of majority as a write-availability event.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "If a follower times out, the leader must be dead."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Timeouts are often used as a failure signal in ordinary application code.</li>
+<li><strong>Corrective mental model</strong>: In distributed systems, delay and failure can look identical. Timeouts create suspicion, not certainty.</li>
+<li><strong>Operational fix</strong>: Fence leaders with terms or epochs, and make stale leaders reject themselves once they see newer metadata.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "As long as state is replicated, we already have consensus."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Replication and consensus both involve multiple copies of the same data.</li>
+<li><strong>Corrective mental model</strong>: Replication distributes state; consensus constrains which state transitions are allowed to become authoritative in the first place.</li>
+<li><strong>Operational fix</strong>: Separate "follower caught up" metrics from "entry chosen by quorum" metrics in dashboards and incident review.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Raft or Paxos will protect us even if one node sends arbitrary garbage."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Consensus is often discussed as if it were the universal answer to coordination.</li>
+<li><strong>Corrective mental model</strong>: Standard Raft and Paxos assume crash faults, not Byzantine behavior. Malicious or arbitrarily faulty nodes require a different protocol family.</li>
+<li><strong>Operational fix</strong>: Keep the trust boundary explicit. If arbitrary faults are in scope, budget for authenticated BFT designs and their higher replica cost.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="055.html">055.md</a> showed why a single durable coordinator decision can block</h3>
+<p>Consensus generalizes that lesson by replicating the decision path itself. Instead of one coordinator log that can strand prepared work, the cluster uses quorum intersection so a later leader can recover the already chosen history.</p>
+<h3>Connection 2: <a href="057.html">057.md</a> turns this abstract problem into the engineer's Raft/Paxos mental model</h3>
+<p>This lesson defined the problem and the failure assumptions. The next lesson maps those assumptions to concrete protocol pieces such as leader election, ballots or terms, log matching, and commit rules.</p>
+<h3>Connection 3: <a href="../consensus-and-coordination/001.html">../consensus-and-coordination/001.md</a> gives the formal safety/liveness vocabulary</h3>
+<p>If you want the proof-oriented framing, revisit that lesson after this one. The definitions of safety, liveness, and fault tolerance there are exactly the constraints Harbor Point is making operational here.</p>
+<hr />
+<h2>Resources</h2>
+<ul>
+<li>[PAPER] <a href="https://groups.csail.mit.edu/tds/papers/Lynch/jacm85.pdf">Impossibility of Distributed Consensus with One Faulty Process</a><ul>
+<li>Focus: Read the result as a statement about liveness limits. It explains why consensus systems cannot promise progress under arbitrary delay plus even one crash.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a><ul>
+<li>Focus: Pay attention to how quorum intersection preserves a chosen value across proposer changes.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Raft)</a><ul>
+<li>Focus: Use the introduction and leader election sections to see how a crash-fault, partially synchronous model becomes an implementable protocol.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/byz.pdf">The Byzantine Generals Problem</a><ul>
+<li>Focus: Compare its assumptions with Raft/Paxos to see exactly why arbitrary faults force a different protocol shape and replica count.</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h2>Key Takeaways</h2>
+<ol>
+<li>Consensus is about choosing one authoritative value per decision slot, not merely keeping replicas eventually similar.</li>
+<li>The fault model is part of the protocol contract; crash faults, partitions, and Byzantine behavior lead to materially different designs.</li>
+<li>Safety and liveness are not symmetric goals in production consensus systems: safety must hold even when the network is ugly, while liveness depends on eventual quorum communication.</li>
+<li>The trade-off for a single authoritative decision path is quorum latency and reduced write availability during minority partitions, which is why consensus belongs in the control plane more often than the data plane.</li>
+</ol>
+<hr />
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="055.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Distributed Transactions and 2PC Limits</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="057.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Raft/Paxos Mental Model for Engineers</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Serializable Techniques in Practice - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Serializable Techniques in Practice</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          054
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">054</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 485: Serializable Techniques in Practice</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Serializability is an outcome, not one magic algorithm; real systems get there by choosing where conflicts surface, whether as blocking, dependency tracking, or commit-time aborts.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="053.html">053.md</a>, Harbor Point discovered that snapshot isolation let two agents consume the last two sellable suites on the same voyage while each transaction still saw a perfectly coherent snapshot. That lesson answered the diagnostic question: why did the reserve-suite policy fail even though the booking code was transactional? This lesson answers the design question that follows immediately in production: how do you close that anomaly without blindly turning the database into one giant queue?</p>
+<p>The useful mental shift is that "serializable" does not tell you how the database behaves under load. It tells you which histories are allowed to commit. Different engines enforce that boundary in very different ways. A lock-based technique can prevent the second agent from even reaching the critical write until the first finishes. Serializable snapshot isolation can let both agents run and then abort one when the dependency graph becomes impossible to serialize. An optimistic validator can let the whole transaction execute on a read snapshot and reject it at commit if any relevant key or range changed underneath it.</p>
+<p>That is why engineers get surprised by serializable systems. The guarantee is stronger than snapshot isolation, but the operational symptom is not always "more waiting." Sometimes it is lock waits and deadlocks. Sometimes it is serialization failures and full-transaction retries. Sometimes it is a hot range that suddenly turns into an abort storm. The mechanism matters because the trade-off shows up directly in p99 latency, retry rate, and the shape of your incident runbook.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point cannot leave the reserve-suite rule as a best-effort check. When an agent confirms an upgrade, the company is making a customer-visible promise about a scarce cabin class. A fix that preserves correctness only in low-concurrency tests is not a fix. The team needs a serializable technique that still lets normal booking volume flow without turning every sailing into a support queue.</p>
+<p>This is where a lot of production work goes wrong. Teams identify a write-skew bug, enable a stronger isolation level, and stop there. They do not ask which serializable technique their engine actually uses, which statements now wait, which ones now abort, whether predicate reads are protected, or whether the application already retries whole transactions safely. The result is a system that is technically stronger on paper and operationally shakier in reality.</p>
+<p>A good design review for Harbor Point now sounds concrete: for <code>POST /bookings/confirm</code>, where is the conflict detected, what is the retry contract, which invariants justify the extra coordination, and which non-critical queries can stay on a weaker and cheaper path? That is the practical value of this lesson. Serializable techniques are not abstract theory after snapshot isolation; they are the set of mechanisms you choose when one invariant is important enough to spend coordination budget on.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: The same booking rule, three different serializable techniques</h3>
+<p>Harbor Point keeps each suite as its own row. The business rule is unchanged from <a href="053.html">053.md</a>: every voyage must keep at least one unsold suite in reserve for disruption handling. The booking transaction therefore needs to read the set of available suites, reject the request if fewer than two remain, and otherwise book one of them.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">cabin_id</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">cabins</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">voyage_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9001</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;suite&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;available&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">cabin_id</span><span class="p">;</span>
+</code></pre></div>
+
+<p>If that query returns <code>S12</code> and <code>S14</code>, the application may sell one suite but must leave one untouched. Under snapshot isolation, two transactions can each read the same two-row result and commit disjoint updates. Under a serializable technique, the database must make the final history look as if one agent clearly went first and the second either saw the updated state or failed.</p>
+<p>The important observation is that all serializable techniques are trying to protect the same invariant, but they create that protection in different places:</p>
+<table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>Where conflict becomes visible</th>
+<th>What Harbor Point feels in production</th>
+<th>Best fit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Strict 2PL or key-range locking</td>
+<td>During execution, through held locks on rows or ranges</td>
+<td>waits, deadlocks, hot-range contention</td>
+<td>short critical transactions on hot data where blocking is acceptable</td>
+</tr>
+<tr>
+<td>Serializable snapshot isolation (SSI)</td>
+<td>After concurrent reads and writes form a dangerous dependency pattern</td>
+<td>serialization failures, fewer blocking reads</td>
+<td>read-heavy OLTP paths that need serializable outcomes without lock-heavy read behavior</td>
+</tr>
+<tr>
+<td>Optimistic validation</td>
+<td>At commit, by validating read and write sets or conflict ranges</td>
+<td>retry storms under contention, strong performance when conflicts are rare</td>
+<td>low-contention workloads with short transactions and disciplined retries</td>
+</tr>
+</tbody>
+</table>
+<p>The lesson is not "pick your favorite algorithm." It is "understand which failure mode you are buying." Harbor Point's booking flow is customer-facing and time-sensitive, so the team has to choose whether it would rather spend its trade-off budget on waiting, aborting, or redesigning the data model to reduce contention.</p>
+<h3>Part 2: How the main techniques actually enforce serializability</h3>
+<h4>Lock-based serializability: make the predicate physically unavailable</h4>
+<p>In a lock-based design, Harbor Point protects the reserve-suite predicate by holding locks until commit. It is not enough to lock only one chosen suite row after the fact. If the invariant depends on the set of rows that match <code>status = 'available'</code>, the database needs row locks plus some form of predicate or key-range protection so a concurrent transaction cannot slip through the same check.</p>
+<p>Mechanically, the flow looks like this:</p>
+<div class="codehilite"><pre><span></span><code>1. T1 reads the available-suite range and acquires locks that cover the predicate.
+2. T2 reaches the same query and blocks or deadlocks on that protected range.
+3. T1 books S12 and commits.
+4. T2 resumes, re-evaluates the predicate, now sees only S14, and rejects the upgrade.
+</code></pre></div>
+
+<p>The advantage is clarity. The second transaction is prevented from making a stale decision because it cannot pass the gate while the first still owns it. The cost is that contention turns directly into waiting. If many upgrades hit the same voyage, lock queues grow, deadlock detection becomes part of normal operations, and p99 latency can move sharply even though correctness is preserved.</p>
+<p>MySQL's InnoDB next-key locks are a concrete example of this family. They extend row locks to the surrounding index gap so the predicate, not just the exact row version, becomes part of concurrency control. That is the key practical point: serializable locking is about guarding a decision surface, not only individual rows.</p>
+<h4>SSI: let reads proceed, then abort the impossible schedule</h4>
+<p>Serializable snapshot isolation starts from the opposite instinct. Let Harbor Point's booking requests read from MVCC snapshots as usual, but watch for read-write dependency patterns that cannot be arranged into any serial order. When the engine sees the dangerous structure, it aborts one transaction and forces the application to retry.</p>
+<p>For the reserve-suite rule, the timeline is closer to this:</p>
+<div class="codehilite"><pre><span></span><code>1. T1 reads the available-suite predicate from snapshot S100.
+2. T2 reads the same predicate from snapshot S101.
+3. T1 writes S12 as booked.
+4. T2 writes S14 as booked.
+5. At commit time, the engine detects a dangerous read-write cycle and aborts one transaction.
+</code></pre></div>
+
+<p>Harbor Point gets a strong outcome without turning every read into a blocking lock negotiation. That is a good trade-off for read-heavy OLTP systems, which is why PostgreSQL's <code>SERIALIZABLE</code> mode uses SSI rather than classic two-phase locking. The cost moves from waits to retries. Product managers may stop hearing about deadlocks, but on-call engineers now need dashboards for serialization-failure rates and retry latency during busy sailings.</p>
+<p>There is another practical implication: the application must treat serialization failures as expected control flow. Retrying only the final <code>UPDATE</code> is wrong, because the original read snapshot is part of the invalid schedule. The whole transaction has to restart and redo the decision from fresh state.</p>
+<h4>Optimistic validation: commit only if the read set is still valid</h4>
+<p>Optimistic serializable systems push the same idea even further. Harbor Point's transaction executes against a read version, records which keys or ranges it observed, buffers its writes, and validates at commit that nothing relevant changed. If the validation fails, the whole transaction aborts.</p>
+<p>FoundationDB is a useful concrete example of this family. Range reads and point reads add conflict ranges; writes do not block readers; commit succeeds only if no committed transaction has invalidated the read set since the transaction's read version. That works well when conflicts are uncommon and transactions stay short. It fails noisily when many agents hammer the same voyage range, because everyone does real work only to discover at commit that one winner invalidated the rest.</p>
+<p>This technique is powerful, but it exposes a subtle production risk: if engineers weaken a read into a snapshot read or otherwise remove the relevant conflict range, they may also weaken serializable protection for the predicate they care about. Optimistic systems give precise control, but precise control means mistakes are easy to encode.</p>
+<h3>Part 3: Choosing and operating the right technique</h3>
+<p>For Harbor Point, the booking flow is a narrow, high-value path. That usually means three operational rules matter more than the isolation-level slogan:</p>
+<ul>
+<li>keep the transaction short enough that lock hold time or validation windows stay small</li>
+<li>retry the entire transaction on serialization failure or deadlock, with side effects kept outside the retry loop</li>
+<li>instrument the cost of the chosen technique, whether lock waits, deadlocks, or serialization-abort rate</li>
+</ul>
+<p>The actual choice depends on workload shape.</p>
+<p>If the hot contention is concentrated on a few voyages and predictable waiting is acceptable, lock-based serializability can be the simplest answer. If the workload is read-heavy and the database already offers SSI, Harbor Point may get a better trade-off from letting readers proceed and paying in retries only when a dangerous pattern really appears. If the team is using an optimistic distributed store, the main job becomes keeping transactions small, conflict ranges correct, and retry behavior fully idempotent.</p>
+<p>The deeper production lesson is that serializability does not rescue a poor data model. If every upgrade on a popular voyage contends on the same broad predicate, all three techniques can become expensive in different ways. Sometimes the best "serializable technique" is partly a schema decision, such as materializing the reserve rule into a per-voyage quota row so the conflict surface is obvious and narrow. You are still spending coordination budget; you are just spending it in a place the engine can enforce efficiently.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>Issue</strong>: "Serializable means the database runs transactions one by one."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: The guarantee is defined by equivalence to some serial order.</li>
+<li><strong>Corrective mental model</strong>: Engines still run transactions concurrently; they just use locks, dependency tracking, or validation so the committed result can be explained by a serial order.</li>
+<li><strong>Operational fix</strong>: Identify whether your engine surfaces contention as blocking or aborts, then build the retry and observability path for that mechanism.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Turning on <code>SERIALIZABLE</code> removes the need to understand predicates."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: The label sounds like a complete abstraction barrier.</li>
+<li><strong>Corrective mental model</strong>: The invariant still has to map to something the engine protects, such as a locked range, tracked dependency, or conflict range.</li>
+<li><strong>Operational fix</strong>: Review the exact read pattern for set-based rules and confirm the engine's technique protects that pattern, not just one updated row.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "Retries are only for deadlocks."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: Many teams first meet retries through lock-based databases.</li>
+<li><strong>Corrective mental model</strong>: SSI and optimistic validators deliberately preserve serializability by aborting a transaction that ran on an invalidated read basis.</li>
+<li><strong>Operational fix</strong>: Put the whole transaction in a retry loop, move external side effects after commit, and require idempotent request keys for user-facing commands.</li>
+</ul>
+</li>
+<li>
+<p><strong>Issue</strong>: "If serializable hurts throughput, the isolation level was the mistake."</p>
+<ul>
+<li><strong>Why it is tempting</strong>: The performance regression appears right after the toggle.</li>
+<li><strong>Corrective mental model</strong>: The true cause is often a wide conflict surface, such as a hot predicate or shared counter, that any correct technique must coordinate around somehow.</li>
+<li><strong>Operational fix</strong>: Measure hot keys and hot ranges, then decide whether to narrow the invariant surface, shard the workload, or keep paying the coordination cost where correctness justifies it.</li>
+</ul>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="053.html">053.md</a> defined the anomaly boundary</h3>
+<p>Snapshot isolation was the diagnosis lesson: it showed why a stable MVCC snapshot can still admit write skew. This lesson is the response lesson: once you know the anomaly shape, you can compare the concrete serializable techniques that close it.</p>
+<h3>Connection 2: <a href="052.html">052.md</a> still matters because transaction scope and serializable technique are separate decisions</h3>
+<p>Harbor Point first needed a real transaction boundary around booking confirmation. Only after that boundary existed did the isolation question become meaningful. A transaction that is too wide or includes external side effects is still a bad transaction even if the isolation level is serializable.</p>
+<h3>Connection 3: <a href="055.html">055.md</a> extends the same question across multiple participants</h3>
+<p>This lesson stayed inside one database's concurrency-control machinery. The next lesson asks what changes when the business action spans multiple resource managers and local serializable execution is no longer enough to make the whole workflow commit together.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Read the chapters on transactions and concurrency control together to compare serial execution, MVCC, and lock-based techniques without collapsing them into one idea.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL Documentation: Transaction Isolation</a><ul>
+<li>Focus: Pay attention to how PostgreSQL explains <code>SERIALIZABLE</code>, predicate protection, and the requirement to retry transactions that fail serialization.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://www.vldb.org/pvldb/vol5/p1850_danrkports_vldb2012.pdf">Serializable Snapshot Isolation in PostgreSQL</a><ul>
+<li>Focus: Use it to understand why SSI preserves serializability with less read blocking than traditional two-phase locking, and where the abort cost comes from.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/en/innodb-locking.html">MySQL 8.4 Reference Manual: InnoDB Locking</a><ul>
+<li>Focus: Look at next-key locks to see how lock-based techniques protect a predicate or key range rather than only one row version.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://apple.github.io/foundationdb/developer-guide.html">FoundationDB Developer Guide</a><ul>
+<li>Focus: Review the sections on transactions, conflict ranges, and snapshot reads to see how optimistic serializable validation is enforced and how it can be weakened deliberately.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Serializability is the correctness target; lock-based control, SSI, and optimistic validation are different ways of paying for that target.</li>
+<li>The practical comparison is not "which algorithm is smartest?" but "where does conflict surface, and does my application handle that failure mode correctly?"</li>
+<li>Serializable systems still need whole-transaction retries, idempotent command handling, and careful treatment of predicates and side effects.</li>
+<li>If serializable execution becomes too expensive, inspect the conflict surface before blaming the guarantee; the real issue is often a hot invariant that needs a narrower or more explicit representation.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="053.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Snapshot Isolation and Anomaly Boundaries</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="055.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Distributed Transactions and 2PC Limits</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

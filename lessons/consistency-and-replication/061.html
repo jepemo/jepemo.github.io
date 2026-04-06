@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Exactly-Once Delivery Myths - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Exactly-Once Delivery Myths</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          061
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">061</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 492: Exactly-Once Delivery Myths</h1>
+<blockquote>
+<p><strong>The core idea</strong>: "Exactly once" is not a free property of a network hop. A production system gets one logical effect only by naming a boundary and then making retries, replays, and crash recovery converge on the same durable outcome inside that boundary.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="060.html">060.md</a>, Harbor Point made <code>POST /bookings</code> retry-safe with an idempotency key. That solved the edge problem: when guest <code>#8841</code> loses the response after reserving cabin <code>S12</code>, a retry can map back to the original booking instead of charging the card twice. But the booking is only the start of the story. After that write commits, Harbor Point still has to publish <code>booking-confirmed</code>, project the passenger manifest, notify the embarkation team, and send the guest a confirmation email.</p>
+<p>The myth appears when a team compresses all of that into one sentence: "our pipeline is exactly once." Suppose <code>manifest-projector</code> reads <code>booking-confirmed</code>, writes the guest into the sailing manifest table, and crashes before it commits its Kafka offset. On restart, the broker redelivers the same event. Nothing about that sequence is exotic. It is what a healthy at-least-once system does when it refuses to lose data after an ambiguous crash.</p>
+<p>The non-obvious point is that delivery, processing, and observable business effect are different questions. Harbor Point can deduplicate producer retries at the log, atomically checkpoint consumer offsets with internal state, and still send the same email twice if the email vendor call sits outside that atomic boundary. Once you separate those layers, "exactly once" stops being a slogan and becomes a design claim that must always finish with "where?" The trade-off is clear: tighter semantics require more state, more coordination, and narrower promises, but they also give the team a guarantee it can actually defend during incidents.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point's booking platform feeds operational systems that people act on immediately. The embarkation dashboard decides who can board. Finance decides which deposits to settle. Customer support decides whether a guest needs manual cleanup after a complaint. If duplicate events create two manifest rows, two onboard-credit adjustments, or two confirmation emails, the support team sees a "random" failure while the platform team argues about whether the broker, consumer, or downstream service is at fault.</p>
+<p>The cost of vague language is real. If engineers believe a broker feature means end-to-end exactly-once delivery, they will skip dedupe tables, sink idempotency keys, and replay drills because the hard part looks solved already. Then the first redelivery after a crash creates visible damage and the postmortem uncovers an unspoken assumption: the system had exactly-once semantics only for records written back into the log, not for the external side effect that mattered to the business.</p>
+<p>That is why production teams have to state the guarantee in operational terms. Are duplicates acceptable if the sink collapses them? Is message loss worse than duplicate work? Can the business effect participate in the same transaction as the offset commit? Those questions decide whether Harbor Point should build at-most-once, at-least-once, or effectively-once behavior at each boundary. "Exactly once" without that boundary is usually marketing, not engineering.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Grounded Situation</h3>
+<p>Keep one Harbor Point flow in view. The <code>booking-api</code> commits the cabin reservation and an outbox row in the same database transaction:</p>
+<div class="codehilite"><pre><span></span><code>booking_id=8841
+event_type=booking-confirmed
+message_id=evt-8841-confirmed
+</code></pre></div>
+
+<p>An <code>outbox-relay</code> publishes that record to the <code>booking-events</code> topic. The <code>manifest-projector</code> consumes it and writes:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">passenger_manifest</span><span class="w"> </span><span class="p">(</span><span class="n">sailing_id</span><span class="p">,</span><span class="w"> </span><span class="n">booking_id</span><span class="p">,</span><span class="w"> </span><span class="n">guest_id</span><span class="p">,</span><span class="w"> </span><span class="n">cabin_id</span><span class="p">)</span>
+<span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;2026-07-14&#39;</span><span class="p">,</span><span class="w"> </span><span class="mi">8841</span><span class="p">,</span><span class="w"> </span><span class="mi">8841</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;S12&#39;</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Now the failure: the database commit succeeds, but the consumer crashes before it records "I have processed offset 912441." When the process comes back, Kafka quite reasonably hands it offset <code>912441</code> again. If Harbor Point acknowledges before the database write, it can lose the manifest update. If it acknowledges after the write, it can see the same event again. The system must choose which risk to carry and what mechanism will absorb it.</p>
+<p>The producer side has the same ambiguity. If the relay sends <code>evt-8841-confirmed</code>, the broker appends it, and the acknowledgment packet is lost, the relay cannot tell whether the record is missing or merely unacknowledged. A resend is rational. Without producer deduplication, the topic may contain two copies of the same logical event before the consumer even starts.</p>
+<p>Exactly-once delivery sounds like it should remove all of this. In practice, it cannot remove uncertainty from a crash-prone network. What Harbor Point can do is move the uncertainty into a durable mechanism that makes repeated delivery converge on one committed result.</p>
+<h3>Part 2: Mechanism</h3>
+<p>The first step is to name the boundary precisely. Harbor Point has at least four different claims it could make:</p>
+<ol>
+<li>The broker appends each producer record once per partition.</li>
+<li>The consumer updates its internal database once per message.</li>
+<li>The consumer emits each follow-up event once.</li>
+<li>The guest receives one confirmation email.</li>
+</ol>
+<p>Those claims are related, but they are not the same. A modern log like Kafka can help with the first claim by assigning a producer identity and sequence numbers so duplicate retries can be discarded. A stream processor can help with the second and third claims by committing source offsets, internal state, and produced records as one recovery unit. None of that automatically solves the fourth claim if the email API is an external side effect outside the transaction.</p>
+<p>Harbor Point therefore needs two layers of protection:</p>
+<div class="codehilite"><pre><span></span><code>Layer 1: Transport and log safety
+producer_id + sequence -&gt; collapse duplicate appends
+
+Layer 2: Business-effect safety
+message_id + durable dedupe record -&gt; collapse duplicate reprocessing
+</code></pre></div>
+
+<p>For the <code>manifest-projector</code>, the safe pattern is not "trust the broker." It is "treat redelivery as normal and make it harmless." In pseudocode:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">handle_booking_confirmed</span><span class="p">(</span><span class="n">event</span><span class="p">):</span>
+    <span class="k">with</span> <span class="n">db</span><span class="o">.</span><span class="n">transaction</span><span class="p">():</span>
+        <span class="n">existing</span> <span class="o">=</span> <span class="n">db</span><span class="o">.</span><span class="n">fetch_one</span><span class="p">(</span>
+            <span class="s2">&quot;SELECT booking_id FROM processed_messages WHERE message_id = </span><span class="si">%s</span><span class="s2"> FOR UPDATE&quot;</span><span class="p">,</span>
+            <span class="p">[</span><span class="n">event</span><span class="o">.</span><span class="n">message_id</span><span class="p">],</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">existing</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s2">&quot;already-applied&quot;</span>
+
+        <span class="n">db</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
+<span class="w">            </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">            INSERT INTO passenger_manifest (sailing_id, booking_id, guest_id, cabin_id)</span>
+<span class="sd">            VALUES (%s, %s, %s, %s)</span>
+<span class="sd">            ON CONFLICT (booking_id) DO NOTHING</span>
+<span class="sd">            &quot;&quot;&quot;</span><span class="p">,</span>
+            <span class="p">[</span><span class="n">event</span><span class="o">.</span><span class="n">sailing_id</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">booking_id</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">guest_id</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">cabin_id</span><span class="p">],</span>
+        <span class="p">)</span>
+        <span class="n">db</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
+            <span class="s2">&quot;INSERT INTO processed_messages (message_id, booking_id) VALUES (</span><span class="si">%s</span><span class="s2">, </span><span class="si">%s</span><span class="s2">)&quot;</span><span class="p">,</span>
+            <span class="p">[</span><span class="n">event</span><span class="o">.</span><span class="n">message_id</span><span class="p">,</span> <span class="n">event</span><span class="o">.</span><span class="n">booking_id</span><span class="p">],</span>
+        <span class="p">)</span>
+
+    <span class="n">commit_offset</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">offset</span><span class="p">)</span>
+</code></pre></div>
+
+<p>This code does not prevent the handler from starting twice. It makes the second run converge on the same durable state as the first. That is the important distinction. Many production systems call this "exactly once" because the observable effect in the projector database becomes single-application even when the transport is at-least-once.</p>
+<p>The boundary gets tighter when Harbor Point can atomically couple more pieces. If the projector reads from Kafka, updates local state, and emits a downstream <code>manifest-updated</code> event back into Kafka using transactions or checkpointed state, then the source offset, state mutation, and produced record can recover together. But the moment the flow crosses into an external email provider or payment gateway, Harbor Point is back in idempotency territory. The sink must accept a stable operation key such as <code>evt-8841-confirmed</code>, or Harbor Point must keep a local send ledger and tolerate retries against it. The infrastructure can narrow the duplicate window; it cannot wish the boundary away.</p>
+<h3>Part 3: Implications and Trade-offs</h3>
+<p>Once the team speaks precisely, architecture decisions get much easier. Harbor Point can promise "exactly-once projection into the manifest database" if <code>message_id</code> dedupe and offset discipline make replays converge there. It can promise "exactly-once append into Kafka output topics" if producer transactions cover the consume-transform-produce loop. It should not promise "exactly-once delivery to every downstream system" unless those systems share the same atomic commit boundary, which they usually do not.</p>
+<p>The trade-offs are concrete. Durable dedupe tables consume storage and require retention policies. Transactional consume-transform-produce pipelines increase latency and reduce peak throughput because more work has to commit together. Long-lived producer identities, checkpoint metadata, and poison-message handling add operational complexity. Engineers also lose some freedom to do ad hoc side effects in the handler, because every side effect now has to fit the replay model or accept duplicates safely.</p>
+<p>That cost is usually worth paying because the alternative is hidden semantic debt. A system that pretends duplicates cannot happen will produce brittle cleanup scripts, confusing postmortems, and vendor integrations that fail only under retries. A system that assumes duplicates will happen can turn them into a normal recovery path. That is the practical meaning behind the myth: exactly-once delivery is rarely an end-to-end network fact, but exactly-once observable effect can be engineered inside a well-defined boundary.</p>
+<p>This sets up the next lesson naturally. Once Harbor Point has a bounded semantic story for duplicates and replays, the next production pressure is not "what if the event is repeated?" but "what if the consumer cannot keep up?" That is where <a href="062.md">062.md</a> picks up with backpressure and flow control.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"Kafka or Flink says exactly once, so my whole pipeline is exactly once."</strong> Those guarantees are boundary-specific. They usually cover broker append, checkpointed state, and produced records, not arbitrary external APIs or human-operated sinks.</p>
+</li>
+<li>
+<p><strong>"A unique <code>message_id</code> is enough on its own."</strong> Only if the duplicate check and the business write commit together. If Harbor Point records the dedupe marker after sending the email or after updating the manifest, a crash can still reopen the duplicate window.</p>
+</li>
+<li>
+<p><strong>"Committing the consumer offset first avoids duplicates, so it is safer."</strong> It avoids duplicates by accepting loss. That is an at-most-once choice, not exactly-once behavior.</p>
+</li>
+<li>
+<p><strong>"Exactly once means the handler code literally runs one time."</strong> Recovery code may run the same message multiple times. The real goal is that repeated executions collapse to one committed effect that later readers observe.</p>
+</li>
+<li>
+<p><strong>"If the sink cannot join the transaction, there is no useful guarantee left."</strong> There is still a useful guarantee: Harbor Point can make duplicates explicit at the sink boundary and use idempotency keys or a send ledger there. The system becomes effectively-once for the business effect even though transport retries still occur underneath.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="060.html">060.md</a> handles ambiguity at the API edge</h3>
+<p>The previous lesson gave Harbor Point one durable identity for a guest action. This lesson extends the same idea downstream: once that action becomes a stream event, consumers still need a durable identity and replay-safe commit point.</p>
+<h3>Connection 2: <a href="055.html">055.md</a> explains why global atomicity is expensive</h3>
+<p>An end-to-end exactly-once claim would require one commit boundary across broker, database, and external sinks. The lesson on distributed transactions shows why that boundary is rare, slow, and operationally fragile in real systems.</p>
+<h3>Connection 3: <a href="062.md">062.md</a> turns from semantics to load regulation</h3>
+<p>After Harbor Point makes redelivery safe, consumer lag becomes the next bottleneck. Backpressure decides whether the system degrades predictably when manifest updates arrive faster than they can be applied.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] Designing Data-Intensive Applications<ul>
+<li>Link: <a href="https://dataintensive.net/">https://dataintensive.net/</a></li>
+<li>Focus: Read the sections on unreliable networks, idempotence, and stream processing semantics to separate transport guarantees from application-visible effects.</li>
+</ul>
+</li>
+<li>[DOC] Apache Kafka Documentation<ul>
+<li>Link: <a href="https://kafka.apache.org/documentation/">https://kafka.apache.org/documentation/</a></li>
+<li>Focus: Look for idempotent producers, transactions, and delivery semantics so you can see exactly which part of the pipeline Kafka can make atomic.</li>
+</ul>
+</li>
+<li>[DOC] Apache Flink: Fault Tolerance<ul>
+<li>Link: <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/">https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/</a></li>
+<li>Focus: Study how checkpoints couple source offsets with operator state and why that still leaves external sinks responsible for their own deduplication story.</li>
+</ul>
+</li>
+<li>[ARTICLE] Making retries safe with idempotent APIs<ul>
+<li>Link: <a href="https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/">https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/</a></li>
+<li>Focus: Compare request-level idempotency with the downstream event-handling problem in this lesson; the same operation identity reappears at a different boundary.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>"Exactly once" is only meaningful when Harbor Point names the boundary where repeated delivery must collapse to one durable result.</li>
+<li>Brokers and stream processors can make some replay paths atomic, but external side effects still need their own idempotency or dedupe mechanism.</li>
+<li>A crash-safe consumer does not assume duplicate delivery away; it records enough state that redelivery becomes a normal recovery case.</li>
+<li>After duplicate effects are bounded, the next systems question is how to regulate load and lag when consumers fall behind.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="060.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Idempotency and Retry-Safe APIs</strong>
+        </a>
+        
+
+        
+        <div class="nav-card nav-card-disabled">
+          <span class="page-kicker">NEXT</span>
+          <strong>End of track</strong>
+        </div>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

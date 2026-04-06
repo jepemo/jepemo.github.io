@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Linearizability vs Serializability - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Linearizability vs Serializability</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          058
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">058</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 489: Linearizability vs Serializability</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Linearizability tells Harbor Point what a single read or write may observe in real time; serializability tells Harbor Point whether a whole transaction behaved like it ran alone. They solve different correctness problems, and production systems often need one, the other, or strict serializability when both matter at once.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="057.html">057.md</a>, Harbor Point built a booking authority cluster that can choose one log entry safely. That still does not answer the question an API owner gets from product: after the booking service returns <code>200 OK</code>, what is the next caller allowed to see? The availability widget, the cabin-upgrade workflow, and the finance ledger do not all need the same guarantee.</p>
+<p>The useful distinction is this: linearizability is about the observed order of individual operations. If agent Sofia books suite <code>S12</code> and gets success at 14:03:12, a later availability read at 14:03:13 must not say <code>available</code> if the API promises linearizable semantics. Serializability is about the effect of an entire transaction across multiple objects. If an upgrade workflow reads the guest record, the cabin inventory row, and the payment-hold row, serializability means the whole unit behaves like it ran alone in some one-at-a-time order.</p>
+<p>That is why the terms are easy to confuse and dangerous to merge. "Serializable" sounds stronger because it mentions whole transactions, but plain serializability does not require real-time order. "Linearizable" sounds globally strong, but per-key linearizable operations can still violate a cross-row invariant when two transactions interleave. Harbor Point needs the difference because the booking page is harmed by stale reads, while the upgrade workflow is harmed by multi-record anomalies.</p>
+<h2>Why This Matters</h2>
+<p>Harbor Point sells suites through call-center agents, the website, and partner travel portals. After the consensus lesson, the team routed booking writes through a leader-backed replicated log. They then made two product choices. The website read availability from local followers to shave latency. The upgrade workflow moved guests between cabins with a sequence of conditional writes against separate rows. Both changes looked reasonable in isolation. Together they created two different incident classes.</p>
+<p>The first incident is user-visible inconsistency. An agent confirms suite <code>S12</code>, yet a travel partner still sees <code>S12</code> as free for a few seconds because its read came from a stale replica. That is not a transaction anomaly; it is a broken real-time visibility contract. The second incident is a broken invariant. Harbor Point must keep at least one wheelchair-accessible cabin unsold until medical-clearance cutoff. Two agents each see that one accessible cabin remains after their sale, and each independently sells one. Every single row update can be linearizable, but the policy still fails because no serializable transaction protected the set of cabins as one unit.</p>
+<p>The trade-off is operational, not academic. Linearizable reads usually force the request through the current leader or a quorum-backed read fence, which costs latency and leader capacity. Serializable transactions preserve multi-row invariants, but they add lock waits, transaction aborts, and retry logic under contention. If Harbor Point needs both "the next read must reflect the last completed write" and "the whole multi-row workflow behaves like one atomic step," the real requirement is strict serializability, which is more expensive still.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: Two questions, two guarantees</h3>
+<p>Keep the Harbor Point scenario concrete. There are two APIs touching the same voyage inventory.</p>
+<p>The first is an availability check:</p>
+<div class="codehilite"><pre><span></span><code>GET /voyages/V17/suites/S12
+</code></pre></div>
+
+<p>If booking transaction <code>B1</code> reserves suite <code>S12</code> and returns success, a later availability request must not observe an older state if Harbor Point promises linearizability. Each operation has to appear as if it took effect at one instant between call and response, and real-time order matters. "Later call sees earlier completed write" is the contract.</p>
+<p>The second is an upgrade workflow:</p>
+<div class="codehilite"><pre><span></span><code>BEGIN
+  read guest #8841
+  read suite S12
+  read suite S14
+  update guest assignment to S14
+  mark S12 vacant
+  mark S14 occupied
+  release old payment hold
+  create new hold
+COMMIT
+</code></pre></div>
+
+<p>Here the question is different. Harbor Point does not care only about the visibility of one row. It cares that the whole workflow preserves invariants: one guest has one cabin, the destination cabin is not double-assigned, and the payment hold matches the assignment. Serializable isolation says the transaction must have the same effect as if all concurrent upgrade transactions ran one at a time in some serial order.</p>
+<p>That difference is the core of the lesson:</p>
+<ul>
+<li>linearizability answers "what may the next operation observe in real time?"</li>
+<li>serializability answers "did concurrent transactions preserve the same outcome as some one-at-a-time execution?"</li>
+</ul>
+<p>One is a property of operations on an object or API surface. The other is a property of transactions over a read/write set.</p>
+<h3>Part 2: How the mechanisms differ internally</h3>
+<p>Linearizability needs a point of authoritative visibility. In Harbor Point's booking authority, that usually means the current leader, or a read path that first confirms the leader still holds authority for the latest committed log position. A stale follower can hold the right bytes eventually and still be the wrong place to answer "is <code>S12</code> free right now?"</p>
+<div class="codehilite"><pre><span></span><code>14:03:12  Agent A -&gt; leader: reserve S12
+14:03:12  leader commits slot 812 = &quot;S12 sold to #8841&quot;
+14:03:12  leader -&gt; Agent A: 200 OK
+
+14:03:13  Partner portal -&gt; stale follower: read S12
+14:03:13  follower replies &quot;available&quot;   &lt;- not linearizable
+
+14:03:13  Partner portal -&gt; leader/read-index path: read S12
+14:03:13  reply &quot;sold to #8841&quot;          &lt;- linearizable
+</code></pre></div>
+
+<p>Serializability uses a different mechanism. The storage engine does not need every read to be the newest committed value at wall-clock time. It needs the committed transactions to fit a valid serial order with no contradictory interleaving. Databases implement that with locks, predicate locks, optimistic validation, MVCC plus serialization checks, or deterministic transaction ordering. The internal question is not "did this read hit the latest leader state?" It is "can these reads and writes commit together without creating an impossible serial schedule?"</p>
+<p>The accessible-cabin rule makes this concrete. Harbor Point reserves two cabins, <code>A12</code> and <code>A14</code>, for emergency relocation until cutoff, and policy says at least one must remain unsold.</p>
+<div class="codehilite"><pre><span></span><code>T1: read A12=free, A14=free
+T2: read A12=free, A14=free
+
+T1: sell A12
+T2: sell A14
+</code></pre></div>
+
+<p>If Harbor Point performs these as separate per-row linearizable writes, every individual write can look perfectly ordered. There is no stale read on either row at the moment it is written. But the combined outcome leaves zero protected cabins, which no serial one-at-a-time execution should allow given the policy. Serializability catches that class of anomaly by treating the whole transaction, including the predicate "at least one of these cabins remains free," as the unit that must be isolated.</p>
+<p>This also explains why plain serializability is not the same as linearizability. A database can be serializable yet still allow a read-only transaction to observe an older snapshot if that snapshot can be placed earlier in the serial order. If Harbor Point product language says "once the booking confirmation screen succeeds, any later availability check anywhere must reflect it," serializability alone is not enough. That stronger requirement is strict serializability, also called external consistency in some systems: serializable transactions plus real-time order.</p>
+<h3>Part 3: Choosing the right guarantee in production</h3>
+<p>Harbor Point should ask three separate design questions instead of one vague "is this strongly consistent?" question.</p>
+<p>Use linearizability when the API contract is about immediate visibility of a single decision point: lock acquisition, leader election, inventory availability for one suite, feature-flag reads, or idempotency-key lookups. The trade-off is that low-latency follower reads become harder to justify, and cross-region read paths often become slower because they must prove freshness.</p>
+<p>Use serializability when correctness depends on a multi-object invariant: moving a guest between cabins, decrementing quota while recording an audit row, applying a refund while updating the invoice ledger, or enforcing "one active hold per guest and voyage." The trade-off is contention management. Under load, the system will pay in blocking, deadlocks, aborts, or higher retry volume.</p>
+<p>Ask for strict serializability when both contracts matter at once: a multi-row workflow must behave atomically, and later callers must observe it in real-time order once it commits. That is the point where time, commit ordering, and external visibility become design constraints rather than implementation details. Harbor Point can get there, but it should budget for more coordination, more precise clock or lease discipline, and more care around cross-region latency. That is why the next lesson turns to time, clocks, and global ordering.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"Our database is serializable, so every later read must see the latest completed write."</strong> This is tempting because "serializable" sounds like the top-shelf guarantee. The corrective model is that plain serializability constrains transaction interleavings, not wall-clock visibility. If the product contract depends on real-time order, Harbor Point needs linearizable reads or strict serializable transactions.</p>
+</li>
+<li>
+<p><strong>"Every row is stored in a linearizable system, so cross-row business rules are automatically safe."</strong> This fails on write-skew-style invariants. Harbor Point can still violate "leave one accessible cabin free" if two transactions each make a locally correct row update without serializable isolation over the whole predicate.</p>
+</li>
+<li>
+<p><strong>"Consensus-backed writes automatically make reads linearizable."</strong> Consensus solves safe log agreement, which the previous lesson covered. A stale follower, a lease that was not checked, or a read path that ignores the latest commit index can still return old data after a completed write.</p>
+</li>
+<li>
+<p><strong>"Linearizability is always the better default because it is stronger."</strong> Stronger for one object is not broader for a whole workflow. Harbor Point should not pay leader-routed read latency for every analytics query, and it should not confuse low-latency single-key correctness with transactional safety.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="057.html">057.md</a> gave Harbor Point one authoritative log</h3>
+<p>That lesson explained how the cluster chooses one history safely. This lesson explains what clients may observe from that history: fresh single-operation visibility, transaction isolation, or both.</p>
+<h3>Connection 2: <a href="055.html">055.md</a> showed why multi-step distributed workflows need explicit correctness boundaries</h3>
+<p>The same discipline applies here. Once a workflow touches several records, the question is no longer just "was the write replicated?" but "what invariant spans the whole unit of work, and what isolation level actually protects it?"</p>
+<h3>Connection 3: <a href="059.html">059.md</a> will explain why clocks and ordering enter the design again</h3>
+<p>Strict serializability and external consistency require the system to connect commit order to real time. That makes lease validity, commit timestamps, and uncertainty windows operational topics, not just theory terms.</p>
+<h2>Resources</h2>
+<ul>
+<li>[ARTICLE] <a href="https://martin.kleppmann.com/2015/04/07/serializability-linearizability.html">Linearizability versus Serializability</a><ul>
+<li>Focus: Read the examples that separate stale reads from transaction anomalies; they map directly to Harbor Point's availability and upgrade paths.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a><ul>
+<li>Focus: Pay attention to the definition of a linearization point and the requirement to preserve real-time precedence.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/learning/api_guarantees/">etcd API Guarantees</a><ul>
+<li>Focus: Notice how the API distinguishes linearizable reads from weaker serializable reads even though both run on a consensus-backed system.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a><ul>
+<li>Focus: Use the external consistency sections to see what extra machinery is needed when serializable transactions must also respect real-time order.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Linearizability is about real-time visibility of individual operations; serializability is about whether whole transactions behave like a serial schedule.</li>
+<li>A system can give Harbor Point linearizable per-key operations and still violate a multi-row invariant, or give serializable transactions without promising that later callers see earlier commits immediately.</li>
+<li>Consensus-backed replication is only part of the story: read freshness, transaction boundaries, and invariant scope determine the actual client contract.</li>
+<li>When Harbor Point needs both transactional correctness and real-time order, the target guarantee is strict serializability, which raises the coordination cost.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="057.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Raft/Paxos Mental Model for Engineers</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="059.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Time, Clocks, and Global Ordering</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Raft/Paxos Mental Model for Engineers - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+  </head>
+  <body>
+    <h1>Raft/Paxos Mental Model for Engineers</h1>
+
+    <nav>
+      <a href="../../index.html">Home</a> |
+      <a href="../../learning.html">Learning</a> |
+      <a href="../../links.html">Links</a> |
+      <a href="https://github.com/jepemo" target="_blank">GitHub</a> |
+      <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a> |
+      <a href="mailto:jeremiespm@gmail.com">Contact</a>
+    </nav>
+
+    <main class="lesson-page">
+      <section class="stack-block">
+        <p class="breadcrumb">
+          <a href="../../learning.html">Learning</a>
+          /
+          <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+          /
+          <a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a>
+          /
+          057
+        </p>
+        <p class="page-kicker">LESSON</p>
+        <p><a href="../../tracks/consistency-and-replication.html">Consistency and Replication</a></p>
+        <div class="meta-strip">
+          <span class="meta-chip">057</span>
+          <span class="meta-chip">30 min</span>
+          <span class="meta-chip">advanced</span>
+          
+        </div>
+      </section>
+
+      <section class="stack-block lesson-content-shell">
+        <h1>Day 488: Raft/Paxos Mental Model for Engineers</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Raft and Paxos both make one decision safe by combining newer leadership epochs with quorum intersection; the engineer's mental model is to track who is allowed to lead, what a quorum has durably accepted, and when that accepted history is safe to expose as the system's truth.</p>
+</blockquote>
+<h2>Today's "Aha!" Moment</h2>
+<p>In <a href="056.html">056.md</a>, Harbor Point defined the problem precisely: for booking slot <code>812</code>, the cluster must never decide both "suite <code>S12</code> goes to booking <code>#8841</code>" and "suite <code>S12</code> goes to booking <code>#8849</code>." This lesson is the point where that abstract safety target turns into an operational picture an engineer can use during design review or a 03:00 incident.</p>
+<p>The useful shift is to stop treating Raft and Paxos as two unrelated algorithms with different jargon. They are two presentations of the same safety skeleton. Every serious attempt to lead carries a newer epoch, called a <code>term</code> in Raft and a <code>ballot</code> or proposal number in Paxos. Every durable decision must be accepted by a quorum. Because quorums intersect, a later leader cannot safely invent an alternative history for slot <code>812</code> if an earlier quorum already made one value durable.</p>
+<p>That is why the right mental model is not "memorize message names." It is "follow authority and durability." Raft packages the steady-state path explicitly: elect one leader, append entries in order, commit after quorum replication, and apply entries to the state machine in log order. Paxos starts from the single-slot proof and says that a proposer with a newer ballot must first gather promises, then drive one value to quorum acceptance. Production Multi-Paxos systems then amortize that work under a stable leader. The trade-off is concrete for Harbor Point: the booking authority gets one defensible history across failovers, but every write now pays quorum latency and every recovery path has to preserve already chosen entries.</p>
+<h2>Why This Matters</h2>
+<p>At Harbor Point, the booking authority cluster sits on the path that decides whether the last open suite can be sold. If one engineer thinks "the leader wrote it locally, so the booking is safe" while another thinks "the cluster only trusts quorum acceptance," the team does not just have a vocabulary problem. It has an incident problem. Those two interpretations lead to different client acknowledgments, different retry behavior, and different post-failover expectations.</p>
+<p>This mental model matters because most production mistakes around consensus happen above the code level. Teams acknowledge before a decision is actually durable, let stale leaders keep serving writes for a few seconds too long, or confuse "replicated somewhere" with "chosen by the cluster." When the mechanism is fuzzy, dashboards and runbooks end up fuzzy too. You see append latency but not quorum commit latency, elections but not log freshness, and client timeouts without any way to distinguish "not chosen" from "chosen but reply lost."</p>
+<p>It also matters because consensus is only one layer of the correctness story. If Harbor Point learns that slot <code>812</code> has one chosen value, it still has to decide what clients can read, how retries are deduplicated, and whether multi-record workflows need transactional isolation beyond log order. That boundary leads directly into <a href="058.html">058.md</a>: once the cluster can choose one history safely, the next question is what that history means for linearizable reads and serializable transactions.</p>
+<h2>Core Walkthrough</h2>
+<h3>Part 1: One safe decision for one contested slot</h3>
+<p>Keep the Harbor Point scenario narrow. Two booking terminals race for the same cabin:</p>
+<div class="codehilite"><pre><span></span><code>slot 812
+  proposal A = reserve suite S12 for booking #8841
+  proposal B = reserve suite S12 for booking #8849
+</code></pre></div>
+
+<p>The engineer's first question is not "which node is primary right now?" It is "which node has current enough authority to ask the cluster to accept a value for slot <code>812</code>?" In Raft, <code>harbor-2</code> might win leadership for term <code>41</code> after receiving votes from a majority. In Paxos language, a proposer using ballot <code>41</code> might gather promises from a quorum that they will not accept lower-numbered proposals. Different verbs, same effect: older leaders are fenced, and any new decision attempt has to flow through the newest quorum-backed epoch.</p>
+<p>Once <code>harbor-2</code> is current leader for term <code>41</code>, the second question is "what has to happen before Harbor Point can treat booking <code>#8841</code> as the cluster's truth?" The answer is not "the leader appended it locally." The answer is "a quorum durably accepted the same value for the same slot under the current epoch." In Raft, that usually looks like the leader appending the log entry locally, replicating it to followers, and only then advancing commit once a majority has the entry. In Paxos, it looks like a proposer driving the value through the accept phase until a quorum of acceptors has accepted it.</p>
+<div class="codehilite"><pre><span></span><code>term/ballot 41
+
+harbor-2 -&gt; harbor-1 : accept slot 812 = #8841
+harbor-2 -&gt; harbor-3 : accept slot 812 = #8841
+
+harbor-1 and harbor-2 persist the same value
+=&gt; quorum reached
+=&gt; slot 812 is now chosen/committed
+</code></pre></div>
+
+<p>This is the entire safety story in miniature. If <code>harbor-2</code> crashes after quorum acceptance but before replying to the client, Harbor Point has an ambiguous client experience but not an ambiguous cluster history. A later leader must preserve slot <code>812 = #8841</code>. If <code>harbor-2</code> crashes before quorum acceptance, the value was never chosen, and a later leader may pick another value for that slot. The difference between those two outcomes is the difference between "proposed" and "durably chosen." That boundary is what on-call engineers need to understand.</p>
+<h3>Part 2: From one slot to a usable replicated log</h3>
+<p>Single-decree Paxos explains one slot cleanly, but Harbor Point does not run a cluster to decide only slot <code>812</code>. It needs a stream of booking commands: reserve, confirm payment, release expired hold, and fence stale workers. The operational question becomes how a system repeats the one-slot safety mechanism without paying full election cost for every new command.</p>
+<p>Multi-Paxos and Raft answer that question with a stable-leader fast path. After leadership is established, the cluster keeps using the same epoch until failure or timeout forces a change. That gives engineers an ordered log instead of a bag of isolated quorum decisions. The main difference is packaging. Raft puts the log front and center with concepts like <code>AppendEntries</code>, log matching, <code>commitIndex</code>, and leader completeness. Paxos implementations often reach a similar place, but the vocabulary starts from proposers, acceptors, and ballots. For an operator, the useful translation looks like this:</p>
+<table>
+<thead>
+<tr>
+<th>Engineer question</th>
+<th>Raft vocabulary</th>
+<th>Paxos / Multi-Paxos vocabulary</th>
+<th>Same invariant</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Who is allowed to drive the next command?</td>
+<td>Current leader for the highest known term</td>
+<td>Proposer or leader using the highest ballot accepted by a quorum</td>
+<td>Stale nodes must not create a conflicting future</td>
+</tr>
+<tr>
+<td>What makes slot <code>812</code> durable?</td>
+<td>Majority replicated entry that the leader can commit</td>
+<td>Majority of acceptors accepted one value for the slot</td>
+<td>Quorum intersection preserves one chosen value</td>
+</tr>
+<tr>
+<td>Why must failover preserve history?</td>
+<td>New leader must have a log current enough to win votes</td>
+<td>Higher-ballot proposer must respect any value already chosen or promised</td>
+<td>Recovery cannot discard a quorum-backed decision</td>
+</tr>
+<tr>
+<td>When does application state change?</td>
+<td>After committed entries are applied in log order</td>
+<td>After the chosen value is learned and executed by the replicated state machine</td>
+<td>Visibility follows durable agreement, not mere proposal</td>
+</tr>
+</tbody>
+</table>
+<p>The practical benefit of this table is that it keeps review conversations grounded. If Harbor Point sees duplicate reservations after a failover, the debugging path is not "Was this more of a Raft issue or a Paxos issue?" It is "Did the system acknowledge before quorum acceptance, did a stale leader keep serving writes, or did recovery fail to carry forward a chosen value?" Those are mechanism questions. The protocol names only tell you which code paths and metrics implement them.</p>
+<h3>Part 3: What the mental model changes in production</h3>
+<p>Once the team thinks in epochs, quorums, and chosen log slots, several design decisions get sharper. Harbor Point can use consensus confidently for the booking authority log, shard ownership, and fencing tokens because those are places where having two simultaneous truths is catastrophic. It should not route every analytics event or every low-value cache invalidation through the same mechanism, because the trade-off is real: one authoritative history costs quorum I/O, concentrates writes behind a current leader, and reduces write availability when the cluster loses majority.</p>
+<p>The mental model also clarifies what consensus does not settle for you. If slot <code>812</code> contains "reserve suite <code>S12</code> for booking <code>#8841</code>," the cluster has ordered that command safely. It has not automatically answered whether a follower read in another region may serve that result immediately, whether two related records across different state machines appear atomically, or whether a client retry after timeout should create a second reservation. Those are higher-level semantics layered on top of the chosen log. Consensus gives Harbor Point a safe sequence of commands; application semantics determine what clients are allowed to observe.</p>
+<p>That boundary is why engineers should learn Raft/Paxos as a mental model instead of a memorized diagram. During a postmortem, the useful questions are stable even if the implementation changes from etcd to a database range group or a custom Multi-Paxos service: What was the latest epoch? Which quorum accepted the command? Was the command only proposed, or was it already chosen? What data did the new leader use to prove it could continue safely? Those questions are operationally portable, and they are exactly what the next lesson needs before it can separate linearizability from serializability.</p>
+<h2>Failure Modes and Misconceptions</h2>
+<ul>
+<li>
+<p><strong>"The leader decided it, so it is committed."</strong> This is tempting because the leader handles the client RPC and often applies entries first. The corrective mental model is that a leader's local append is only a proposal until a quorum has accepted the same slot value. Operationally, Harbor Point should expose proposal, quorum-acknowledged, committed, and applied stages as separate metrics instead of one generic "write succeeded" counter.</p>
+</li>
+<li>
+<p><strong>"Raft and Paxos are different enough that lessons from one do not transfer."</strong> This confusion comes from different role names and different diagrams. Underneath, both rely on newer epochs to fence stale authority and quorum intersection to preserve one history. In design reviews, write the invariants in neutral language first, then map them to protocol-specific code paths.</p>
+</li>
+<li>
+<p><strong>"Winning an election means the new leader can rewrite whatever was in flight."</strong> Engineers slip into this mistake when they think of elections as political victories instead of safety checks. A legitimate new leader is constrained by the metadata a quorum already made durable, whether that is a committed Raft prefix or a Paxos-chosen value. The operational fix is to watch vote or promise rejection reasons and log freshness during failover, not just leader identity.</p>
+</li>
+<li>
+<p><strong>"Consensus automatically gives the application serializable behavior."</strong> A chosen log entry is not the same thing as a fully specified client contract. Harbor Point still needs explicit decisions about read freshness, transaction boundaries, and idempotent retries. That is why <a href="058.html">058.md</a> exists: safe log order is necessary, but it is not the whole database semantics story.</p>
+</li>
+</ul>
+<h2>Connections</h2>
+<h3>Connection 1: <a href="056.html">056.md</a> defined the safety target and the fault model</h3>
+<p>This lesson takes the abstract statement "choose one value despite crashes and partitions" and turns it into the engineer's checklist: newer epoch, quorum acceptance, preserved history after failover.</p>
+<h3>Connection 2: <a href="020.html">020.md</a> shows the same mental model inside a database write path</h3>
+<p>If you want to see this mechanism applied to per-range replication rather than a generic booking authority service, revisit that lesson after this one. The log, quorum, and commit ideas are the same; only the storage-engine context changes.</p>
+<h3>Connection 3: <a href="058.html">058.md</a> asks what a chosen history means to clients</h3>
+<p>Consensus tells Harbor Point which command order is authoritative. The next lesson separates that cluster-level agreement from client-visible guarantees like linearizability and transaction-level guarantees like serializability.</p>
+<h2>Resources</h2>
+<ul>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a><ul>
+<li>Focus: Read it as the one-slot safety proof. Proposal numbers and quorum intersection are the pieces to carry into any production implementation.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Raft)</a><ul>
+<li>Focus: Pay attention to leader election, log matching, and leader completeness. Those sections make the steady-state engineer's mental model explicit.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub33002/">Paxos Made Live: An Engineering Perspective</a><ul>
+<li>Focus: See how an elegant quorum proof turns into configuration handling, recovery logic, and operational guardrails inside a real service.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/learning/api_guarantees/">etcd API Guarantees</a><ul>
+<li>Focus: Notice where a Raft-backed system draws the line between committed log history and client-visible semantics such as linearizable reads.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Terms or ballots fence stale leaders, and quorum intersection is what keeps one chosen history intact across failover.</li>
+<li>A leader's local state is not the commit point; Harbor Point can trust slot <code>812</code> only after a quorum has accepted the same value for that slot.</li>
+<li>Raft and Paxos mostly differ in how they package the same safety skeleton into code and operator-facing concepts.</li>
+<li>Consensus gives the system one authoritative log, but read semantics, transaction semantics, and retry behavior still need explicit design above that log.</li>
+</ol>
+      </section>
+
+      <section class="lesson-navigation-grid">
+        
+        <a class="nav-card" href="056.html">
+          <span class="page-kicker">PREVIOUS</span>
+          <strong>Consensus Problem and Fault Models</strong>
+        </a>
+        
+
+        
+        <a class="nav-card" href="058.html">
+          <span class="page-kicker">NEXT</span>
+          <strong>Linearizability vs Serializability</strong>
+        </a>
+        
+      </section>
+
+      <section class="stack-block">
+        <p><a href="../../tracks/consistency-and-replication.html">← Back to Consistency and Replication</a></p>
+        <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+      </section>
+    </main>
+
+    <hr />
+    <footer>
+      <p>
+        Generated on 2026-04-06 12:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+  </body>
+</html>
