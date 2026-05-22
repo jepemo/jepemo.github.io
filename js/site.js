@@ -1,27 +1,45 @@
 (() => {
   const root = document.documentElement;
-  const valid = { skin: ["clean", "brutalist", "nerd"], theme: ["system", "light", "dark"] };
-  for (const key of Object.keys(valid)) {
-    const stored = localStorage.getItem(`mystuff-learn:${key}`);
-    const migrated = key === "skin" && stored === "standard" ? "clean" : stored;
-    const value = valid[key].includes(migrated) ? migrated : key === "skin" ? "clean" : "system";
-    root.dataset[key] = value;
-    if (migrated !== stored) {
-      localStorage.setItem(`mystuff-learn:${key}`, value);
+  const storageKey = "mystuff-cli:theme";
+  const legacyTheme = localStorage.getItem("mystuff-learn:theme");
+  const storedTheme = localStorage.getItem(storageKey);
+  const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+  const initialTheme =
+    storedTheme === "light" || storedTheme === "dark"
+      ? storedTheme
+      : legacyTheme === "light" || legacyTheme === "dark"
+        ? legacyTheme
+        : prefersDark
+          ? "dark"
+          : "light";
+
+  const applyTheme = (theme) => {
+    root.dataset.theme = theme;
+    localStorage.setItem(storageKey, theme);
+    const toggle = document.querySelector("[data-theme-toggle]");
+    if (toggle) {
+      toggle.setAttribute(
+        "aria-label",
+        theme === "dark" ? "Switch to light mode" : "Switch to dark mode",
+      );
     }
-    const select = document.querySelector(`[data-pref="${key}"]`);
-    if (select) {
-      select.value = value;
-      select.addEventListener("change", () => {
-        root.dataset[key] = select.value;
-        localStorage.setItem(`mystuff-learn:${key}`, select.value);
-      });
-    }
+  };
+
+  applyTheme(initialTheme);
+
+  const toggle = document.querySelector("[data-theme-toggle]");
+  if (toggle) {
+    toggle.addEventListener("click", () => {
+      applyTheme(root.dataset.theme === "dark" ? "light" : "dark");
+    });
   }
+
   for (const form of document.querySelectorAll(".quiz")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      const selected = [...form.querySelectorAll("input:checked")].map((input) => input.value).sort();
+      const selected = [...form.querySelectorAll("input:checked")]
+        .map((input) => input.value)
+        .sort();
       const correct = JSON.parse(form.dataset.correct).sort();
       const ok = JSON.stringify(selected) === JSON.stringify(correct);
       form.classList.toggle("is-correct", ok);
