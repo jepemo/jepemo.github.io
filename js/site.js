@@ -34,6 +34,67 @@
     });
   }
 
+  const learningViewRoot = document.querySelector("[data-learning-view-root]");
+  if (learningViewRoot) {
+    const viewStorageKey = "mystuff-cli:learning-view";
+    const views = [
+      ...learningViewRoot.querySelectorAll("[data-learning-view]"),
+    ];
+    const buttons = [
+      ...learningViewRoot.querySelectorAll("[data-learning-view-button]"),
+    ];
+    const viewNames = new Set(views.map((view) => view.dataset.learningView));
+    const defaultView = viewNames.has("classifications")
+      ? "classifications"
+      : views[0]?.dataset.learningView;
+    const storedView = localStorage.getItem(viewStorageKey);
+    const hashView = window.location.hash.replace(/^#/, "");
+
+    const setLearningView = (viewName, syncUrl = false) => {
+      if (!viewNames.has(viewName)) {
+        return;
+      }
+
+      for (const view of views) {
+        view.hidden = view.dataset.learningView !== viewName;
+      }
+
+      for (const button of buttons) {
+        const isActive = button.dataset.learningViewButton === viewName;
+        button.setAttribute("aria-pressed", String(isActive));
+      }
+
+      localStorage.setItem(viewStorageKey, viewName);
+
+      if (syncUrl) {
+        const url = new URL(window.location);
+        url.hash = viewName === defaultView ? "" : viewName;
+        history.replaceState(null, "", url);
+      }
+    };
+
+    setLearningView(
+      viewNames.has(hashView)
+        ? hashView
+        : viewNames.has(storedView)
+          ? storedView
+          : defaultView,
+    );
+
+    for (const button of buttons) {
+      button.addEventListener("click", () => {
+        setLearningView(button.dataset.learningViewButton, true);
+      });
+    }
+
+    window.addEventListener("hashchange", () => {
+      const nextView = window.location.hash.replace(/^#/, "");
+      if (viewNames.has(nextView)) {
+        setLearningView(nextView);
+      }
+    });
+  }
+
   for (const form of document.querySelectorAll(".quiz")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
