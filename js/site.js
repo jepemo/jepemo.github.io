@@ -95,6 +95,39 @@
     });
   }
 
+  const readModeToggle = document.querySelector("[data-read-mode-toggle]");
+  if (readModeToggle) {
+    const readModeStorageKey = "mystuff-cli:read-mode";
+
+    const setReadMode = (enabled) => {
+      if (enabled) {
+        root.dataset.readMode = "on";
+      } else {
+        delete root.dataset.readMode;
+      }
+
+      localStorage.setItem(readModeStorageKey, enabled ? "on" : "off");
+      readModeToggle.setAttribute("aria-pressed", String(enabled));
+      readModeToggle.setAttribute(
+        "aria-label",
+        enabled ? "Exit read mode" : "Enter read mode",
+      );
+      readModeToggle.textContent = enabled ? "EXIT" : "READ";
+    };
+
+    setReadMode(localStorage.getItem(readModeStorageKey) === "on");
+
+    readModeToggle.addEventListener("click", () => {
+      setReadMode(root.dataset.readMode !== "on");
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && root.dataset.readMode === "on") {
+        setReadMode(false);
+      }
+    });
+  }
+
   for (const form of document.querySelectorAll(".quiz")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
