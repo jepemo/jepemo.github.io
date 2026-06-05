@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Schedulers and Control Planes: Safety, Liveness, and Failure Modes - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Distributed Schedulers and Control Planes: Safety, Liveness, and Failure Modes</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a>
+    /
+    003
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">003</span>
+    <span class="meta-chip">35 min</span>
+    <span class="meta-chip">advanced</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Distributed Schedulers and Control Planes: Safety, Liveness, and Failure Modes</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A scheduler is useful only if it preserves safety while still making liveness progress under partial failure, so the design trade-off is between refusing uncertain actions and repairing stalled work quickly enough to matter.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Suppose <code>fraud-batch</code> needs one exclusive GPU, must run in <code>eu-central</code>, and belongs to a tenant with a strict quota. The scheduler sees <code>node-gpu-7</code> as eligible, but the quota controller is slow to publish its latest usage, and the node heartbeat has not arrived for several seconds. The control plane now faces a choice: bind the job anyway, wait for stronger evidence, or place the job in a recoverable pending state.</p>
+<p>That choice is where safety and liveness separate. <strong>Safety</strong> means the control plane never makes a forbidden state true: two workloads cannot own the same exclusive GPU, a tenant cannot exceed quota, a workload cannot run in the wrong region, and a controller cannot mutate state it does not own. <strong>Liveness</strong> means the system eventually makes useful progress when the required authority and capacity exist: eligible work should not sit forever in a queue because one cache entry is stale or one repair loop missed an event.</p>
+<p>Distributed schedulers spend most of their complexity budget on this boundary. If they act too aggressively, they can violate safety with duplicate placement, quota bypass, or split ownership. If they act too conservatively, they can preserve every invariant while the platform fails to run available work. Failure modes are the patterns that push the system toward one side of that trade-off.</p>
+<h2>Safety Is About Forbidden States</h2>
+<p>Safety properties say what must never happen. In a scheduler and control plane, they are usually expressed as invariants over durable state:</p>
+<ul>
+<li>One exclusive resource has at most one accepted owner.</li>
+<li>A workload runs only in an allowed region, zone, or tenancy boundary.</li>
+<li>A binding is accepted only by the authority that owns placement.</li>
+<li>A repair controller does not create duplicate work for a task that is already running.</li>
+<li>A quota reservation is either committed once or clearly released.</li>
+</ul>
+<p>These rules are stronger than "the scheduler should usually choose a good node." They define states the system must not enter, even during retries, restarts, leadership changes, stale watches, and network partitions. Safety is why a scheduler often writes through an authoritative API instead of treating its local cache as truth. The cache can guide a proposal; the authoritative write decides whether the proposal is still valid.</p>
+<p>The common design mistake is to treat a positive observation as a reservation. Seeing that <code>node-gpu-7</code> looked free a moment ago is not the same as owning its GPU. A safe design turns the observation into a conditional write: bind only if the resource is still available, the workload version has not changed, and the quota reservation is still valid. If the write is rejected, the scheduler learns something and retries through the normal control flow.</p>
+<h2>Liveness Is About Eventual Progress</h2>
+<p>Liveness properties say what should eventually happen. They do not promise that every request succeeds immediately. They promise that when the required conditions are present, the control plane does not get stuck forever.</p>
+<p>For <code>fraud-batch</code>, liveness might mean:</p>
+<ul>
+<li>A pending job is reconsidered when quota becomes available.</li>
+<li>A failed binding eventually returns to the scheduling queue.</li>
+<li>A node that recovers eventually reports status and accepts eligible work.</li>
+<li>A controller that restarts resumes from durable state instead of losing the work item.</li>
+<li>A transient API failure produces backoff and retry, not silent abandonment.</li>
+</ul>
+<p>Liveness depends on durable queues, watches, periodic resync, leases, timeouts, and idempotent actuation. A pure event-driven controller can miss progress if an event is dropped or a process restarts between receiving and recording it. A pure polling controller can waste capacity and overload the API. Most production control planes combine both: watch for fast reaction, resync for recovery, and keep enough durable state to know which action is still owed.</p>
+<p>Liveness also needs bounded waiting. Waiting for stronger evidence is reasonable when the next action is dangerous, but an unbounded wait turns uncertainty into an outage. A job that waits for a missing heartbeat should either observe recovery, time out into a repair path, or be requeued with a reason that another controller can inspect.</p>
+<h2>Failure Modes At The Boundary</h2>
+<p>The same failure can look different depending on which property it threatens.</p>
+<ul>
+<li><strong>Stale eligibility</strong>: the scheduler cache says a node has free GPU capacity, but the authoritative resource state has changed. Acting directly from the cache threatens safety; rejecting every stale cache entry forever threatens liveness.</li>
+<li><strong>Ambiguous ownership</strong>: two controllers both believe they own the same transition, such as pending-to-bound or bound-to-failed. That can violate safety through duplicate writes and hurt liveness through oscillation.</li>
+<li><strong>Lost wakeup</strong>: a quota release or node recovery event is missed. Safety may still hold, but liveness fails because eligible work is never reconsidered.</li>
+<li><strong>Retry amplification</strong>: many controllers observe missing status and all retry at once. Liveness logic turns into load that prevents the API from recovering.</li>
+<li><strong>Fail-open repair</strong>: a repair loop starts replacement work before proving that the previous owner is gone. This improves apparent progress while risking duplicate execution.</li>
+<li><strong>Fail-closed repair</strong>: the system refuses replacement until every uncertainty is resolved. This protects invariants while leaving capacity idle and work pending.</li>
+</ul>
+<p>Good designs make these modes visible in state. They distinguish <code>pending</code>, <code>reserved</code>, <code>bound</code>, <code>running</code>, <code>unknown</code>, <code>failed</code>, and <code>released</code> instead of hiding everything behind a single boolean. They also record who made the last transition and which evidence was used. That evidence turns "the scheduler is stuck" into a more precise diagnosis.</p>
+<h2>Worked Example: A Conservative Binding</h2>
+<p>Return to <code>fraud-batch</code>. The scheduler finds <code>node-gpu-7</code> and wants to bind the workload. A safety-first placement flow might be:</p>
+<div class="codehilite"><pre><span></span><code>1. Read desired workload version: gpu=1, region=eu-central, tenant=fraud.
+2. Read observed node cache: node-gpu-7 appears eligible.
+3. Request quota reservation through the quota authority.
+4. Write a conditional binding through the placement authority.
+5. If accepted, wait for node-local status.
+6. If status is missing past a timeout, move to repair through an owned transition.
+</code></pre></div>
+
+<p>The important detail is that steps 3 and 4 are not advisory. They are the points where safety is enforced. The scheduler can score nodes from cache, but quota and binding must be committed by the systems that own those invariants.</p>
+<p>Now consider liveness. If the quota controller is slow, the job cannot remain invisible. The scheduler should record why the workload is waiting and arrange a wakeup: quota watch, delayed retry, or periodic resync. If <code>node-gpu-7</code> stops heartbeating after the binding is accepted, the repair controller should not immediately create duplicate execution. It should follow an explicit timeout and release path, then requeue work once the old ownership has been resolved.</p>
+<p>The control plane is healthy when both halves are true: forbidden states are rejected, and recoverable states eventually move forward.</p>
+<h2>Design Rules</h2>
+<ul>
+<li>Make invariants explicit before optimizing placement speed.</li>
+<li>Separate observation from authority: caches propose, authoritative writes commit.</li>
+<li>Give every state transition one owner.</li>
+<li>Use idempotent actions so retries do not create duplicate effects.</li>
+<li>Combine watch-driven wakeups with periodic resync so missed events do not block liveness.</li>
+<li>Treat unknown as a real state with timeout and repair rules.</li>
+<li>Prefer visible pending reasons over silent waits.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li>The previous lesson, <a href="002.html"><code>002.md</code></a>, separated desired state from observed state. This lesson adds the safety and liveness properties that constrain actions between those states.</li>
+<li>The next lesson, <a href="004.html"><code>004.md</code></a>, turns these properties into reconciliation loops, work queues, and idempotent actuation.</li>
+<li><a href="../consensus-and-coordination/TRACK.md"><code>consensus-and-coordination</code></a> gives the vocabulary for authority, leases, and ownership when multiple actors might act on the same state.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Use the chapters on consistency, transactions, and distributed failure to sharpen the distinction between invariants and eventual progress.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/architecture/controller/">Kubernetes Controllers</a><ul>
+<li>Focus: Study how control loops compare desired and current state while retrying through API-owned state transitions.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/">Kubernetes Scheduler</a><ul>
+<li>Focus: Connect filtering, scoring, and binding to the safety boundary between scheduler cache and authoritative placement.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/">Large-scale cluster management at Google with Borg</a><ul>
+<li>Focus: Look for how production schedulers handle placement, recovery, and shared cluster invariants at large scale.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Safety says which scheduler states must never become true; liveness says which eligible work must eventually move forward.</li>
+<li>Scheduler caches can guide proposals, but authoritative writes must enforce quota, placement, ownership, and tenancy invariants.</li>
+<li>The central trade-off is refusing uncertain actions versus repairing stalled work quickly enough to preserve useful progress.</li>
+<li>Durable queues, explicit state transitions, timeouts, and idempotent retries are what keep safety and liveness from fighting blindly.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="002.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Distributed Schedulers and Control Planes: Desired State, Observed State, and Control Flow</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="004.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Distributed Schedulers and Control Planes: Reconciliation Loops, Work Queues, and Idempotent Actuation</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">← Back to Distributed Schedulers and Control Planes</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-05 07:53 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

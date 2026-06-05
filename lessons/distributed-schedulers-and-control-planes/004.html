@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Schedulers and Control Planes: Reconciliation Loops, Work Queues, and Idempotent Actuation - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Distributed Schedulers and Control Planes: Reconciliation Loops, Work Queues, and Idempotent Actuation</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a>
+    /
+    004
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">004</span>
+    <span class="meta-chip">35 min</span>
+    <span class="meta-chip">advanced</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Distributed Schedulers and Control Planes: Reconciliation Loops, Work Queues, and Idempotent Actuation</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A reconciler turns noisy change signals into repeated state comparisons and idempotent actions, so the design trade-off is between reacting quickly and avoiding duplicate or unsafe effects when the same work is retried.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Suppose <code>fraud-batch</code> declares <code>replicas=3</code>, but only two workers are running after <code>node-gpu-7</code> drops its heartbeat. The API server emits an update, the node monitor emits another update, and the quota controller later emits a third. A naive controller might treat each event as a command: create a replacement, then create another replacement, then adjust quota again. That looks active, but it can violate the safety rules from the previous lesson.</p>
+<p>A reconciliation loop uses a different shape. Events do not directly carry orders. They enqueue a key such as <code>workloads/fraud-batch</code>. A worker later reads the latest desired state and the latest observed state it is allowed to trust, compares them, and performs one bounded action if the gap is still real. If the same key is processed again, the action should either be a no-op or safely advance the same transition.</p>
+<p>This is why idempotent actuation matters. Reconciliation accepts that notifications can be duplicated, dropped, reordered, or delayed. The control plane stays correct because the action is derived from current state, not from blind faith in the event that woke the controller.</p>
+<h2>The Reconciliation Shape</h2>
+<p>Most scheduler-adjacent controllers follow a level-based pattern:</p>
+<div class="codehilite"><pre><span></span><code>watch event -&gt; enqueue key -&gt; read current state -&gt; compare -&gt; act -&gt; requeue or forget
+</code></pre></div>
+
+<p>The key point is that the queue item is small. It usually says "look at this object again," not "perform this exact mutation." That lets the controller collapse many events for the same object into one decision. If <code>fraud-batch</code> receives five status updates while it is already queued, the worker can still read the current workload, current bindings, current quota status, and current node condition once before deciding what to do.</p>
+<p>A minimal reconcile function looks like this:</p>
+<div class="codehilite"><pre><span></span><code>reconcile(key):
+  desired = read_workload(key)
+  observed = read_status_and_bindings(key)
+
+  if desired is deleted:
+    release_owned_resources(key)
+    return done
+
+  if observed.running &lt; desired.replicas:
+    ensure_replacement_request_exists(key)
+    return requeue_after(delay)
+
+  if observed.running &gt; desired.replicas:
+    ensure_extra_work_is_draining(key)
+    return requeue_after(delay)
+
+  update_status_if_needed(key)
+  return done
+</code></pre></div>
+
+<p>The verbs are deliberately <code>ensure</code>, not <code>create</code> or <code>delete</code>. <code>ensure_replacement_request_exists</code> should be safe if it runs twice. It can write a deterministic object name, attach an owner reference, use a request id, or make a conditional update against the latest resource version. The controller is allowed to retry because retrying does not multiply the side effect.</p>
+<h2>Work Queues Are Control Surfaces</h2>
+<p>A work queue is not just an implementation detail. It is where the control plane decides which gaps receive attention first, how retries are paced, and how overload is contained.</p>
+<p>Useful queue behavior includes:</p>
+<ul>
+<li><strong>Deduplication</strong>: many events for <code>fraud-batch</code> should not create unbounded duplicate work.</li>
+<li><strong>Rate limiting</strong>: a failing action should back off instead of hammering the API.</li>
+<li><strong>Priority</strong>: repair for user-facing work may outrank low-priority batch cleanup.</li>
+<li><strong>Fairness</strong>: one noisy workload should not starve unrelated keys.</li>
+<li><strong>Resync</strong>: periodic enqueueing should recover from missed or dropped events.</li>
+<li><strong>Visibility</strong>: queue depth, retry count, and oldest item age should be observable.</li>
+</ul>
+<p>The trade-off is practical. A fast queue makes the platform feel responsive, especially during node recovery or rollout. An unbounded fast queue can amplify partial failure by turning every stale observation into API traffic. A heavily rate-limited queue protects the control plane, but it can make liveness problems last longer than users expect. Good controllers expose these choices as operating parameters rather than hiding them in a tight loop.</p>
+<h2>Idempotent Actuation</h2>
+<p>Actuation is the part of the controller that changes the world: writing a binding, creating a replacement request, releasing quota, updating status, or asking a node agent to drain work. In a distributed control plane, actuation must assume uncertainty after every call.</p>
+<p>The awkward case is common:</p>
+<div class="codehilite"><pre><span></span><code>controller sends create replacement
+network timeout before response
+controller does not know whether create succeeded
+controller retries
+</code></pre></div>
+
+<p>If the retry creates a second replacement, the actuator is not idempotent. A safer design gives the action a stable identity. For <code>fraud-batch</code>, the replacement request might be named from the workload id and failed binding id. Retrying the same actuation then observes that the replacement already exists and returns success. If the old binding later recovers, ownership and state-machine rules decide whether the replacement should proceed, wait, or be cancelled.</p>
+<p>Idempotency is not only about HTTP verbs or API syntax. It is a system property: the same intended transition can be attempted repeatedly without producing extra ownership, extra quota consumption, or contradictory status. That usually requires deterministic names, compare-and-swap updates, clear owner references, finalizers, and status fields that distinguish "requested" from "completed."</p>
+<h2>Worked Example: Repairing A Missing Replica</h2>
+<p>Imagine <code>fraud-batch</code> has desired state <code>replicas=3</code>, but observed state is <code>running=2</code>, <code>unknown=1</code>. The node monitor marks one binding as <code>unknown</code> after a missed heartbeat.</p>
+<p>A reconciler should not immediately create a fourth live copy. It can follow a staged repair path:</p>
+<div class="codehilite"><pre><span></span><code>1. Enqueue workloads/fraud-batch when the binding becomes unknown.
+2. Read desired replicas, current bindings, quota reservation, and node condition.
+3. If the unknown binding is within its grace period, record status and requeue later.
+4. If the grace period expires, mark the old binding for release through the owner.
+5. Once release is committed, ensure one replacement request exists.
+6. Requeue until status reports three running replicas or a new blocker appears.
+</code></pre></div>
+
+<p>This path protects safety because the replacement waits for a controlled release. It protects liveness because the unknown state has a timeout and a next action. It is also idempotent: every step can run again after a crash without creating a second release, a second replacement, or a second quota reservation.</p>
+<p>The design is not free. It adds state transitions, delayed retries, and more operational evidence to inspect. That cost is usually worth paying because it turns partial failure into a known control path instead of a collection of ad hoc retries.</p>
+<h2>Failure Modes</h2>
+<ul>
+<li><strong>Edge-triggered thinking</strong>: treating the event as the source of truth. The fix is to enqueue keys and recompute from current state.</li>
+<li><strong>Non-idempotent create</strong>: retrying after a timeout creates duplicate work. The fix is stable identity, conditional writes, and ownership metadata.</li>
+<li><strong>Hot key starvation</strong>: one broken workload is retried so often that other workloads wait. The fix is per-key rate limiting and fair scheduling across the queue.</li>
+<li><strong>No resync path</strong>: a missed watch event leaves work stuck forever. The fix is periodic resync or another durable recovery signal.</li>
+<li><strong>Status write loops</strong>: controllers keep updating status with meaningless differences. The fix is to write status only when the externally visible state actually changes.</li>
+<li><strong>Hidden actuation failure</strong>: the controller logs an error but does not requeue. The fix is to make retry, backoff, and terminal conditions explicit.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li>The previous lesson, <a href="003.html"><code>003.md</code></a>, named the safety and liveness properties that reconciliation loops must preserve.</li>
+<li>The next lesson, <a href="005.html"><code>005.md</code></a>, adds leases and leadership so multiple controller replicas can share work without losing ownership boundaries.</li>
+<li><a href="../cloud-platform-and-microservices/TRACK.md"><code>cloud-platform-and-microservices</code></a> provides adjacent context for API-driven infrastructure and declarative operations.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/architecture/controller/">Kubernetes Controllers</a><ul>
+<li>Focus: Study the desired-state loop and how controllers repeatedly move current state toward intended state.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/kubernetes/sample-controller">Kubernetes Sample Controller</a><ul>
+<li>Focus: Look at informers, work queues, and reconcile-style processing in a concrete controller implementation.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://pkg.go.dev/k8s.io/client-go/util/workqueue">client-go Workqueue Package</a><ul>
+<li>Focus: Pay attention to deduplication, delayed retries, and rate-limited queues.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://ahmet.im/blog/controller-pitfalls/">Level Triggering and Reconciliation in Kubernetes</a><ul>
+<li>Focus: Use the controller pitfalls as a checklist for idempotency, status handling, and reconcile shape.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>A reconciler should treat events as wakeups, not as commands.</li>
+<li>Work queues shape responsiveness, overload behavior, retry pacing, and fairness.</li>
+<li>Idempotent actuation lets a controller retry after timeouts, crashes, and duplicate events without multiplying side effects.</li>
+<li>The central trade-off is quick convergence versus controlled, observable retries that preserve safety under uncertainty.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="003.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Distributed Schedulers and Control Planes: Safety, Liveness, and Failure Modes</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="005.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Distributed Schedulers and Control Planes: Leases, Leadership, and Ownership Transfer</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">← Back to Distributed Schedulers and Control Planes</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-05 07:53 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

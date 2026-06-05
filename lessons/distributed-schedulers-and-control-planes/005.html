@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Schedulers and Control Planes: Leases, Leadership, and Ownership Transfer - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Distributed Schedulers and Control Planes: Leases, Leadership, and Ownership Transfer</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a>
+    /
+    005
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">005</span>
+    <span class="meta-chip">35 min</span>
+    <span class="meta-chip">advanced</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Distributed Schedulers and Control Planes: Leases, Leadership, and Ownership Transfer</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A lease gives one controller replica time-bounded authority to act, so the design trade-off is between fast failover and strong protection against two owners acting at once.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Suppose the repair controller for <code>fraud-batch</code> runs as three replicas: <code>ctrl-a</code>, <code>ctrl-b</code>, and <code>ctrl-c</code>. They all watch the same workload queue, and they can all see that one GPU binding is stuck in <code>unknown</code>. If all three replicas try to repair it at once, the reconciliation loop from the previous lesson is no longer safe. The system needs high availability, but it also needs one clear owner for each dangerous transition.</p>
+<p>A lease is the usual compromise. It is a durable record that says "this actor may act for this scope until this time, if it keeps renewing." The scope might be the whole scheduler, one shard of the scheduling queue, one tenant, or one resource partition. A leader is simply the actor currently holding the lease for that scope.</p>
+<p>The non-obvious point is that a lease is not proof that the old leader is dead. It is a rule that other actors can use to decide when authority may transfer. A paused process, delayed packet, slow disk, or skewed clock can make an old leader look absent even though it will resume later. Safe control planes combine leases with fencing tokens, conditional writes, and ownership checks so an expired leader cannot keep mutating state after a new leader takes over.</p>
+<h2>Why Leases Exist</h2>
+<p>Control planes often run multiple replicas because the controller itself can fail. If the only scheduler process crashes, no new work is placed. If the only repair loop stops, failed work stays failed. Running multiple replicas improves liveness, but it creates a safety problem: replicated controllers may duplicate the same action.</p>
+<p>Leases draw an authority boundary around a scope of work. For example:</p>
+<ul>
+<li><code>scheduler-global</code>: one leader performs all scheduling.</li>
+<li><code>scheduler-shard-12</code>: one leader owns a subset of queue keys.</li>
+<li><code>tenant-fraud-repair</code>: one leader repairs workloads for a tenant.</li>
+<li><code>node-gpu-7-drain</code>: one leader coordinates a node-local transition.</li>
+</ul>
+<p>The lease holder can process the associated work queue and write owned transitions. Other replicas can watch, stay warm, and attempt takeover only after the lease is not renewed. This keeps standby replicas useful without letting every replica act as if it owns the system.</p>
+<p>The main trade-off is lease duration. Short leases detect leader failure quickly and improve failover. They also increase sensitivity to pauses, clock problems, and transient API slowness. Long leases reduce false takeover, but they make the platform wait longer after a real leader failure. The right value depends on how expensive duplicate action is compared with delayed progress.</p>
+<h2>What A Lease Record Carries</h2>
+<p>A useful lease record is more than a boolean lock. It usually contains enough information to make takeover and fencing debuggable:</p>
+<div class="codehilite"><pre><span></span><code>scope: scheduler-shard-12
+holder: ctrl-a
+lease_duration: 15s
+renew_time: 10:41:05.120
+epoch: 1842
+resource_version: 991477
+</code></pre></div>
+
+<p>The <code>holder</code> names the current actor. The <code>renew_time</code> and <code>lease_duration</code> define when others may try to acquire. The <code>resource_version</code> or compare-and-swap condition prevents two contenders from both believing they updated the same record. The <code>epoch</code> is a fencing token: every privileged write made by the leader can include the epoch, and the authority can reject writes from older epochs.</p>
+<p>That fencing token matters because process state can lag behind authority. Imagine <code>ctrl-a</code> holds epoch <code>1842</code>, then stalls for twenty seconds. <code>ctrl-b</code> sees the lease expire and acquires epoch <code>1843</code>. When <code>ctrl-a</code> wakes up, it may still have local memory that says it is leader. If the binding API accepts writes only from the current epoch, <code>ctrl-a</code> becomes harmless: its stale repair request is rejected.</p>
+<p>Without fencing, the system has only a polite agreement between processes. With fencing, the authority enforces the ownership transfer.</p>
+<h2>Leadership Loop</h2>
+<p>A leader election loop is itself a small reconciler. It repeatedly reads the lease record, tries a conditional update, and renews before expiry:</p>
+<div class="codehilite"><pre><span></span><code>while running:
+  lease = read(scope)
+
+  if lease is empty or expired:
+    try_acquire(scope, holder=self, epoch=lease.epoch + 1)
+
+  if lease.holder == self:
+    renew_before_deadline(scope, epoch=lease.epoch)
+    process_owned_queue(scope, epoch=lease.epoch)
+
+  sleep(jittered_interval)
+</code></pre></div>
+
+<p>The loop should separate "I am currently leader" from "my last renewal succeeded." If renewal fails, the replica should stop starting new privileged work. It may finish local cleanup that does not mutate shared authority, but it should not bind workloads, release quota, or declare ownership over new transitions.</p>
+<p>This is also why leader election should be boring and conservative. A controller that continues acting after losing the lease is worse than a controller that pauses too often. Pausing hurts liveness; stale authority can break safety across many workloads.</p>
+<h2>Ownership Transfer</h2>
+<p>Ownership transfer is the path from old leader to new leader. A safe transfer has three parts:</p>
+<ol>
+<li>The old leader stops renewing or loses its ability to renew.</li>
+<li>The new leader acquires the lease through an authoritative conditional write.</li>
+<li>Shared mutation points reject actions from the old leader's epoch.</li>
+</ol>
+<p>For <code>fraud-batch</code>, a transfer might look like this:</p>
+<div class="codehilite"><pre><span></span><code>10:41:05  ctrl-a renews scheduler-shard-12 at epoch 1842
+10:41:08  ctrl-a pauses during garbage collection
+10:41:22  ctrl-b observes expired lease and acquires epoch 1843
+10:41:23  ctrl-b resumes repair work for fraud-batch
+10:41:24  ctrl-a wakes up and tries to write a replacement request with epoch 1842
+10:41:24  API rejects ctrl-a because scheduler-shard-12 is now epoch 1843
+</code></pre></div>
+
+<p>The transfer is safe because authority moved in durable state and the old epoch was fenced out. It is live because <code>ctrl-b</code> can resume queue processing after the timeout instead of waiting for a human to decide whether <code>ctrl-a</code> is dead.</p>
+<p>The hard part is choosing which actions require fencing. Reading state does not. Updating local metrics usually does not. Writing a binding, claiming a shard, releasing quota, or declaring a task failed does. Dangerous writes should carry enough ownership evidence for the receiving API to reject stale actors.</p>
+<h2>Failure Modes</h2>
+<ul>
+<li><strong>Lease as a death detector</strong>: treating expiry as proof that the old leader is gone. The fix is to treat expiry as permission to attempt takeover, then fence stale writes.</li>
+<li><strong>No fencing token</strong>: the old leader resumes and writes after a new leader takes over. The fix is epochs or generations checked by the authoritative mutation point.</li>
+<li><strong>Lease too short</strong>: normal pauses cause repeated leadership churn. The fix is to tune duration, renewal interval, and retry jitter against real latency distributions.</li>
+<li><strong>Lease too long</strong>: real failure leaves work idle for too long. The fix is to align lease duration with recovery objectives and the cost of delayed scheduling.</li>
+<li><strong>Oversized scope</strong>: one global leader becomes a bottleneck. The fix is sharding, but each shard still needs clear ownership.</li>
+<li><strong>Split ownership model</strong>: a controller uses leases for queue processing but writes bindings without checking the lease epoch. The fix is end-to-end authority, not just election ceremony.</li>
+</ul>
+<h2>Design Rules</h2>
+<ul>
+<li>Lease scopes should match the work that needs exclusive authority.</li>
+<li>Renewal should happen well before expiry, with jitter and backoff for API pressure.</li>
+<li>Losing renewal should stop privileged actuation quickly.</li>
+<li>Every dangerous write should include a fencing token or equivalent ownership proof.</li>
+<li>Lease duration should be set from failure and latency assumptions, not copied blindly.</li>
+<li>Leadership state should be observable: holder, epoch, renew time, renewal errors, and takeover count.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li>The previous lesson, <a href="004.html"><code>004.md</code></a>, explained why reconcilers need idempotent actions. Leases add the ownership rule that decides which replica may perform those actions.</li>
+<li>The next lesson, <a href="006.html"><code>006.md</code></a>, uses this ownership foundation when walking through filtering, scoring, and binding in scheduler architecture.</li>
+<li><a href="../consensus-and-coordination/TRACK.md"><code>consensus-and-coordination</code></a> provides the deeper background for compare-and-swap, leadership, fencing, and coordination services.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/architecture/leases/">Kubernetes Leases</a><ul>
+<li>Focus: Study how lease objects represent time-bounded ownership in a real control plane.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://pkg.go.dev/k8s.io/client-go/tools/leaderelection">client-go Leader Election</a><ul>
+<li>Focus: Look for renewal deadlines, retry periods, callbacks, and the assumptions behind leader transitions.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a><ul>
+<li>Focus: Use the paper to connect practical leases and locks with production coordination needs.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://zookeeper.apache.org/doc/current/recipes.html">ZooKeeper Recipes and Solutions</a><ul>
+<li>Focus: Compare leader election and lock recipes with lease-based controller ownership.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Leases give one controller replica time-bounded authority for a clearly defined scope.</li>
+<li>Expiry is not proof that the old leader is dead; safe transfer requires fencing stale actors at mutation points.</li>
+<li>The central trade-off is faster failover versus stronger protection against false takeover and split ownership.</li>
+<li>Leadership is only useful when dangerous writes check the same ownership model that elected the leader.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="004.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Distributed Schedulers and Control Planes: Reconciliation Loops, Work Queues, and Idempotent Actuation</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="006.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Distributed Schedulers and Control Planes: Scheduling Architecture, Filtering, Scoring, and Binding</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">← Back to Distributed Schedulers and Control Planes</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-05 07:53 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

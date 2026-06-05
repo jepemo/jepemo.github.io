@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Schedulers and Control Planes: Autoscaling Feedback Loops and Stability - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Distributed Schedulers and Control Planes: Autoscaling Feedback Loops and Stability</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a>
+    /
+    010
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">010</span>
+    <span class="meta-chip">35 min</span>
+    <span class="meta-chip">advanced</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Distributed Schedulers and Control Planes: Autoscaling Feedback Loops and Stability</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Autoscaling is a feedback loop between observed load, desired capacity, scheduling, and real startup time, so the design trade-off is between reacting quickly and avoiding oscillation when signals lag or demand spikes.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Suppose <code>risk-api</code> suddenly sees traffic double in <code>eu-central</code>, while <code>fraud-batch</code> and notebooks are already competing for the same GPU and CPU pool. The autoscaler observes high request latency and high CPU usage, decides the service needs more replicas, and writes a new desired replica count. The scheduler then tries to place those replicas, but some nodes are full, quota state is changing, and new replicas take time to start and become useful.</p>
+<p>The tempting mental model is simple: load rises, add replicas; load falls, remove replicas. Real autoscaling is slower and more coupled. Metrics are delayed, placement is constrained, startup takes time, and the act of adding work changes the scheduler queue and capacity model. If the autoscaler reacts to every noisy sample, it can create thrash: scale up, fail to place, retry, overcorrect, then scale down just as new capacity becomes ready.</p>
+<p>A stable autoscaling design treats scaling as a control loop, not a reflex. It chooses signals carefully, smooths noisy inputs, respects cooldowns, caps rate of change, and distinguishes "more replicas would help" from "more replicas can actually be placed and become healthy." The scheduler and autoscaler are separate controllers, but they are part of one system.</p>
+<h2>The Autoscaling Loop</h2>
+<p>A basic loop has five stages:</p>
+<div class="codehilite"><pre><span></span><code>measure -&gt; decide -&gt; update desired state -&gt; schedule/actuate -&gt; observe effect
+</code></pre></div>
+
+<p>Each stage can lag:</p>
+<ul>
+<li><strong>Measure</strong>: metrics arrive after scraping, aggregation, or queueing delay.</li>
+<li><strong>Decide</strong>: the autoscaler computes a target from current and historical signal.</li>
+<li><strong>Update desired state</strong>: the control plane records a new replica count or capacity request.</li>
+<li><strong>Schedule/actuate</strong>: the scheduler binds work and the runtime starts it.</li>
+<li><strong>Observe effect</strong>: the new capacity becomes healthy, receives traffic, and changes metrics.</li>
+</ul>
+<p>For <code>risk-api</code>, the autoscaler may decide <code>replicas=12</code> from a metric sample taken thirty seconds ago. The scheduler may place only eight replicas because the protected GPU lane is full. Four pending replicas may still count as desired capacity but not as serving capacity. If the autoscaler ignores that gap, it can keep raising desired replicas even though the bottleneck is placement, not replica count.</p>
+<p>The useful question is not only "what target should the autoscaler choose?" It is "which part of the loop is currently limiting progress?"</p>
+<h2>Choosing Signals</h2>
+<p>Autoscaling signals should describe demand or saturation that additional capacity can actually relieve. Common signals include:</p>
+<ul>
+<li>CPU or memory utilization</li>
+<li>request rate</li>
+<li>request latency</li>
+<li>queue depth or oldest item age</li>
+<li>work-in-progress per replica</li>
+<li>GPU utilization or accelerator queue length</li>
+<li>error rate caused by saturation</li>
+<li>pending work that is blocked by capacity</li>
+</ul>
+<p>Not every high metric should trigger scaling. High latency caused by a downstream database outage may not improve with more <code>risk-api</code> replicas. High CPU during startup can make a new replica look overloaded before it is useful. A deep queue caused by quota exhaustion may need capacity, but a deep queue caused by invalid work needs rejection or policy repair.</p>
+<p>Signals should also match the resource being scaled. If the autoscaler is adding application replicas, request rate and per-replica work may be useful. If it is adding nodes, unschedulable pods and resource requests matter more. If it is scaling GPU workers, accelerator saturation and queue age may matter more than average CPU.</p>
+<h2>Stability Controls</h2>
+<p>Stable autoscaling usually needs damping. Without it, the controller reacts faster than the system can show the result of its previous action.</p>
+<p>Common stability controls include:</p>
+<ul>
+<li><strong>Smoothing</strong>: average noisy signals over a useful window.</li>
+<li><strong>Cooldowns</strong>: wait after scaling before taking another action.</li>
+<li><strong>Rate limits</strong>: cap how much desired capacity can change at once.</li>
+<li><strong>Hysteresis</strong>: require a stronger signal to reverse direction than to continue.</li>
+<li><strong>Readiness gates</strong>: count only replicas that are actually serving.</li>
+<li><strong>Scale-down delays</strong>: avoid removing capacity immediately after a short dip.</li>
+<li><strong>Min and max bounds</strong>: keep the loop inside operationally safe limits.</li>
+<li><strong>Blocked reasons</strong>: stop treating unschedulable work as proof that demand is infinite.</li>
+</ul>
+<p>The trade-off is direct. More damping reduces oscillation and protects the scheduler from bursts of desired-state changes. Too much damping makes the system slow to react during real demand spikes. A high-priority API may accept faster scale-up and slower scale-down. A batch worker pool may accept slower reactions to avoid wasting capacity.</p>
+<h2>Scheduler Coupling</h2>
+<p>Autoscalers and schedulers interact through desired state and pending work. That coupling creates feedback paths:</p>
+<div class="codehilite"><pre><span></span><code>autoscaler raises desired replicas
+scheduler tries to place replicas
+pending replicas increase queue pressure
+cluster autoscaler may add nodes
+new nodes become ready later
+application metrics improve later still
+autoscaler reads new metrics and adjusts again
+</code></pre></div>
+
+<p>If each controller reads only its local signal, the combined system can behave badly. The application autoscaler may keep increasing replicas because latency remains high. The scheduler may keep reporting unschedulable work. The cluster autoscaler may add nodes, but nodes take minutes to become ready. By the time capacity appears, the application autoscaler may have overshot.</p>
+<p>A safer design shares enough state to explain the bottleneck:</p>
+<ul>
+<li>desired replicas</li>
+<li>ready replicas</li>
+<li>pending replicas</li>
+<li>pending reasons</li>
+<li>quota blocks</li>
+<li>node provisioning state</li>
+<li>recent scale actions</li>
+<li>startup and readiness delay</li>
+</ul>
+<p>This does not mean one controller owns everything. It means each controller should distinguish demand that it can satisfy from demand blocked by another boundary.</p>
+<h2>Worked Example: Stabilizing <code>risk-api</code></h2>
+<p>Imagine <code>risk-api</code> normally runs four replicas. During an incident, request rate doubles and latency rises.</p>
+<p>An unstable loop might behave like this:</p>
+<div class="codehilite"><pre><span></span><code>00:00  latency high, scale 4 -&gt; 12
+00:30  only 6 replicas ready, latency still high, scale 12 -&gt; 24
+01:00  many replicas pending, cluster adds nodes
+02:30  nodes arrive, 24 replicas start, traffic stabilizes
+03:00  utilization low, scale 24 -&gt; 5
+03:30  traffic spikes again while old replicas terminate
+</code></pre></div>
+
+<p>A more stable loop records the same pressure but adds guardrails:</p>
+<div class="codehilite"><pre><span></span><code>00:00  latency high, scale 4 -&gt; 10 with max step of +6
+00:30  6 ready, 4 pending due to capacity, hold decision during cooldown
+01:00  cluster provisioning in progress, do not keep increasing desired replicas
+02:30  10 ready, latency falling, hold scale-down delay
+05:00  reduce gradually if low utilization persists
+</code></pre></div>
+
+<p>The second loop is slower to declare victory, but it is easier to reason about. It separates demand, placement, provisioning, readiness, and scale-down. It also prevents desired state from racing far ahead of usable capacity.</p>
+<h2>Operational Failure Modes</h2>
+<ul>
+<li><strong>Scaling on the wrong signal</strong>: adding replicas for latency caused by a downstream dependency. The fix is to pair saturation signals with bottleneck diagnosis.</li>
+<li><strong>Counting pending as serving</strong>: desired replicas rise, but ready capacity does not. The fix is to track desired, pending, bound, starting, and ready separately.</li>
+<li><strong>No cooldown</strong>: the autoscaler reacts before earlier changes take effect. The fix is cooldown, rate limits, and readiness-aware decisions.</li>
+<li><strong>Scale-down too fast</strong>: capacity disappears after a temporary dip, causing another spike. The fix is stabilization windows and gradual reduction.</li>
+<li><strong>Unschedulable means infinite demand</strong>: placement failures trigger more desired replicas. The fix is pending reasons, quota awareness, and scheduler feedback.</li>
+<li><strong>Competing autoscalers</strong>: application, queue, and cluster autoscalers each amplify the others. The fix is clear ownership, bounded actions, and shared observability.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li>The previous lesson, <a href="009.html"><code>009.md</code></a>, explained capacity, quotas, and overcommitment. Autoscaling depends on those signals to avoid scaling against imaginary capacity.</li>
+<li>The next lesson, <a href="011.html"><code>011.md</code></a>, applies the same stability thinking to rollouts, reconfiguration, and safe change.</li>
+<li><a href="../control-theory-and-feedback-systems/TRACK.md"><code>control-theory-and-feedback-systems</code></a> gives deeper vocabulary for feedback, delay, damping, and oscillation.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Kubernetes Horizontal Pod Autoscaling</a><ul>
+<li>Focus: Study how measured utilization, desired replicas, readiness, and stabilization interact.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md">Kubernetes Cluster Autoscaler FAQ</a><ul>
+<li>Focus: Connect unschedulable work, node provisioning delay, and scheduler-visible capacity.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://keda.sh/docs/latest/concepts/">KEDA Concepts</a><ul>
+<li>Focus: Look at event-driven scaling signals, triggers, cooldowns, and activation thresholds.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/handling-overload/">Site Reliability Engineering: Handling Overload</a><ul>
+<li>Focus: Use overload handling to reason about when scaling helps and when backpressure is the safer control.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Autoscaling is a feedback loop with delayed measurement, scheduling, startup, and observed effect.</li>
+<li>Stable autoscaling needs smoothing, cooldowns, rate limits, bounds, and readiness-aware decisions.</li>
+<li>Scheduler feedback matters because pending replicas may be blocked by quota, topology, provisioning, or capacity rather than application demand.</li>
+<li>The central trade-off is fast reaction to real demand versus damping enough to avoid oscillation and scheduler churn.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="009.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Distributed Schedulers and Control Planes: Capacity Models, Quotas, and Overcommitment</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="011.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Distributed Schedulers and Control Planes: Rollouts, Reconfiguration, and Safe Change</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">← Back to Distributed Schedulers and Control Planes</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-05 07:53 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

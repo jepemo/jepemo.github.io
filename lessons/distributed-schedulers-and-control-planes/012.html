@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Schedulers and Control Planes: Watch Streams, Caches, and Staleness Boundaries - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Distributed Schedulers and Control Planes: Watch Streams, Caches, and Staleness Boundaries</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a>
+    /
+    012
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">012</span>
+    <span class="meta-chip">35 min</span>
+    <span class="meta-chip">advanced</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Distributed Schedulers and Control Planes: Watch Streams, Caches, and Staleness Boundaries</h1>
+<blockquote>
+<p><strong>The core idea</strong>: Watch streams and caches let controllers react without overwhelming the authoritative store, so the design trade-off is between low-latency local decisions and explicit boundaries around stale state.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Suppose the <code>risk-api</code> rollout from the previous lesson has enabled <code>scheduler-policy-v5</code> for a small canary. The scheduler, rollout controller, autoscaler, quota controller, and admission layer all need to notice new objects, policy updates, replica health, pending reasons, and capacity changes. If every controller polls the API store before every decision, the control plane becomes slow and expensive. If every controller trusts a local cache blindly, decisions can be made from old reality.</p>
+<p>The usual answer is a watch stream backed by a local cache. A controller first lists the objects it cares about, then watches for later changes. The cache becomes a local working view: fast to read, indexed for the controller's needs, and updated by events from the authoritative store. That makes reconciliation practical at scale.</p>
+<p>The non-obvious part is that the cache is not truth. It is a snapshot plus a stream of changes, and both can lag, disconnect, compact, or restart. A safe control plane treats cache freshness as a property of each decision. Some decisions can tolerate slightly stale state because reconciliation will repair them. Other decisions, such as binding scarce capacity or admitting a quota-consuming request, need stronger checks against an authoritative version.</p>
+<h2>List, Watch, and Cache</h2>
+<p>A common controller data path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>authoritative store -&gt; API server -&gt; list response -&gt; local cache
+                                      watch stream -&gt; local cache
+                                      work queue   -&gt; reconciler
+</code></pre></div>
+
+<p>The initial <strong>list</strong> gives the controller a complete starting point for a scope: all pods in a namespace, all placement policies in a region, or all pending scheduling requests for a lane. The response carries a version marker that says, in effect, "this is the world as of this point in the store's history."</p>
+<p>The <strong>watch</strong> then streams later changes: added, modified, deleted, and sometimes bookmark events. The controller applies those events to its local cache and enqueues work for reconciliation. Instead of scanning the whole world, the controller can react to the small set of objects that changed.</p>
+<p>The <strong>cache</strong> is the controller's read-optimized memory of that world. It may have indexes by tenant, node, zone, priority class, owner reference, or policy version. For the scheduler, those indexes can answer questions like:</p>
+<ul>
+<li>which pods are pending in <code>eu-central</code></li>
+<li>which nodes still have GPU capacity</li>
+<li>which placement policy applies to <code>risk-api</code></li>
+<li>which reservations belong to the recovery lane</li>
+<li>which objects changed since the last scheduling cycle</li>
+</ul>
+<p>This design moves many reads away from the authoritative store. It also introduces a new responsibility: the controller must know when its local view is fresh enough for the action it is about to take.</p>
+<h2>Resource Versions and Freshness</h2>
+<p>Freshness needs a concrete handle. In many control planes, each object or list response has a monotonically advancing version, revision, timestamp, or generation. Kubernetes calls this idea <code>resourceVersion</code>; etcd exposes revisions. The exact name matters less than the contract: a client can say which point in history its cache has reached.</p>
+<p>A version marker helps answer three questions:</p>
+<ul>
+<li><strong>What did I see?</strong> The controller can attach the observed version to a decision.</li>
+<li><strong>What changed since then?</strong> The watch stream can resume from a known point when possible.</li>
+<li><strong>Is my write still valid?</strong> An update can use optimistic concurrency so it fails if the object changed after the controller read it.</li>
+</ul>
+<p>For example, a scheduler may read a cached node object that says <code>allocatable_gpu=1</code> at version <code>9001</code>. Before binding <code>risk-api</code>, it should not assume that GPU is still free just because the cache says so. Another scheduler, quota controller, or operator may have changed the state. The binding path needs an authoritative compare-and-update, lease, reservation, or conflict check.</p>
+<p>That distinction is the staleness boundary. The cache can find candidates quickly. The authoritative write path must prove that the decision is still safe.</p>
+<h2>Where Staleness Is Acceptable</h2>
+<p>Not every stale read is dangerous. A controller that notices <code>risk-api</code> has seven replicas when it eventually should have eight can enqueue a reconcile and try again later. If the cache is slightly behind, the next watch event or periodic resync can repair the view. This is why reconciliation works well for many desired-state loops.</p>
+<p>Staleness is usually acceptable when:</p>
+<ul>
+<li>the action is idempotent</li>
+<li>the next reconcile can repair a missed or duplicate action</li>
+<li>the action does not consume scarce exclusive capacity</li>
+<li>the controller records enough state to detect conflicts later</li>
+<li>the user-visible consequence is delay rather than corruption</li>
+</ul>
+<p>Staleness is less acceptable when:</p>
+<ul>
+<li>two actors could claim the same capacity</li>
+<li>admission would allow a request beyond quota</li>
+<li>a rollout gate could advance based on missing failures</li>
+<li>an emergency override must stop new action immediately</li>
+<li>a policy change affects security, isolation, or ownership</li>
+</ul>
+<p>The practical design is often mixed. Read broadly from cache, then confirm narrowly at the boundary where a decision becomes authoritative.</p>
+<h2>Missed Events, Relist, and Compaction</h2>
+<p>Watch streams are not magic. Networks disconnect, clients restart, servers compact old history, and buffers overflow. A controller cannot assume it will see every event forever.</p>
+<p>A robust controller handles watch failure as a normal path:</p>
+<div class="codehilite"><pre><span></span><code>1. list objects and record version 5000
+2. watch changes after version 5000
+3. apply events to cache and enqueue affected keys
+4. if the watch is interrupted, resume from the last safe version
+5. if that version is too old, relist and rebuild the cache
+</code></pre></div>
+
+<p>Relisting is expensive, but it is the cost of returning to a coherent view. The controller should make relist visible in metrics because repeated relists can signal API pressure, slow consumers, excessive object churn, or a watch stream that cannot keep up.</p>
+<p>Controllers also need to handle delete events carefully. If a delete is missed and the cache still believes an object exists, the controller can keep reconciling a ghost. If a delete arrives before related cleanup is visible, the controller can release capacity too early. Owner references, finalizers, tombstones, and authoritative existence checks are tools for making deletion safe under lag.</p>
+<h2>Worked Example: Stale Policy During a Canary</h2>
+<p>Imagine <code>scheduler-policy-v5</code> is active for <code>risk-api</code> canary placements. The rollout controller updates the policy object:</p>
+<div class="codehilite"><pre><span></span><code>policyVersion: v5-canary
+scope: risk-api eu-central
+active: true
+maxZoneSkew: 1
+</code></pre></div>
+
+<p>The scheduler watches policy objects and node objects. Its cache receives the policy update quickly, but a node-capacity watch is delayed for twenty seconds. During that window, the scheduler sees a candidate node in <code>zone-b</code> with one free GPU even though another binding already consumed it.</p>
+<p>A weak design binds directly from the cached node view:</p>
+<div class="codehilite"><pre><span></span><code>cache says node-b7 has 1 GPU
+bind risk-api replica to node-b7
+later discover conflict or overcommitment
+</code></pre></div>
+
+<p>A stronger design separates selection from commitment:</p>
+<div class="codehilite"><pre><span></span><code>cache selects node-b7 as a candidate
+binding request includes observed node version
+authoritative path rejects if capacity changed
+scheduler retries with a fresh candidate
+</code></pre></div>
+
+<p>The stronger design still benefits from the cache. It avoids scanning every node through the API server. But it does not let the cache cross the boundary where exclusive capacity is claimed.</p>
+<p>The same pattern applies to rollout gates. A cached view can compute "no pending-reason regression" cheaply, but advancing the rollout should include a freshness check: did every required watch reach at least the policy activation version, and are the key signals current enough to trust?</p>
+<h2>Operational Failure Modes</h2>
+<ul>
+<li><strong>Cache treated as truth</strong>: a controller commits scarce capacity from a stale snapshot. The fix is authoritative conflict checks at binding, admission, or reservation time.</li>
+<li><strong>No freshness signal</strong>: operators cannot tell whether a calm dashboard reflects a healthy system or a stuck watch. The fix is watch lag, last event version, relist count, and cache-sync metrics.</li>
+<li><strong>Relist storm</strong>: many controllers lose watches and rebuild caches at once. The fix is backoff, bookmarks, pagination, and scoped watches.</li>
+<li><strong>Dropped delete semantics</strong>: stale objects remain in cache or cleanup runs too early. The fix is tombstone handling, finalizers, owner references, and existence checks.</li>
+<li><strong>Unbounded watch scope</strong>: every controller watches more objects than it needs. The fix is filtering by namespace, field, label, tenant, lane, or controller ownership.</li>
+<li><strong>Rollout gate from stale signals</strong>: a canary advances while failures are delayed in a cache. The fix is freshness requirements for the signals that gate activation.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li>The previous lesson, <a href="011.html"><code>011.md</code></a>, treated rollouts as controlled state transitions. Watch freshness decides when rollout evidence is current enough to act on.</li>
+<li>The next lesson, <a href="013.html"><code>013.md</code></a>, moves to admission and policy. Admission paths often read from cache for context but need authoritative checks when accepting writes.</li>
+<li><a href="../consistency-and-replication/TRACK.md"><code>consistency-and-replication</code></a> provides deeper background for revisions, stale reads, and consistency boundaries.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://kubernetes.io/docs/reference/using-api/api-concepts/">Kubernetes API Concepts</a><ul>
+<li>Focus: Study <code>resourceVersion</code>, watches, bookmarks, pagination, and efficient change detection.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/architecture/controller/">Kubernetes Controllers</a><ul>
+<li>Focus: Connect watch-driven observation with reconciliation against desired state.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/learning/api_guarantees/">etcd API Guarantees</a><ul>
+<li>Focus: Look at revisions, watch behavior, and the consistency expectations behind control-plane storage.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://pkg.go.dev/k8s.io/client-go/tools/cache">client-go tools/cache</a><ul>
+<li>Focus: Inspect informers, stores, indexers, resync, and deleted object handling as implementation vocabulary.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Watch streams and caches make large control planes responsive without turning every decision into a direct store read.</li>
+<li>A cache is a fast local view, not the authoritative boundary for scarce capacity, admission, ownership, or safety gates.</li>
+<li>Version markers, relist paths, and cache-sync metrics make staleness visible enough to reason about.</li>
+<li>The central trade-off is lower read pressure and faster local decisions versus explicit safeguards for stale or incomplete observations.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="011.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Distributed Schedulers and Control Planes: Rollouts, Reconfiguration, and Safe Change</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="013.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Distributed Schedulers and Control Planes: Admission, Policy, and API Control Surfaces</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">← Back to Distributed Schedulers and Control Planes</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-05 07:53 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

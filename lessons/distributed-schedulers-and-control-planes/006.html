@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Schedulers and Control Planes: Scheduling Architecture, Filtering, Scoring, and Binding - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Distributed Schedulers and Control Planes: Scheduling Architecture, Filtering, Scoring, and Binding</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a>
+    /
+    006
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">Distributed Schedulers and Control Planes</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">006</span>
+    <span class="meta-chip">35 min</span>
+    <span class="meta-chip">advanced</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Distributed Schedulers and Control Planes: Scheduling Architecture, Filtering, Scoring, and Binding</h1>
+<blockquote>
+<p><strong>The core idea</strong>: A scheduler separates impossible placements from preferred placements and commits only through an authoritative binding step, so the design trade-off is between fast local decisions and safe placement under stale cluster state.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Suppose <code>fraud-batch</code> is waiting for one GPU worker in <code>eu-central</code>. It needs an exclusive GPU, cannot exceed tenant quota, prefers nodes close to its input data, and should avoid a rack that is already under network pressure. The scheduler has a queue entry for the workload and a cached view of nodes, but that cache is not the source of truth. Another workload may be binding to the same GPU while <code>fraud-batch</code> is being evaluated.</p>
+<p>That is why production schedulers split the path into stages. <strong>Filtering</strong> removes nodes that cannot safely run the workload. <strong>Scoring</strong> ranks the remaining nodes by preferences and cost. <strong>Binding</strong> commits the selected placement through the authority that owns workload-to-node assignment. The local scheduler can be clever, but the final write must still be safe.</p>
+<p>The common misconception is that scheduling is mostly about picking the "best" node. In distributed control planes, the harder question is when the scheduler is allowed to believe its own choice. A good architecture lets the scheduler use fast local state for exploration while making the binding step authoritative enough to reject stale, conflicting, or policy-breaking decisions.</p>
+<h2>The Scheduler Pipeline</h2>
+<p>A simple scheduling path looks like this:</p>
+<div class="codehilite"><pre><span></span><code>pending queue -&gt; snapshot/cache -&gt; filter -&gt; score -&gt; reserve/assume -&gt; bind -&gt; observe
+</code></pre></div>
+
+<p>Each stage answers a different question:</p>
+<ul>
+<li><strong>Pending queue</strong>: which workload should be considered next?</li>
+<li><strong>Snapshot/cache</strong>: what does the scheduler currently believe about nodes, quotas, topology, and existing bindings?</li>
+<li><strong>Filter</strong>: which nodes are impossible because they violate hard requirements?</li>
+<li><strong>Score</strong>: among feasible nodes, which placement is preferable?</li>
+<li><strong>Reserve/assume</strong>: how does the scheduler avoid racing itself while the binding is in flight?</li>
+<li><strong>Bind</strong>: can the authority commit this placement against current state?</li>
+<li><strong>Observe</strong>: did the node agent accept and run the work?</li>
+</ul>
+<p>This shape keeps safety and liveness in view. Filters protect hard invariants. Scoring improves utilization and latency without pretending to be a proof of correctness. Binding is the point where desired placement becomes committed state. Observation closes the loop because a bound workload may still fail to start.</p>
+<h2>Filtering: Removing Unsafe Candidates</h2>
+<p>Filters should be boring and strict. They answer yes-or-no questions about feasibility:</p>
+<ul>
+<li>Does the node have the required resource type, such as GPU?</li>
+<li>Is the node in an allowed region, zone, or tenancy boundary?</li>
+<li>Would the workload exceed quota or exclusive resource ownership?</li>
+<li>Is the node healthy enough to accept new work?</li>
+<li>Does the workload require a runtime, accelerator, label, or policy that the node lacks?</li>
+</ul>
+<p>For <code>fraud-batch</code>, <code>node-gpu-7</code> may pass because it is in <code>eu-central</code>, has the right GPU type, and is not cordoned. <code>node-gpu-9</code> may fail because it is in <code>us-east</code>. <code>node-gpu-11</code> may fail because its last heartbeat is too old. A filter failure should usually record a reason that operators and later controllers can inspect.</p>
+<p>Filtering has a hidden cost: the scheduler can only filter on evidence it has. If node health is stale, a strict filter may reject a node that has recovered. If quota data lags, a loose filter may pass a placement that binding later rejects. This is why filters should distinguish local feasibility checks from authoritative commitment checks. Local filtering narrows the search; it does not replace the final authority.</p>
+<h2>Scoring: Ranking Feasible Candidates</h2>
+<p>Scoring handles preferences after the hard constraints are satisfied. It might prefer:</p>
+<ul>
+<li>nodes with more spare GPU memory</li>
+<li>nodes near the workload's input data</li>
+<li>nodes that spread replicas across failure domains</li>
+<li>nodes that reduce fragmentation</li>
+<li>nodes that preserve scarce capacity for stricter future workloads</li>
+<li>nodes with lower current network pressure</li>
+</ul>
+<p>Scores are useful because many feasible placements are not equally good. Running <code>fraud-batch</code> next to its input data may reduce job time. Spreading replicas across racks may reduce blast radius. Avoiding fragmentation may keep the cluster useful for the next large GPU request.</p>
+<p>The risk is false precision. A score is not an invariant; it is an opinion based on a model. A scheduler that treats score differences as exact truth can thrash workloads, overfit stale metrics, or spend too much time chasing tiny improvements. Mature schedulers often keep scoring modular, weighted, and observable so operators can tell whether a placement was driven by locality, fairness, fragmentation, or policy.</p>
+<h2>Binding: Turning A Choice Into Authority</h2>
+<p>Binding is the commit step. The scheduler chooses a candidate, but the control plane must still make the placement durable:</p>
+<div class="codehilite"><pre><span></span><code>1. Scheduler selects node-gpu-7 from a local snapshot.
+2. Scheduler records an assumed placement in its local cache.
+3. Scheduler sends a binding request to the authoritative API.
+4. API accepts only if workload version, node state, quota, and ownership still allow it.
+5. Node agent observes the binding and attempts to start the workload.
+6. Status updates confirm running, failed, or unknown.
+</code></pre></div>
+
+<p>The local assumed placement prevents the scheduler from immediately placing another workload onto the same apparent capacity while the bind is pending. The authoritative binding prevents the scheduler from committing a stale or conflicting choice. Both are needed. Local assumption is fast but provisional; binding is slower but authoritative.</p>
+<p>The lease and fencing model from the previous lesson applies here. If <code>scheduler-shard-12</code> is currently owned by <code>ctrl-b</code> at epoch <code>1843</code>, the binding write should include that ownership evidence. A stale scheduler replica should not be able to bind <code>fraud-batch</code> just because it still has a promising cache entry.</p>
+<h2>Worked Example: One Placement Attempt</h2>
+<p>Consider one scheduling cycle for <code>fraud-batch</code>:</p>
+<div class="codehilite"><pre><span></span><code>workload: fraud-batch
+requirements:
+  region: eu-central
+  gpu: 1 exclusive
+  tenant: fraud
+preferences:
+  close_to: fraud-inputs-eu
+  spread_across: rack
+  avoid: nodes with high network pressure
+</code></pre></div>
+
+<p>The scheduler reads a snapshot and finds four candidate nodes:</p>
+<div class="codehilite"><pre><span></span><code>node-gpu-7   eu-central  gpu-free  data-near  rack-a  healthy
+node-gpu-9   us-east     gpu-free  data-far   rack-c  healthy
+node-gpu-11  eu-central  gpu-free  data-near  rack-b  stale heartbeat
+node-gpu-13  eu-central  gpu-free  data-far   rack-d  healthy
+</code></pre></div>
+
+<p>Filtering removes <code>node-gpu-9</code> because of region and <code>node-gpu-11</code> because its heartbeat is too stale for a new placement. Scoring ranks <code>node-gpu-7</code> over <code>node-gpu-13</code> because it is closer to the input data. The scheduler assumes <code>node-gpu-7</code> locally and sends a binding request.</p>
+<p>If the binding succeeds, the node agent becomes responsible for local execution and status. If the binding fails because another workload already took the GPU, the scheduler clears the assumption, records the rejection reason, and requeues <code>fraud-batch</code>. That failure is not a bug by itself. It is the expected safety boundary between fast scheduling from cache and authoritative commitment.</p>
+<h2>Operational Failure Modes</h2>
+<ul>
+<li><strong>Filter does too much</strong>: expensive policy checks slow the entire queue. The fix is to keep hard feasibility checks clear and move expensive preference logic into scoring or precomputed state.</li>
+<li><strong>Score hides policy</strong>: a soft preference is accidentally used as if it were a hard constraint. The fix is to separate filter reasons from score contributions.</li>
+<li><strong>Binding bypasses authority</strong>: the scheduler writes directly to node-local state. The fix is an authoritative binding API that can reject stale or conflicting decisions.</li>
+<li><strong>Assumed state leaks</strong>: a failed bind leaves capacity reserved in the scheduler cache. The fix is timeout, rollback, and reconciliation of assumed placements.</li>
+<li><strong>Stale cache causes churn</strong>: repeated bind failures come from old node or quota data. The fix is backoff, cache freshness signals, and better invalidation.</li>
+<li><strong>No placement explanation</strong>: operators cannot tell why a node was chosen. The fix is structured filter failures and score breakdowns.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li>The previous lesson, <a href="005.html"><code>005.md</code></a>, explained leases and fencing. Scheduler binding uses the same ownership idea to keep stale leaders from committing placements.</li>
+<li>The next lesson, <a href="007.html"><code>007.md</code></a>, goes deeper into placement preferences such as locality, topology, spreading, and failure domains.</li>
+<li><a href="../cloud-platform-and-microservices/TRACK.md"><code>cloud-platform-and-microservices</code></a> gives adjacent context for declarative workload APIs and platform-owned placement.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/">Kubernetes Scheduler</a><ul>
+<li>Focus: Study filtering, scoring, and binding as separate stages in a production scheduler.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/">Kubernetes Scheduling Framework</a><ul>
+<li>Focus: Look at how scheduler plugins separate queueing, filtering, scoring, reserving, permitting, and binding.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/">Large-scale cluster management at Google with Borg</a><ul>
+<li>Focus: Use Borg to connect scheduler architecture with resource constraints, placement decisions, and cluster utilization.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://research.google/pubs/omega-flexible-scalable-schedulers-for-large-compute-clusters/">Omega: Flexible, Scalable Schedulers for Large Compute Clusters</a><ul>
+<li>Focus: Compare centralized binding authority with optimistic, concurrent scheduling.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Filtering removes unsafe or impossible nodes; scoring ranks feasible nodes by preference and cost.</li>
+<li>Scheduler caches make placement fast, but binding must be authoritative because cached state can be stale.</li>
+<li>Reserve or assume stages prevent the scheduler from racing itself while a binding is pending.</li>
+<li>The central trade-off is fast local decision-making versus safe commitment under concurrent, changing cluster state.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="005.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Distributed Schedulers and Control Planes: Leases, Leadership, and Ownership Transfer</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="007.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Distributed Schedulers and Control Planes: Placement, Locality, and Topology Constraints</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/distributed-schedulers-and-control-planes.html">← Back to Distributed Schedulers and Control Planes</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-05 07:53 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
