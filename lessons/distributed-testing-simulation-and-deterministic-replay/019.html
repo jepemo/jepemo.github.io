@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distributed Testing, Simulation, and Deterministic Replay: Testing Client Semantics, Idempotency, and Exactly-Once Claims - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Distributed Testing, Simulation, and Deterministic Replay: Testing Client Semantics, Idempotency, and Exactly-Once Claims</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/distributed-testing-simulation-and-deterministic-replay.html">Distributed Testing, Simulation, and Deterministic Replay</a>
+    /
+    019
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/distributed-testing-simulation-and-deterministic-replay.html">Distributed Testing, Simulation, and Deterministic Replay</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">019</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Distributed Testing, Simulation, and Deterministic Replay: Testing Client Semantics, Idempotency, and Exactly-Once Claims</h1>
+<h2>Core Insight</h2>
+<p>In <code>CheckoutService</code>, the internal replication protocol is now tested with history oracles, but a customer does not care which quorum accepted an entry. The customer cares whether pressing "confirm order" once can charge them twice, whether retrying after a timeout is safe, and what response they should trust after an ambiguous failure.</p>
+<p>"Exactly once" is rarely a simple internal property. In distributed systems, it is usually a client-facing contract built from smaller mechanisms: idempotency keys, deduplication windows, durable request records, retry discipline, external-effect guards, and response recovery. A test that checks only the database row can miss the thing the client actually experiences: duplicate money movement, duplicate email, duplicate shipment, or an unknown outcome that forces unsafe retries.</p>
+<p>The trade-off is client simplicity versus system complexity. A strong client contract makes retries safe and understandable, but the service must preserve request identity, record enough outcome evidence, and coordinate external effects across crashes and partitions. If the test harness does not model the client's ambiguous view of the world, it can prove a cleaner guarantee than the system really offers.</p>
+<h2>Name the Client Contract</h2>
+<p>Before testing idempotency or exactly-once behavior, write the contract in client language.</p>
+<p>Weak contracts sound like this:</p>
+<div class="codehilite"><pre><span></span><code>The server usually deduplicates retries.
+The operation should not run twice.
+The client can retry on timeout.
+</code></pre></div>
+
+<p>Those statements are not testable enough. A stronger contract names the operation, the identity, the observable effect, and the ambiguous cases:</p>
+<div class="codehilite"><pre><span></span><code>For a given merchant and idempotency key, confirm(order_id, key)
+creates at most one external payment capture.
+
+If the client repeats the same request with the same key after a timeout,
+the service returns the original outcome or a stable &quot;still unknown&quot; response.
+
+If the request body changes under the same key,
+the service rejects the request instead of creating a second effect.
+</code></pre></div>
+
+<p>That contract tells the harness what to observe. It also reveals what must be modeled: retries, request identity, request body equality, durable outcome records, and external payment effects.</p>
+<h2>Idempotency Is Not Just Deduplication</h2>
+<p>Deduplication often means "drop repeats." Idempotency is stronger and more precise: applying the same operation identity multiple times has the same externally visible effect as applying it once.</p>
+<p>A naive deduplication table might store only keys:</p>
+<div class="codehilite"><pre><span></span><code>seen_keys:
+  k1
+</code></pre></div>
+
+<p>That is not enough. The service also needs to know what the key meant and what happened:</p>
+<div class="codehilite"><pre><span></span><code>idempotency_record:
+  merchant: m1
+  key: k1
+  request_hash: h_confirm_order_1_amount_50
+  status: captured
+  payment_capture_id: p778
+  response_body: approved
+</code></pre></div>
+
+<p>Without the request hash, a client or adapter bug could reuse <code>k1</code> for a different request. Without the outcome, a retry after timeout cannot recover the original response. Without a durable record, a crash can forget that the external effect already happened.</p>
+<p>Idempotency also has a scope. A key may be unique per tenant, per account, per operation type, per endpoint, or globally. Tests should include the scope explicitly:</p>
+<div class="codehilite"><pre><span></span><code>same key, same merchant -&gt; same operation identity
+same key, different merchant -&gt; independent operation identity
+same key, different request hash -&gt; conflict
+same key, expired retention window -&gt; contract-specific behavior
+</code></pre></div>
+
+<h2>Exactly-Once Claims Need Effect Oracles</h2>
+<p>Exactly-once language is dangerous because it can mean several different things:</p>
+<ul>
+<li>the server processes the request handler once</li>
+<li>the database stores one command record</li>
+<li>the message queue delivers one message</li>
+<li>the external provider sees one capture</li>
+<li>the client observes one successful outcome</li>
+</ul>
+<p>Those are different properties. A handler can run twice while the external effect happens once. A queue can deliver twice while an idempotent consumer writes once. A database can hold one row while the payment provider saw two captures.</p>
+<p>The oracle must match the promise. If the client promise is "at most one external capture," the test should count provider-observed captures, not only local database rows.</p>
+<div class="codehilite"><pre><span></span><code>bad oracle:
+  assert orders[order_id].status == &quot;confirmed&quot;
+
+better oracle:
+  assert payment_provider.captures_for(idempotency_key).count &lt;= 1
+  assert every retry returns the same terminal outcome or a safe unknown response
+  assert conflicting request bodies under the same key are rejected
+</code></pre></div>
+
+<p>For some systems, the honest contract is not exactly once. It may be:</p>
+<div class="codehilite"><pre><span></span><code>at-least-once delivery with idempotent consumer
+at-most-once external effect
+effectively-once within a retention window
+exactly-once state transition inside one transactional log
+retryable until a stable outcome is returned
+</code></pre></div>
+
+<p>Testing gets much easier when the claim is honest.</p>
+<h2>Ambiguous Outcomes Are the Hard Case</h2>
+<p>The most important client tests are often not the clean success path. They are the unknown outcome path.</p>
+<p>Suppose the client sends a request:</p>
+<div class="codehilite"><pre><span></span><code>1  client -&gt; service: confirm(order-1, key k1)
+2  service records in-flight key k1
+3  service sends capture(k1) to payment provider
+4  payment provider captures funds
+5  service crashes before recording provider response
+6  client times out
+</code></pre></div>
+
+<p>From the client's perspective, the operation is unknown. It might have failed before the external effect, succeeded before the crash, or still be in progress.</p>
+<p>Unsafe retry behavior looks like this:</p>
+<div class="codehilite"><pre><span></span><code>7  client retries confirm(order-1, key k1)
+8  service finds no durable outcome
+9  service sends a second capture
+10 provider records duplicate capture
+</code></pre></div>
+
+<p>Safer behavior uses durable intent and recovery evidence:</p>
+<div class="codehilite"><pre><span></span><code>2  service durably records key k1 as in-flight
+3  service sends capture with provider idempotency key k1
+4  provider captures funds
+5  service crashes before recording response
+6  client retries with k1
+7  service sees in-flight k1
+8  service asks provider or recovery log for outcome
+9  service records captured p778
+10 service returns stable approved response
+</code></pre></div>
+
+<p>The test harness must create the crash between the external effect and local outcome recording. If it only crashes before or after the whole handler, it misses the dangerous boundary.</p>
+<h2>Worked Example</h2>
+<p>The deterministic harness models a client, two service replicas, a replicated idempotency table, and a payment provider stub:</p>
+<div class="codehilite"><pre><span></span><code>actors:
+  C  client
+  A  service replica
+  B  service replica
+  P  payment provider model
+
+state:
+  idempotency table replicated asynchronously
+  provider records every capture attempt
+</code></pre></div>
+
+<p>The property is:</p>
+<div class="codehilite"><pre><span></span><code>For merchant m1 and idempotency key k1,
+all retries of the same confirm request cause at most one provider capture.
+</code></pre></div>
+
+<p>The harness explores this schedule:</p>
+<div class="codehilite"><pre><span></span><code>1   C sends confirm(order-1, k1, amount=50) to A
+2   A durably records in-flight(k1, hash=h1)
+3   A sends replication m1 -&gt; B
+4   network delays m1
+5   A sends capture(k1, h1) to P
+6   P records capture p1 and returns approved
+7   A crashes before recording outcome p1
+8   C times out
+9   C retries confirm(order-1, k1, amount=50) to B
+10  B has not seen m1
+11  B sends capture(k1, h1) to P
+12  invariant checks provider captures for k1
+</code></pre></div>
+
+<p>If the provider model has correct idempotency by key and request hash, step 11 should return the original outcome or reject the duplicate without a second capture. If the provider model accepts the second capture, the service must have a stronger local or shared guard before calling the provider.</p>
+<p>Now add a second generated retry:</p>
+<div class="codehilite"><pre><span></span><code>13  C retries confirm(order-1, k1, amount=75) to B
+</code></pre></div>
+
+<p>That is not the same operation. The service should reject it as an idempotency conflict:</p>
+<div class="codehilite"><pre><span></span><code>409 conflict:
+  same idempotency key
+  different request hash
+</code></pre></div>
+
+<p>The final database state is not enough. The oracle checks:</p>
+<div class="codehilite"><pre><span></span><code>provider_captures(m1, k1).count &lt;= 1
+all same-hash retries return compatible outcome
+all different-hash retries under k1 are rejected
+if outcome is unknown, response is stable and safe to retry
+</code></pre></div>
+
+<p>Those checks express the client semantics directly.</p>
+<h2>What the Harness Must Control</h2>
+<p>Client semantics tests need the same deterministic controls as earlier lessons, plus a few client-specific ones.</p>
+<p>The harness should control request identity:</p>
+<ul>
+<li>idempotency key</li>
+<li>tenant or merchant scope</li>
+<li>operation type</li>
+<li>request body hash</li>
+<li>client retry attempt id</li>
+</ul>
+<p>It should control ambiguous failure points:</p>
+<ul>
+<li>timeout before request reaches service</li>
+<li>crash after durable intent but before external effect</li>
+<li>crash after external effect but before local outcome</li>
+<li>lost response after successful commit</li>
+<li>retry routed to a stale replica</li>
+<li>provider returns unknown or retryable error</li>
+</ul>
+<p>It should record external effects:</p>
+<ul>
+<li>payment captures</li>
+<li>shipments</li>
+<li>emails</li>
+<li>queue publishes</li>
+<li>ledger entries</li>
+<li>third-party API calls</li>
+</ul>
+<p>It should distinguish client-visible responses:</p>
+<div class="codehilite"><pre><span></span><code>success: terminal outcome known
+conflict: same key with different request
+in_progress: safe retry later
+unknown: service cannot yet prove terminal outcome
+failure: operation definitely did not happen
+</code></pre></div>
+
+<p>The response vocabulary matters because clients automate retries based on it.</p>
+<h2>Common Failure Modes</h2>
+<p>One mistake is asserting only internal state. If the client promise concerns an external effect, the test must observe that effect.</p>
+<p>Another mistake is treating timeout as failure. A timeout means the client does not know. The service must make retries safe under that uncertainty.</p>
+<p>A third mistake is storing idempotency keys without request hashes or scopes. That can merge unrelated operations or allow conflicting requests to reuse the same identity.</p>
+<p>A fourth mistake is letting retention windows disappear from tests. If idempotency records expire after 24 hours, the contract must say what happens after 24 hours and the harness should test that boundary.</p>
+<p>A fifth mistake is using exactly-once language when the real contract is narrower. "At most one external capture for the same scoped idempotency key" is often more testable and more honest than "exactly once."</p>
+<h2>Practice</h2>
+<p>Take one client-facing operation that supports retries.</p>
+<ol>
+<li>What is the exact operation identity?</li>
+<li>What is the idempotency scope?</li>
+<li>Which request fields must match on retry?</li>
+<li>Which external effects should be counted by the oracle?</li>
+<li>What response should the client get after a timeout?</li>
+<li>What happens if the service crashes after the external effect but before local recording?</li>
+<li>What is the retention window for the idempotency record?</li>
+<li>Which response states are safe for automated retry?</li>
+</ol>
+<p>Then write one test schedule that crashes at the most inconvenient point: after the side effect may have happened, before the client receives a stable outcome. That is where client semantics become real.</p>
+<h2>Connections</h2>
+<ul>
+<li>Builds on <a href="018.html">Testing Consensus, Replication, and Membership Protocols</a>, because internal protocol evidence supports the service's ability to preserve client-visible guarantees.</li>
+<li>Prepares for <a href="020.html">Observability for Reproducible Distributed Bugs</a>, because client-semantics failures require traces that connect retries, idempotency records, and external effects.</li>
+<li>Connects to reliability practice because post-incident evidence often starts from a customer-visible duplicate, not from an internal invariant failure.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a></li>
+<li>[DOC] <a href="https://stripe.com/docs/api/idempotent_requests">Stripe API: Idempotent Requests</a></li>
+<li>[DOC] <a href="https://kafka.apache.org/documentation/#semantics">Apache Kafka Documentation: Message Delivery Semantics</a></li>
+<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a></li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Client semantics should be tested as observable contracts: request identity, retry behavior, external effects, and stable outcomes.</li>
+<li>Idempotency requires scope, request equality, durable outcome evidence, and a defined retention boundary.</li>
+<li>Exactly-once claims must name exactly what is counted: handler execution, database state, message delivery, external side effect, or client-visible outcome.</li>
+<li>The hardest tests crash or partition the system when the side effect may have happened but the client still sees an unknown result.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="018.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Distributed Testing, Simulation, and Deterministic Replay: Testing Consensus, Replication, and Membership Protocols</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="020.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Distributed Testing, Simulation, and Deterministic Replay: Observability for Reproducible Distributed Bugs</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/distributed-testing-simulation-and-deterministic-replay.html">← Back to Distributed Testing, Simulation, and Deterministic Replay</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-07 07:19 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
