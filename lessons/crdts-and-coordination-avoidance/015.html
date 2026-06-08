@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CRDTs and Coordination Avoidance: Metadata Growth, Compaction, and Tombstone Collection - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>CRDTs and Coordination Avoidance: Metadata Growth, Compaction, and Tombstone Collection</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/crdts-and-coordination-avoidance.html">CRDTs and Coordination Avoidance</a>
+    /
+    015
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/crdts-and-coordination-avoidance.html">CRDTs and Coordination Avoidance</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">015</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>CRDTs and Coordination Avoidance: Metadata Growth, Compaction, and Tombstone Collection</h1>
+<h2>Core Insight</h2>
+<p>Imagine the replicated workspace from the previous lessons. A user deletes the label <code>urgent</code> from a document in Madrid. Dublin has already seen the label and receives the delete. Lisbon was offline for two weeks and still has an old add event for <code>urgent</code> in its local state. When Lisbon reconnects, what prevents the deleted label from coming back?</p>
+<p>The answer is metadata. A CRDT value often stores more than the user-visible value. It stores dots, causal context, remove markers, version-vector entries, delta history, schema markers, and sometimes explicit tombstones. That metadata is not clutter. It is evidence the merge function needs to distinguish "this update is new" from "this update was already removed."</p>
+<p>Compaction is the work of replacing detailed evidence with smaller evidence, or deleting evidence that is no longer needed. Tombstone collection is the specific cleanup of remove evidence. The hard part is knowing when cleanup is safe. If you compact too late, metadata becomes the dominant cost. If you compact too early, old state can resurrect deletes, duplicate effects, or create false conflicts.</p>
+<p>The trade-off is safety versus retained history. CRDTs buy local writes and delayed merge by carrying enough history to make later reconciliation meaningful. The production skill is to define a stability boundary: the point after which old events cannot arrive in a form that would change the outcome.</p>
+<h2>The Naive Cleanup Breaks Deletes</h2>
+<p>Start with an observed-remove set of labels. An add creates a dot:</p>
+<div class="codehilite"><pre><span></span><code>Madrid adds urgent:
+  live adds:
+    urgent -&gt; {M:7}
+  tombstones:
+    {}
+</code></pre></div>
+
+<p>Dublin sees <code>M:7</code> and removes <code>urgent</code>:</p>
+<div class="codehilite"><pre><span></span><code>Dublin removes urgent after observing M:7:
+  live adds:
+    urgent -&gt; {}
+  tombstones:
+    urgent -&gt; {M:7}
+</code></pre></div>
+
+<p>The tombstone says: if an old message later carries add dot <code>M:7</code>, do not show it again.</p>
+<p>Now imagine an operator sees that the label is not visible anywhere in the current healthy regions and deletes the tombstone to save space:</p>
+<div class="codehilite"><pre><span></span><code>after unsafe cleanup:
+  live adds:
+    urgent -&gt; {}
+  tombstones:
+    {}
+</code></pre></div>
+
+<p>Lisbon reconnects with an old state:</p>
+<div class="codehilite"><pre><span></span><code>Lisbon old state:
+  live adds:
+    urgent -&gt; {M:7}
+</code></pre></div>
+
+<p>Merge has no evidence that <code>M:7</code> was removed, so <code>urgent</code> can reappear.</p>
+<div class="codehilite"><pre><span></span><code>merged state:
+  live adds:
+    urgent -&gt; {M:7}
+</code></pre></div>
+
+<p>This is why "it is not visible right now" is not a safe cleanup rule. A tombstone is needed not because the item is visible, but because old add evidence may still be in flight, on disk, in a backup, or on an offline device.</p>
+<h2>What Counts As Stable?</h2>
+<p>A dot or tombstone is stable when the system has enough evidence that forgetting it cannot change future merges.</p>
+<p>Different systems use different stability rules:</p>
+<div class="codehilite"><pre><span></span><code>all active replicas acknowledged:
+  every replica in the current membership has seen the remove
+
+durable snapshot boundary:
+  old logs and old states before snapshot S will never be replayed
+
+membership epoch change:
+  replicas from epoch E are retired or must rejoin through a full repair path
+
+time-based retention plus repair policy:
+  old offline clients cannot directly merge stale state after the retention window
+
+central compaction authority:
+  one service decides when enough reachability evidence exists
+</code></pre></div>
+
+<p>Only the first sounds purely logical. The others are operational contracts. That is normal. Production compaction is where CRDT algebra meets backups, client lifetimes, rollout policy, and incident recovery.</p>
+<p>The important difference is this:</p>
+<div class="codehilite"><pre><span></span><code>unsafe:
+  &quot;The tombstone is old, so delete it.&quot;
+
+safer:
+  &quot;No accepted merge path can reintroduce the removed dot after this boundary.&quot;
+</code></pre></div>
+
+<h2>Worked Example: Collecting A Tombstone</h2>
+<p>Suppose a workspace has three server replicas and many mobile clients:</p>
+<div class="codehilite"><pre><span></span><code>servers:
+  Madrid
+  Dublin
+  Lisbon
+
+mobile clients:
+  partial replicas
+  can be offline for up to 30 days
+</code></pre></div>
+
+<p>The system stores document labels as an OR-set. A remove creates a tombstone for the observed add dots.</p>
+<div class="codehilite"><pre><span></span><code>remove label urgent:
+  removed dots:
+    M:7
+</code></pre></div>
+
+<p>A safe cleanup policy could be:</p>
+<div class="codehilite"><pre><span></span><code>1. Server replicas must all acknowledge the remove.
+2. The remove must be included in a durable workspace snapshot.
+3. Mobile clients older than the snapshot cannot sync deltas directly.
+4. Old clients must rejoin by downloading the compacted snapshot.
+5. Backups older than the snapshot cannot be restored into live anti-entropy.
+</code></pre></div>
+
+<p>After those conditions, the system can replace detailed remove evidence with the snapshot boundary:</p>
+<div class="codehilite"><pre><span></span><code>before compaction:
+  live adds:
+    urgent -&gt; {}
+  tombstones:
+    urgent -&gt; {M:7}
+  context:
+    M up to 7 is known
+
+after compaction:
+  live adds:
+    urgent -&gt; {}
+  tombstones:
+    {}
+  compacted snapshot:
+    all states before snapshot S must rejoin through S
+</code></pre></div>
+
+<p>Notice what changed. The system did not simply forget. It moved the evidence from one place to another: from per-dot tombstone storage into a rejoin and snapshot rule.</p>
+<p>If an old Lisbon mobile client returns with <code>M:7</code>, the server must not merge that old state blindly. It should say:</p>
+<div class="codehilite"><pre><span></span><code>client state is before snapshot S:
+  direct delta merge rejected
+  client downloads compacted state
+  local unsynced operations are replayed only if they are after the accepted boundary
+</code></pre></div>
+
+<p>Compaction is safe only because the topology and rejoin protocol enforce the same story as the metadata used to enforce.</p>
+<h2>Compaction Techniques</h2>
+<p>Compaction usually means one of several moves.</p>
+<div class="codehilite"><pre><span></span><code>explicit tombstones -&gt; causal context:
+  replace individual removed dots with a version-vector summary
+
+full dot set -&gt; version vector plus exceptions:
+  summarize contiguous actor histories and keep only gaps
+
+delta log -&gt; durable state snapshot:
+  stop retaining every old delta after peers can repair from a snapshot
+
+many client actors -&gt; server actors:
+  route dot creation through fewer durable actors
+
+old schema markers -&gt; migration boundary:
+  remove compatibility state only after old writers cannot appear
+</code></pre></div>
+
+<p>Each technique has a cost.</p>
+<div class="codehilite"><pre><span></span><code>causal summaries:
+  smaller, but harder to debug than explicit tombstones
+
+snapshots:
+  compact, but require a rejoin protocol and backup discipline
+
+fewer actors:
+  smaller vectors, but more routing and less pure client-local authorship
+
+retention windows:
+  simple, but only safe if stale replicas are blocked or repaired
+</code></pre></div>
+
+<p>There is no free compaction. The metadata leaves the object only when another part of the system takes over the guarantee.</p>
+<h2>What To Measure</h2>
+<p>Metadata problems usually appear before correctness failures do. Track them directly:</p>
+<div class="codehilite"><pre><span></span><code>tombstone_count_per_object
+causal_context_bytes_per_object
+vector_entries_per_object
+delta_log_retention_bytes
+oldest_uncompacted_dot_age
+replicas_blocking_compaction
+offline_client_age_distribution
+snapshot_rejoin_failures
+delete_resurrection_incidents
+</code></pre></div>
+
+<p>The operational question is not only "how much metadata do we have?" It is "which promise is preventing cleanup?"</p>
+<div class="codehilite"><pre><span></span><code>metadata remains because:
+  a replica has not acknowledged
+  an old client can still sync
+  a backup may still be restored
+  a schema migration is incomplete
+  a safety-sensitive remove needs longer evidence
+</code></pre></div>
+
+<p>Once you can name the blocker, you can decide whether to wait, force repair, retire a replica, shorten offline support, or redesign the CRDT state.</p>
+<h2>Failure Modes</h2>
+<ul>
+<li><strong>Deleting tombstones by age alone</strong>: Time does not prove that old adds cannot arrive.</li>
+<li><strong>Forgetting offline clients</strong>: A mobile replica can carry old state long after servers look clean.</li>
+<li><strong>Restoring old backups into live merge</strong>: A restore path can reintroduce dots the live system has compacted away.</li>
+<li><strong>Compacting without rejoin rules</strong>: Old replicas need a safe path back, usually through a snapshot or full repair.</li>
+<li><strong>Letting actor IDs explode</strong>: One vector entry per transient client can make metadata larger than the user data.</li>
+<li><strong>Reusing actor counters</strong>: A restarted actor that reuses old dots can break duplicate detection and remove evidence.</li>
+<li><strong>Hiding metadata from product decisions</strong>: Offline support, residency, and deletion semantics determine how much history must be retained.</li>
+<li><strong>Cleaning derived indexes but not source state</strong>: Search or analytics cleanup does not prove source CRDT metadata is safe to drop.</li>
+</ul>
+<h2>Practice</h2>
+<p>Design a compaction policy for a replicated document label set.</p>
+<div class="codehilite"><pre><span></span><code>system:
+  three regional server replicas
+  mobile clients can be offline for 30 days
+  weekly durable snapshots
+  backups retained for 90 days
+  labels use observed-remove semantics
+</code></pre></div>
+
+<p>Answer:</p>
+<div class="codehilite"><pre><span></span><code>1. What evidence must exist before an explicit tombstone can be removed?
+2. What happens when a mobile client older than the latest compacted snapshot reconnects?
+3. Can a 90-day-old backup be restored directly into anti-entropy?
+4. Which metrics show that compaction is blocked?
+5. What product promise would change if offline clients were allowed to merge stale state forever?
+</code></pre></div>
+
+<p>The small win is recognizing that compaction is not a garbage-collection timer. It is a correctness boundary.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="006.html"><code>006.md</code></a> introduced dots and causal context; this lesson shows how those structures become operational retention rules.</li>
+<li><a href="008.html"><code>008.md</code></a> showed why observed-remove sets need tombstones or compact causal summaries.</li>
+<li><a href="014.html"><code>014.md</code></a> explained topology and repair paths; compaction is safe only when those paths enforce the cleanup boundary.</li>
+<li><a href="016.html"><code>016.md</code></a> moves from cleanup boundaries to transaction and atomic-update boundaries.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[PAPER] <a href="https://inria.hal.science/inria-00555588/document">A comprehensive study of Convergent and Commutative Replicated Data Types</a><ul>
+<li>Focus: Review the metadata carried by sets, counters, registers, and maps.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://arxiv.org/abs/1210.3368">An Optimized Conflict-free Replicated Set</a><ul>
+<li>Focus: Study OR-set metadata reduction and how causal context can replace explicit tombstone detail.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://arxiv.org/abs/1603.01529">Delta State Replicated Data Types</a><ul>
+<li>Focus: Connect delta retention, repair, and compaction to the anti-entropy protocol.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.riak.com/riak/kv/latest/developing/data-types/sets/index.html">Riak Data Types: Sets</a><ul>
+<li>Focus: See how an available database exposes observed-remove behavior to application code.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
+<li>Focus: Connect tombstones, compaction, snapshots, and derived data to operational reliability.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>CRDT metadata is correctness evidence, not incidental storage overhead.</li>
+<li>Tombstones and causal context can be removed only after a stability boundary prevents old state from changing future merges.</li>
+<li>Safe compaction usually moves evidence into snapshots, rejoin rules, acknowledgments, or membership epochs.</li>
+<li>The operational trade-off is retained history versus storage, bandwidth, privacy, backup, and offline-support cost.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="014.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>CRDTs and Coordination Avoidance: Topology, Placement, and Locality Trade-Offs</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="016.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>CRDTs and Coordination Avoidance: Transactions, Causal Consistency, and Atomic Updates</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/crdts-and-coordination-avoidance.html">← Back to CRDTs and Coordination Avoidance</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-08 12:55 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

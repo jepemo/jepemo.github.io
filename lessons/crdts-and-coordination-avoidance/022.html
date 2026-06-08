@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CRDTs and Coordination Avoidance: Migration, Compatibility, and Rolling Upgrades - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>CRDTs and Coordination Avoidance: Migration, Compatibility, and Rolling Upgrades</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/crdts-and-coordination-avoidance.html">CRDTs and Coordination Avoidance</a>
+    /
+    022
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/crdts-and-coordination-avoidance.html">CRDTs and Coordination Avoidance</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">022</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>CRDTs and Coordination Avoidance: Migration, Compatibility, and Rolling Upgrades</h1>
+<h2>Core Insight</h2>
+<p>Imagine a collaborative app that has stored tags as a simple add-only set for years. The product now needs observed-remove semantics, so users can remove a tag on one device without it reappearing from another device's old state. The new client writes dots and tombstones. The old client only knows <code>tags = {"urgent", "vip"}</code>.</p>
+<p>If you deploy the new merge code everywhere at once, the data center may be fine, but offline clients and edge replicas are still old. Some of them will wake up next week and send old-format operations. Others may read a new-format snapshot and silently drop fields they do not understand. In a coordination-avoidance system, "rolling upgrade" includes clients that are not rolling on your schedule.</p>
+<p>CRDT migration is not just schema migration. It is migration of merge semantics. A new field can change how deletes, compaction, permissions, dependencies, or conflicts behave. The system must preserve convergence while old and new replicas coexist.</p>
+<p>The practical design is to make compatibility a protocol, not a hope. Introduce new operation versions, adapters, feature gates, epochs, backfills, and safe read/write phases. A replica should either understand an operation, translate it, buffer it, or reject it with a clear reason. It should not silently apply half of a new semantic rule.</p>
+<h2>Why Ordinary Schema Migration Is Not Enough</h2>
+<p>In a single-primary database, a common migration is:</p>
+<div class="codehilite"><pre><span></span><code>1. add nullable column
+2. backfill
+3. deploy code that writes the column
+4. remove old column later
+</code></pre></div>
+
+<p>That pattern is useful, but CRDT systems add more pressure:</p>
+<div class="codehilite"><pre><span></span><code>offline clients:
+  may keep writing old operations for days or months
+
+edge replicas:
+  may accept writes before global state catches up
+
+anti-entropy:
+  may replay old states or deltas after new code is deployed
+
+merge semantics:
+  may change the meaning of old fields
+
+compaction:
+  may delete metadata that old clients still reference
+</code></pre></div>
+
+<p>Consider the tag migration:</p>
+<div class="codehilite"><pre><span></span><code>old state:
+  tags: set tag
+
+new state:
+  adds: tag -&gt; set dot
+  removes: set dot
+</code></pre></div>
+
+<p>The old representation can tell you that <code>"urgent"</code> is currently visible. It cannot tell you which add dot created it. The new observed-remove representation needs dots so a remove can say exactly which observed additions it removes.</p>
+<p>If a new replica converts:</p>
+<div class="codehilite"><pre><span></span><code>tags = {&quot;urgent&quot;}
+</code></pre></div>
+
+<p>into:</p>
+<div class="codehilite"><pre><span></span><code>adds[&quot;urgent&quot;] = {migration:1}
+removes = {}
+</code></pre></div>
+
+<p>then an old client may later send the old set again:</p>
+<div class="codehilite"><pre><span></span><code>old client sync:
+  tags = {&quot;urgent&quot;}
+</code></pre></div>
+
+<p>If the adapter turns that into a fresh add every time, the tag may become impossible to remove. The migration needs stable translation, not one-off parsing.</p>
+<h2>Versioned Operations</h2>
+<p>A safe migration begins by making operation shape explicit:</p>
+<div class="codehilite"><pre><span></span><code>operation:
+  op_id: phone:77
+  object: project:P7
+  kind: tags.add
+  schema_version: 1
+  effect:
+    tag: urgent
+</code></pre></div>
+
+<p>New operations carry the new shape:</p>
+<div class="codehilite"><pre><span></span><code>operation:
+  op_id: phone:102
+  object: project:P7
+  kind: tags.add
+  schema_version: 2
+  effect:
+    tag: urgent
+    dot: phone:102
+</code></pre></div>
+
+<p>Versioning lets each replica choose a safe path:</p>
+<div class="codehilite"><pre><span></span><code>if version is supported:
+  validate and apply
+elif translator exists:
+  translate to supported form
+elif operation can wait:
+  buffer and request upgrade or missing context
+else:
+  reject with reason
+</code></pre></div>
+
+<p>The dangerous path is silent downgrade:</p>
+<div class="codehilite"><pre><span></span><code>new operation:
+  effect:
+    add tag urgent with dot phone:102
+    remove dots {tablet:9}
+
+old client sees:
+  tag urgent
+
+old client drops:
+  remove dots {tablet:9}
+</code></pre></div>
+
+<p>The old client has not merely ignored optional metadata. It has changed the meaning of the operation. If a field affects merge semantics, old replicas must not silently discard it.</p>
+<p>Use this rule:</p>
+<div class="codehilite"><pre><span></span><code>optional field:
+  can be ignored without changing safety or merge meaning
+
+semantic field:
+  must be understood, translated, buffered, or rejected
+</code></pre></div>
+
+<h2>Compatibility Modes</h2>
+<p>Rolling upgrades are easier when the system names its mode.</p>
+<div class="codehilite"><pre><span></span><code>mode 1: read-old-write-old
+  every replica understands only old operations
+
+mode 2: read-new-write-old
+  new code can read new representation
+  writes still use old operation shape
+
+mode 3: read-new-write-both
+  new writers emit old and new compatible effects
+  validators compare both views
+
+mode 4: read-new-write-new
+  new operation shape is allowed
+  old clients must be upgraded, routed through adapters, or blocked
+
+mode 5: compact-old
+  old metadata is removed only after stability is proven
+</code></pre></div>
+
+<p>The exact names matter less than the discipline. You do not want a random client to start writing <code>version 2</code> operations before edges, validators, repair tools, and support dashboards can explain them.</p>
+<p>Feature gates help:</p>
+<div class="codehilite"><pre><span></span><code>project P7:
+  tag_model = observed_remove
+  epoch = tags-v2
+  minimum_client = 4.8
+</code></pre></div>
+
+<p>When a client below <code>4.8</code> tries to write tags, the server or edge can decide:</p>
+<div class="codehilite"><pre><span></span><code>allow old note edits:
+  safe unrelated field
+
+reject old tag writes:
+  old client cannot preserve observed-remove semantics
+
+offer upgrade:
+  client must resync from tags-v2 snapshot
+</code></pre></div>
+
+<p>This is a coordination boundary, but a targeted one. You are not coordinating every note or comment. You are coordinating the moment when an object starts using new semantics.</p>
+<h2>Worked Example: Migrating Tags To Observed-Remove</h2>
+<p>Start with old add-only tags:</p>
+<div class="codehilite"><pre><span></span><code>old project:
+  tags = {&quot;urgent&quot;}
+</code></pre></div>
+
+<p>The product needs removal:</p>
+<div class="codehilite"><pre><span></span><code>user action:
+  remove &quot;urgent&quot;
+</code></pre></div>
+
+<p>The target CRDT is:</p>
+<div class="codehilite"><pre><span></span><code>adds:
+  urgent -&gt; {dot}
+
+removes:
+  {dot}
+
+visible:
+  urgent is visible if any add dot is not removed
+</code></pre></div>
+
+<p>A safe migration can use these phases.</p>
+<p>Phase 1: readers learn the new shape.</p>
+<div class="codehilite"><pre><span></span><code>new reader:
+  if tags_v2 exists:
+    render tags_v2
+  else:
+    render old tags
+</code></pre></div>
+
+<p>No one writes <code>tags_v2</code> yet.</p>
+<p>Phase 2: backfill stable dots.</p>
+<div class="codehilite"><pre><span></span><code>for each project P:
+  for each old tag T:
+    create dot migration:P:T
+    tags_v2.adds[T].add(migration:P:T)
+</code></pre></div>
+
+<p>The migration dot is deterministic. Running the backfill twice produces the same dot, not a new add.</p>
+<p>Phase 3: compare old and new views.</p>
+<div class="codehilite"><pre><span></span><code>old visible:
+  {&quot;urgent&quot;}
+
+new visible:
+  {&quot;urgent&quot;}
+
+if different:
+  stop rollout and repair before allowing writes
+</code></pre></div>
+
+<p>Phase 4: new writes use <code>tags_v2</code>.</p>
+<div class="codehilite"><pre><span></span><code>new remove:
+  removes.add(migration:P:urgent)
+</code></pre></div>
+
+<p>Old clients must not keep writing the old <code>tags</code> field for objects in <code>tags-v2</code> epoch. If they do, they can resurrect removed tags. The system can reject old tag writes:</p>
+<div class="codehilite"><pre><span></span><code>rejection:
+  old tag write rejected
+  reason: project P is in tags-v2 epoch
+  action: client must upgrade and resync
+</code></pre></div>
+
+<p>Phase 5: compact old state.</p>
+<div class="codehilite"><pre><span></span><code>safe to remove old tags only when:
+  all active writers use tags_v2
+  old clients are blocked or forced to resync
+  repair tools read tags_v2
+  snapshots include tags_v2
+  observability dashboards expose tags_v2 conflicts
+</code></pre></div>
+
+<p>The small win is concrete: the learner can now explain why "add new field and backfill" is not enough. The backfill needs stable identity, old writers need a policy, and compaction needs a rejoin boundary.</p>
+<h2>Rolling Upgrades And Epochs</h2>
+<p>Some migrations change only representation. Others change authority or safety semantics. Those need epochs.</p>
+<div class="codehilite"><pre><span></span><code>epoch tags-v1:
+  old add-only tags
+
+epoch tags-v2:
+  observed-remove tags
+  old tag writes rejected
+  old clients must resync
+</code></pre></div>
+
+<p>An epoch says, "from this boundary onward, operations are interpreted under this rule." It gives validators and repair tools something precise to check:</p>
+<div class="codehilite"><pre><span></span><code>operation phone:88
+  object: project:P7
+  epoch: tags-v1
+  effect: tags.add(&quot;urgent&quot;)
+
+current object epoch:
+  tags-v2
+
+decision:
+  reject or translate only if safe
+</code></pre></div>
+
+<p>Not every field needs a hard epoch. A backward-compatible metadata field may roll out without blocking old clients:</p>
+<div class="codehilite"><pre><span></span><code>new optional field:
+  display_color = blue
+
+old clients:
+  ignore color
+  still preserve source facts
+</code></pre></div>
+
+<p>But a field that changes remove semantics, permission semantics, inventory rights, or compaction safety should get an explicit boundary.</p>
+<p>The trade-off is user experience. Blocking old clients can be painful. Allowing them to corrupt new semantics is worse. Good rollout plans make the block narrow and explainable:</p>
+<div class="codehilite"><pre><span></span><code>you can still add notes
+you cannot edit tags until this client upgrades
+</code></pre></div>
+
+<h2>Compatibility Tests</h2>
+<p>The previous lesson tested generated histories. Migration tests should generate mixed-version histories.</p>
+<div class="codehilite"><pre><span></span><code>replicas:
+  old client v1
+  new client v2
+  edge v2
+  region v2
+
+events:
+  old client writes old tag
+  backfill creates migration dot
+  new client removes tag
+  old client reconnects with stale old state
+  edge rejects old tag write in tags-v2 epoch
+  all replicas converge
+</code></pre></div>
+
+<p>Useful properties:</p>
+<div class="codehilite"><pre><span></span><code>stable translation:
+  translating the same old fact twice produces the same new identity
+
+no silent semantic drop:
+  a client that cannot preserve new semantics must not apply only part of the effect
+
+mixed-version convergence:
+  all supported versions converge after allowed delivery
+
+epoch enforcement:
+  old operations after a boundary are rejected, translated, or quarantined by policy
+
+rollback safety:
+  rolling back code does not create writers that corrupt already-migrated objects
+</code></pre></div>
+
+<p>Rollback deserves special attention. If a deployment rolls back from <code>v2</code> code to <code>v1</code> code after some objects entered <code>tags-v2</code>, the old code may be unable to interpret current data.</p>
+<p>Plan rollback like this:</p>
+<div class="codehilite"><pre><span></span><code>before enabling v2 writes:
+  old code can safely read or refuse v2 objects
+
+after enabling v2 writes:
+  rollback must preserve validators that reject unsafe old writes
+  or rollback must be blocked until data is returned to a safe state
+</code></pre></div>
+
+<p>Rollback is not only redeploying a binary. It is returning to a previous protocol, and the data may already have moved forward.</p>
+<h2>Failure Modes</h2>
+<ul>
+<li><strong>Silent field dropping</strong>: Old clients ignore metadata that changes merge meaning, such as dots, tombstones, epochs, or authorization caveats.</li>
+<li><strong>Unstable backfill identities</strong>: Re-running migration creates fresh dots, duplicate adds, or new conflicts.</li>
+<li><strong>Old writers after new semantics</strong>: A stale client writes old-format state and resurrects deleted or rejected facts.</li>
+<li><strong>Compacting too early</strong>: Old clients or repair tools still need metadata that the new code removed.</li>
+<li><strong>Assuming server rollout equals system rollout</strong>: Offline clients and edge replicas may remain old long after servers deploy.</li>
+<li><strong>No rollback plan</strong>: Once new operations exist, old code may not be safe to run without validators or adapters.</li>
+<li><strong>Testing only all-old and all-new</strong>: The dangerous cases are mixed-version histories.</li>
+<li><strong>Treating compatibility as UI concern</strong>: The merge protocol, validators, snapshots, and repair tools all need compatibility behavior.</li>
+</ul>
+<h2>Practice</h2>
+<p>Design a migration for this change:</p>
+<div class="codehilite"><pre><span></span><code>old field:
+  assignees = add-only set of user_id
+
+new field:
+  assignees = observed-remove set with dots
+</code></pre></div>
+
+<p>Fill in:</p>
+<div class="codehilite"><pre><span></span><code>1. How will you create deterministic migration dots?
+2. Which clients may read old and new state?
+3. When may new clients write the new operation shape?
+4. What should happen when an old client writes assignees after the object enters v2?
+5. Which dashboards or debug records should show rejected old writes?
+6. When is it safe to compact the old field?
+</code></pre></div>
+
+<p>Then add a rollback scenario:</p>
+<div class="codehilite"><pre><span></span><code>v2 writes have been enabled for 10 percent of projects.
+The team discovers a bug and wants to roll back code.
+</code></pre></div>
+
+<p>Explain whether rollback is safe, which validators must remain active, and what data or epochs prevent old code from corrupting migrated projects.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="009.html"><code>009.md</code></a> introduced maps, nested CRDTs, and schema evolution; this lesson makes schema evolution operational.</li>
+<li><a href="015.html"><code>015.md</code></a> covered compaction; migration needs the same discipline before deleting old metadata.</li>
+<li><a href="020.html"><code>020.md</code></a> showed rejected operations and repair records; compatibility failures must be observable in that same language.</li>
+<li><a href="021.html"><code>021.md</code></a> introduced trust epochs; migration epochs use a similar boundary for semantic changes.</li>
+<li><a href="023.html"><code>023.md</code></a> turns these pieces into a design review checklist for deciding where coordination avoidance is appropriate.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[ARTICLE] <a href="https://martinfowler.com/articles/evodb.html">Evolutionary Database Design</a><ul>
+<li>Focus: Use the expand, migrate, contract mindset, then adapt it to replicated clients and merge semantics.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://protobuf.dev/programming-guides/proto3/#updating">Protocol Buffers: Updating A Message Type</a><ul>
+<li>Focus: Study wire compatibility rules and compare them with CRDT semantic compatibility.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html">Confluent Schema Registry: Schema Evolution</a><ul>
+<li>Focus: Review compatibility modes and the idea of safe reader/writer evolution.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://automerge.org/docs/">Automerge: The Local-First Database</a><ul>
+<li>Focus: Connect document sync and change histories to long-lived client compatibility.</li>
+</ul>
+</li>
+<li>[PAPER] <a href="https://inria.hal.science/inria-00555588/document">A comprehensive study of Convergent and Commutative Replicated Data Types</a><ul>
+<li>Focus: Recheck how dots, tombstones, and merge semantics affect migration safety.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>CRDT migrations change both data shape and merge semantics, so compatibility must cover old clients, edge replicas, snapshots, and repair tools.</li>
+<li>Semantic fields such as dots, tombstones, epochs, and authorization caveats must not be silently dropped by old code.</li>
+<li>Safe rolling upgrades use phases: read-new, backfill with stable identity, compare views, gate new writes, and compact only after stability.</li>
+<li>Mixed-version histories and rollback paths are part of the design, not an afterthought.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="021.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>CRDTs and Coordination Avoidance: Security, Trust Boundaries, and Malicious Updates</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="023.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>CRDTs and Coordination Avoidance: Design Review for Coordination Avoidance Strategy</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/crdts-and-coordination-avoidance.html">← Back to CRDTs and Coordination Avoidance</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-08 12:55 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
