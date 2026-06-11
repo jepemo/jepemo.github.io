@@ -78,78 +78,119 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Observability and Debugging Distributed Systems</h1>
-<h2>Aha!</h2>
-<p>Imagine reconstructing one failed <code>checkout</code> request after the user has already left.</p>
-<p>A user says, "Checkout took twenty seconds and then failed." Six services were involved. No single service saw the whole trip. If every component reports only that it was "healthy," the team still cannot explain the user's experience.</p>
-<p><strong>Observability</strong> is the ability to reconstruct behavior from the evidence a system leaves behind. In a distributed system, that evidence must cross boundaries: the same request needs to remain recognizable through services, queues, retries, and delayed work so humans can rebuild the story later.</p>
-<h2>Why This Matters</h2>
-<p>This lesson matters because <strong>Distributed Systems Foundations</strong> is not just a sequence of distributed-systems terms. It is a way to reason about user-visible promises when state, time, messages, and failure are spread across independent components. The practical value is being able to name what the system can know, what it cannot know yet, and which promise should survive while uncertainty is resolved.</p>
-<h2>Core Walkthrough</h2>
-<h3>Worked Example</h3>
-<p>Use one checkout request.</p>
-<div class="codehilite"><pre><span></span><code>request id: abc
-
-web log       received checkout
-payment span  waited 8.2 s
-queue metric  depth rising
-order event   never emitted
+<h2>Core Insight</h2>
+<p>Imagine a user reports this: "Checkout spun for twenty seconds, charged my card, and then said the order failed." Six services were involved. The web service, payment service, inventory service, queue worker, email service, and order database all report that they were mostly healthy.</p>
+<p>That is not enough. In a distributed system, no single component sees the whole user journey. Each participant sees local facts: one request arrived, one dependency waited, one retry happened, one queue grew, one event was or was not written.</p>
+<p><strong>Observability</strong> is the ability to reconstruct behavior from the evidence the system leaves behind. It is not just dashboards. It is the practical ability to ask, after the fact, "What happened to this user-visible promise, across these boundaries, in this time window?"</p>
+<p>The trade-off is that evidence has a cost. Logs, metrics, traces, events, labels, and retained payloads consume storage, bandwidth, attention, and sometimes privacy budget. Good observability preserves enough evidence to explain important failures without turning telemetry into its own source of noise.</p>
+<h2>Reconstruct One Checkout</h2>
+<p>Use one checkout attempt as the worked example. The user clicks <strong>Place order</strong>. The request receives a correlation id at the edge:</p>
+<div class="codehilite"><pre><span></span><code>correlation_id: checkout-abc
+order_id: order-42
+payment_operation: pay:order-42
 </code></pre></div>
 
-<p>Each signal says something different. A log records a local fact. A metric shows aggregate behavior over time. A trace connects one request across services. An event record shows that a durable business transition did or did not happen.</p>
-<p>No one signal is the whole truth. Together, joined by identity and time, they can explain why the user saw failure while individual services looked normal in isolation.</p>
-<p>The same evidence also helps distinguish similar symptoms. A slow checkout caused by payment latency, queue backlog, lock contention, and missing order repair can all look like "checkout failed" to the user. Observability is what lets the system tell those stories apart.</p>
-<h3>Mechanism</h3>
-<p>The foundation has four parts.</p>
+<p>During the request, different systems leave different evidence:</p>
+<div class="codehilite"><pre><span></span><code>web log:
+  checkout-abc received Place order
+
+payment trace span:
+  checkout-abc waited 8.2 s on provider authorization
+
+queue metric:
+  order-confirmation depth rose from 20 to 1400
+
+order event store:
+  order_confirmed was never emitted for order-42
+
+payment record:
+  pay:order-42 authorized
+</code></pre></div>
+
+<p>No one signal is the whole truth. The log gives a local fact. The trace connects timing across services. The metric shows aggregate pressure. The event store shows whether a durable business transition happened. The payment record shows a side effect that the order path must reconcile.</p>
+<p>Joined together, those facts tell a useful story: the user request reached the system, payment probably succeeded, the order confirmation path did not complete, and the queue was under pressure. That is much better than "checkout failed."</p>
+<h2>Signals And What They Answer</h2>
+<p>Distributed debugging becomes easier when each signal has a job.</p>
+<p><strong>Logs</strong> record local facts. A good log line says what happened at one component with enough identity and context to join it later. Logs are poor when they are anonymous, overly verbose, or filled with messages that do not name the operation.</p>
+<p><strong>Metrics</strong> summarize behavior over time. They answer questions like "is latency rising?", "is queue depth growing?", and "are errors increasing?" Metrics are good for trends and alerts. They are not enough to explain one specific user journey.</p>
+<p><strong>Traces</strong> connect work across boundaries. A trace can show that a checkout spent 100 ms in web code, 8.2 seconds waiting on payment, 300 ms in inventory, and never reached the email worker. Traces are strongest when ids survive service calls, queues, retries, and async jobs.</p>
+<p><strong>Events and durable records</strong> show business transitions. They answer questions like "did payment authorize?", "did the order get confirmed?", and "did the repair job run?" In many incidents, the missing event is as important as the events that exist.</p>
+<p>The mechanism is correlation. Related facts need stable identifiers so a human or tool can join them:</p>
+<div class="codehilite"><pre><span></span><code>request id: follows one attempt
+operation id: follows one logical side effect
+order id: follows the business object
+trace id: follows a path through services
+</code></pre></div>
+
+<p>Those ids are different on purpose. A retry may have a new request id but the same payment operation id. Treating every id as interchangeable makes the investigation harder.</p>
+<h2>Instrument The Workflow, Not Just The Code</h2>
+<p>A common mistake is instrumenting each service in isolation. The service may look healthy while the workflow is broken. The right starting point is the promise the user experiences.</p>
+<p>For checkout, future-you needs to answer:</p>
 <ul>
-<li><strong>Correlation:</strong> carry stable ids so related evidence can be joined.</li>
-<li><strong>Coverage:</strong> instrument the places where work changes state, waits, retries, or leaves the synchronous path.</li>
-<li><strong>Context:</strong> record enough detail to interpret what happened, not just that something happened.</li>
-<li><strong>Reconstruction:</strong> make it possible to order evidence into a plausible timeline.</li>
-</ul>
-<p>A useful trace answers questions such as: when did the request arrive, which downstream dependency consumed the time, which retry occurred, where did the workflow stop, and what user promise became uncertain?</p>
-<p>Observability is therefore designed with the workflow. If ids disappear at a queue boundary or async jobs start new anonymous lives, the future incident investigation already has a hole in it.</p>
-<p>It also helps to think about absence. If the order event never appears, that missing fact may be more important than ten healthy logs. Good systems leave enough structure that "what did not happen?" is answerable too.</p>
-<h3>How To Use The Model</h3>
-<p>Walk the product path and ask what future-you would need to know during an incident.</p>
-<p>For checkout:</p>
-<ol>
 <li>Did the request reach the edge?</li>
-<li>Which order id and payment operation id were attached?</li>
-<li>Which service consumed most of the latency budget?</li>
-<li>Did the payment side effect occur?</li>
+<li>Which order and payment operation were attached?</li>
+<li>Which dependency consumed the latency budget?</li>
+<li>Did the payment side effect happen?</li>
 <li>Did the order record get written?</li>
-<li>Which response did the user receive?</li>
-</ol>
-<p>Those questions determine what to log, what to trace, what to count, and what to preserve durably. Good observability begins with explainability, not with buying dashboards.</p>
-<p>A useful check is to imagine a teammate joining the incident late. Could they answer the core questions from retained evidence alone, or would they need the original author beside them narrating what the system "usually" does? If the second is true, the design still depends on tribal memory.</p>
-<h2>Failure Modes and Misconceptions</h2>
-<p>The representative failure is the user path breaking while each service looks healthy alone. CPU is fine. Error rate is low. Yet a queue is backing up, one dependency is slow, retries are hiding in averages, and the product promise is failing end to end.</p>
-<p>Observability has costs. More detail costs storage, bandwidth, and attention. High-cardinality labels can explode metrics. Verbose logs can leak sensitive data or drown useful facts. Sampling can hide rare failures. The trade-off is preserving enough evidence for important questions without turning telemetry into its own outage.</p>
-<p>A common misconception is that observability means dashboards. Dashboards show chosen summaries; observability also means being able to ask new questions when the failure is not one you predicted.</p>
-<p>Another is that logs alone are enough. Logs without shared identity become a pile of testimony with no case number.</p>
-<p>A third is that tracing proves global truth. A trace is still assembled from local witnesses. Missing spans and skewed clocks remain evidence too.</p>
-<h2>Connections</h2>
-<ul>
-<li>This lesson belongs to <a href="./TRACK.md"><code>distributed-systems-foundations</code></a>, the foundation track for later distributed-systems specializations.</li>
-<li>It prepares vocabulary used by neighboring tracks such as <a href="../consistency-and-replication/TRACK.md"><code>consistency-and-replication</code></a>, <a href="../consensus-and-coordination/TRACK.md"><code>consensus-and-coordination</code></a>, and <a href="../event-driven-and-streaming/TRACK.md"><code>event-driven-and-streaming</code></a>.</li>
+<li>Did a confirmation event leave the synchronous path?</li>
+<li>What response did the user receive?</li>
 </ul>
+<p>Those questions tell you where evidence must exist. A queue boundary needs to preserve correlation ids. A background worker needs to link back to the order and operation. A retry needs to record whether it is a new attempt or the same logical action. A repair path needs to leave evidence that it ran.</p>
+<p>Absence needs design too. If an <code>order_confirmed</code> event never appears, the system should make that absence queryable. Otherwise the investigation becomes guesswork: did the event fail to emit, sit in a queue, get dropped, or use a different name?</p>
+<h2>Debugging As Timeline Building</h2>
+<p>When an incident happens, the first useful artifact is often a timeline:</p>
+<div class="codehilite"><pre><span></span><code>12:00:01.000  web received checkout-abc
+12:00:01.080  inventory reserved item sku-9
+12:00:01.120  payment authorization started pay:order-42
+12:00:09.340  payment provider accepted
+12:00:09.500  web timeout already returned error
+12:00:10.000  order_confirmed missing
+12:00:11.000  repair job scheduled
+</code></pre></div>
+
+<p>The timestamps do not have to be perfect proof of causality. Earlier lessons covered why clocks can drift. The timeline is still useful because it organizes local evidence and exposes missing links.</p>
+<p>A good timeline separates facts from guesses. "Payment provider accepted" is a fact if it comes from a durable payment record. "The user probably retried because the page errored" is an inference unless there is a second request tied to the same order. This separation keeps the debugging process honest.</p>
+<p>The same discipline helps during design review. Ask: if this workflow fails in the middle, could someone reconstruct the product story from retained evidence without asking the original engineer to narrate it?</p>
+<h2>Failure Modes And Trade-offs</h2>
+<p>The representative failure is every service looking healthy while the user path is broken. CPU is fine. Error rate is low. But a queue is backing up, retries are stretching latency, a downstream provider is slow, and the workflow never emits its final event.</p>
+<p>Another failure is losing identity at a boundary. A synchronous request has a trace id, but the queued job starts with a fresh anonymous id. The incident splits into two unconnected stories.</p>
+<p>Observability can also fail by excess. Too many high-cardinality labels can make metrics expensive. Too much logging can leak sensitive data or drown useful facts. Sampling can hide rare but important failures. Retaining every payload forever is rarely acceptable.</p>
+<p>The trade-off is to preserve evidence for the questions that matter most: user-visible promises, side effects, ownership boundaries, retries, queues, and repair paths. Everything else should earn its cost.</p>
+<h2>Practice Prompt</h2>
+<p>Pick one workflow: checkout, password reset, file upload, message send, seat booking, or account deletion. Fill in these lines:</p>
+<div class="codehilite"><pre><span></span><code>user-visible promise:
+stable business id:
+operation ids:
+places work crosses a boundary:
+logs needed:
+metrics needed:
+trace spans needed:
+durable events or records:
+missing fact that must be queryable:
+</code></pre></div>
+
+<p>If an async worker, queue, retry, or repair job cannot be tied back to the original promise, add the missing identity before the incident happens.</p>
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] <a href="https://www.somethingsimilar.com/2013/01/14/notes-on-distributed-systems-for-young-bloods/">Notes on Distributed Systems for Young Bloods</a><ul>
-<li>Focus: Practical framing for latency, failure, and uncertainty in real distributed systems.</li>
+<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry: Signals</a><ul>
+<li>Focus: How traces, metrics, logs, and related signals fit together.</li>
 </ul>
 </li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Replication, consistency, fault tolerance, and data-system trade-offs.</li>
+<li>[PAPER] <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</a><ul>
+<li>Focus: Why distributed tracing exists and how request paths are reconstructed across services.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Site Reliability Engineering: Monitoring Distributed Systems</a><ul>
+<li>Focus: Practical monitoring signals, alerting, and the limits of summaries.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Observability is the ability to reconstruct distributed behavior from evidence.</li>
-<li>Correlation ids make separate facts belong to one story.</li>
-<li>Logs, metrics, traces, and events answer different questions.</li>
-<li>Instrument the workflow around the promises humans may later need to explain.</li>
+<li>Observability is the ability to reconstruct distributed behavior from retained evidence.</li>
+<li>Logs, metrics, traces, and durable events answer different questions and need shared identity.</li>
+<li>Instrument workflows around user-visible promises, side effects, queues, retries, and repair paths.</li>
+<li>More telemetry is not automatically better; the trade-off is preserving useful evidence without creating noise, cost, or privacy risk.</li>
 </ul>
 </section>
 
@@ -179,7 +220,7 @@ order event   never emitted
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-09 13:40 UTC | @jepemo | Built with
+        Generated on 2026-06-11 10:01 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -78,109 +78,107 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Network Boundaries, Latency, and Partial Failure</h1>
-<h2>Aha!</h2>
-<p>Imagine changing your display name in an app. You press <strong>Save</strong>, wait, and then the page says there was an error. A few seconds later, you refresh and the new name is there anyway. Did the save fail? Did it work? Why did the product seem to say both things?</p>
-<p>That small confusion is what a network boundary creates. Inside one process, a function call shares memory, stack, and fate with its caller. If it returns, the caller gets the result. If it raises, the caller gets the error. Across a network boundary, the caller sends a message to an independent participant with its own queue, clock, process state, disk, deployment version, and ways to fail.</p>
-<p>The important lesson is not merely that networks can be slow. It is that messages create uncertainty. The caller may know that it sent a request, that its own timer expired, or that a response arrived. It does not automatically know whether the remote service never received the request, received it and became slow, completed the work but lost the response, completed the work and crashed before reporting, or is still working.</p>
-<p>Two terms help name that experience. <strong>Latency</strong> is the time a message or response takes to arrive. In real systems it is not one neat number: many requests are fast, some are slower, and a few are much slower. <strong>Partial failure</strong> means one part of the system is broken, slow, isolated, overloaded, or unreachable while other parts continue to run. The whole product has not vanished, but it no longer behaves like one simple local program.</p>
-<p>This is why a timeout is a policy boundary, not a proof. It means, "I stopped waiting after this much time." It does not mean, "The remote operation did not happen." The central trade-off is between waiting longer for clearer evidence and moving on sooner to protect the caller's latency budget. Good distributed design gives that missing answer a named behavior instead of pretending uncertainty is the same thing as failure.</p>
-<h2>Why This Matters</h2>
-<p>This lesson matters because <strong>Distributed Systems Foundations</strong> is not just a sequence of distributed-systems terms. It is a way to reason about user-visible promises when state, time, messages, and failure are spread across independent components. The practical value is being able to name what the system can know, what it cannot know yet, and which promise should survive while uncertainty is resolved.</p>
-<h2>Core Walkthrough</h2>
-<h3>Worked Example</h3>
-<p>Now slow that profile update down and inspect it. A web gateway receives the user's request, calls a profile service, and the profile service writes the change to its database before returning a response.</p>
-<p>On an ordinary day, the story feels simple:</p>
-<div class="codehilite"><pre><span></span><code>user
-  -&gt; gateway: change display name
-  -&gt; profile service: apply update
-  &lt;- profile service: success
-  &lt;- gateway: show updated profile
+<h2>Core Insight</h2>
+<p>Imagine changing your display name in an app. You press <strong>Save</strong>, wait for a second, and the page says the update failed. A few moments later you refresh, and the new name is there. The product seemed to give two answers: "it failed" and "it worked."</p>
+<p>That confusion is the first important lesson about a network boundary. A boundary appears when one part of a system must send a message to another independent part instead of calling local code in the same process. The caller can observe its own request, timer, and response. It cannot directly observe the remote service's memory, disk, queue, clock, or crash state.</p>
+<p>The hard part is not just that networks are slower than local calls. The hard part is that late or missing messages create uncertainty. A timeout tells the caller, "I stopped waiting." It does not prove that the remote operation never happened.</p>
+<p>This is where two terms become useful. <strong>Latency</strong> is the time it takes for a request, response, or message to travel through the system and be handled. <strong>Partial failure</strong> means some parts of the system are slow, isolated, overloaded, or broken while other parts keep running. A good distributed design gives that uncertain middle state a name and a safe next step.</p>
+<h2>Follow The Message</h2>
+<p>Use the profile update as a small worked example. The browser sends a request to a gateway. The gateway asks the profile service to update the display name. The profile service writes the new value to its database and tries to return success.</p>
+<p>On the happy path, the story is easy:</p>
+<div class="codehilite"><pre><span></span><code>browser -&gt; gateway: save display name
+gateway -&gt; profile: update name for user-17
+profile -&gt; database: write version 52
+profile -&gt; gateway: success
+gateway -&gt; browser: saved
 </code></pre></div>
 
-<p>Now add a network slowdown between the gateway and the profile service:</p>
-<div class="codehilite"><pre><span></span><code>gateway -- update request --&gt; profile
-gateway &lt;-- ? -------------- profile
+<p>Now slow the link between the gateway and the profile service. The profile service may still write the database row, but the response may arrive after the gateway's timer expires.</p>
+<div class="codehilite"><pre><span></span><code>gateway -&gt; profile: update name, op-413
+gateway &lt;- ?       response is late
 
-possible truths:
+gateway local fact:
+  &quot;I sent op-413 and stopped waiting after 800 ms.&quot;
+
+possible remote truths:
   request never arrived
-  request arrived but is queued
+  request is queued
   update was written
-  response was lost
-  profile is slow but healthy
-  profile is overloaded
+  update was written but the response was lost
+  profile service is healthy but slow
+  profile service is overloaded
 </code></pre></div>
 
-<p>From the gateway's local view, the request took too long. From the profile service's local view, it may have applied the update correctly. From the user's view, the product must still make sense. If the page says "failed" but the name changes later, the product feels inconsistent. If the gateway retries without a stable operation identity, the update may be applied twice when the operation is not naturally idempotent. If the gateway waits forever, a small slowdown can tie up resources and make unrelated requests fail.</p>
-<p>The distributed design lives in this gap between the product story and the evidence story. The product story says, "The user changed a profile field." The evidence story says, "The gateway sent request <code>op-413</code>, timed out after 800 ms, and does not yet know whether the profile service wrote version 52." A reliable design gives that gap a name and a repair path.</p>
-<h3>Latency Budgets</h3>
-<p>Once a system can be late, it needs a rule for how long to wait. A <strong>latency budget</strong> is that rule: the amount of time a participant is willing to spend before choosing another behavior. It is not only a number in a config file. It is part of the product promise. A checkout page, search box, bank transfer, multiplayer game, and incident alert can all need different budgets because users and downstream systems need different guarantees.</p>
-<p>Those budgets should come from the shape of latency, not only from the average. If most calls finish in 40 ms but ordinary slow calls take 900 ms, a 100 ms timeout will turn normal tail latency into artificial failure. If a timeout is so long that callers pile up while waiting, one slow dependency can consume threads, connections, memory, or worker slots and cause a larger outage.</p>
-<p>The budget also has to be shared across the whole path. If a user request has a two-second product budget, the gateway cannot safely give every downstream dependency two seconds of its own. Each hop spends part of the remaining time. Good systems pass deadlines or budget context so downstream services know whether useful work is still possible.</p>
-<div class="codehilite"><pre><span></span><code>product budget: 2000 ms
+<p>None of those remote truths is the same as the gateway's local fact. The gateway knows that it waited too long. It does not know which remote truth is real until more evidence arrives.</p>
+<p>That distinction protects the design from a common mistake: treating a remote call like a slow local function call. A local function usually returns or raises in the caller's process. A remote call crosses a place where work can continue after the caller gives up waiting.</p>
+<h2>Timeout As A Product Decision</h2>
+<p>A <strong>timeout</strong> is a rule for how long a caller waits before choosing another behavior. It is not only a technical setting. It is part of the product promise because it shapes what the user sees.</p>
+<p>If the timeout is too short, normal slow requests look like failures. If it is too long, one slow dependency can tie up threads, connections, memory, or workers until unrelated requests begin to fail. The trade-off is between waiting longer for clearer evidence and moving sooner to protect the rest of the system.</p>
+<p>Good timeouts use a latency budget. A <strong>latency budget</strong> is the amount of time the whole request can spend before the product experience becomes unacceptable. Each hop spends part of that budget.</p>
+<div class="codehilite"><pre><span></span><code>profile save budget: 2000 ms
 
-gateway work:       100 ms
-profile timeout:    700 ms
-cache fallback:     150 ms
-render response:    100 ms
-reserved slack:     950 ms
+browser and gateway work:       150 ms
+profile service timeout:        700 ms
+read-after-timeout check:       250 ms
+render response:                100 ms
+reserved slack and network:     800 ms
 </code></pre></div>
 
-<p>The exact numbers are less important than the habit. A timeout should express what the caller will do next, not merely how impatient the caller feels.</p>
-<h3>Partial Failure</h3>
-<p>Partial failure is harder than total failure because the system still has enough working parts to make decisions. A dead process is often obvious. A slow process, isolated region, full queue, stuck connection pool, stale cache, or one-way packet loss is harder. Some requests may succeed while others time out. One observer may see health checks pass while another sees user-facing errors.</p>
-<p>This means every participant should separate local fact from remote inference:</p>
-<div class="codehilite"><pre><span></span><code>local fact:
-  I sent request op-413 at 12:00:01.
-  I stopped waiting at 12:00:02.
+<p>The exact numbers are less important than the habit. The gateway should not give every downstream dependency the full two seconds. If it does, the total path can exceed the user-facing budget and create more waiting than the product can afford.</p>
+<p>Deadlines are one way to carry this idea through a request. A deadline says, "This whole operation is no longer useful after this time." Downstream services can then stop starting expensive work when the answer would arrive too late to help.</p>
+<h2>Designing The Unknown State</h2>
+<p>When the result is unknown, the system needs policy, not guesswork. Four small design choices make the profile example much easier to reason about.</p>
+<p>First, give the operation a stable identity. The gateway can send <code>op-413</code> with every attempt to update the display name. That identity lets the profile service recognize repeated attempts as the same logical action.</p>
+<p>Second, name the owner of the official fact. If the profile service owns display names, the gateway should not invent a final answer that contradicts the profile service's durable record. The gateway can report uncertainty, ask again, or schedule repair, but it should respect the owner.</p>
+<p>Third, expose an honest intermediate state. A state such as <code>save_pending</code> or <code>checking_profile_update</code> is more accurate than a boolean that can only say <code>success</code> or <code>failed</code>. The user interface does not need to expose internal jargon, but the system needs a name for the condition.</p>
+<p>Fourth, keep enough evidence to repair. Logs, operation records, version numbers, and retry records help the system answer later: did operation <code>op-413</code> write version 52, fail safely, or remain unprocessed?</p>
+<p>The pattern looks like this:</p>
+<div class="codehilite"><pre><span></span><code>if response arrives in time:
+  show saved
 
-remote inference:
-  The profile service might not have updated.
-  The profile service might update later.
-  The response might have been lost.
+if timeout expires:
+  record outcome_unknown for op-413
+  check the owner or retry with the same operation id
+  show pending or a recoverable message
 </code></pre></div>
 
-<p>Designs become clearer when they store enough evidence to recover. A stable operation id lets a retry mean "continue the same logical action" instead of "start a new action." A version number lets the service reject an update based on stale state. A durable status such as <code>pending_confirmation</code> is more honest than a boolean that pretends the outcome is already known.</p>
-<p>The system also needs to decide who owns the official state. If the profile service owns profile updates, the gateway should not invent a final answer that contradicts the profile service's durable record. It can show an uncertain state, schedule a read-after-timeout, or ask the user to refresh, but it should not pretend to know what only the owner can know.</p>
-<h3>Retry Pressure</h3>
-<p>Retries are useful because many failures are temporary. They are dangerous because they add traffic exactly when a dependency may already be slow. A retry storm happens when many callers time out and retry together, doubling or tripling load against the same struggling service. The original slowdown can become a wider incident.</p>
-<p>Safe retry design connects four decisions:</p>
-<ul>
-<li>Identity: how does the receiver know two attempts are the same logical operation?</li>
-<li>Budget: how many retries are allowed before the caller chooses another behavior?</li>
-<li>Spacing: how does the caller avoid retrying in lockstep with everyone else?</li>
-<li>Meaning: what should the user or downstream system believe while the outcome is unknown?</li>
-</ul>
-<p>Backoff and jitter help with spacing. Idempotency keys help with identity. Deadlines help with budgets. A named status helps with meaning. None of those tools replaces the design question: what promise must survive if the first answer is missing?</p>
-<p>For the profile example, the gateway might send <code>operation_id=op-413</code>. If it times out, it can retry with the same id. The profile service can return the existing result if it already applied the operation. If the operation is still unknown, the gateway can show "updating" and reconcile later. The user-visible promise becomes: "The system will not silently apply two different profile changes because one response was late."</p>
-<h2>Failure Modes and Misconceptions</h2>
-<p>The first misconception is that a timeout means failure. A timeout means the caller stopped waiting. The remote work may still be absent, queued, active, complete, or complete with a lost response.</p>
-<p>The second misconception is that average latency describes user experience. Distributed systems often fail in the tail. The rare slow requests can consume shared resources, trigger retries, and create visible incidents even when the average looks fine.</p>
-<p>The third misconception is that partial failure is an implementation detail hidden below the product. It becomes product behavior whenever a user sees a pending state, duplicate action, stale page, delayed notification, failed checkout, or support case.</p>
-<p>The fourth misconception is that "just retry" is a complete policy. Retrying without identity, budget, spacing, and repair can turn uncertainty into duplicated work or overload.</p>
-<h2>Connections</h2>
-<ul>
-<li>This lesson belongs to <a href="./TRACK.md"><code>distributed-systems-foundations</code></a>, the foundation track for later distributed-systems specializations.</li>
-<li>It prepares vocabulary used by neighboring tracks such as <a href="../consistency-and-replication/TRACK.md"><code>consistency-and-replication</code></a>, <a href="../consensus-and-coordination/TRACK.md"><code>consensus-and-coordination</code></a>, and <a href="../event-driven-and-streaming/TRACK.md"><code>event-driven-and-streaming</code></a>.</li>
-</ul>
+<p>The important part is not this exact policy. The important part is that the system does not confuse "I lack an answer" with "the operation did not happen."</p>
+<h2>Partial Failure In Practice</h2>
+<p>Partial failure is harder than total failure because the system still has enough working pieces to make decisions. A dead process is often obvious. A slow queue, stuck connection pool, isolated region, overloaded database, stale cache, or one-way network path can be much harder to interpret.</p>
+<p>One observer may see health checks pass while another sees user-facing timeouts. One service may keep accepting work while another cannot read the result. A queue may store messages correctly while workers fall behind. The product is still alive, but its parts no longer agree on what has happened.</p>
+<p>That is why distributed systems use defensive boundaries. A caller should have a timeout. A receiver should handle duplicate messages. A workflow should store operation identity. A product should have a pending or degraded state when certainty is not available yet.</p>
+<p>These choices do not remove failure. They stop ordinary failure from turning into accidental behavior.</p>
+<h2>Practice Prompt</h2>
+<p>Take a feature such as saving a profile, sending a chat message, booking a seat, or uploading a file. Write five short lines:</p>
+<div class="codehilite"><pre><span></span><code>operation:
+owner of the official state:
+caller timeout:
+what the timeout proves:
+state shown while the result is unknown:
+</code></pre></div>
+
+<p>If the fourth line says anything stronger than "the caller stopped waiting," revise it. That is the mental move this lesson is meant to build.</p>
 <h2>Resources</h2>
 <ul>
 <li>[ARTICLE] <a href="https://www.somethingsimilar.com/2013/01/14/notes-on-distributed-systems-for-young-bloods/">Notes on Distributed Systems for Young Bloods</a><ul>
-<li>Focus: Practical framing for latency, failure, and uncertainty in real distributed systems.</li>
+<li>Focus: Practical framing for latency, failure, and uncertainty in distributed systems.</li>
+</ul>
+</li>
+<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
+<li>Focus: How timeout and retry choices interact with overload and tail latency.</li>
 </ul>
 </li>
 <li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Replication, consistency, fault tolerance, and data-system trade-offs.</li>
+<li>Focus: The chapters on reliability, replication, and the limits of local reasoning in distributed data systems.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A network boundary turns a call into message exchange under uncertainty.</li>
-<li>Latency is a distribution, so tail behavior matters.</li>
-<li>A timeout is a local decision to stop waiting, not proof about remote state.</li>
-<li>Partial failure means some parts keep acting while others are slow, isolated, or ambiguous.</li>
-<li>Retries need identity, budgets, spacing, and a user-visible meaning.</li>
-<li>Good designs preserve a named promise while the outcome is unknown.</li>
+<li>A network boundary turns a call into message exchange with incomplete evidence.</li>
+<li>A timeout proves that the caller stopped waiting; it does not prove what the remote service did.</li>
+<li>Latency must be treated as a distribution, because slow tail requests often shape incidents.</li>
+<li>Partial failure needs named states, operation evidence, and repair paths instead of guessed outcomes.</li>
 </ul>
 </section>
 
@@ -210,7 +208,7 @@ remote inference:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-09 13:40 UTC | @jepemo | Built with
+        Generated on 2026-06-11 10:01 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
