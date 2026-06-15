@@ -84,11 +84,11 @@
 <h2>Core Insight</h2>
 <p>Imagine the learning platform has just split catalog, enrollment, billing, identity, and notifications into separate services. The previous lesson made the service boundary visible; now that boundary has traffic crossing it. The first problem is simple enough: enrollment needs to call billing, catalog, and notifications. The deeper problem appears a few weeks later. One service client retries for two minutes, another gives up after one second, a third hides failures behind vague errors, and only half the calls emit useful trace context.</p>
 <p>That is the moment when service-to-service communication stops being just "make an HTTP request." Each remote call is now a reliability boundary. It needs an explicit timeout, retry posture, identity expectation, telemetry shape, and fallback decision. Without that policy, every team invents different defaults and the platform becomes unpredictable under stress.</p>
-<p>This lesson deliberately stops before service mesh adoption. A mesh is one possible implementation later in the track. The mental model here is more basic: internal traffic needs a policy contract whether that policy lives in application code, shared libraries, sidecars, or platform configuration.</p>
+<p>This lesson deliberately stops before service mesh adoption. A mesh is one possible implementation later in the track. The mental model here is more basic: internal traffic needs a policy contract whether that policy lives in application code, shared libraries, sidecars, gateways, or platform configuration.</p>
 <p>The trade-off is consistency versus local freedom. Teams can tune calls however they want, but inconsistent behavior makes outages harder to contain. Central policy can make the fleet more predictable, but only if it preserves enough context for the domain semantics of each call.</p>
 <h2>The Call Is a Boundary</h2>
 <p>A local function call usually fails in ways the process can see directly. A network call fails ambiguously. The request may not arrive. The response may be delayed. The server may finish the work after the client times out. A retry may repeat a side effect. A dependency may be overloaded, and your retry behavior may make it worse.</p>
-<p>For enrollment calling billing, the platform should know:</p>
+<p>For enrollment calling billing, the platform should know five things before the first production request crosses the boundary:</p>
 <ul>
 <li>how long enrollment waits before giving up</li>
 <li>whether the operation is safe to retry</li>
@@ -104,12 +104,39 @@
    fallback: queue manual review, do not silently enroll
 </code></pre></div>
 
-<p>The exact values are less important than the fact that the policy exists. A service boundary without communication policy is an implicit contract waiting to surprise the system.</p>
+<p>The exact values are less important than the fact that the policy exists. A service boundary without communication policy is an implicit contract waiting to surprise the system. The platform may work on a quiet Tuesday, but the undefined parts show up during overload: callers wait longer than their users can tolerate, retries add load to an already slow dependency, and incident responders cannot tell which request in enrollment corresponds to which failed payment attempt in billing.</p>
+<p>The key distinction is that a policy is not just a library setting. It is a statement about behavior under uncertainty. "Retry three times" is not a good policy by itself. The policy needs to say which operations are retryable, how retries are budgeted, how deadlines flow through a request path, and which fallback preserves correctness when the dependency is unavailable.</p>
+<h2>Worked Request Path</h2>
+<p>Trace one checkout attempt. A learner clicks enroll on a paid course. Enrollment has to check course availability, ask billing to authorize payment, and then record the enrollment result. The old monolith may have handled this inside one process. The microservice version has at least one remote call where uncertainty enters.</p>
+<div class="codehilite"><pre><span></span><code>learner request
+  -&gt; enrollment service
+     -&gt; billing service
+        -&gt; payment provider
+</code></pre></div>
+
+<p>Now add a deadline. Suppose the user-facing request has a 2 second budget. Enrollment cannot spend all 2 seconds waiting for billing, because it still needs time to write its own state and answer the user. Billing cannot spend all of enrollment's remaining time waiting for the payment provider, because billing may need to record a pending or failed attempt. A deadline-aware path might look like this:</p>
+<div class="codehilite"><pre><span></span><code>user request budget:       2000 ms
+enrollment -&gt; billing:      800 ms timeout
+billing -&gt; payment provider: 500 ms timeout
+enrollment response work:    200 ms reserved
+</code></pre></div>
+
+<p>The numbers are illustrative; the shape is the lesson. Timeouts need to fit together. If enrollment gives up after 800 ms but billing keeps waiting for the payment provider for 5 seconds, the system can do useless work after the caller has already moved on. If enrollment retries an unsafe payment command without an idempotency key, a timeout can turn into a duplicate charge. If the request lacks trace context, the incident timeline becomes guesswork.</p>
+<p>A better policy makes the semantics visible:</p>
+<div class="codehilite"><pre><span></span><code>operation: authorize payment for enrollment
+identity: enrollment-service may call billing authorize endpoint
+deadline: enrollment waits at most 800 ms
+retry: no blind retry; retry only with idempotency key and billing-owned dedupe
+trace: propagate request id, learner id class, enrollment id, billing attempt id
+fallback: mark enrollment pending_payment; show user a pending state
+</code></pre></div>
+
+<p>Notice that the fallback is not a transport detail. It is a product and domain decision. The platform can standardize deadline propagation and tracing, but it cannot decide whether a learner should receive course access after uncertain payment. That belongs to the services that own enrollment and billing semantics.</p>
 <h2>Policy Belongs at the Right Layer</h2>
 <p>Not every concern belongs in the same place. Some behavior is transport-level, some is platform-level, and some is domain-level.</p>
-<p>Transport policy includes timeouts, connection limits, TLS posture, retry budgets, and basic routing behavior. Platform policy includes common telemetry, service identity, and fleet-wide defaults. Domain policy decides whether an enrollment can continue, whether a payment can be retried, or whether a failed notification should block a workflow.</p>
+<p>Transport policy includes timeouts, connection limits, TLS posture, retry budgets, and basic routing behavior. Platform policy includes common telemetry, service identity, certificate rotation, and fleet-wide defaults. Domain policy decides whether an enrollment can continue, whether a payment can be retried, or whether a failed notification should block a workflow.</p>
 <div class="codehilite"><pre><span></span><code>transport/platform:
-  timeout, retry budget, identity, telemetry
+  timeout, retry budget, identity, telemetry, routing defaults
 
 domain:
   payment authorization, enrollment eligibility, compensation
@@ -117,13 +144,56 @@ domain:
 
 <p>That split matters because centralizing the wrong policy creates hidden coupling. A platform can standardize a retry budget, but it cannot decide whether charging a card twice is acceptable or whether a learner should be enrolled after billing becomes uncertain. The service that owns the business rule must still own the semantic consequence.</p>
 <p>The trade-off is leverage versus meaning. Shared network policy reduces duplicated operational work, but the application still has to express which calls are idempotent, which failures are safe, and which decisions belong to the domain.</p>
-<h2>Failure Modes</h2>
+<p>The boundary between layers should be explicit:</p>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Usually belongs to</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mTLS identity</td>
+<td>platform</td>
+<td>every service needs consistent caller identity</td>
+</tr>
+<tr>
+<td>trace propagation</td>
+<td>platform/shared libraries</td>
+<td>incidents need uniform request evidence</td>
+</tr>
+<tr>
+<td>retry budget</td>
+<td>platform plus service config</td>
+<td>consistency matters, but calls differ</td>
+</tr>
+<tr>
+<td>idempotency key meaning</td>
+<td>domain service</td>
+<td>only the owner knows what counts as the same command</td>
+</tr>
+<tr>
+<td>fallback user state</td>
+<td>domain workflow</td>
+<td>correctness depends on product semantics</td>
+</tr>
+</tbody>
+</table>
+<p>This split prevents two opposite mistakes. One mistake is leaving everything to application teams, which creates a fleet of incompatible defaults. The other is centralizing meaning in the platform, which makes the platform accidentally responsible for business correctness. Good platform policy creates guardrails around transport behavior while leaving semantic ownership with the services.</p>
+<h2>Failure Modes and Design Checks</h2>
 <p><strong>Issue</strong>: Copying the same retry policy onto every call.</p>
 <p><strong>Clarification / Fix</strong>: Classify calls by semantics. Idempotent reads, commands with idempotency keys, and irreversible side effects need different retry behavior.</p>
 <p><strong>Issue</strong>: Treating timeout values as local preferences.</p>
 <p><strong>Clarification / Fix</strong>: Coordinate timeouts across a request path. A downstream timeout that exceeds the caller's deadline creates wasted work and confusing failure reports.</p>
 <p><strong>Issue</strong>: Leaving observability as an application afterthought.</p>
 <p><strong>Clarification / Fix</strong>: Make trace propagation, request identifiers, and dependency labels part of the communication contract from the beginning.</p>
+<p><strong>Issue</strong>: Setting downstream timeouts longer than upstream deadlines.</p>
+<p><strong>Clarification / Fix</strong>: Propagate deadlines or compute budgets across the whole request path. A dependency should not keep doing work that the caller can no longer use.</p>
+<p><strong>Issue</strong>: Treating authentication as enough service identity.</p>
+<p><strong>Clarification / Fix</strong>: Authentication proves who is calling, but policy must also say which service is allowed to call which endpoint and under what conditions.</p>
+<p>Close the lesson and reconstruct the policy for one service call from memory. Name the caller, callee, operation semantics, timeout, retry posture, caller identity, trace fields, and fallback. If you cannot fill one of those boxes, the call has an implicit contract. The next outage will probably discover it for you.</p>
 <h2>Resources</h2>
 <ul>
 <li>[DOC] <a href="https://sre.google/sre-book/handling-overload/">Google SRE Book: Handling Overload</a><ul>
@@ -138,11 +208,16 @@ domain:
 <li>Focus: Use it as a mental model for containing dependency failure across service calls.</li>
 </ul>
 </li>
+<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/signals/traces/">OpenTelemetry Traces</a><ul>
+<li>Focus: Use it for the trace vocabulary that connects requests across service boundaries.</li>
+</ul>
+</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
 <li>Every service-to-service call needs explicit policy for timeout, retry, identity, telemetry, and fallback behavior.</li>
 <li>Shared network policy improves consistency, but domain semantics still belong with the service that owns the rule.</li>
+<li>Deadlines, retries, and fallbacks must be designed as one request path, not as isolated client defaults.</li>
 <li>The core trade-off is fleet predictability versus the local context each call needs to stay correct.</li>
 </ul>
 </section>
@@ -173,7 +248,7 @@ domain:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-15 09:06 UTC | @jepemo | Built with
+        Generated on 2026-06-15 16:34 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

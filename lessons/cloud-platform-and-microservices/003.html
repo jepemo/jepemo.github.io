@@ -106,6 +106,35 @@ observe again
 
 <p>If one replica crashes, the desired state has not changed. The controller sees that reality no longer matches the target and creates a replacement. If a rollout begins, the desired version changes, and the controller moves the workload toward that version while preserving the rollout rules it was given.</p>
 <p>This is the operational shift. The cluster is not passive after deployment. It keeps looking for drift. That makes the platform more resilient than a one-shot script, but it also means the declaration is only as good as the policies and signals attached to it.</p>
+<p>The control loop has four pieces:</p>
+<ul>
+<li><strong>Desired state</strong>: the object stored in the Kubernetes API, such as a Deployment saying "run three replicas of enrollment version v2."</li>
+<li><strong>Observed state</strong>: what the cluster currently sees, such as two ready pods, one pending pod, or an image pull error.</li>
+<li><strong>Controller action</strong>: the attempt to reduce the gap, such as creating a pod, replacing an unhealthy replica, or pausing a rollout.</li>
+<li><strong>Status and events</strong>: the evidence that explains whether convergence is happening, blocked, or failing.</li>
+</ul>
+<p>That last piece is easy to underweight. In a declarative system, "I applied the YAML" is only the beginning. The useful question is "what does the controller believe is different between desired state and live state?" Kubernetes exposes that belief through status fields, events, readiness, rollout progress, and logs from the components involved.</p>
+<h2>Worked Reconciliation Path</h2>
+<p>Trace the enrollment service during a rollout from <code>v1</code> to <code>v2</code>. The team declares that enrollment should run three replicas of <code>v2</code>, with no traffic sent to a pod until its readiness probe succeeds.</p>
+<div class="codehilite"><pre><span></span><code>desired:
+  enrollment Deployment
+  replicas: 3
+  image: enrollment:v2
+  readiness: /ready must pass
+</code></pre></div>
+
+<p>The cluster does not flip instantly from old to new. A controller compares desired and observed state, then moves step by step:</p>
+<div class="codehilite"><pre><span></span><code>observe: 3 ready v1 pods, 0 v2 pods
+act: create 1 v2 pod
+observe: v2 pod running, not ready
+act: keep v1 pods serving traffic
+observe: v2 pod ready
+act: remove 1 v1 pod, create next v2 pod
+observe: repeat until 3 ready v2 pods
+</code></pre></div>
+
+<p>This path shows why readiness is not decoration. The rollout controller can create a pod, but it should not treat that pod as safe for traffic until the workload says it can serve its contract. If the new enrollment version starts but cannot connect to billing, readiness should fail. The rollout pauses in a useful place: the old version can continue serving while the new version exposes its problem.</p>
+<p>The same path also shows the limit of Kubernetes. The platform can coordinate replica replacement, but it does not know whether <code>v2</code> changed enrollment semantics safely. If <code>v2</code> writes a new event shape that billing cannot read, the readiness probe might still pass. Declarative operations control workload state; they do not replace API compatibility, migration discipline, or the service-to-service policy from the previous lesson.</p>
 <h2>Health Is Part of the Contract</h2>
 <p>Kubernetes can only automate safely when workloads tell the truth about their condition. A process can be alive while still unable to serve traffic. It may be warming caches, loading secrets, connecting to billing, or waiting for a database migration to finish.</p>
 <p>That is why liveness and readiness answer different questions:</p>
@@ -119,7 +148,8 @@ ready for user traffic
 </code></pre></div>
 
 <p>For the learning platform, billing might be alive but not ready while it verifies payment-provider credentials. If the readiness check lies, Kubernetes can route enrollment traffic into a service that exists but cannot safely answer. The platform will be faithfully automating the wrong signal.</p>
-<p>The trade-off is convenience versus honesty. A superficial health check is easy to add, but truthful readiness requires the application to expose enough internal state for the platform to make safe traffic decisions.</p>
+<p>The trade-off is convenience versus honesty. A superficial health check is easy to add, but truthful readiness requires the application to expose enough internal state for the platform to make safe traffic decisions. That does not mean readiness should check every downstream dependency in the same way. A service that can degrade gracefully may stay ready while one optional dependency is down. A service that cannot answer safely without a payment provider should report not ready for the paths that depend on that provider.</p>
+<p>Liveness has a different risk. A liveness check that is too aggressive can restart a slow but recoverable process and make an incident worse. A liveness check should answer "is this process stuck in a state that restart is likely to fix?" Readiness should answer "should this process receive traffic right now?" Mixing those questions causes either traffic to reach unsafe workloads or healthy-but-slow workloads to be killed unnecessarily.</p>
 <h2>Rollout as Controlled Convergence</h2>
 <p>Once desired state and health are in place, rollout becomes another reconciliation problem. The team declares a new image version and a rollout strategy. The platform creates some new replicas, waits for readiness, removes old replicas, and repeats until live state matches the new target.</p>
 <div class="codehilite"><pre><span></span><code>declare catalog:v2
@@ -132,17 +162,35 @@ ready for user traffic
 
 <p>This does not make rollout magic. Kubernetes does not know whether a new catalog version changes business semantics safely. It does not invent idempotency, backward-compatible APIs, or good timeout policy. It gives the team a control loop for workload state; the service still has to be designed to survive rolling change.</p>
 <p>That boundary matters for the next lessons in the track. Kubernetes can maintain and change workloads, edge systems can move selected logic closer to users, and schedulers can place work under constraints. None of those layers remove the need for clear service contracts and honest operational signals.</p>
-<h2>Failure Modes</h2>
+<p>The practical debugging loop follows the same model:</p>
+<ol>
+<li><strong>Read the declared intent</strong>: what did the Deployment, Service, probe, resource request, or rollout strategy ask for?</li>
+<li><strong>Read observed state</strong>: how many pods exist, where are they scheduled, and which are ready?</li>
+<li><strong>Read events and status</strong>: is the controller blocked by image pull, scheduling, readiness, quota, or rollout progress?</li>
+<li><strong>Check workload truth</strong>: do logs and metrics show that the application can actually serve its contract?</li>
+<li><strong>Change intent or fix the workload</strong>: update the declaration only when the desired state is wrong; fix code or dependencies when the workload cannot satisfy the declaration.</li>
+</ol>
+<p>This is slower than "rerun the deploy command," but it is more reliable because it matches how the platform actually works. You are not negotiating with a script. You are examining the gap between desired and observed state.</p>
+<h2>Failure Modes and Design Checks</h2>
 <p><strong>Issue</strong>: Treating declared state as immediate truth.</p>
 <p><strong>Clarification / Fix</strong>: Watch the reconciliation path. Pending pods, failed readiness, image pull errors, and paused rollouts are part of the gap between intent and live state.</p>
 <p><strong>Issue</strong>: Using shallow readiness checks.</p>
 <p><strong>Clarification / Fix</strong>: Readiness should reflect whether the workload can actually serve its contract. A process-alive endpoint is usually not enough.</p>
 <p><strong>Issue</strong>: Expecting Kubernetes to fix weak application design.</p>
 <p><strong>Clarification / Fix</strong>: Kubernetes can restart, reschedule, and roll out workloads. It cannot invent service boundaries, data semantics, idempotency, or safe dependency behavior.</p>
+<p><strong>Issue</strong>: Using liveness to express readiness.</p>
+<p><strong>Clarification / Fix</strong>: Keep restart decisions separate from traffic decisions. A workload can be alive but unsafe for traffic, or temporarily slow but not worth restarting.</p>
+<p><strong>Issue</strong>: Debugging only from YAML.</p>
+<p><strong>Clarification / Fix</strong>: The declaration says what should be true; status, events, probes, and workload telemetry explain why the cluster has or has not reached it.</p>
+<p>Close the lesson and reconstruct one Kubernetes incident from memory. State the desired condition, the observed condition, the controller action you expect, the health signal involved, and the evidence you would inspect first. If you cannot separate those five pieces, Kubernetes will feel like a pile of objects instead of a reconciliation system.</p>
 <h2>Resources</h2>
 <ul>
 <li>[DOC] <a href="https://kubernetes.io/docs/concepts/overview/">Kubernetes Concepts Overview</a><ul>
 <li>Focus: Read the object vocabulary through the lens of desired state and reconciliation.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/architecture/controller/">Kubernetes Controllers</a><ul>
+<li>Focus: Use this to understand controllers as loops that watch state and act toward desired state.</li>
 </ul>
 </li>
 <li>[DOC] <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Kubernetes Deployments</a><ul>
@@ -163,6 +211,7 @@ ready for user traffic
 <li>Kubernetes is best understood as desired state plus continuous reconciliation.</li>
 <li>Health signals are part of the application-platform contract; weak readiness makes safe automation impossible.</li>
 <li>Declarative rollout improves repeatability, but service correctness still depends on compatible contracts and honest operational design.</li>
+<li>Debugging Kubernetes means reading the gap between declared intent, observed state, controller action, and workload truth.</li>
 </ul>
 </section>
 
@@ -192,7 +241,7 @@ ready for user traffic
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-15 09:06 UTC | @jepemo | Built with
+        Generated on 2026-06-15 16:34 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
