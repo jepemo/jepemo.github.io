@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Persistent Connections, HOL Blocking, and HTTP/1.1 Limits - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<button class="read-mode-toggle" type="button" data-read-mode-toggle aria-label="Enter read mode" aria-pressed="false">
+  READ
+</button>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Persistent Connections, HOL Blocking, and HTTP/1.1 Limits</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/distributed-systems.html">Distributed Systems</a>
+    /
+    <a href="../../tracks/http-protocol-and-content-delivery.html">HTTP Protocol and Content Delivery</a>
+    /
+    013
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/http-protocol-and-content-delivery.html">HTTP Protocol and Content Delivery</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">013</span>
+    <span class="meta-chip">25 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Persistent Connections, HOL Blocking, and HTTP/1.1 Limits</h1>
+<blockquote>
+<p><strong>The core idea</strong>: HTTP/1.1 persistent connections save setup cost by reusing TCP connections, but each connection still carries one ordered response path, so slow responses and bounded pools create head-of-line pressure.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Imagine a product page that loads HTML, CSS, JavaScript, product images, recommendations, inventory, and a cart summary. In a local demo, every request is quick. In production, one large image is slow and one API response streams for several seconds. The browser appears to "stall" even though the origin is healthy. Some requests wait in the browser. Others wait in a backend connection pool. Operators see open sockets, long response times, and clients retrying.</p>
+<p>HTTP/1.1 persistent connections are the first reason this is not simply "one request equals one connection." A client can open a TCP connection to an origin and reuse it for multiple HTTP requests. That avoids paying connection setup over and over, and it lets the connection benefit from already-warmed transport state. For HTTPS, it also avoids repeating the expensive parts of TLS setup for every object.</p>
+<p>The non-obvious part is the limit that remains. HTTP/1.1 does not multiplex independent response streams over one connection. On a single connection, the response path is ordered. If a long response body is occupying that connection, another request assigned to the same connection cannot receive its response at the same time. That is the HTTP/1.1 version of head-of-line pressure.</p>
+<p>The trade-off is <strong>reuse efficiency versus blocked work on a limited set of connections</strong>. Reuse reduces handshake cost, socket churn, and server overhead. But when each connection has only one active response path, clients and proxies need connection pools, timeouts, and careful retry behavior. Too few connections create waiting. Too many connections create overload and unfairness. The design question becomes: how much concurrency should this client, proxy, or service create for this origin, and what happens when one response is slow?</p>
+<h2>Why Persistent Connections Exist</h2>
+<p>In the simplest mental model, a client could open a new TCP connection for every HTTP request:</p>
+<div class="codehilite"><pre><span></span><code>request A -&gt; open TCP -&gt; send request -&gt; read response -&gt; close
+request B -&gt; open TCP -&gt; send request -&gt; read response -&gt; close
+request C -&gt; open TCP -&gt; send request -&gt; read response -&gt; close
+</code></pre></div>
+
+<p>That works, but it is expensive. Each new connection has setup latency. It consumes client, server, NAT, proxy, and load balancer state. It can start with conservative transport behavior before the connection has learned anything about the path. With TLS, the setup also includes cryptographic negotiation.</p>
+<p>A persistent connection changes the shape:</p>
+<div class="codehilite"><pre><span></span><code>open TCP once
+-&gt; request A -&gt; response A
+-&gt; request B -&gt; response B
+-&gt; request C -&gt; response C
+-&gt; close later
+</code></pre></div>
+
+<p>HTTP/1.1 made persistent connections the normal behavior unless a participant says otherwise. A response can include <code>Connection: close</code> to indicate that the connection will not be reused after the current message. Otherwise, a client usually expects it may send another request after the current response is complete.</p>
+<p>The win is visible on small objects. A product page may need dozens of assets. Reusing connections avoids a storm of repeated setup work. The server also avoids creating and destroying sockets for every image, stylesheet, or API call. Connection reuse is one reason HTTP/1.1 could support the growing web better than the older one-request-per-connection style.</p>
+<p>But reuse is not free. A reused connection is shared state. It has an idle timeout. It can be closed by either side. A proxy can sit between client and origin with its own pool and timeout. A client might try to reuse a socket just as the server has closed it. A server might keep too many idle connections and run out of file descriptors. The performance feature becomes an operational boundary.</p>
+<h2>The Ordered Response Path</h2>
+<p>The main HTTP/1.1 limit is easier to see with a timeline.</p>
+<p>Suppose a browser has one connection to <code>www.shop.test</code> and three requests:</p>
+<div class="codehilite"><pre><span></span><code>R1: GET /product/42.html       small HTML
+R2: GET /images/hero.jpg       large image
+R3: GET /api/cart-summary      small JSON
+</code></pre></div>
+
+<p>Without pipelining, the client usually sends a request, waits for its response, then sends the next request on that same connection:</p>
+<div class="codehilite"><pre><span></span><code>connection 1:
+  send R1 -&gt; receive response 1
+  send R2 -&gt; receive response 2
+  send R3 -&gt; receive response 3
+</code></pre></div>
+
+<p>If <code>R2</code> is a large or slow response, <code>R3</code> waits behind it on that connection. The JSON response may be tiny, but it cannot be received before the image response finishes if both are serialized through the same HTTP/1.1 connection.</p>
+<p>HTTP/1.1 pipelining tried to improve this by allowing multiple requests to be sent before the earlier responses came back:</p>
+<div class="codehilite"><pre><span></span><code>connection 1:
+  send R1, R2, R3
+  receive response 1, response 2, response 3 in order
+</code></pre></div>
+
+<p>That reduces request-send waiting, but the responses still have to come back in order. If response 2 is slow, response 3 is stuck behind it even if the server could compute response 3 quickly. This is head-of-line blocking at the HTTP message layer: later work waits because earlier work occupies the ordered line.</p>
+<p>In practice, browser support for HTTP/1.1 pipelining was limited because of ordered response blocking and unreliable intermediary behavior. Instead, clients opened several connections per origin. That creates parallel lanes:</p>
+<div class="codehilite"><pre><span></span><code>connection 1: R1 -&gt; response 1
+connection 2: R2 -&gt; response 2, slow body
+connection 3: R3 -&gt; response 3
+</code></pre></div>
+
+<p>Now the cart summary does not have to wait behind the large image. The cost is more connection state. The client, server, and any proxy or load balancer now have to manage multiple sockets for the same origin.</p>
+<p>The important boundary sentence is: HTTP/1.1 connection reuse saves setup work, but it does not turn one connection into many independent response streams.</p>
+<h2>Connection Pools Are Concurrency Controls</h2>
+<p>Browsers, API clients, reverse proxies, and service clients commonly use connection pools. A pool is a bounded set of reusable connections to a target. The pool answers a concrete question: when code wants to send another request, should it reuse an idle connection, wait for one, or open a new one up to a limit?</p>
+<p>For a browser, the target is usually an origin. For a backend service, the target might be an upstream host, load balancer, or proxy. In both cases, the pool limit is a concurrency policy.</p>
+<p>Consider a service calling an inventory API:</p>
+<div class="codehilite"><pre><span></span><code>checkout service
+  connection pool to inventory-api: max 20 connections
+</code></pre></div>
+
+<p>At normal load, requests reuse idle connections. At high load, all 20 connections may be busy. New calls wait in the pool queue. If one upstream response streams slowly or hangs, it occupies one connection for longer. If several hang, the pool can saturate. The checkout service then sees latency even before the inventory API is fully down.</p>
+<p>This is not only a client problem. Servers also have limits: maximum connections, worker threads, event-loop capacity, file descriptors, idle connection memory, and load balancer connection tracking. If every client responds to latency by opening many more connections, the system can amplify the incident.</p>
+<p>Good pool behavior is explicit:</p>
+<div class="codehilite"><pre><span></span><code>max connections per target
+max idle connections
+idle timeout below or aligned with server timeout
+request timeout
+response header timeout
+body read timeout for streaming cases
+retry only when method and operation semantics allow it
+</code></pre></div>
+
+<p>The method lessons matter here. Retrying a <code>GET</code> after a stale idle connection fails is often safe. Retrying a non-idempotent <code>POST</code> after an ambiguous timeout can duplicate side effects unless the API has idempotency keys or another safety mechanism. Connection failures and HTTP semantics meet at the retry boundary.</p>
+<h2>Worked Path: A Product Page Stall</h2>
+<p>Trace the product page incident.</p>
+<p>The page loads these resources:</p>
+<div class="codehilite"><pre><span></span><code>/product/42.html
+/assets/app.css
+/assets/app.js
+/images/hero.jpg
+/api/recommendations?product=42
+/api/cart-summary
+</code></pre></div>
+
+<p>The browser opens a small pool of HTTP/1.1 connections to <code>www.shop.test</code>:</p>
+<div class="codehilite"><pre><span></span><code>conn A: /product/42.html -&gt; /assets/app.css
+conn B: /assets/app.js
+conn C: /images/hero.jpg
+</code></pre></div>
+
+<p>The image on connection C is large and slow. Meanwhile JavaScript wants <code>/api/cart-summary</code>. If the browser has already reached its per-origin connection limit, the cart request waits until one connection is available. The page feels slow even though the cart endpoint itself might be fast.</p>
+<p>On the server side, a reverse proxy has its own upstream pool:</p>
+<div class="codehilite"><pre><span></span><code>browser connections
+  -&gt; edge proxy
+  -&gt; upstream pool to app servers
+</code></pre></div>
+
+<p>If the proxy's upstream pool is saturated by slow response bodies, quick API requests can wait behind them before the application even sees the request. The app logs may show normal processing time because the queueing happened in the proxy or client pool. That is why operators need connection-pool and proxy metrics, not just application handler duration.</p>
+<p>A useful trace separates the waiting points:</p>
+<div class="codehilite"><pre><span></span><code>browser queue time
+-&gt; connection assigned
+-&gt; request sent
+-&gt; proxy queue time
+-&gt; upstream connection assigned
+-&gt; app handler time
+-&gt; first byte sent
+-&gt; response body duration
+-&gt; connection returned to pool
+</code></pre></div>
+
+<p>The fix is not automatically "increase all connection limits." That may reduce waiting for one client while increasing load on the origin. Better fixes depend on the cause: serve large static assets from a CDN or separate host, tune pool limits, shorten or isolate slow streaming responses, add timeouts, compress or resize assets, or move to HTTP/2 where multiple streams can share one connection with different trade-offs.</p>
+<p>The key is to identify which line is blocked. A slow image body occupying a browser connection is different from an upstream pool waiting for app servers. A stale idle socket that fails on reuse is different from a full pool. All three can look like "HTTP is slow" from the user's chair.</p>
+<h2>Operational Failure Modes</h2>
+<p><strong>Failure: infinite or oversized connection pools.</strong> Opening more connections can hide blocking briefly, then overload the server, load balancer, or NAT table. Pool size is a concurrency budget, not just a performance knob.</p>
+<p><strong>Failure: stale idle connection reuse.</strong> A client may keep a socket idle longer than the server or proxy allows. The next request tries to reuse a connection that the other side has closed. Clients need sensible idle timeouts and retry behavior that respects method safety and idempotency.</p>
+<p><strong>Failure: measuring only application handler time.</strong> If a request waits in a browser, client library, reverse proxy, or upstream pool before application code runs, app logs understate user-visible latency. Measure queue time, connection acquisition time, time to first byte, and body duration.</p>
+<p><strong>Failure: mixing slow streams with latency-sensitive calls.</strong> One long download or streaming response can occupy a connection and pool slot. Separate hosts, pools, routes, or protocols may be needed when slow bodies and tiny interactive calls have very different latency needs.</p>
+<p><strong>Failure: assuming pipelining solves HTTP/1.1 concurrency.</strong> Pipelining can send requests early, but responses are still ordered and many intermediaries historically handled it poorly. It is not the same as multiplexing.</p>
+<p>Useful signals include connection reuse ratio, active and idle connection counts, pool wait time, connection errors on first write, idle timeout closes, response time to first byte, response body duration, and per-origin connection limits. When user latency rises, these signals tell you whether the bottleneck is setup churn, pool waiting, slow bodies, or server processing.</p>
+<h2>Connections</h2>
+<p>The body lesson showed that a slow response body can last much longer than the server's first decision. This lesson shows where that slow body sits: on a finite connection path that may be reused by other requests.</p>
+<p>The next lesson explains how HTTP/2 changes the shape by multiplexing many streams over one connection. That removes one HTTP/1.1 limit, but it introduces new shared-fate and flow-control concerns. The point is not that HTTP/2 is "faster" in the abstract; it changes which queues and blockers you have to inspect.</p>
+<p>Close the lesson and reconstruct a slow page load from memory: number of origins, connection limits per origin, which responses have long bodies, where requests wait for a connection, and which metrics would prove the waiting point.</p>
+<h2>Resources</h2>
+<ul>
+<li>[RFC] <a href="https://www.rfc-editor.org/rfc/rfc9112">HTTP/1.1 RFC 9112</a><ul>
+<li>Focus: Use it for persistent connection behavior, message ordering, transfer coding, and connection management in HTTP/1.1.</li>
+</ul>
+</li>
+<li>[RFC] <a href="https://www.rfc-editor.org/rfc/rfc9110">HTTP Semantics RFC 9110</a><ul>
+<li>Focus: Review method semantics and why retry decisions depend on safety, idempotency, and application contracts.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Connection_management_in_HTTP_1.x">MDN: Connection management in HTTP/1.x</a><ul>
+<li>Focus: Read it for short-lived connections, persistent connections, pipelining, and browser connection behavior.</li>
+</ul>
+</li>
+<li>[BOOK] <a href="https://hpbn.co/http1x/">High Performance Browser Networking: HTTP/1.X</a><ul>
+<li>Focus: Use it for practical latency, connection reuse, browser limits, and head-of-line blocking intuition.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Persistent connections reduce repeated TCP and TLS setup cost, but they introduce reusable connection state that must be timed out, pooled, and observed.</li>
+<li>HTTP/1.1 does not multiplex independent response streams on one connection; slow earlier responses can block later work assigned to the same ordered path.</li>
+<li>Connection pools are concurrency controls, so pool size, idle timeout, request timeout, and retry policy are part of the HTTP design.</li>
+<li>Debugging HTTP/1.1 latency requires separating connection acquisition, proxy queueing, handler time, first byte, and body duration.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="012.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Request and Response Bodies: Streaming, Compression, and Range Delivery</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="014.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>HTTP/2 Multiplexing, Flow Control, and HPACK</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/http-protocol-and-content-delivery.html">← Back to HTTP Protocol and Content Delivery</a></p>
+  <p><a href="../../classifications/distributed-systems.html">← Back to Distributed Systems</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-19 07:41 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
