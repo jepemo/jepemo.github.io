@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Consistency Models and User Guarantees - @jepemo</title>
+    <title>Replication, Partitioning, and State Placement - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
@@ -54,7 +54,7 @@
 
     <main class="lesson-page">
       
-<h1>Consistency Models and User Guarantees</h1>
+<h1>Replication, Partitioning, and State Placement</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -77,120 +77,114 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Consistency Models and User Guarantees</h1>
+  <h1>Replication, Partitioning, and State Placement</h1>
 <h2>Core Insight</h2>
-<p>Imagine changing your password on a laptop. The page says <strong>Saved</strong>. A few seconds later, you try to log in from your phone. If the phone still accepts the old password, the system has not merely shown a small replication delay. It has broken a promise the user reasonably believed was true.</p>
-<p>A <strong>consistency model</strong> is a promise about what reads may observe after writes. It answers questions like: after I save something, must I see it? Can I go backward to an older version? Can someone see a reply before the message it answers? Must every user agree on one latest value?</p>
-<p>The term can sound theoretical, but the effect is product behavior. A profile page, password flow, timeline, inventory counter, and bank ledger may all use replicated state. They should not all make the same promise.</p>
-<p>The useful habit is to name the observation that would hurt. Then choose the weakest guarantee that still protects the user-visible promise. Stronger guarantees usually spend more coordination, latency, or availability. Weaker guarantees can be fine when staleness is clear, bounded, and repairable.</p>
-<h2>Reads After Writes</h2>
-<p>Use the password example as the worked path. The user changes a password through a laptop. The write reaches one owner or replica. A later login attempt from the phone reads from a different replica.</p>
-<div class="codehilite"><pre><span></span><code>laptop:
-  write password version 12
-  page says &quot;Saved&quot;
+<p>Imagine opening a social app and loading the timeline for user <code>u-42</code>. The request looks simple from the outside: fetch posts for this user. Inside the system, several design decisions have already been made before the first row is read.</p>
+<p>Which machine owns <code>u-42</code>'s timeline? Which copies are allowed to answer reads? Which copy is allowed to accept writes? What happens if the owner is overloaded, moved, or dead?</p>
+<p><strong>State placement</strong> is the design of those answers. <strong>Partitioning</strong> splits data across owners so no single machine has to hold everything. <strong>Replication</strong> creates extra copies for survival, locality, read capacity, or recovery. These choices are not only about speed. They decide authority, routing, failover, repair, and the consistency guarantees the next lesson will name.</p>
+<p>The common beginner mistake is to say "we sharded it" or "we replicated it" as if that finished the design. A distributed system also needs to know who owns each fact, which copies are trusted for which purpose, and how the placement map changes without losing state.</p>
+<h2>Follow One Key</h2>
+<p>Use <code>u-42</code> as the worked example. A router receives the request and uses a placement rule to choose a shard.</p>
+<div class="codehilite"><pre><span></span><code>request: load timeline for u-42
 
-phone:
-  read password state
-  which version may it see?
+router
+  -&gt; shard 7
+       owner: timeline writes for u-42
+       replica A: nearby reads
+       replica B: failover candidate
 </code></pre></div>
 
-<p>If the phone sees version 11 and accepts the old password, the system has violated a strong security expectation. The user was told the change was saved. For this workflow, a stale read is not just inconvenient; it can be unsafe.</p>
-<p>Now compare a like counter:</p>
-<div class="codehilite"><pre><span></span><code>user taps like
-nearby replica shows count 104
-another region still shows count 103 for a short time
+<p>The <strong>partitioning</strong> rule says <code>u-42</code> belongs to shard 7. That rule might be a hash range, a directory lookup, a tenant mapping, or a region-based assignment. The mechanism varies, but the question is the same: where should this key go?</p>
+<p>The <strong>ownership</strong> rule says shard 7 is allowed to make official changes for this timeline. Without ownership, two machines might accept conflicting writes and later disagree about which posts exist.</p>
+<p>The <strong>replication</strong> rule says additional copies exist. Replica A might serve reads close to the user. Replica B might be ready for failover. But a copy is useful only if the system knows how fresh it is and what it is allowed to do.</p>
+<p>This small path already exposes the design:</p>
+<div class="codehilite"><pre><span></span><code>key -&gt; router -&gt; owner -&gt; replicas -&gt; repair
 </code></pre></div>
 
-<p>That may be acceptable if the product does not promise exact immediate agreement. The same replication lag that is unacceptable for passwords can be fine for a casual counter.</p>
-<p>This is why consistency belongs to the workflow, not only to the storage engine. The question is not "is the database consistent?" The question is "what does this read path promise after this write path?"</p>
-<h2>Common Guarantees</h2>
-<p>Several common guarantees are easiest to understand from the user's point of view.</p>
-<p><strong>Read-your-writes</strong> means that after you write something, your later reads should reflect that write. If you save a profile bio and immediately reload the profile, you should not see the old bio.</p>
-<p><strong>Monotonic reads</strong> means your session should not move backward. If you have already seen version 12 of a document, a later read should not show version 10 as if time reversed.</p>
-<p><strong>Causal consistency</strong> means dependent events stay in a sensible order. If a reply depends on a message, observers should not see the reply without the message it answers.</p>
-<p><strong>Linearizability</strong> is stronger. It makes operations behave as if there is one latest real-time order shared by everyone. Once a write completes, later reads by any participant should see it or something newer.</p>
-<p>These guarantees are related, but they protect different experiences:</p>
-<div class="codehilite"><pre><span></span><code>read-your-writes:
-  &quot;I saved it, so I should see it.&quot;
+<p>If you cannot follow that path for one key, the placement design is not yet operational.</p>
+<h2>Partitioning Spreads Ownership</h2>
+<p>Partitioning is how a system divides state into pieces. The pieces are often called shards, partitions, ranges, or tablets. Each piece has an owner for the writes that matter.</p>
+<p>A simple hash rule spreads user ids across shards:</p>
+<div class="codehilite"><pre><span></span><code>hash(user_id) % 4
 
-monotonic reads:
-  &quot;Do not show me an older version after a newer one.&quot;
-
-causal consistency:
-  &quot;Do not show an effect without its cause.&quot;
-
-linearizability:
-  &quot;Everyone observes one current order.&quot;
+shard 0: some users
+shard 1: some users
+shard 2: some users
+shard 3: some users
 </code></pre></div>
 
-<p>The stronger the promise, the more the system may need routing, version tokens, quorum reads, leader reads, waiting, or coordination.</p>
-<h2>Choosing The Promise</h2>
-<p>A useful consistency decision starts as a product sentence.</p>
-<p>For a password change:</p>
-<div class="codehilite"><pre><span></span><code>After password version 12 is accepted,
-all later login checks for that account must reject version 11.
+<p>This can balance many ordinary users, but it does not solve every load problem. If one celebrity account receives a huge share of traffic, all writes for that account may still hit one owner. That is a <strong>hot shard</strong> or hot key problem.</p>
+<p>Range partitioning creates a different trade-off. It can make scans efficient because nearby keys live together, but it can also concentrate traffic if many requests target the same range.</p>
+<p>Co-locating related state is another choice. Keeping a user's timeline, settings, and notifications together can make some operations simpler. Spreading them apart can improve scale but makes multi-part operations cross more boundaries.</p>
+<p>Partitioning is therefore not just "more shards means more scale." It is a routing and ownership contract. It must explain how keys are assigned, how skew is detected, and how the system moves state when the original assignment stops working.</p>
+<h2>Replication Adds Copies, Not Automatic Safety</h2>
+<p>Replication means keeping more than one copy of data. A replica can help the system survive a machine loss, serve reads from a nearby location, or rebuild state after failure.</p>
+<p>But a replica is not automatically safe for every job. A replica may be stale. It may be missing recent writes. It may not be eligible to become the owner. It may serve timeline reads safely while being unsafe for password checks or payment status.</p>
+<p>Useful replication design answers four questions:</p>
+<ul>
+<li>What may this replica serve?</li>
+<li>How far behind can it be?</li>
+<li>How does it catch up after falling behind?</li>
+<li>When may it become the owner?</li>
+</ul>
+<p>For the timeline example, the product may allow a nearby replica to serve reads that are a few seconds behind. The same system might route writes to the owner and require stronger confirmation before telling the user a post was saved.</p>
+<p>That is the trade-off. More replicas can improve survival and read locality, but they add coordination, lag, monitoring, and repair work. The system must turn "there is a copy" into a clear read, write, failover, and catch-up policy.</p>
+<h2>Rebalancing And Movement</h2>
+<p>Placement changes over time. A shard grows too large. A region becomes busy. A machine needs replacement. A new shard is added. The system must move state while users continue sending requests.</p>
+<p>Suppose <code>u-42</code> moves from shard 7 to shard 12:</p>
+<div class="codehilite"><pre><span></span><code>before:
+  router -&gt; shard 7
+
+during move:
+  copy data from shard 7 to shard 12
+  decide which shard accepts writes
+  keep reads from going backward
+
+after:
+  router -&gt; shard 12
 </code></pre></div>
 
-<p>For a profile bio:</p>
-<div class="codehilite"><pre><span></span><code>After I save my bio,
-my own session should show the saved version.
-Other users may see the old version briefly.
-</code></pre></div>
-
-<p>For a message thread:</p>
-<div class="codehilite"><pre><span></span><code>If a reply is visible,
-the message it replies to should also be visible.
-</code></pre></div>
-
-<p>Those sentences are more useful than saying "strong" or "eventual" too early. They tell the system what observation is allowed, who the guarantee applies to, and how much staleness the product can tolerate.</p>
-<p>Mechanisms can then follow. A session token can route a user to a replica that has seen their write. A read can include a minimum version. A write can wait for enough replicas before returning success. A message service can preserve causal metadata so replies do not appear before their causes.</p>
-<p>Each mechanism has a cost. Waiting for more replicas increases latency. Routing to a specific owner may reduce local availability. Carrying version tokens adds complexity. Serving from any nearby replica is fast, but it weakens what the user may observe.</p>
+<p>The risky period is the middle. If both shards accept writes, the system can create conflicting histories. If the router switches before shard 12 has the needed data, users may see missing state. If repair traffic competes with live traffic, the move can trigger the outage it was meant to prevent.</p>
+<p>A careful move has a choreography. It names the source, destination, owner during transfer, routing switch point, verification step, and rollback plan. State placement proves itself during these transitions, not only when the map is stable.</p>
 <h2>Failure Modes And Trade-offs</h2>
-<p>The representative failure is a user seeing old state after being told a write succeeded. This often happens when a write reaches one replica but a later read goes to a different, stale replica.</p>
-<p>Another failure is time moving backward inside one session. A dashboard shows version 20, then refreshes from a lagging replica and shows version 17. The data may eventually converge, but the user experience becomes hard to trust.</p>
-<p>A third failure is causal inversion. A reply appears before the message it answers. A notification says "Alice accepted your invite" before the invite is visible. The system has not merely shown stale data; it has shown events in an order that breaks the story.</p>
-<p>The trade-off is not "strong is good, weak is bad." It is:</p>
-<div class="codehilite"><pre><span></span><code>Stronger guarantees reduce surprising observations,
-but usually cost more waiting, coordination, routing, or reduced availability.
-
-Weaker guarantees can improve latency and availability,
-but they require honest product behavior and repair.
-</code></pre></div>
-
-<p>The right consistency model is the one that protects the promise users would reasonably infer from the interface.</p>
+<p>The representative failure is a hot shard. The system has many partitions, but one key or range receives so much traffic that its owner becomes the bottleneck. Adding replicas may help reads, but it may not help writes if one owner still makes every official change.</p>
+<p>Another failure is unsafe failover. A stale replica becomes owner and loses writes that had reached the old owner but not the replica. The system may look available while quietly moving backward.</p>
+<p>A third failure is routing drift. Some clients or routers use the old placement map while others use the new one. Requests split across owners, and the system has to repair conflicts that a clean handoff could have avoided.</p>
+<p>The main trade-off is between simple authority and flexible distribution. One owner per key is easy to reason about but can bottleneck. Many replicas and frequent moves improve capacity and survival but require better metadata, monitoring, and repair. Co-locating state simplifies some transactions but may create large uneven shards. Splitting state spreads load but makes cross-key workflows more distributed.</p>
 <h2>Practice Prompt</h2>
-<p>Pick one workflow: password change, profile edit, message reply, shopping cart update, bank transfer, dashboard metric, or notification read state. Fill in these lines:</p>
-<div class="codehilite"><pre><span></span><code>write:
-later read:
-who needs the guarantee:
-stale observation that would hurt:
-acceptable stale window:
-mechanism that could enforce it:
-trade-off:
+<p>Pick one key in a system you know: <code>user_id</code>, <code>tenant_id</code>, <code>account_id</code>, <code>order_id</code>, <code>room_id</code>, or <code>document_id</code>. Trace it:</p>
+<div class="codehilite"><pre><span></span><code>key:
+placement rule:
+write owner:
+read replicas:
+allowed staleness:
+failover rule:
+movement or rebalance plan:
+hot-key risk:
 </code></pre></div>
 
-<p>If the stale observation would break trust or safety, do not hide it behind eventual consistency. Name the stronger read rule or coordination point.</p>
+<p>If "replica" appears in the answer, also write what that replica is allowed to do. A copy without an authority policy is only part of the design.</p>
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] <a href="https://jepsen.io/consistency">Jepsen: Consistency Models</a><ul>
-<li>Focus: Plain-language definitions and examples for common consistency guarantees.</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
+<li>Focus: Partitioning, replication, sloppy quorums, and repair in a highly available storage system.</li>
 </ul>
 </li>
-<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a><ul>
-<li>Focus: The classic definition of a single real-time order for concurrent operations.</li>
+<li>[PAPER] <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf">Bigtable: A Distributed Storage System for Structured Data</a><ul>
+<li>Focus: Tablet placement, splitting, serving, and operational state movement.</li>
 </ul>
 </li>
 <li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Replication lag, consistency guarantees, and the operational costs of stronger promises.</li>
+<li>Focus: Partitioning, replication, leader/follower choices, and the trade-offs of state placement.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A consistency model is a promise about what reads may observe after writes.</li>
-<li>Different workflows need different guarantees; passwords and like counters should not be treated alike.</li>
-<li>Stronger guarantees reduce surprising observations but usually cost coordination, latency, or availability.</li>
-<li>Start from the user-visible promise, then choose the read and write rules that preserve it.</li>
+<li>State placement decides where a key lives, who owns writes, and which copies may answer which questions.</li>
+<li>Partitioning spreads ownership, but poor keys or skew can still create hot shards.</li>
+<li>Replication adds useful copies only when read, failover, freshness, and repair policies are explicit.</li>
+<li>Rebalancing is part of the design because placement has to change without losing authority or state.</li>
 </ul>
 </section>
 
@@ -198,14 +192,14 @@ trade-off:
   
   <a class="nav-card" href="007.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Replication, Partitioning, and State Placement</strong>
+    <strong>CAP, PACELC, and Partition-Time Behavior</strong>
   </a>
   
 
   
   <a class="nav-card" href="009.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Gossip, Membership, and Dissemination</strong>
+    <strong>Consistency Models and User Guarantees</strong>
   </a>
   
 </section>
@@ -220,7 +214,7 @@ trade-off:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 07:41 UTC | @jepemo | Built with
+        Generated on 2026-06-19 12:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

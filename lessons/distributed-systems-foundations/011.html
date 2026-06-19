@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Backpressure, Load, and Cascading Failure - @jepemo</title>
+    <title>Observability and Debugging Distributed Systems - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
@@ -54,7 +54,7 @@
 
     <main class="lesson-page">
       
-<h1>Backpressure, Load, and Cascading Failure</h1>
+<h1>Observability and Debugging Distributed Systems</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -77,124 +77,120 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Backpressure, Load, and Cascading Failure</h1>
+  <h1>Observability and Debugging Distributed Systems</h1>
 <h2>Core Insight</h2>
-<p>Imagine a cafe kitchen that can cook 100 meals per hour. One day 300 orders arrive in an hour. If the cashier keeps accepting every order with a cheerful promise, the kitchen has not become more capable. It has created a growing pile of commitments it cannot keep.</p>
-<p>Distributed systems behave the same way under overload. A queue, worker pool, database, or downstream API has finite capacity. If callers keep adding work faster than the system can finish it, latency rises, timeouts start, retries multiply, and a local slowdown can become a system-wide failure.</p>
-<p><strong>Backpressure</strong> is how a system signals that incoming work must slow down before overload spreads. It may reject work, delay work, reduce concurrency, return <code>429</code>, ask a producer to send fewer items, shed optional features, or degrade to a smaller response.</p>
-<p>The goal is not to avoid every error. The goal is to preserve the most important promises when capacity is limited. The trade-off is uncomfortable: refusing or degrading some work early can be more reliable than accepting everything and collapsing later.</p>
-<h2>When A Queue Stops Helping</h2>
-<p>Use a worker queue that writes to a database:</p>
-<div class="codehilite"><pre><span></span><code>clients -&gt; API -&gt; queue -&gt; workers -&gt; database
+<p>Imagine a user reports this: "Checkout spun for twenty seconds, charged my card, and then said the order failed." Six services were involved. The web service, payment service, inventory service, queue worker, email service, and order database all report that they were mostly healthy.</p>
+<p>That is not enough. In a distributed system, no single component sees the whole user journey. Each participant sees local facts: one request arrived, one dependency waited, one retry happened, one queue grew, one event was or was not written.</p>
+<p><strong>Observability</strong> is the ability to reconstruct behavior from the evidence the system leaves behind. It is not just dashboards. It is the practical ability to ask, after the fact, "What happened to this user-visible promise, across these boundaries, in this time window?"</p>
+<p>The trade-off is that evidence has a cost. Logs, metrics, traces, events, labels, and retained payloads consume storage, bandwidth, attention, and sometimes privacy budget. Good observability preserves enough evidence to explain important failures without turning telemetry into its own source of noise.</p>
+<h2>Reconstruct One Checkout</h2>
+<p>Use one checkout attempt as the worked example. The user clicks <strong>Place order</strong>. The request receives a correlation id at the edge:</p>
+<div class="codehilite"><pre><span></span><code>correlation_id: checkout-abc
+order_id: order-42
+payment_operation: pay:order-42
 </code></pre></div>
 
-<p>At first, the queue is helpful. If clients send a short burst of requests, the queue smooths the burst and workers catch up.</p>
-<div class="codehilite"><pre><span></span><code>brief burst:
-  arrival rate &gt; service rate for 10 seconds
-  queue grows briefly
-  workers catch up
+<p>During the request, different systems leave different evidence:</p>
+<div class="codehilite"><pre><span></span><code>web log:
+  checkout-abc received Place order
+
+payment trace span:
+  checkout-abc waited 8.2 s on provider authorization
+
+queue metric:
+  order-confirmation depth rose from 20 to 1400
+
+order event store:
+  order_confirmed was never emitted for order-42
+
+payment record:
+  pay:order-42 authorized
 </code></pre></div>
 
-<p>Now change the situation. The database slows down for thirty minutes. Workers can finish only 100 jobs per minute, but clients are adding 300 jobs per minute.</p>
-<div class="codehilite"><pre><span></span><code>sustained overload:
-  arrivals: 300/min
-  completions: 100/min
-  queue growth: 200/min
+<p>No one signal is the whole truth. The log gives a local fact. The trace connects timing across services. The metric shows aggregate pressure. The event store shows whether a durable business transition happened. The payment record shows a side effect that the order path must reconcile.</p>
+<p>Joined together, those facts tell a useful story: the user request reached the system, payment probably succeeded, the order confirmation path did not complete, and the queue was under pressure. That is much better than "checkout failed."</p>
+<h2>Signals And What They Answer</h2>
+<p>Distributed debugging becomes easier when each signal has a job.</p>
+<p><strong>Logs</strong> record local facts. A good log line says what happened at one component with enough identity and context to join it later. Logs are poor when they are anonymous, overly verbose, or filled with messages that do not name the operation.</p>
+<p><strong>Metrics</strong> summarize behavior over time. They answer questions like "is latency rising?", "is queue depth growing?", and "are errors increasing?" Metrics are good for trends and alerts. They are not enough to explain one specific user journey.</p>
+<p><strong>Traces</strong> connect work across boundaries. A trace can show that a checkout spent 100 ms in web code, 8.2 seconds waiting on payment, 300 ms in inventory, and never reached the email worker. Traces are strongest when ids survive service calls, queues, retries, and async jobs.</p>
+<p><strong>Events and durable records</strong> show business transitions. They answer questions like "did payment authorize?", "did the order get confirmed?", and "did the repair job run?" In many incidents, the missing event is as important as the events that exist.</p>
+<p>The mechanism is correlation. Related facts need stable identifiers so a human or tool can join them:</p>
+<div class="codehilite"><pre><span></span><code>request id: follows one attempt
+operation id: follows one logical side effect
+order id: follows the business object
+trace id: follows a path through services
 </code></pre></div>
 
-<p>The queue no longer represents resilience. It represents unkept promises. Jobs get older. Clients time out. Callers retry. Workers hold connections longer. The database receives more pressure from repeated attempts. A buffer that absorbed variation becomes storage for failure.</p>
-<p>That is the first useful mental model: queues are good shock absorbers and bad capacity plans.</p>
-<h2>Controls That Apply Pressure Back</h2>
-<p>Backpressure is not one mechanism. It is a family of controls that keep demand closer to capacity.</p>
-<p><strong>Admission control</strong> decides whether new work is allowed in. If the queue is too deep or the dependency is unhealthy, the system can reject early instead of accepting work it probably cannot finish.</p>
-<p><strong>Concurrency limits</strong> cap how many requests, jobs, or database operations run at once. This protects a dependency from being flooded by every caller at the same time.</p>
-<p><strong>Rate limits</strong> bound how quickly a caller, tenant, user, or service may send work. They make overload less likely to be caused by one noisy source.</p>
-<p><strong>Load shedding</strong> drops or degrades lower-priority work to preserve critical paths. A checkout might skip recommendations before it fails payment authorization.</p>
-<p><strong>Retry budgets</strong> limit how much extra traffic retries may create. A retry can help with a temporary error. A retry storm can double or triple load during the exact moment when the system is weakest.</p>
-<p>The controls work best when they are tied to product priorities:</p>
-<div class="codehilite"><pre><span></span><code>preserve:
-  payment commit
-  order receipt
-  account security action
-
-degrade first:
-  recommendations
-  analytics enrichment
-  noncritical notifications
-</code></pre></div>
-
-<p>This is why overload policy is not only infrastructure. It decides which promises survive pressure.</p>
-<h2>Cascading Failure</h2>
-<p>A <strong>cascading failure</strong> happens when one overloaded part causes other parts to overload too.</p>
-<p>Consider this path:</p>
-<div class="codehilite"><pre><span></span><code>API -&gt; payment service -&gt; provider
-</code></pre></div>
-
-<p>The provider becomes slow. Payment requests take longer. API threads wait longer. Users time out and retry. Each retry creates another payment attempt or status check. Payment workers spend more time on work that may already be stale. The provider receives even more traffic. Soon the API, payment service, and provider are all under stress.</p>
-<p>The original problem may have been one slow dependency. The cascade comes from the feedback loop:</p>
-<div class="codehilite"><pre><span></span><code>slow dependency
-  -&gt; longer waits
-  -&gt; caller timeouts
-  -&gt; retries
-  -&gt; more load
-  -&gt; even slower dependency
-</code></pre></div>
-
-<p>Backpressure breaks that loop. It can stop new work, cap concurrency, return a clear retry-after response, shed optional work, or move the workflow into a pending state with repair. The response may be less pleasant than success, but it is better than letting every path fail together.</p>
-<h2>Designing Overload Behavior</h2>
-<p>A healthy overload design names behavior before the incident.</p>
-<p>For each important path, ask:</p>
+<p>Those ids are different on purpose. A retry may have a new request id but the same payment operation id. Treating every id as interchangeable makes the investigation harder.</p>
+<h2>Instrument The Workflow, Not Just The Code</h2>
+<p>A common mistake is instrumenting each service in isolation. The service may look healthy while the workflow is broken. The right starting point is the promise the user experiences.</p>
+<p>For checkout, future-you needs to answer:</p>
 <ul>
-<li>What is the capacity limit we are protecting?</li>
-<li>Which work is highest priority?</li>
-<li>Which work can be delayed?</li>
-<li>Which work becomes worthless after a deadline?</li>
-<li>Which callers may retry, and how much?</li>
-<li>What response should users see when admission closes?</li>
+<li>Did the request reach the edge?</li>
+<li>Which order and payment operation were attached?</li>
+<li>Which dependency consumed the latency budget?</li>
+<li>Did the payment side effect happen?</li>
+<li>Did the order record get written?</li>
+<li>Did a confirmation event leave the synchronous path?</li>
+<li>What response did the user receive?</li>
 </ul>
-<p>Deadlines matter because old work can become harmful. Sending a confirmation email two seconds late may be fine. Charging a stale payment attempt after the user has canceled may not be. A queue should know when work has expired.</p>
-<p>Recovery also needs a policy. When load drops, the system should not instantly reopen every gate and recreate the overload. It may drain useful work, discard expired work, ramp admission gradually, and keep lower-priority features degraded until core paths are stable.</p>
-<p>Good backpressure makes overload visible. Metrics such as queue age, queue depth, concurrency, rejection rate, retry rate, and deadline expiration show whether the system is protecting itself or merely delaying collapse.</p>
-<h2>Failure Modes And Trade-offs</h2>
-<p>The representative failure is accepting too much work. The system tries to be available by saying yes, but it accumulates so much delayed work that eventually it cannot serve anything well.</p>
-<p>Another failure is unbounded retries. Callers trying to be helpful multiply the work. Without jitter, budgets, and deadlines, many callers retry together and turn a slowdown into a surge.</p>
-<p>A third failure is shedding the wrong work. If optional background jobs keep running while checkout fails, the system is preserving the wrong promise. Priority should be explicit, tested, and visible in dashboards.</p>
-<p>The trade-off is between completeness and survival under pressure. Serving every request at full fidelity is ideal when capacity exists. Under overload, a smaller honest promise can be more correct: reject early, degrade optional work, preserve critical state transitions, and repair later when necessary.</p>
-<h2>Practice Prompt</h2>
-<p>Pick one path: checkout, search, login, video upload, report generation, notification send, or background import. Fill in these lines:</p>
-<div class="codehilite"><pre><span></span><code>protected dependency:
-normal capacity:
-overload signal:
-admission rule:
-work to preserve:
-work to shed or degrade:
-retry budget:
-deadline or expiration rule:
-recovery rule:
+<p>Those questions tell you where evidence must exist. A queue boundary needs to preserve correlation ids. A background worker needs to link back to the order and operation. A retry needs to record whether it is a new attempt or the same logical action. A repair path needs to leave evidence that it ran.</p>
+<p>Absence needs design too. If an <code>order_confirmed</code> event never appears, the system should make that absence queryable. Otherwise the investigation becomes guesswork: did the event fail to emit, sit in a queue, get dropped, or use a different name?</p>
+<h2>Debugging As Timeline Building</h2>
+<p>When an incident happens, the first useful artifact is often a timeline:</p>
+<div class="codehilite"><pre><span></span><code>12:00:01.000  web received checkout-abc
+12:00:01.080  inventory reserved item sku-9
+12:00:01.120  payment authorization started pay:order-42
+12:00:09.340  payment provider accepted
+12:00:09.500  web timeout already returned error
+12:00:10.000  order_confirmed missing
+12:00:11.000  repair job scheduled
 </code></pre></div>
 
-<p>If the answer says "queue everything," add the point where the system stops accepting work that can no longer keep its promise.</p>
+<p>The timestamps do not have to be perfect proof of causality. Earlier lessons covered why clocks can drift. The timeline is still useful because it organizes local evidence and exposes missing links.</p>
+<p>A good timeline separates facts from guesses. "Payment provider accepted" is a fact if it comes from a durable payment record. "The user probably retried because the page errored" is an inference unless there is a second request tied to the same order. This separation keeps the debugging process honest.</p>
+<p>The same discipline helps during design review. Ask: if this workflow fails in the middle, could someone reconstruct the product story from retained evidence without asking the original engineer to narrate it?</p>
+<h2>Failure Modes And Trade-offs</h2>
+<p>The representative failure is every service looking healthy while the user path is broken. CPU is fine. Error rate is low. But a queue is backing up, retries are stretching latency, a downstream provider is slow, and the workflow never emits its final event.</p>
+<p>Another failure is losing identity at a boundary. A synchronous request has a trace id, but the queued job starts with a fresh anonymous id. The incident splits into two unconnected stories.</p>
+<p>Observability can also fail by excess. Too many high-cardinality labels can make metrics expensive. Too much logging can leak sensitive data or drown useful facts. Sampling can hide rare but important failures. Retaining every payload forever is rarely acceptable.</p>
+<p>The trade-off is to preserve evidence for the questions that matter most: user-visible promises, side effects, ownership boundaries, retries, queues, and repair paths. Everything else should earn its cost.</p>
+<h2>Practice Prompt</h2>
+<p>Pick one workflow: checkout, password reset, file upload, message send, seat booking, or account deletion. Fill in these lines:</p>
+<div class="codehilite"><pre><span></span><code>user-visible promise:
+stable business id:
+operation ids:
+places work crosses a boundary:
+logs needed:
+metrics needed:
+trace spans needed:
+durable events or records:
+missing fact that must be queryable:
+</code></pre></div>
+
+<p>If an async worker, queue, retry, or repair job cannot be tied back to the original promise, add the missing identity before the incident happens.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] <a href="https://sre.google/sre-book/handling-overload/">Site Reliability Engineering: Handling Overload</a><ul>
-<li>Focus: Load shedding, graceful degradation, and practical overload behavior.</li>
+<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry: Signals</a><ul>
+<li>Focus: How traces, metrics, logs, and related signals fit together.</li>
 </ul>
 </li>
-<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">Using Load Shedding to Avoid Overload</a><ul>
-<li>Focus: How to reject or shed work before saturation becomes collapse.</li>
+<li>[PAPER] <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</a><ul>
+<li>Focus: Why distributed tracing exists and how request paths are reconstructed across services.</li>
 </ul>
 </li>
-<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
-<li>Focus: Retry budgets, backoff, jitter, and their connection to overload.</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Site Reliability Engineering: Monitoring Distributed Systems</a><ul>
+<li>Focus: Practical monitoring signals, alerting, and the limits of summaries.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Backpressure protects limited capacity by slowing, rejecting, or degrading incoming work.</li>
-<li>Queues smooth short bursts, but sustained queue growth is evidence of an unkept promise.</li>
-<li>Cascading failure often comes from feedback loops: slow dependencies, timeouts, retries, and more load.</li>
-<li>Overload policy is a product decision because it chooses which promises survive under pressure.</li>
+<li>Observability is the ability to reconstruct distributed behavior from retained evidence.</li>
+<li>Logs, metrics, traces, and durable events answer different questions and need shared identity.</li>
+<li>Instrument workflows around user-visible promises, side effects, queues, retries, and repair paths.</li>
+<li>More telemetry is not automatically better; the trade-off is preserving useful evidence without creating noise, cost, or privacy risk.</li>
 </ul>
 </section>
 
@@ -202,14 +198,14 @@ recovery rule:
   
   <a class="nav-card" href="010.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Observability and Debugging Distributed Systems</strong>
+    <strong>Gossip, Membership, and Dissemination</strong>
   </a>
   
 
   
   <a class="nav-card" href="012.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Schemas, Contracts, and Versioned Messages</strong>
+    <strong>Backpressure, Load, and Cascading Failure</strong>
   </a>
   
 </section>
@@ -224,7 +220,7 @@ recovery rule:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 07:41 UTC | @jepemo | Built with
+        Generated on 2026-06-19 12:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

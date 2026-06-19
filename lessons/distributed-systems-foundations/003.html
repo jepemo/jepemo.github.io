@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Fault Tolerance, Retries, and Idempotency - @jepemo</title>
+    <title>Network Boundaries, Latency, and Partial Failure - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
@@ -54,7 +54,7 @@
 
     <main class="lesson-page">
       
-<h1>Fault Tolerance, Retries, and Idempotency</h1>
+<h1>Network Boundaries, Latency, and Partial Failure</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -77,138 +77,108 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Fault Tolerance, Retries, and Idempotency</h1>
+  <h1>Network Boundaries, Latency, and Partial Failure</h1>
 <h2>Core Insight</h2>
-<p>Imagine buying a book online. You press <strong>Pay</strong> once. The page waits, then says something went wrong. Behind the page, the payment service may already have sent the charge to the card provider. What should the store do now?</p>
-<p>If it blindly sends a second charge, the customer may pay twice. If it never tries again, the order may stay stuck even though the customer still wanted the book. The system has to preserve one user-visible promise while the evidence is incomplete: one customer intent should produce at most one successful charge.</p>
-<p>That is the practical meaning of fault tolerance in this lesson. <strong>Fault tolerance</strong> means the workflow keeps its important promise when ordinary faults happen: timeouts, process restarts, duplicate messages, lost responses, slow queues, or late provider callbacks.</p>
-<p>The key mechanism is <strong>idempotency</strong>. An operation is idempotent when repeating the same logical request does not repeat the side effect. For a payment, a retry with the same idempotency key should continue or return the original payment attempt, not create a second charge.</p>
-<p>Retries are therefore useful only when they are part of a larger policy. The system needs stable operation identity, receiver-side memory, bounded retry behavior, and a repair path for cases that cannot finish inside the live request.</p>
-<h2>From Timeout To Policy</h2>
-<p>Use a checkout flow as the worked example. The customer submits order <code>order-42</code>. The gateway asks the payment service to authorize the card. The payment service calls the external provider. The provider accepts the charge, but the response back to the gateway arrives too late.</p>
-<div class="codehilite"><pre><span></span><code>customer intent:
-  buy order-42 once
-
-gateway:
-  -&gt; payment service: authorize order-42
-  &lt;- ? timeout
-
-payment service:
-  -&gt; provider: charge card
-  &lt;- provider: accepted
-  -&gt; local record: order-42 charged
+<p>Imagine changing your display name in an app. You press <strong>Save</strong>, wait for a second, and the page says the update failed. A few moments later you refresh, and the new name is there. The product seemed to give two answers: "it failed" and "it worked."</p>
+<p>That confusion is the first important lesson about a network boundary. A boundary appears when one part of a system must send a message to another independent part instead of calling local code in the same process. The caller can observe its own request, timer, and response. It cannot directly observe the remote service's memory, disk, queue, clock, or crash state.</p>
+<p>The hard part is not just that networks are slower than local calls. The hard part is that late or missing messages create uncertainty. A timeout tells the caller, "I stopped waiting." It does not prove that the remote operation never happened.</p>
+<p>This is where two terms become useful. <strong>Latency</strong> is the time it takes for a request, response, or message to travel through the system and be handled. <strong>Partial failure</strong> means some parts of the system are slow, isolated, overloaded, or broken while other parts keep running. A good distributed design gives that uncertain middle state a name and a safe next step.</p>
+<h2>Follow The Message</h2>
+<p>Use the profile update as a small worked example. The browser sends a request to a gateway. The gateway asks the profile service to update the display name. The profile service writes the new value to its database and tries to return success.</p>
+<p>On the happy path, the story is easy:</p>
+<div class="codehilite"><pre><span></span><code>browser -&gt; gateway: save display name
+gateway -&gt; profile: update name for user-17
+profile -&gt; database: write version 52
+profile -&gt; gateway: success
+gateway -&gt; browser: saved
 </code></pre></div>
 
-<p>From the gateway's local view, the request did not produce a timely answer. From the payment service's local view, the charge may already be successful. From the customer's view, the store should not turn uncertainty into either a duplicate charge or a lost order.</p>
-<p>A safer design gives the payment attempt a stable identity:</p>
-<div class="codehilite"><pre><span></span><code>idempotency key: pay:order-42
+<p>Now slow the link between the gateway and the profile service. The profile service may still write the database row, but the response may arrive after the gateway's timer expires.</p>
+<div class="codehilite"><pre><span></span><code>gateway -&gt; profile: update name, op-413
+gateway &lt;- ?       response is late
 
-attempt 1:
-  gateway -&gt; payment service: authorize, key=pay:order-42
-  gateway &lt;- timeout
+gateway local fact:
+  &quot;I sent op-413 and stopped waiting after 800 ms.&quot;
 
-attempt 2:
-  gateway -&gt; payment service: authorize, key=pay:order-42
-
-receiver behavior:
-  if key is new: start the operation and store the key
-  if key succeeded: return the stored result
-  if key is still running: return pending
-  if key was reused with different details: reject it
+possible remote truths:
+  request never arrived
+  request is queued
+  update was written
+  update was written but the response was lost
+  profile service is healthy but slow
+  profile service is overloaded
 </code></pre></div>
 
-<p>The idempotency key does not make the network reliable. It gives the receiver a way to see that two messages represent one logical intent.</p>
-<h2>Idempotency As A Contract</h2>
-<p>Idempotency is a contract between caller and receiver. The caller promises to reuse the same key for repeated attempts of the same logical operation. The receiver promises to check durable state before applying the side effect again.</p>
-<p>For payments, the side effect is the charge. For a message system, it might be delivering one message to one conversation. For a seat booking system, it might be reserving one seat. The identity should match the promise. A key such as <code>pay:order-42</code> is useful because it names the payment attempt for one order. A random per-attempt request id is not enough.</p>
-<p>This distinction matters:</p>
-<div class="codehilite"><pre><span></span><code>trace id:
-  useful for following one attempt through logs
-  may change on each retry
+<p>None of those remote truths is the same as the gateway's local fact. The gateway knows that it waited too long. It does not know which remote truth is real until more evidence arrives.</p>
+<p>That distinction protects the design from a common mistake: treating a remote call like a slow local function call. A local function usually returns or raises in the caller's process. A remote call crosses a place where work can continue after the caller gives up waiting.</p>
+<h2>Timeout As A Product Decision</h2>
+<p>A <strong>timeout</strong> is a rule for how long a caller waits before choosing another behavior. It is not only a technical setting. It is part of the product promise because it shapes what the user sees.</p>
+<p>If the timeout is too short, normal slow requests look like failures. If it is too long, one slow dependency can tie up threads, connections, memory, or workers until unrelated requests begin to fail. The trade-off is between waiting longer for clearer evidence and moving sooner to protect the rest of the system.</p>
+<p>Good timeouts use a latency budget. A <strong>latency budget</strong> is the amount of time the whole request can spend before the product experience becomes unacceptable. Each hop spends part of that budget.</p>
+<div class="codehilite"><pre><span></span><code>profile save budget: 2000 ms
 
-idempotency key:
-  useful for preserving one logical operation
-  must stay the same across retries of that operation
+browser and gateway work:       150 ms
+profile service timeout:        700 ms
+read-after-timeout check:       250 ms
+render response:                100 ms
+reserved slack and network:     800 ms
 </code></pre></div>
 
-<p>The receiver also needs to remember enough about the original request. If a client reuses <code>pay:order-42</code> but changes the amount or currency, the service should reject the duplicate instead of treating it as the same payment. Otherwise the key can hide a real conflict.</p>
-<p>Idempotency also has a lifetime. Keeping keys forever may be expensive. Expiring them too early may let a late retry create a duplicate side effect. The right retention window depends on how long retries, callbacks, queues, and human repair can continue.</p>
-<h2>Retry Policy</h2>
-<p>Retries recover from temporary faults. They also add load at the exact moment when a dependency may already be slow. A retry policy must therefore answer four questions.</p>
-<ul>
-<li>Identity: how does the receiver know this is the same logical operation?</li>
-<li>Budget: how many attempts fit inside the user-facing deadline?</li>
-<li>Spacing: how do callers avoid retrying at the same instant?</li>
-<li>Meaning: what does the product show while the result is unknown?</li>
-</ul>
-<p>Backoff helps with spacing by waiting longer between attempts. Jitter helps by adding small randomness so many callers do not retry in lockstep. A deadline stops stale work from continuing after the result is no longer useful to the product.</p>
-<div class="codehilite"><pre><span></span><code>payment deadline: 3 seconds
+<p>The exact numbers are less important than the habit. The gateway should not give every downstream dependency the full two seconds. If it does, the total path can exceed the user-facing budget and create more waiting than the product can afford.</p>
+<p>Deadlines are one way to carry this idea through a request. A deadline says, "This whole operation is no longer useful after this time." Downstream services can then stop starting expensive work when the answer would arrive too late to help.</p>
+<h2>Designing The Unknown State</h2>
+<p>When the result is unknown, the system needs policy, not guesswork. Four small design choices make the profile example much easier to reason about.</p>
+<p>First, give the operation a stable identity. The gateway can send <code>op-413</code> with every attempt to update the display name. That identity lets the profile service recognize repeated attempts as the same logical action.</p>
+<p>Second, name the owner of the official fact. If the profile service owns display names, the gateway should not invent a final answer that contradicts the profile service's durable record. The gateway can report uncertainty, ask again, or schedule repair, but it should respect the owner.</p>
+<p>Third, expose an honest intermediate state. A state such as <code>save_pending</code> or <code>checking_profile_update</code> is more accurate than a boolean that can only say <code>success</code> or <code>failed</code>. The user interface does not need to expose internal jargon, but the system needs a name for the condition.</p>
+<p>Fourth, keep enough evidence to repair. Logs, operation records, version numbers, and retry records help the system answer later: did operation <code>op-413</code> write version 52, fail safely, or remain unprocessed?</p>
+<p>The pattern looks like this:</p>
+<div class="codehilite"><pre><span></span><code>if response arrives in time:
+  show saved
 
-attempt 1 at 0 ms
-attempt 2 after 200 ms plus jitter
-attempt 3 after 600 ms plus jitter
-then stop live retries and mark payment_pending
+if timeout expires:
+  record outcome_unknown for op-413
+  check the owner or retry with the same operation id
+  show pending or a recoverable message
 </code></pre></div>
 
-<p>This policy makes a trade-off explicit. The system tries to complete temporary failures quickly, but it does not let retries grow without bound. If the payment remains uncertain after the deadline, the workflow moves into a repairable state instead of pretending that the answer is known.</p>
-<h2>Repair When The Live Path Cannot Finish</h2>
-<p>Some failures last longer than a web request. The user may close the page. The provider callback may arrive minutes later. A worker may restart after writing one record but before publishing the next event.</p>
-<p>That is why fault-tolerant workflows need durable states. A state such as <code>payment_pending</code> or <code>needs_reconciliation</code> tells the system that the operation is neither lost nor complete. It is waiting for more evidence.</p>
-<p>One simple state machine might look like this:</p>
-<div class="codehilite"><pre><span></span><code>new
-  -&gt; authorizing
-  -&gt; charged
-  -&gt; order_confirmed
-
-authorizing
-  -&gt; payment_pending
-  -&gt; failed_safely
-
-payment_pending
-  -&gt; charged
-  -&gt; failed_safely
-  -&gt; needs_human_review
-</code></pre></div>
-
-<p>The exact names depend on the product. The useful habit is separating product state from evidence state. "The gateway timed out" is evidence. It is not the same as "the payment failed." "The provider accepted the charge" is evidence. It still needs to be joined with order state before the customer promise is complete.</p>
-<p>Reconciliation is the repair loop that joins those pieces later. It may ask the payment service for the final status, read provider receipts, compare order records, and choose the next safe transition. Repair is not a failure of design. It is how the design admits that distributed evidence can arrive late.</p>
-<h2>Failure Modes And Trade-offs</h2>
-<p>The first failure mode is duplicate side effects. Retrying an operation without a stable identity can repeat the work that matters most: charging a card, sending an email, booking a seat, or creating a shipment.</p>
-<p>The second failure mode is a retry storm. If many callers time out and immediately retry, they can multiply traffic against the dependency that is already struggling. Backoff, jitter, deadlines, and circuit breakers reduce this risk, but they do not replace a clear product policy.</p>
-<p>The third failure mode is hiding uncertainty behind a boolean. A field such as <code>paid=true</code> or <code>paid=false</code> may be too small for a workflow that can be authorizing, charged but not confirmed, failed safely, waiting for provider evidence, or under review.</p>
-<p>The main trade-off is between responsiveness and certainty. Waiting for stronger evidence can reduce ambiguity, but it may make the product feel slow or unavailable. Showing <code>pending</code> quickly keeps the interface responsive, but it requires honest repair and communication. Rejecting new work during overload protects capacity, but it reduces availability. The right choice depends on which promise would be most costly to break.</p>
+<p>The important part is not this exact policy. The important part is that the system does not confuse "I lack an answer" with "the operation did not happen."</p>
+<h2>Partial Failure In Practice</h2>
+<p>Partial failure is harder than total failure because the system still has enough working pieces to make decisions. A dead process is often obvious. A slow queue, stuck connection pool, isolated region, overloaded database, stale cache, or one-way network path can be much harder to interpret.</p>
+<p>One observer may see health checks pass while another sees user-facing timeouts. One service may keep accepting work while another cannot read the result. A queue may store messages correctly while workers fall behind. The product is still alive, but its parts no longer agree on what has happened.</p>
+<p>That is why distributed systems use defensive boundaries. A caller should have a timeout. A receiver should handle duplicate messages. A workflow should store operation identity. A product should have a pending or degraded state when certainty is not available yet.</p>
+<p>These choices do not remove failure. They stop ordinary failure from turning into accidental behavior.</p>
 <h2>Practice Prompt</h2>
-<p>Pick one workflow with a visible side effect: charging a card, sending a notification, creating an account, reserving a seat, or submitting a form. Write these lines:</p>
-<div class="codehilite"><pre><span></span><code>user-visible promise:
-side effect owner:
-idempotency key:
-retry budget:
-state after live retries stop:
-repair evidence:
+<p>Take a feature such as saving a profile, sending a chat message, booking a seat, or uploading a file. Write five short lines:</p>
+<div class="codehilite"><pre><span></span><code>operation:
+owner of the official state:
+caller timeout:
+what the timeout proves:
+state shown while the result is unknown:
 </code></pre></div>
 
-<p>If the idempotency key changes on every attempt, it is not protecting the logical operation. If the state after retries is only <code>failed</code>, ask whether the system really knows that the side effect did not happen.</p>
+<p>If the fourth line says anything stronger than "the caller stopped waiting," revise it. That is the mental move this lesson is meant to build.</p>
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
-<li>Focus: How retries, backoff, jitter, and timeouts interact during overload.</li>
+<li>[ARTICLE] <a href="https://www.somethingsimilar.com/2013/01/14/notes-on-distributed-systems-for-young-bloods/">Notes on Distributed Systems for Young Bloods</a><ul>
+<li>Focus: Practical framing for latency, failure, and uncertainty in distributed systems.</li>
 </ul>
 </li>
-<li>[DOC] <a href="https://docs.stripe.com/api/idempotent_requests">Stripe API: Idempotent Requests</a><ul>
-<li>Focus: A practical example of idempotency keys for safely retrying side-effecting API calls.</li>
+<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
+<li>Focus: How timeout and retry choices interact with overload and tail latency.</li>
 </ul>
 </li>
 <li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Reliability, fault tolerance, and the difference between local evidence and distributed truth.</li>
+<li>Focus: The chapters on reliability, replication, and the limits of local reasoning in distributed data systems.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Fault tolerance protects a user-visible promise when ordinary faults interrupt the happy path.</li>
-<li>Retries are safe only when the receiver can recognize repeated attempts as one logical operation.</li>
-<li>Idempotency needs durable receiver-side records, not just a random request id.</li>
-<li>When live retries cannot finish, named pending states and reconciliation preserve the workflow without pretending certainty.</li>
+<li>A network boundary turns a call into message exchange with incomplete evidence.</li>
+<li>A timeout proves that the caller stopped waiting; it does not prove what the remote service did.</li>
+<li>Latency must be treated as a distribution, because slow tail requests often shape incidents.</li>
+<li>Partial failure needs named states, operation evidence, and repair paths instead of guessed outcomes.</li>
 </ul>
 </section>
 
@@ -216,14 +186,14 @@ repair evidence:
   
   <a class="nav-card" href="002.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Network Boundaries, Latency, and Partial Failure</strong>
+    <strong>What Makes a System Distributed</strong>
   </a>
   
 
   
   <a class="nav-card" href="004.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Consensus, Quorums, and Coordination</strong>
+    <strong>Fault Tolerance, Retries, and Idempotency</strong>
   </a>
   
 </section>
@@ -238,7 +208,7 @@ repair evidence:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 07:41 UTC | @jepemo | Built with
+        Generated on 2026-06-19 12:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Schemas, Contracts, and Versioned Messages - @jepemo</title>
+    <title>Backpressure, Load, and Cascading Failure - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
@@ -54,7 +54,7 @@
 
     <main class="lesson-page">
       
-<h1>Schemas, Contracts, and Versioned Messages</h1>
+<h1>Backpressure, Load, and Cascading Failure</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -77,117 +77,124 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Schemas, Contracts, and Versioned Messages</h1>
+  <h1>Backpressure, Load, and Cascading Failure</h1>
 <h2>Core Insight</h2>
-<p>Imagine an <code>order_created</code> event. The order service deploys a new version at 10:00. The invoice service will not deploy until 10:20. For twenty minutes, the system contains old consumers, new producers, old messages in queues, and new messages being written.</p>
-<p>If the new producer sends a shape that the old invoice service cannot read, the rollout breaks even though every service may look healthy on its own. The failure is not a CPU problem or a network problem. It is a contract problem.</p>
-<p>A <strong>message contract</strong> is the agreement that lets independently deployed participants keep understanding one another while they evolve. A <strong>schema</strong> describes the shape of a message: field names, types, optional fields, required fields, and sometimes defaults. A <strong>compatibility rule</strong> says which old and new participants can safely coexist.</p>
-<p>The trade-off is that safe evolution often turns one desired change into several releases. That feels slower than changing everything at once. It is also what lets a distributed system stay alive while different parts move at different times.</p>
-<h2>A Mixed-Version Rollout</h2>
-<p>Use an <code>order_created</code> event as the worked example.</p>
-<p>Version 1 contains two fields:</p>
-<div class="codehilite"><pre><span></span><code>order_created v1:
-  order_id
-  total
+<p>Imagine a cafe kitchen that can cook 100 meals per hour. One day 300 orders arrive in an hour. If the cashier keeps accepting every order with a cheerful promise, the kitchen has not become more capable. It has created a growing pile of commitments it cannot keep.</p>
+<p>Distributed systems behave the same way under overload. A queue, worker pool, database, or downstream API has finite capacity. If callers keep adding work faster than the system can finish it, latency rises, timeouts start, retries multiply, and a local slowdown can become a system-wide failure.</p>
+<p><strong>Backpressure</strong> is how a system signals that incoming work must slow down before overload spreads. It may reject work, delay work, reduce concurrency, return <code>429</code>, ask a producer to send fewer items, shed optional features, or degrade to a smaller response.</p>
+<p>The goal is not to avoid every error. The goal is to preserve the most important promises when capacity is limited. The trade-off is uncomfortable: refusing or degrading some work early can be more reliable than accepting everything and collapsing later.</p>
+<h2>When A Queue Stops Helping</h2>
+<p>Use a worker queue that writes to a database:</p>
+<div class="codehilite"><pre><span></span><code>clients -&gt; API -&gt; queue -&gt; workers -&gt; database
 </code></pre></div>
 
-<p>The team wants version 2 to include currency:</p>
-<div class="codehilite"><pre><span></span><code>order_created v2:
-  order_id
-  total
-  currency
+<p>At first, the queue is helpful. If clients send a short burst of requests, the queue smooths the burst and workers catch up.</p>
+<div class="codehilite"><pre><span></span><code>brief burst:
+  arrival rate &gt; service rate for 10 seconds
+  queue grows briefly
+  workers catch up
 </code></pre></div>
 
-<p>Adding <code>currency</code> can be safe if three things are true:</p>
+<p>Now change the situation. The database slows down for thirty minutes. Workers can finish only 100 jobs per minute, but clients are adding 300 jobs per minute.</p>
+<div class="codehilite"><pre><span></span><code>sustained overload:
+  arrivals: 300/min
+  completions: 100/min
+  queue growth: 200/min
+</code></pre></div>
+
+<p>The queue no longer represents resilience. It represents unkept promises. Jobs get older. Clients time out. Callers retry. Workers hold connections longer. The database receives more pressure from repeated attempts. A buffer that absorbed variation becomes storage for failure.</p>
+<p>That is the first useful mental model: queues are good shock absorbers and bad capacity plans.</p>
+<h2>Controls That Apply Pressure Back</h2>
+<p>Backpressure is not one mechanism. It is a family of controls that keep demand closer to capacity.</p>
+<p><strong>Admission control</strong> decides whether new work is allowed in. If the queue is too deep or the dependency is unhealthy, the system can reject early instead of accepting work it probably cannot finish.</p>
+<p><strong>Concurrency limits</strong> cap how many requests, jobs, or database operations run at once. This protects a dependency from being flooded by every caller at the same time.</p>
+<p><strong>Rate limits</strong> bound how quickly a caller, tenant, user, or service may send work. They make overload less likely to be caused by one noisy source.</p>
+<p><strong>Load shedding</strong> drops or degrades lower-priority work to preserve critical paths. A checkout might skip recommendations before it fails payment authorization.</p>
+<p><strong>Retry budgets</strong> limit how much extra traffic retries may create. A retry can help with a temporary error. A retry storm can double or triple load during the exact moment when the system is weakest.</p>
+<p>The controls work best when they are tied to product priorities:</p>
+<div class="codehilite"><pre><span></span><code>preserve:
+  payment commit
+  order receipt
+  account security action
+
+degrade first:
+  recommendations
+  analytics enrichment
+  noncritical notifications
+</code></pre></div>
+
+<p>This is why overload policy is not only infrastructure. It decides which promises survive pressure.</p>
+<h2>Cascading Failure</h2>
+<p>A <strong>cascading failure</strong> happens when one overloaded part causes other parts to overload too.</p>
+<p>Consider this path:</p>
+<div class="codehilite"><pre><span></span><code>API -&gt; payment service -&gt; provider
+</code></pre></div>
+
+<p>The provider becomes slow. Payment requests take longer. API threads wait longer. Users time out and retry. Each retry creates another payment attempt or status check. Payment workers spend more time on work that may already be stale. The provider receives even more traffic. Soon the API, payment service, and provider are all under stress.</p>
+<p>The original problem may have been one slow dependency. The cascade comes from the feedback loop:</p>
+<div class="codehilite"><pre><span></span><code>slow dependency
+  -&gt; longer waits
+  -&gt; caller timeouts
+  -&gt; retries
+  -&gt; more load
+  -&gt; even slower dependency
+</code></pre></div>
+
+<p>Backpressure breaks that loop. It can stop new work, cap concurrency, return a clear retry-after response, shed optional work, or move the workflow into a pending state with repair. The response may be less pleasant than success, but it is better than letting every path fail together.</p>
+<h2>Designing Overload Behavior</h2>
+<p>A healthy overload design names behavior before the incident.</p>
+<p>For each important path, ask:</p>
 <ul>
-<li>old consumers ignore unknown optional fields;</li>
-<li>new consumers can still read old messages without <code>currency</code>;</li>
-<li>producers do not make <code>currency</code> mandatory before the fleet is ready.</li>
+<li>What is the capacity limit we are protecting?</li>
+<li>Which work is highest priority?</li>
+<li>Which work can be delayed?</li>
+<li>Which work becomes worthless after a deadline?</li>
+<li>Which callers may retry, and how much?</li>
+<li>What response should users see when admission closes?</li>
 </ul>
-<p>The same change becomes unsafe if the old consumer rejects unknown fields, if the new consumer assumes <code>currency</code> always exists, or if the producer silently changes the meaning of <code>total</code>.</p>
-<p>The important deployment question is:</p>
-<div class="codehilite"><pre><span></span><code>Which combinations of old and new producers,
-old and new consumers,
-and old and new messages
-must coexist safely?
-</code></pre></div>
-
-<p>That question matters because messages are not always read immediately. They can sit in queues, be retried after a deploy, move to a dead-letter queue, or be replayed months later during recovery.</p>
-<h2>Shape Compatibility And Meaning Compatibility</h2>
-<p>Schema tools are good at checking shape. They can often tell whether a field was removed, whether a type changed, whether a required field has no default, or whether a reader can ignore a new optional field.</p>
-<p>Shape is not the whole contract.</p>
-<p>Consider this change:</p>
-<div class="codehilite"><pre><span></span><code>before:
-  total = price before tax
-
-after:
-  total = price after tax
-</code></pre></div>
-
-<p>The field name and type stayed the same. A schema checker may be satisfied. The invoice service may still produce the wrong invoice because the meaning changed under the same name.</p>
-<p>That is <strong>semantic compatibility</strong>. It asks whether old and new participants attach the same meaning to the message. Renaming a field can break shape. Reusing a field with changed meaning can break trust more quietly.</p>
-<p>A useful contract review separates the two:</p>
-<div class="codehilite"><pre><span></span><code>shape:
-  Can the reader parse the message?
-
-meaning:
-  Will the reader interpret the message correctly?
-</code></pre></div>
-
-<p>Both need to be true for safe evolution.</p>
-<h2>Rollout Order</h2>
-<p>A safe rollout usually prepares readers before writers depend on a new shape or meaning.</p>
-<p>For the <code>currency</code> change, the sequence might be:</p>
-<div class="codehilite"><pre><span></span><code>1. Deploy consumers that can read v1 and v2.
-2. Deploy producers that start sending currency.
-3. Wait until old messages have drained or remain readable.
-4. Make new behavior depend on currency only after the fleet is ready.
-5. Remove old compatibility code after the retention and replay window closes.
-</code></pre></div>
-
-<p>This sequence protects mixed-version operation. At each step, the system can still process messages produced by the previous step.</p>
-<p>The same idea applies to request/response APIs, event streams, database records, and command payloads. The slower and more asynchronous the workflow, the more important compatibility becomes. A synchronous HTTP caller usually meets a callee in the same moment. An event may be written today and interpreted by future code later.</p>
-<p>Version numbers help only when they are attached to real behavior. A field called <code>schema_version = 2</code> is useful if readers know what version 2 means and what old versions may still appear. It is not magic.</p>
+<p>Deadlines matter because old work can become harmful. Sending a confirmation email two seconds late may be fine. Charging a stale payment attempt after the user has canceled may not be. A queue should know when work has expired.</p>
+<p>Recovery also needs a policy. When load drops, the system should not instantly reopen every gate and recreate the overload. It may drain useful work, discard expired work, ramp admission gradually, and keep lower-priority features degraded until core paths are stable.</p>
+<p>Good backpressure makes overload visible. Metrics such as queue age, queue depth, concurrency, rejection rate, retry rate, and deadline expiration show whether the system is protecting itself or merely delaying collapse.</p>
 <h2>Failure Modes And Trade-offs</h2>
-<p>The representative failure is an old consumer rejecting a new message and stopping a pipeline. The message is valid to the new producer, but not survivable for the mixed fleet.</p>
-<p>A quieter failure is a new consumer assuming a field is always present before all old producers can send it. The rollout may work in staging, then fail when one older producer emits a v1 message from a retry or delayed queue.</p>
-<p>Another failure is semantic drift. Two teams use the same field name but no longer mean the same thing. These bugs can pass parsers, tests, and dashboards while corrupting business behavior.</p>
-<p>The trade-off is discipline versus speed. Compatibility slows some refactors, keeps deprecated fields alive longer, and forces rollout planning. The payoff is that services can deploy independently without turning every contract change into an all-at-once event.</p>
+<p>The representative failure is accepting too much work. The system tries to be available by saying yes, but it accumulates so much delayed work that eventually it cannot serve anything well.</p>
+<p>Another failure is unbounded retries. Callers trying to be helpful multiply the work. Without jitter, budgets, and deadlines, many callers retry together and turn a slowdown into a surge.</p>
+<p>A third failure is shedding the wrong work. If optional background jobs keep running while checkout fails, the system is preserving the wrong promise. Priority should be explicit, tested, and visible in dashboards.</p>
+<p>The trade-off is between completeness and survival under pressure. Serving every request at full fidelity is ideal when capacity exists. Under overload, a smaller honest promise can be more correct: reject early, degrade optional work, preserve critical state transitions, and repair later when necessary.</p>
 <h2>Practice Prompt</h2>
-<p>Pick one message or API payload: <code>order_created</code>, <code>user_updated</code>, <code>payment_authorized</code>, <code>inventory_reserved</code>, or <code>password_changed</code>. Fill in these lines:</p>
-<div class="codehilite"><pre><span></span><code>message:
-current required fields:
-current optional fields:
-proposed change:
-old consumer reading new message:
-new consumer reading old message:
-queued or replayed message risk:
-semantic meaning that must not change silently:
-safe rollout order:
+<p>Pick one path: checkout, search, login, video upload, report generation, notification send, or background import. Fill in these lines:</p>
+<div class="codehilite"><pre><span></span><code>protected dependency:
+normal capacity:
+overload signal:
+admission rule:
+work to preserve:
+work to shed or degrade:
+retry budget:
+deadline or expiration rule:
+recovery rule:
 </code></pre></div>
 
-<p>If you cannot say what old consumers will do with the new shape, the rollout is not ready.</p>
+<p>If the answer says "queue everything," add the point where the system stops accepting work that can no longer keep its promise.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://avro.apache.org/docs/current/specification/#schema-resolution">Apache Avro: Schema Resolution</a><ul>
-<li>Focus: How readers and writers with different schemas resolve fields and defaults.</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/handling-overload/">Site Reliability Engineering: Handling Overload</a><ul>
+<li>Focus: Load shedding, graceful degradation, and practical overload behavior.</li>
 </ul>
 </li>
-<li>[DOC] <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html">Confluent Schema Registry: Schema Evolution and Compatibility</a><ul>
-<li>Focus: Backward, forward, and full compatibility rules for event schemas.</li>
+<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">Using Load Shedding to Avoid Overload</a><ul>
+<li>Focus: How to reject or shed work before saturation becomes collapse.</li>
 </ul>
 </li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Schema evolution, data encoding, and compatibility across independently deployed systems.</li>
+<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
+<li>Focus: Retry budgets, backoff, jitter, and their connection to overload.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Message contracts let independently deployed services keep understanding one another while they evolve.</li>
-<li>Compatibility must cover mixed producers, mixed consumers, queued messages, retries, and replay.</li>
-<li>Shape compatibility is not enough; semantic meaning can break even when the schema parses.</li>
-<li>Safe rollout usually prepares readers before writers depend on a new message form.</li>
+<li>Backpressure protects limited capacity by slowing, rejecting, or degrading incoming work.</li>
+<li>Queues smooth short bursts, but sustained queue growth is evidence of an unkept promise.</li>
+<li>Cascading failure often comes from feedback loops: slow dependencies, timeouts, retries, and more load.</li>
+<li>Overload policy is a product decision because it chooses which promises survive under pressure.</li>
 </ul>
 </section>
 
@@ -195,14 +202,14 @@ safe rollout order:
   
   <a class="nav-card" href="011.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Backpressure, Load, and Cascading Failure</strong>
+    <strong>Observability and Debugging Distributed Systems</strong>
   </a>
   
 
   
   <a class="nav-card" href="013.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Degraded Modes, Playbooks, and Incident Evidence</strong>
+    <strong>Schemas, Contracts, and Versioned Messages</strong>
   </a>
   
 </section>
@@ -217,7 +224,7 @@ safe rollout order:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 07:41 UTC | @jepemo | Built with
+        Generated on 2026-06-19 12:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
