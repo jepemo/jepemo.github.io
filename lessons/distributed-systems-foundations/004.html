@@ -70,7 +70,7 @@
   <p><a href="../../tracks/distributed-systems-foundations.html">Distributed Systems Foundations</a></p>
   <div class="meta-strip">
     <span class="meta-chip">004</span>
-    <span class="meta-chip">20 min</span>
+    <span class="meta-chip">25 min</span>
     <span class="meta-chip">beginner</span>
     
   </div>
@@ -79,82 +79,152 @@
 <section class="stack-block lesson-content-shell">
   <h1>Fault Tolerance, Retries, and Idempotency</h1>
 <h2>Core Insight</h2>
-<p>Imagine buying a book online. You press <strong>Pay</strong> once. The page waits, then says something went wrong. Behind the page, the payment service may already have sent the charge to the card provider. What should the store do now?</p>
-<p>If it blindly sends a second charge, the customer may pay twice. If it never tries again, the order may stay stuck even though the customer still wanted the book. The system has to preserve one user-visible promise while the evidence is incomplete: one customer intent should produce at most one successful charge.</p>
-<p>That is the practical meaning of fault tolerance in this lesson. <strong>Fault tolerance</strong> means the workflow keeps its important promise when ordinary faults happen: timeouts, process restarts, duplicate messages, lost responses, slow queues, or late provider callbacks.</p>
-<p>The key mechanism is <strong>idempotency</strong>. An operation is idempotent when repeating the same logical request does not repeat the side effect. For a payment, a retry with the same idempotency key should continue or return the original payment attempt, not create a second charge.</p>
-<p>Retries are therefore useful only when they are part of a larger policy. The system needs stable operation identity, receiver-side memory, bounded retry behavior, and a repair path for cases that cannot finish inside the live request.</p>
-<h2>From Timeout To Policy</h2>
-<p>Use a checkout flow as the worked example. The customer submits order <code>order-42</code>. The gateway asks the payment service to authorize the card. The payment service calls the external provider. The provider accepts the charge, but the response back to the gateway arrives too late.</p>
+<p>Imagine buying a book online. You press <strong>Pay</strong> once. The page waits, then says the payment could not be confirmed. Behind the page, the payment service may already have sent the charge to the card provider. The provider may have accepted it. The response may have arrived late, been dropped, or reached a caller that had already stopped waiting.</p>
+<p>The store now has a dangerous choice. If it blindly sends another charge, the customer may pay twice. If it refuses to do anything else, the order may stay stuck even though the customer still wanted the book. The system must keep a product promise while evidence is incomplete: one customer intent should produce at most one successful charge, and the order should not disappear just because a response was late.</p>
+<p><strong>Fault tolerance</strong> means the workflow keeps its important promise when ordinary faults interrupt the happy path. The faults here are not exotic: timeout, process restart, duplicate message, lost response, slow queue, provider callback arriving late, or worker crash after writing one record.</p>
+<p>Retries are useful because many faults are temporary. Idempotency is what makes retries safe for side-effecting work. An operation is <strong>idempotent</strong> when repeating the same logical request does not repeat the side effect. For a payment, retrying <code>pay:order-42</code> should return or continue the same payment attempt, not create a fresh charge every time the caller gets nervous.</p>
+<h2>The Failure Window</h2>
+<p>Use a checkout workflow with one side effect: charging a card.</p>
 <div class="codehilite"><pre><span></span><code>customer intent:
   buy order-42 once
 
 gateway:
-  -&gt; payment service: authorize order-42
-  &lt;- ? timeout
+  receives Pay click
+  calls payment service
+  waits for response
 
 payment service:
-  -&gt; provider: charge card
-  &lt;- provider: accepted
-  -&gt; local record: order-42 charged
+  records payment attempt
+  calls external card provider
+  stores provider result
 </code></pre></div>
 
-<p>From the gateway's local view, the request did not produce a timely answer. From the payment service's local view, the charge may already be successful. From the customer's view, the store should not turn uncertainty into either a duplicate charge or a lost order.</p>
-<p>A safer design gives the payment attempt a stable identity:</p>
-<div class="codehilite"><pre><span></span><code>idempotency key: pay:order-42
+<p>The risky window is the gap between "the side effect may have happened" and "the caller received a reliable answer."</p>
+<div class="codehilite"><pre><span></span><code>gateway -&gt; payment: authorize order-42
+payment -&gt; provider: charge card
+provider -&gt; payment: accepted
+payment -&gt; database: store charged
 
-attempt 1:
-  gateway -&gt; payment service: authorize, key=pay:order-42
+gateway timeout fires before response arrives
+</code></pre></div>
+
+<p>The gateway's local fact is real: it did not receive a timely answer. The payment service's local fact may also be real: it charged the card and stored the result. A fault-tolerant design must protect both realities without inventing a global truth too early.</p>
+<p>A naive retry looks like this:</p>
+<div class="codehilite"><pre><span></span><code>attempt 1:
+  gateway -&gt; payment: charge order-42
   gateway &lt;- timeout
 
 attempt 2:
-  gateway -&gt; payment service: authorize, key=pay:order-42
+  gateway -&gt; payment: charge order-42
 
-receiver behavior:
-  if key is new: start the operation and store the key
-  if key succeeded: return the stored result
-  if key is still running: return pending
-  if key was reused with different details: reject it
+result:
+  two independent charge attempts may exist
 </code></pre></div>
 
-<p>The idempotency key does not make the network reliable. It gives the receiver a way to see that two messages represent one logical intent.</p>
-<h2>Idempotency As A Contract</h2>
-<p>Idempotency is a contract between caller and receiver. The caller promises to reuse the same key for repeated attempts of the same logical operation. The receiver promises to check durable state before applying the side effect again.</p>
-<p>For payments, the side effect is the charge. For a message system, it might be delivering one message to one conversation. For a seat booking system, it might be reserving one seat. The identity should match the promise. A key such as <code>pay:order-42</code> is useful because it names the payment attempt for one order. A random per-attempt request id is not enough.</p>
-<p>This distinction matters:</p>
-<div class="codehilite"><pre><span></span><code>trace id:
-  useful for following one attempt through logs
-  may change on each retry
-
-idempotency key:
-  useful for preserving one logical operation
-  must stay the same across retries of that operation
+<p>The retry improved liveness, because the system tried again. It damaged safety, because the repeated message may create a duplicate side effect. Fault tolerance is not just "try harder." It is "try again without breaking the promise."</p>
+<h2>Idempotency As Receiver Memory</h2>
+<p>The central mechanism is receiver-side memory tied to stable operation identity.</p>
+<p>The caller sends an idempotency key that names the logical operation:</p>
+<div class="codehilite"><pre><span></span><code>idempotency_key = pay:order-42
+amount = 29.00
+currency = EUR
+customer = customer-17
 </code></pre></div>
 
-<p>The receiver also needs to remember enough about the original request. If a client reuses <code>pay:order-42</code> but changes the amount or currency, the service should reject the duplicate instead of treating it as the same payment. Otherwise the key can hide a real conflict.</p>
-<p>Idempotency also has a lifetime. Keeping keys forever may be expensive. Expiring them too early may let a late retry create a duplicate side effect. The right retention window depends on how long retries, callbacks, queues, and human repair can continue.</p>
-<h2>Retry Policy</h2>
-<p>Retries recover from temporary faults. They also add load at the exact moment when a dependency may already be slow. A retry policy must therefore answer four questions.</p>
+<p>The receiver stores the key before or as part of starting the side effect. A simplified table might look like this:</p>
+<div class="codehilite"><pre><span></span><code>payment_attempts
+
+key           request_hash  status       provider_id  response
+pay:order-42  h7a9          running      null         null
+</code></pre></div>
+
+<p>When the same key arrives again, the receiver does not simply run the charge again. It checks the record.</p>
+<div class="codehilite"><pre><span></span><code>if key is new:
+  create payment_attempt record
+  start provider charge
+
+if key exists and request_hash matches:
+  if status is running: return pending
+  if status is succeeded: return stored success response
+  if status is failed_final: return stored failure response
+
+if key exists and request_hash differs:
+  reject as idempotency conflict
+</code></pre></div>
+
+<p>The request hash matters. If a client reuses <code>pay:order-42</code> but changes the amount from <code>29.00</code> to <code>290.00</code>, the receiver should not treat that as the same operation. Stable identity protects repeated attempts of the same intent. It should not hide a changed request.</p>
+<p>This is why a trace id is not an idempotency key. A trace id is useful for following one attempt through logs. It may change on every retry. An idempotency key must stay stable across retries of the same logical operation and must be checked by the side-effect owner before the side effect is applied again.</p>
+<p>Idempotency is therefore not a magic HTTP header. It is a contract:</p>
 <ul>
-<li>Identity: how does the receiver know this is the same logical operation?</li>
-<li>Budget: how many attempts fit inside the user-facing deadline?</li>
-<li>Spacing: how do callers avoid retrying at the same instant?</li>
-<li>Meaning: what does the product show while the result is unknown?</li>
+<li>the caller reuses the same key for the same logical operation</li>
+<li>the receiver stores enough durable state to recognize the key</li>
+<li>the receiver returns the original outcome or a safe intermediate state</li>
+<li>both sides agree how long the key remains valid</li>
 </ul>
-<p>Backoff helps with spacing by waiting longer between attempts. Jitter helps by adding small randomness so many callers do not retry in lockstep. A deadline stops stale work from continuing after the result is no longer useful to the product.</p>
-<div class="codehilite"><pre><span></span><code>payment deadline: 3 seconds
+<p>Without durable receiver memory, the key is just decoration.</p>
+<p>There is one more detail that often gets missed: the first write of the idempotency record must be protected from races. If two retry attempts for <code>pay:order-42</code> arrive at nearly the same time, both should not be able to look for the key, find nothing, and start two provider charges. The payment service needs an atomic create-or-read step, usually enforced by a unique constraint, transaction, compare-and-set operation, or other owner-side guard.</p>
+<p>The shape is:</p>
+<div class="codehilite"><pre><span></span><code>try to create key=pay:order-42
+if create succeeds:
+  this request owns the first execution
+if create fails because key already exists:
+  read the existing attempt and follow its status
+</code></pre></div>
+
+<p>That small guard is where the promise becomes real. Idempotency is not only about choosing a nice key; it is about making the side-effect owner refuse to start two independent executions for the same key, even under concurrent retries.</p>
+<h2>A Worked Retry Path</h2>
+<p>Now replay the book purchase with an idempotency-aware payment service.</p>
+<div class="codehilite"><pre><span></span><code>attempt 1 at 0 ms:
+  gateway -&gt; payment: authorize key=pay:order-42
+  payment stores key with status=running
+  payment calls provider
+  gateway timeout at 800 ms
+
+provider response at 1100 ms:
+  provider -&gt; payment: accepted provider_id=ch_9
+  payment stores status=succeeded, response=charged
+
+attempt 2 at 1300 ms:
+  gateway -&gt; payment: authorize key=pay:order-42
+  payment finds existing succeeded key
+  payment returns stored charged response
+</code></pre></div>
+
+<p>The second attempt did not perform a second charge. It converted a missing response into a recovered response.</p>
+<p>There is also an important in-progress case:</p>
+<div class="codehilite"><pre><span></span><code>attempt 2 arrives while provider call is still running:
+  payment finds key=pay:order-42 with status=running
+  payment returns payment_pending
+</code></pre></div>
+
+<p>The caller can then show a pending state or schedule a later check. It should not keep creating new attempts. It should not tell the user that payment failed unless the payment owner has durable evidence that the attempt failed safely.</p>
+<p>This worked path shows the difference between fault tolerance and blind repetition. A fault-tolerant workflow keeps an operation alive across uncertain boundaries, but keeps the side effect tied to one identity.</p>
+<h2>Retry Policy: Which Faults Deserve Another Attempt?</h2>
+<p>Retries recover from temporary faults, but they are not free. A retry adds load to a dependency that may already be slow. If many callers retry at the same time, retries can turn a small slowdown into a wider outage.</p>
+<p>A useful retry policy answers five questions.</p>
+<p>First: <strong>what identity makes a retry safe?</strong> For payment, the answer is the idempotency key owned by the payment service.</p>
+<p>Second: <strong>which failures are retryable?</strong> A timeout, connection reset, <code>503 Service Unavailable</code>, or <code>429 Too Many Requests</code> may be retryable with care. A validation error, bad currency, expired card, or idempotency conflict usually should not be retried unchanged.</p>
+<p>Third: <strong>how many attempts fit inside the deadline?</strong> The caller should not retry forever inside one user request.</p>
+<p>Fourth: <strong>how are attempts spaced?</strong> Backoff waits longer between attempts. Jitter adds randomness so many callers do not retry in lockstep.</p>
+<p>Fifth: <strong>what state appears when live retries stop?</strong> If the outcome remains unknown, the workflow needs a named state such as <code>payment_pending</code> or <code>needs_reconciliation</code>.</p>
+<p>A compact policy might be:</p>
+<div class="codehilite"><pre><span></span><code>payment live deadline: 3000 ms
 
 attempt 1 at 0 ms
 attempt 2 after 200 ms plus jitter
 attempt 3 after 600 ms plus jitter
-then stop live retries and mark payment_pending
+then stop live retries
+
+if outcome still unknown:
+  mark order payment_pending
+  schedule reconciliation
+  show user an honest pending state
 </code></pre></div>
 
-<p>This policy makes a trade-off explicit. The system tries to complete temporary failures quickly, but it does not let retries grow without bound. If the payment remains uncertain after the deadline, the workflow moves into a repairable state instead of pretending that the answer is known.</p>
-<h2>Repair When The Live Path Cannot Finish</h2>
-<p>Some failures last longer than a web request. The user may close the page. The provider callback may arrive minutes later. A worker may restart after writing one record but before publishing the next event.</p>
-<p>That is why fault-tolerant workflows need durable states. A state such as <code>payment_pending</code> or <code>needs_reconciliation</code> tells the system that the operation is neither lost nor complete. It is waiting for more evidence.</p>
-<p>One simple state machine might look like this:</p>
+<p>The trade-off is explicit. The system tries to recover quickly from temporary faults, but it protects the dependency and the user promise by stopping live retries before they become uncontrolled load.</p>
+<h2>Repair After The Live Request</h2>
+<p>Some failures outlast the browser request. The user closes the tab. The provider callback arrives ten minutes later. A worker restarts after charging but before publishing an <code>OrderPaid</code> event. A queue delivers a message twice.</p>
+<p>That is why fault-tolerant workflows need durable states. A boolean such as <code>paid=true</code> or <code>paid=false</code> is often too small. The workflow may need states that separate evidence from the final product promise:</p>
 <div class="codehilite"><pre><span></span><code>new
   -&gt; authorizing
   -&gt; charged
@@ -170,45 +240,64 @@ payment_pending
   -&gt; needs_human_review
 </code></pre></div>
 
-<p>The exact names depend on the product. The useful habit is separating product state from evidence state. "The gateway timed out" is evidence. It is not the same as "the payment failed." "The provider accepted the charge" is evidence. It still needs to be joined with order state before the customer promise is complete.</p>
-<p>Reconciliation is the repair loop that joins those pieces later. It may ask the payment service for the final status, read provider receipts, compare order records, and choose the next safe transition. Repair is not a failure of design. It is how the design admits that distributed evidence can arrive late.</p>
-<h2>Failure Modes And Trade-offs</h2>
-<p>The first failure mode is duplicate side effects. Retrying an operation without a stable identity can repeat the work that matters most: charging a card, sending an email, booking a seat, or creating a shipment.</p>
-<p>The second failure mode is a retry storm. If many callers time out and immediately retry, they can multiply traffic against the dependency that is already struggling. Backoff, jitter, deadlines, and circuit breakers reduce this risk, but they do not replace a clear product policy.</p>
-<p>The third failure mode is hiding uncertainty behind a boolean. A field such as <code>paid=true</code> or <code>paid=false</code> may be too small for a workflow that can be authorizing, charged but not confirmed, failed safely, waiting for provider evidence, or under review.</p>
-<p>The main trade-off is between responsiveness and certainty. Waiting for stronger evidence can reduce ambiguity, but it may make the product feel slow or unavailable. Showing <code>pending</code> quickly keeps the interface responsive, but it requires honest repair and communication. Rejecting new work during overload protects capacity, but it reduces availability. The right choice depends on which promise would be most costly to break.</p>
+<p><code>payment_pending</code> is not a failure to finish the design. It is the design admitting that evidence may arrive late. A reconciliation worker can later ask the payment service, read provider receipts, compare order records, and move the order to the next safe state.</p>
+<p>This repair loop should also be idempotent. If the reconciliation worker runs twice for <code>pay:order-42</code>, the second run should observe the same final state or do harmless work. Otherwise the repair path can create the same duplicate side effects that the live path avoided.</p>
+<p>The practical rule is: every path that can repeat should either be read-only, idempotent, or guarded by a durable owner that recognizes repeated work.</p>
+<h2>Failure Modes And Limits</h2>
+<p>The first failure mode is duplicate side effects. Retrying without stable identity can charge a card twice, reserve two seats, send duplicate notifications, or create multiple shipments.</p>
+<p>The second failure mode is a retry storm. If callers time out and immediately retry, they multiply traffic against a dependency that may already be saturated. Backoff, jitter, deadlines, and circuit breakers reduce this risk, but the safest retry is still one that is bounded and tied to product meaning.</p>
+<p>The third failure mode is weak receiver memory. If the payment service stores idempotency keys only in process memory, a restart can forget an in-flight attempt and allow a duplicate. The receiver's memory must survive the failures the system claims to tolerate.</p>
+<p>The fourth failure mode is expiring keys too early. Keeping idempotency records forever can be expensive, but expiring them before late retries, provider callbacks, or human repair are impossible can reopen the duplicate window.</p>
+<p>Idempotency also has limits. It protects repeated execution of one logical operation. It does not decide global ordering across many operations. It does not elect a leader. It does not guarantee that all replicas agree. Those problems lead into coordination and consensus in the next lesson.</p>
+<h2>Operational Signals</h2>
+<p>Fault-tolerant retry design needs evidence in production. Useful signals include:</p>
+<ul>
+<li>retry rate by caller, endpoint, and reason</li>
+<li>idempotency conflict counts</li>
+<li>duplicate key hits that returned stored responses</li>
+<li><code>running</code> attempts older than the expected deadline</li>
+<li>size and age of <code>payment_pending</code> or reconciliation queues</li>
+<li>provider callbacks that arrive after the user request ended</li>
+<li>retry traffic as a percentage of normal traffic</li>
+</ul>
+<p>These signals tell you whether retries are healing temporary faults or hiding a deeper problem. If <code>payment_pending</code> grows for hours, repair is not keeping up. If idempotency conflicts spike, clients may be reusing keys incorrectly. If duplicate key hits are common during provider latency, idempotency may be protecting users from duplicate charges exactly as intended.</p>
 <h2>Practice Prompt</h2>
-<p>Pick one workflow with a visible side effect: charging a card, sending a notification, creating an account, reserving a seat, or submitting a form. Write these lines:</p>
+<p>Pick one workflow with a visible side effect: charging a card, sending a notification, creating an account, reserving a seat, or submitting a form. Write:</p>
 <div class="codehilite"><pre><span></span><code>user-visible promise:
 side effect owner:
 idempotency key:
-retry budget:
+fields included in the request hash:
+retryable failures:
+non-retryable failures:
+live retry budget:
 state after live retries stop:
 repair evidence:
+signal that would show retries are causing harm:
 </code></pre></div>
 
-<p>If the idempotency key changes on every attempt, it is not protecting the logical operation. If the state after retries is only <code>failed</code>, ask whether the system really knows that the side effect did not happen.</p>
+<p>If the idempotency key changes on every attempt, it is not protecting the logical operation. If the receiver does not store the key durably, the system is only pretending to be idempotent.</p>
 <h2>Resources</h2>
 <ul>
 <li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
-<li>Focus: How retries, backoff, jitter, and timeouts interact during overload.</li>
+<li>Focus: How retries, backoff, jitter, timeouts, and overload interact in production systems.</li>
 </ul>
 </li>
 <li>[DOC] <a href="https://docs.stripe.com/api/idempotent_requests">Stripe API: Idempotent Requests</a><ul>
-<li>Focus: A practical example of idempotency keys for safely retrying side-effecting API calls.</li>
+<li>Focus: A concrete API design for making side-effecting requests safe to retry.</li>
 </ul>
 </li>
 <li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Reliability, fault tolerance, and the difference between local evidence and distributed truth.</li>
+<li>Focus: Reliability, fault tolerance, and why distributed systems need explicit recovery paths.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Fault tolerance protects a user-visible promise when ordinary faults interrupt the happy path.</li>
-<li>Retries are safe only when the receiver can recognize repeated attempts as one logical operation.</li>
-<li>Idempotency needs durable receiver-side records, not just a random request id.</li>
-<li>When live retries cannot finish, named pending states and reconciliation preserve the workflow without pretending certainty.</li>
+<li>Fault tolerance preserves a product promise when ordinary faults interrupt the happy path.</li>
+<li>Retries are safe for side effects only when the receiver can recognize the same logical operation.</li>
+<li>Idempotency requires stable keys, request matching, durable receiver memory, and a retention policy.</li>
+<li>Retry policy must be bounded with deadlines, backoff, jitter, and clear retryable versus non-retryable failures.</li>
+<li>When live retries cannot finish, pending states and reconciliation keep the workflow honest and repairable.</li>
 </ul>
 </section>
 
@@ -238,7 +327,7 @@ repair evidence:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 12:39 UTC | @jepemo | Built with
+        Generated on 2026-06-19 13:15 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
