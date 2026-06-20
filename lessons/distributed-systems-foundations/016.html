@@ -250,6 +250,113 @@ failed_safely
 <li>What work is rejected, retried, repaired, or degraded?</li>
 <li>What evidence proves the workflow is safe after an incident?</li>
 </ul>
+<h2>Worked ADR: Checkout Order Placement Under Partial Failure</h2>
+<p>The following is a deliberately narrow answer to the scenario. It is not a universal checkout architecture. Its value is that every mechanism has a named promise, boundary, and cost.</p>
+<h3>Context</h3>
+<p>The store accepts orders in two regions. Users expect one purchase intent to create at most one charge and one final order outcome. Payment is external, so the gateway can time out before it knows whether the provider accepted the operation. Order confirmation may continue asynchronously. Carts can tolerate a short stale read; payment and final order state cannot silently fork.</p>
+<div class="codehilite"><pre><span></span><code>user intent:       order-42
+payment operation: pay:order-42
+official order owner: order shard for order-42
+durable evidence:  order record, payment record, outbox events, repair record
+</code></pre></div>
+
+<p>The important boundary is between a caller's timeout and the provider's outcome. A timeout proves that one caller stopped waiting. It does not prove payment failed. The design needs an honest intermediate state instead of forcing that uncertainty into “success” or “failure.”</p>
+<h3>Decision</h3>
+<p>The gateway creates <code>order-42</code> and the stable payment operation <code>pay:order-42</code> before calling the payment service. The payment receiver stores outcomes by that operation id, so a retry from the browser can ask about the same intent rather than create another charge.</p>
+<div class="codehilite"><pre><span></span><code>browser -&gt; gateway: place order, idempotency key = order-42
+gateway -&gt; order owner: save order_intent
+gateway -&gt; payment: authorize pay:order-42
+
+payment result known:
+  write durable authorization result
+  publish payment_authorized through an outbox
+
+payment result unknown at deadline:
+  write payment_pending
+  expose a status lookup; do not issue uncontrolled retries
+</code></pre></div>
+
+<p>Only the order owner may make the final transition to <code>order_confirmed</code> or <code>failed_safely</code>. It consumes payment evidence and inventory evidence through durable events. A confirmation worker may retry delivery, but its state transition is idempotent: seeing the same <code>payment_authorized</code> event twice does not create two orders.</p>
+<div class="codehilite"><pre><span></span><code>order state machine:
+
+order_intent_saved
+  -&gt; inventory_reserved
+  -&gt; payment_authorizing
+  -&gt; payment_pending      (gateway lacks enough evidence)
+  -&gt; order_confirmed      (one durable payment and inventory decision)
+  -&gt; failed_safely        (no payment, or a reconciled compensation)
+  -&gt; needs_reconciliation (evidence conflicts or is incomplete)
+</code></pre></div>
+
+<p>For normal reads, carts and product details may come from nearby replicas with an explicit freshness boundary. After a customer places an order, the status endpoint carries the order version or routes to the owner so the customer's session does not move backward from <code>payment_pending</code> to an earlier “no order” view. During a regional partition, a region without the order owner's coordination path does not independently confirm final orders. It can preserve cart state and order intent, then show a pending or unavailable outcome.</p>
+<h3>Walk The Normal Path</h3>
+<p>In the ordinary case, the user submits once. The gateway records intent, reserves inventory, sends one payment operation, and receives an authorization. The payment service records that authorization durably before publishing an event. The order owner records the final decision and emits <code>order_confirmed</code> through an outbox for email and analytics.</p>
+<div class="codehilite"><pre><span></span><code>1. gateway: order-42 intent saved
+2. inventory owner: sku-9 reserved for order-42
+3. payment: pay:order-42 authorized
+4. order owner: order-42 confirmed
+5. outbox: order_confirmed delivered to subscribers
+</code></pre></div>
+
+<p>The response can say “confirmed” only after step 4. Email delivery may lag because it is not the authority for order state. If an email queue is delayed, the order remains confirmed and the operator has a separate, repairable notification problem.</p>
+<h3>Walk The Ambiguous Timeout Path</h3>
+<p>Now the provider accepts <code>pay:order-42</code> after the gateway's deadline. The gateway records <code>payment_pending</code> and tells the user that the result is being confirmed. The user retries, but the retry carries <code>pay:order-42</code>; the payment service returns the existing result rather than contacting the provider again.</p>
+<div class="codehilite"><pre><span></span><code>gateway timeout -&gt; payment_pending
+provider later records authorization -&gt; payment_authorized event
+order worker sees event -&gt; order_confirmed
+status endpoint returns confirmed or pending, never two charges
+</code></pre></div>
+
+<p>If inventory cannot be honored by the time payment evidence arrives, the repair worker records <code>needs_reconciliation</code>, releases what it safely can, and voids or refunds the authorization according to provider rules. The system has not made the user happy in every path, but it has avoided lying about the outcome and retained the evidence needed to repair it.</p>
+<h3>Overload And Degraded Operation</h3>
+<p>The payment provider may become slow for many orders. The system watches provider latency, timeout rate, retry-budget use, queue age, and authorizations lacking final order decisions. When the evidence crosses a threshold, the payment-degraded playbook activates.</p>
+<div class="codehilite"><pre><span></span><code>preserve:
+  cart reads, order intent, order-status lookup, reconciliation
+
+degrade:
+  recommendations, nonessential email, immediate payment confirmation
+
+admission control:
+  bound new payment attempts and return Retry-After or payment_unavailable
+</code></pre></div>
+
+<p>The confirmation queue has a capacity and age budget. Workers have a concurrency limit so they do not overload the order store while it is slow. Retries use backoff, jitter, deadlines, and a shared budget. A message that is too old to be useful is discarded only if it has no unresolved side effect; a payment authorization instead enters reconciliation. This is the cost of preserving trustworthy state transitions under pressure.</p>
+<h3>Contracts And Operational Evidence</h3>
+<p>The events <code>payment_authorized</code>, <code>order_confirmed</code>, and <code>payment_reconciled</code> have versioned schemas. Readers are deployed before writers depend on a new field, and consumers can process retained old messages for the documented replay window. Fields such as amount, currency, and provider reference have explicit meanings; a type-compatible change that changes meaning is treated as a new contract.</p>
+<p>Every boundary retains joinable identity:</p>
+<div class="codehilite"><pre><span></span><code>request_id: one gateway attempt
+trace_id: one observed execution path
+order_id: durable business object
+payment_operation: one external side effect
+message_id: one queue delivery
+</code></pre></div>
+
+<p>Logs explain local outcomes, traces show cross-service waiting, metrics expose systemic pressure, and durable records establish payment, order, and repair state. Support can answer “why is order-42 pending?” without reconstructing the incident from memory.</p>
+<h3>Consequences And Open Risks</h3>
+<p>The design improves duplicate-charge protection, gives users an honest pending state, and keeps a repair path when evidence arrives late. It costs additional state transitions, outbox processing, idempotency storage, reconciliation logic, and some latency before confirmation. During partitions or provider trouble, some checkouts are intentionally unavailable or pending rather than falsely confirmed.</p>
+<p>Open risks remain: inventory reservation expiry must match payment reconciliation timing; provider idempotency guarantees must be verified; a regional outage may delay final order confirmation; and schema retirement requires replay evidence. These are not reasons to avoid the design. They are the risks that a reviewer can now test, monitor, and assign to an owner.</p>
+<h3>Decision Trace During A Regional Partition</h3>
+<p>Assume the region hosting the order owner becomes unreachable from the gateway's region just after an order intent is saved. The local gateway might still have a cart replica and a reachable payment provider. Confirming the order locally would create a second authority for the final order state. The design refuses that shortcut.</p>
+<div class="codehilite"><pre><span></span><code>gateway can prove:
+  the customer submitted an intent
+  its local region cannot reach the order owner
+
+gateway cannot prove:
+  whether another region already finalized order-42
+  whether inventory and payment can still be combined safely
+
+safe response:
+  preserve idempotent intent when allowed
+  return pending or unavailable
+  do not confirm final order state
+</code></pre></div>
+
+<p>When communication returns, the order owner reads the durable intent and the payment operation record, then performs the same idempotent transition or reconciliation path as any delayed workflow. This costs availability for final confirmation during the partition, but it protects the promise that one order has one official outcome.</p>
+<p>The recovery review checks more than network health. It samples order and payment agreement, checks the age of pending intents, verifies that old-epoch writers cannot make new final decisions, and ramps admission gradually. A green latency graph without reconciled records is insufficient evidence to restore normal promises.</p>
+<p>The status endpoint exposes the reconciliation state and a stable order reference, so the customer does not create a new intent merely because one browser request ended. Each manual repair records the operator, evidence, decision, and provider reference. That audit trail makes later refunds, support conversations, and incident review part of the same architecture rather than a separate spreadsheet process.</p>
+<p>It also reveals recurring ambiguity patterns that should become product and reliability improvements, not permanent manual operational labor.</p>
+<h2>Readiness Check</h2>
+<p>Close the lesson and sketch your own ADR for a different workflow: password reset, file upload, seat booking, message send, or account deletion. Include one normal path, one ambiguous timeout, one overload response, and one recovery query. If a reviewer cannot identify the owner of the final fact, the operation id that survives retries, the honest intermediate state, and the evidence for exit from degraded mode, revise the design before choosing more technology.</p>
 <h2>Resources</h2>
 <ul>
 <li>[ARTICLE] <a href="https://adr.github.io/">Architecture Decision Records</a><ul>
@@ -300,7 +407,7 @@ failed_safely
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 13:15 UTC | @jepemo | Built with
+        Generated on 2026-06-20 17:09 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

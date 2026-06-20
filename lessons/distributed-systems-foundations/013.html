@@ -148,6 +148,55 @@ meaning:
 <p>This sequence protects mixed-version operation. At each step, the system can still process messages produced by the previous step.</p>
 <p>The same idea applies to request/response APIs, event streams, database records, and command payloads. The slower and more asynchronous the workflow, the more important compatibility becomes. A synchronous HTTP caller usually meets a callee in the same moment. An event may be written today and interpreted by future code later.</p>
 <p>Version numbers help only when they are attached to real behavior. A field called <code>schema_version = 2</code> is useful if readers know what version 2 means and what old versions may still appear. It is not magic.</p>
+<h2>Worked Trace: Add <code>currency</code> Without Breaking A Queue</h2>
+<p>Suppose the order service publishes to a queue and invoicing, analytics, and a repair worker consume the event. A message produced yesterday can still be delivered today.</p>
+<div class="codehilite"><pre><span></span><code>M1, produced by v1
+{ &quot;order_id&quot;: &quot;order-42&quot;, &quot;total&quot;: 25.00 }
+
+M2, produced by v2
+{ &quot;order_id&quot;: &quot;order-43&quot;, &quot;total&quot;: 25.00, &quot;currency&quot;: &quot;EUR&quot; }
+</code></pre></div>
+
+<p>The safe rollout begins with readers. The new invoice consumer can read M1 with a documented legacy interpretation or an explicit <code>unknown</code> state, and it can read M2 when <code>currency</code> exists. It must not invent a default that could produce an incorrect invoice.</p>
+<div class="codehilite"><pre><span></span><code>new reader + old message -&gt; works while M1 exists
+new reader + new message -&gt; target behavior
+</code></pre></div>
+
+<p>Only then does the producer send M2. Old consumers must ignore the unknown optional field or use a compatible decoder; otherwise the producer cannot safely emit M2 until those consumers are upgraded. This is why a version number is not the compatibility plan. The real plan is the coexistence matrix:</p>
+<div class="codehilite"><pre><span></span><code>old reader + old message -&gt; works
+new reader + old message -&gt; works
+old reader + new message -&gt; works until old readers are gone
+new reader + new message -&gt; works
+</code></pre></div>
+
+<p>Shape compatibility is necessary but insufficient. <code>total: 25.00</code> must state whether it includes tax, shipping, discounts, and which currency applies. If the meaning changes, add <code>total_including_tax</code> rather than silently redefining <code>total</code>. A parser cannot catch a field whose name and type stayed the same while its business meaning changed.</p>
+<p>After all producers write <code>currency</code>, compatibility is still needed for queued messages, retries, dead-letter stores, backups, and replay tools. Remove the legacy reader path only after the retention and recovery window has passed and telemetry shows no v1 messages remain. A schema registry can enforce mechanical checks, but ownership, meaning, rollout order, and replay readiness are contract decisions that teams must make explicit.</p>
+<p>Useful evidence includes schema-validation rejections, unknown-field decode failures, missing-field fallback use, oldest queued message by version, and replay failures. The trade-off is more releases and temporary compatibility code in exchange for independent deployment and a safe operational recovery path.</p>
+<h2>Compatibility Is A Directional Promise</h2>
+<p>Teams often say that a schema is “compatible” without naming the direction. That leaves a gap precisely when an old queue item or an older consumer appears during a rollout.</p>
+<p><strong>Backward compatibility</strong> asks whether a new reader can interpret old data. In this example, it means the new invoice consumer can process M1, even though <code>currency</code> is missing. A default is safe only if it is a true, documented default. If the historical order may be in several currencies, the reader must obtain the currency from an authoritative record or stop and request repair.</p>
+<p><strong>Forward compatibility</strong> asks whether an old reader can tolerate data written by a new producer. It means the old analytics consumer ignores the new <code>currency</code> field rather than rejecting the entire event. Some formats support this naturally; some generated decoders need an explicit unknown-field rule. The contract needs a tested answer, not an assumption.</p>
+<p><strong>Full compatibility</strong> is the mixed-fleet promise that both directions hold while old and new writers, readers, and messages coexist. It costs more discipline, but it is usually the appropriate target for independently deployed event systems.</p>
+<div class="codehilite"><pre><span></span><code>new reader reads M1 -&gt; backward-compatible path
+old reader reads M2 -&gt; forward-compatible path
+both paths work      -&gt; mixed rollout can proceed
+</code></pre></div>
+
+<p>The field type matters as well. Changing <code>total</code> from a decimal value to a formatted string such as <code>"EUR 25.00"</code> may look convenient to a user interface, but it breaks readers that calculate with a number. Adding a separate display field is safer. Replacing an enum value can similarly break old readers that assume the set is closed. When a reader cannot make a safe interpretation, it should reject the message into a visible repair path rather than silently inventing business data.</p>
+<h2>Replay Is A Contract Test, Not An Afterthought</h2>
+<p>The hardest consumer is often not the one currently deployed. It is tomorrow's incident tool reading last month's events. A replay can cross a schema migration, code deployment, and changed business rules all at once.</p>
+<p>Before retiring M1 support, rehearse a small replay: select a stored M1 event, run it through the current consumers, and verify the resulting invoice or order state. Do the same for M2. The test should include an old message from a retry or dead-letter queue, because those are exactly the records that return when normal assumptions have failed.</p>
+<p>Keep a written retirement date and an owner for that decision. Otherwise compatibility code tends either to disappear too early during cleanup or to stay indefinitely because nobody can prove the replay boundary has passed. The owner should review retained data, recovery tools, consumer metrics, and the documented meaning before approving removal.</p>
+<div class="codehilite"><pre><span></span><code>replay check:
+  M1 -&gt; current consumer -&gt; documented legacy outcome
+  M2 -&gt; current consumer -&gt; current outcome
+  duplicate delivery -&gt; idempotent outcome
+  malformed message -&gt; visible dead-letter and repair evidence
+</code></pre></div>
+
+<p>This exposes an important boundary: schema compatibility does not make processing idempotent. A reader may parse the same <code>order_created</code> event twice and still create two invoices unless the consumer uses <code>order_id</code> or an event id to recognize prior work. Contracts need both an interpretation rule and a processing rule.</p>
+<p>The operational signals become release gates. If legacy fallback is still used, if dead-letter volume rises after the producer deploys, or if a replay cannot explain an old record, the rollout is incomplete. The right response is to pause the writer change or extend compatibility, not to declare the old messages irrelevant because the current service looks healthy.</p>
+<p>This evidence also gives support and finance teams a concrete answer when a historical order must be reconstructed months after the original deployment.</p>
 <h2>Failure Modes And Trade-offs</h2>
 <p>The representative failure is an old consumer rejecting a new message and stopping a pipeline. The message is valid to the new producer, but not survivable for the mixed fleet.</p>
 <p>A quieter failure is a new consumer assuming a field is always present before all old producers can send it. The rollout may work in staging, then fail when one older producer emits a v1 message from a retry or delayed queue.</p>
@@ -217,7 +266,7 @@ safe rollout order:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 13:15 UTC | @jepemo | Built with
+        Generated on 2026-06-20 17:09 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

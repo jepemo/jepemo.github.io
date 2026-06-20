@@ -79,118 +79,182 @@
 <section class="stack-block lesson-content-shell">
   <h1>Observability and Debugging Distributed Systems</h1>
 <h2>Core Insight</h2>
-<p>Imagine a user reports this: "Checkout spun for twenty seconds, charged my card, and then said the order failed." Six services were involved. The web service, payment service, inventory service, queue worker, email service, and order database all report that they were mostly healthy.</p>
-<p>That is not enough. In a distributed system, no single component sees the whole user journey. Each participant sees local facts: one request arrived, one dependency waited, one retry happened, one queue grew, one event was or was not written.</p>
-<p><strong>Observability</strong> is the ability to reconstruct behavior from the evidence the system leaves behind. It is not just dashboards. It is the practical ability to ask, after the fact, "What happened to this user-visible promise, across these boundaries, in this time window?"</p>
-<p>The trade-off is that evidence has a cost. Logs, metrics, traces, events, labels, and retained payloads consume storage, bandwidth, attention, and sometimes privacy budget. Good observability preserves enough evidence to explain important failures without turning telemetry into its own source of noise.</p>
-<h2>Reconstruct One Checkout</h2>
-<p>Use one checkout attempt as the worked example. The user clicks <strong>Place order</strong>. The request receives a correlation id at the edge:</p>
-<div class="codehilite"><pre><span></span><code>correlation_id: checkout-abc
-order_id: order-42
-payment_operation: pay:order-42
+<p>A buyer reports: “Checkout spun for twenty seconds, my bank shows a charge, and the site said the order failed.” The checkout path crosses a web service, inventory, a payment provider, a queue, an order worker, and an email service. Each component can report that it is mostly healthy. None of those local statements answers the buyer's question: <em>was my order created, charged, both, or neither?</em></p>
+<p>Distributed systems divide work and therefore divide evidence. One service sees an HTTP request. Another sees a payment authorization. A queue sees a message wait. A worker sees an attempt to create an order. A database sees a durable state transition. If those facts cannot be joined, an incident becomes a collection of plausible stories rather than an investigation.</p>
+<p><strong>Observability</strong> is the ability to reconstruct a user-visible promise from the evidence a system retains. It is more than a dashboard and more than “having logs.” It means that an engineer can ask what happened to one order, across time and boundaries, distinguish a fact from an inference, and find the safe repair action.</p>
+<p>The trade-off is real. Logs, traces, metrics, labels, and retained event payloads consume storage, CPU, bandwidth, attention, and privacy budget. Good observability does not collect every possible datum. It deliberately preserves the evidence required to explain important state changes, retries, queue crossings, ownership changes, and repair decisions.</p>
+<h2>Start With The Promise And Its Identities</h2>
+<p>The checkout promise is not “the request got a 200 response.” It is closer to: “the buyer receives one truthful outcome for the intended purchase, and the system can repair any partial completion without charging twice.” That promise needs several identifiers because one identifier cannot represent every part of the workflow.</p>
+<div class="codehilite"><pre><span></span><code>order_id:             order-42       durable business object
+payment_operation_id: pay:order-42   one intended charge; used for idempotency
+request_id:           req-A          one HTTP attempt
+trace_id:             trace-81       one observed execution path
+message_id:           msg-551        one queued delivery attempt
 </code></pre></div>
 
-<p>During the request, different systems leave different evidence:</p>
-<div class="codehilite"><pre><span></span><code>web log:
-  checkout-abc received Place order
+<p>These ids are related, not interchangeable. The buyer may retry after a timeout. The retry gets a new <code>request_id</code> and perhaps a new trace, but it must retain <code>payment_operation_id: pay:order-42</code> so the payment service can recognize the same intended charge. A queue may redeliver one message and assign a new delivery attempt while the business order remains <code>order-42</code>.</p>
+<p>This distinction prevents two common mistakes. If every retry receives a new payment operation id, a timeout can become a double charge. If every asynchronous worker creates a new anonymous identity, investigators cannot connect a late order confirmation to the checkout that created it.</p>
+<h2>The Evidence Has Different Jobs</h2>
+<p>Observability signals answer different questions. Treating them as substitutes loses useful information.</p>
+<p><strong>Structured logs</strong> record local facts at an event boundary: a request arrived, a dependency timed out, a message was accepted, or an idempotency key matched existing work. A useful checkout log includes the relevant ids, result, reason, and component. It should not need to include a full card number, address, or unbounded payload to be useful.</p>
+<p><strong>Traces</strong> connect work across calls. A trace is a tree or graph of spans that shows which operation waited on which dependency and for how long. A queue producer can put trace context in message headers; the worker can continue or link the trace when it consumes the message. The trace explains the path and timing, not whether a business transition was made durable.</p>
+<p><strong>Metrics</strong> summarize many executions. Queue depth, age of the oldest message, payment-provider latency, timeout rate, retry rate, and order-confirmation lag can show whether one incident is part of a broader condition. Metrics are excellent for detecting a pattern and poor at explaining the fate of <code>order-42</code> by themselves.</p>
+<p><strong>Durable business records and events</strong> answer authoritative state questions: did <code>pay:order-42</code> authorize, did the order become confirmed, was a refund issued, and did a repair job record its decision? They are the source of truth for critical side effects. A trace may suggest that a payment call returned success; the durable payment record establishes whether the system has recognized an authorization it must reconcile.</p>
+<p>The design goal is a joinable evidence set:</p>
+<div class="codehilite"><pre><span></span><code>request/trace evidence  -&gt; timing and local path
+queue evidence          -&gt; handoff and delay
+business records        -&gt; durable state and repair decision
+metrics                 -&gt; whether the path is systematically under pressure
+</code></pre></div>
 
-payment trace span:
-  checkout-abc waited 8.2 s on provider authorization
+<h2>Worked Trace: A Timed-Out Checkout With A Late Authorization</h2>
+<p>At <code>12:00:00</code>, the buyer presses <strong>Place order</strong>. The web service allocates the identities above and begins <code>trace-81</code>.</p>
+<div class="codehilite"><pre><span></span><code>req-A, trace-81, order-42, pay:order-42
 
-queue metric:
-  order-confirmation depth rose from 20 to 1400
+web span: checkout.request started
+inventory record: sku-9 reserved for order-42
+payment span: authorize pay:order-42 started
+</code></pre></div>
 
-order event store:
-  order_confirmed was never emitted for order-42
+<h3>1. The Edge Deadline Ends The First Attempt</h3>
+<p>The payment provider is slow. The web service has a five-second deadline so it does not wait forever and consume all its request threads.</p>
+<div class="codehilite"><pre><span></span><code>12:00:05.000
+web log:
+  request_id=req-A
+  order_id=order-42
+  result=timeout_waiting_for_payment
 
+response to buyer:
+  &quot;We could not confirm your order yet. Do not retry payment manually.&quot;
+</code></pre></div>
+
+<p>This is a fact: the web layer stopped waiting and returned an uncertain outcome. It is not proof that payment failed. A correct user response should preserve that uncertainty instead of saying “payment rejected” without evidence.</p>
+<h3>2. Payment Finishes After The Caller Has Given Up</h3>
+<p>At <code>12:00:09</code>, the provider responds. The payment service stores a durable authorization under <code>pay:order-42</code> and emits a business event through its outbox or queue boundary.</p>
+<div class="codehilite"><pre><span></span><code>12:00:09.240
 payment record:
-  pay:order-42 authorized
+  operation_id=pay:order-42
+  status=authorized
+  provider_reference=provider-774
+
+outbox event:
+  payment_authorized for order-42
+  trace context: trace-81
 </code></pre></div>
 
-<p>No one signal is the whole truth. The log gives a local fact. The trace connects timing across services. The metric shows aggregate pressure. The event store shows whether a durable business transition happened. The payment record shows a side effect that the order path must reconcile.</p>
-<p>Joined together, those facts tell a useful story: the user request reached the system, payment probably succeeded, the order confirmation path did not complete, and the queue was under pressure. That is much better than "checkout failed."</p>
-<h2>Signals And What They Answer</h2>
-<p>Distributed debugging becomes easier when each signal has a job.</p>
-<p><strong>Logs</strong> record local facts. A good log line says what happened at one component with enough identity and context to join it later. Logs are poor when they are anonymous, overly verbose, or filled with messages that do not name the operation.</p>
-<p><strong>Metrics</strong> summarize behavior over time. They answer questions like "is latency rising?", "is queue depth growing?", and "are errors increasing?" Metrics are good for trends and alerts. They are not enough to explain one specific user journey.</p>
-<p><strong>Traces</strong> connect work across boundaries. A trace can show that a checkout spent 100 ms in web code, 8.2 seconds waiting on payment, 300 ms in inventory, and never reached the email worker. Traces are strongest when ids survive service calls, queues, retries, and async jobs.</p>
-<p><strong>Events and durable records</strong> show business transitions. They answer questions like "did payment authorize?", "did the order get confirmed?", and "did the repair job run?" In many incidents, the missing event is as important as the events that exist.</p>
-<p>The mechanism is correlation. Related facts need stable identifiers so a human or tool can join them:</p>
-<div class="codehilite"><pre><span></span><code>request id: follows one attempt
-operation id: follows one logical side effect
-order id: follows the business object
-trace id: follows a path through services
+<p>This creates an important split: the buyer saw a timeout, but the system now has an authorized payment. Any subsequent action must use the same operation id rather than creating a second authorization.</p>
+<h3>3. The Queue Shows A Systemic Delay</h3>
+<p>The event reaches an order-confirmation queue, but workers are slow because their database dependency is saturated. Metrics show that the queue is not a one-off anomaly.</p>
+<div class="codehilite"><pre><span></span><code>12:00:10
+queue metric:
+  depth = 1,400
+  oldest message age = 8 minutes
+
+queue record:
+  message_id=msg-551
+  order_id=order-42
+  state=waiting_for_worker
 </code></pre></div>
 
-<p>Those ids are different on purpose. A retry may have a new request id but the same payment operation id. Treating every id as interchangeable makes the investigation harder.</p>
-<h2>Instrument The Workflow, Not Just The Code</h2>
-<p>A common mistake is instrumenting each service in isolation. The service may look healthy while the workflow is broken. The right starting point is the promise the user experiences.</p>
-<p>For checkout, future-you needs to answer:</p>
-<ul>
-<li>Did the request reach the edge?</li>
-<li>Which order and payment operation were attached?</li>
-<li>Which dependency consumed the latency budget?</li>
-<li>Did the payment side effect happen?</li>
-<li>Did the order record get written?</li>
-<li>Did a confirmation event leave the synchronous path?</li>
-<li>What response did the user receive?</li>
-</ul>
-<p>Those questions tell you where evidence must exist. A queue boundary needs to preserve correlation ids. A background worker needs to link back to the order and operation. A retry needs to record whether it is a new attempt or the same logical action. A repair path needs to leave evidence that it ran.</p>
-<p>Absence needs design too. If an <code>order_confirmed</code> event never appears, the system should make that absence queryable. Otherwise the investigation becomes guesswork: did the event fail to emit, sit in a queue, get dropped, or use a different name?</p>
-<h2>Debugging As Timeline Building</h2>
-<p>When an incident happens, the first useful artifact is often a timeline:</p>
-<div class="codehilite"><pre><span></span><code>12:00:01.000  web received checkout-abc
-12:00:01.080  inventory reserved item sku-9
-12:00:01.120  payment authorization started pay:order-42
-12:00:09.340  payment provider accepted
-12:00:09.500  web timeout already returned error
-12:00:10.000  order_confirmed missing
-12:00:11.000  repair job scheduled
+<p>The metric alone cannot say what happened to <code>order-42</code>; it has no per-order identity. The queue record can. Together they explain both the individual delay and the operational pressure causing it.</p>
+<h3>4. The Buyer Retries Without Creating A New Charge</h3>
+<p>At <code>12:00:12</code>, the buyer refreshes checkout. The web service creates <code>req-B</code> and perhaps <code>trace-82</code>, but it reuses <code>pay:order-42</code> after finding the existing order attempt.</p>
+<div class="codehilite"><pre><span></span><code>req-B -&gt; payment service
+payment_operation_id = pay:order-42
+
+payment service response:
+  existing authorization found
+  do not contact provider again
 </code></pre></div>
 
-<p>The timestamps do not have to be perfect proof of causality. Earlier lessons covered why clocks can drift. The timeline is still useful because it organizes local evidence and exposes missing links.</p>
-<p>A good timeline separates facts from guesses. "Payment provider accepted" is a fact if it comes from a durable payment record. "The user probably retried because the page errored" is an inference unless there is a second request tied to the same order. This separation keeps the debugging process honest.</p>
-<p>The same discipline helps during design review. Ask: if this workflow fails in the middle, could someone reconstruct the product story from retained evidence without asking the original engineer to narrate it?</p>
+<p>This is where observability supports correctness. The log and trace for <code>req-B</code> are new because it is a new request attempt. The durable payment operation is the same because it represents the same business intent. An investigator can see that the buyer retried; the payment record can prove whether the retry was safely deduplicated.</p>
+<h3>5. A Worker Reconstructs And Repairs The State</h3>
+<p>At <code>12:08</code>, a worker consumes <code>msg-551</code>, creates the order record, and records <code>order_confirmed</code>. If the reservation has expired or the order can no longer be completed, a repair workflow can instead release the reservation and initiate a refund or void using <code>provider-774</code>.</p>
+<div class="codehilite"><pre><span></span><code>worker trace span linked to trace-81
+
+order record:
+  order-42 = confirmed
+
+or repair record:
+  order-42 = payment_authorized_but_unfulfillable
+  action = void_or_refund
+</code></pre></div>
+
+<p>The exact outcome is a design decision. What observability must guarantee is that the decision and the evidence behind it are queryable. The investigation should not end at “the page timed out.” It should answer where the workflow stopped, which side effect occurred, and which repair is safe.</p>
+<h2>Build A Timeline, Then Separate Facts From Inferences</h2>
+<p>An incident timeline organizes evidence without pretending that wall-clock order is perfect proof of causality.</p>
+<div class="codehilite"><pre><span></span><code>12:00:00.000  fact: web received req-A for order-42
+12:00:00.080  fact: inventory reserved sku-9
+12:00:05.000  fact: web returned timeout to the buyer
+12:00:09.240  fact: payment record shows pay:order-42 authorized
+12:00:10.000  fact: msg-551 entered the confirmation queue
+12:00:12.000  fact: req-B reused pay:order-42
+12:08:00.000  fact: worker confirmed order-42
+</code></pre></div>
+
+<p>“The buyer probably retried because the page timed out” is an inference until <code>req-B</code> or client telemetry confirms it. “The provider charged the buyer” should be tied to the durable provider result, not only to a trace span. “The queue caused the delay” is a hypothesis supported by queue age, worker latency, and the message's timestamps; it can be strengthened by comparing other orders in the same period.</p>
+<p>This discipline matters because distributed telemetry is incomplete. Clocks drift, traces are sampled, logs can be dropped, and messages can be delivered more than once. A good timeline labels what is known, what is missing, and what repair action is safe under that uncertainty.</p>
+<h2>Instrument Boundaries, Not Just Services</h2>
+<p>A dashboard showing normal CPU for the web service does not prove checkout is healthy. The workflow crosses boundaries where information and responsibility change hands: HTTP requests, downstream calls, transaction commits, queue publish, worker consume, retry, and repair.</p>
+<p>At each boundary, preserve enough context to answer four questions:</p>
+<div class="codehilite"><pre><span></span><code>what logical operation is this?
+which business object does it affect?
+what outcome or error occurred?
+what evidence proves the next handoff or state transition?
+</code></pre></div>
+
+<p>For a queue, this usually means storing the business ids in the message body or headers, propagating trace context, recording enqueue and consume time, and making delivery attempts visible. For a retry, it means a new request id plus the same idempotency or operation id. For a repair job, it means a durable record that names the reason, source evidence, and chosen action.</p>
+<p>Absence must be observable too. If there is no <code>order_confirmed</code> event after a payment authorization, the system should let an engineer query that gap. Otherwise the team cannot distinguish “the event was never written,” “it is waiting in a queue,” “a consumer failed,” and “the event name changed.” Missing evidence is often the actual debugging clue.</p>
 <h2>Failure Modes And Trade-offs</h2>
-<p>The representative failure is every service looking healthy while the user path is broken. CPU is fine. Error rate is low. But a queue is backing up, retries are stretching latency, a downstream provider is slow, and the workflow never emits its final event.</p>
-<p>Another failure is losing identity at a boundary. A synchronous request has a trace id, but the queued job starts with a fresh anonymous id. The incident splits into two unconnected stories.</p>
-<p>Observability can also fail by excess. Too many high-cardinality labels can make metrics expensive. Too much logging can leak sensitive data or drown useful facts. Sampling can hide rare but important failures. Retaining every payload forever is rarely acceptable.</p>
-<p>The trade-off is to preserve evidence for the questions that matter most: user-visible promises, side effects, ownership boundaries, retries, queues, and repair paths. Everything else should earn its cost.</p>
-<h2>Practice Prompt</h2>
-<p>Pick one workflow: checkout, password reset, file upload, message send, seat booking, or account deletion. Fill in these lines:</p>
+<p>The representative failure is every component reporting health while the user workflow is broken. A queue can be growing, a provider can be slow, retries can inflate load, and a final business event can be missing even though CPU and error-rate dashboards look ordinary.</p>
+<p>Another failure is lost identity at an asynchronous boundary. If <code>msg-551</code> omits <code>order-42</code>, the worker starts a separate story. If a retry changes <code>pay:order-42</code>, the system may create a duplicate charge. Correlation data is a correctness aid, not just debugging decoration.</p>
+<p>More telemetry is not automatically safer. High-cardinality metric labels can exhaust a monitoring system. Logging full request bodies can expose payment or personal data. Sampling can hide the rare failing trace that matters most. Retaining every payload forever creates cost and privacy obligations. Systems often sample routine success paths but retain errors, slow operations, or traces tied to high-value workflows more aggressively.</p>
+<p>Useful operational signals include:</p>
+<ul>
+<li>success, timeout, and uncertain-outcome rates for the checkout promise;</li>
+<li>payment authorization age without a matching order or repair record;</li>
+<li>queue depth, oldest-message age, worker latency, and redelivery count;</li>
+<li>retries per payment operation and idempotency-key reuse rate;</li>
+<li>trace-context propagation failures at queue and worker boundaries; and</li>
+<li>cardinality, sampling, retention, and sensitive-field redaction health for telemetry itself.</li>
+</ul>
+<p>The trade-off is evidence versus cost, but the decision should be tied to recovery. Preserve the smallest safe set of facts needed to detect a broken promise, identify side effects, and choose the repair path. Everything retained beyond that should justify its operational and privacy cost.</p>
+<h2>Design Check</h2>
+<p>Choose one workflow: checkout, password reset, file upload, message send, seat booking, or account deletion. Without looking back, write:</p>
 <div class="codehilite"><pre><span></span><code>user-visible promise:
-stable business id:
-operation ids:
-places work crosses a boundary:
-logs needed:
-metrics needed:
-trace spans needed:
-durable events or records:
+durable business id:
+idempotency or operation id:
+per-attempt request id:
+trace context across synchronous and asynchronous boundaries:
+durable state transitions that prove side effects:
+queue or worker evidence:
+metric that detects a systemic version of the failure:
 missing fact that must be queryable:
+safe repair action if the workflow stops midway:
 </code></pre></div>
 
-<p>If an async worker, queue, retry, or repair job cannot be tied back to the original promise, add the missing identity before the incident happens.</p>
+<p>Then imagine a caller retries after a timeout. If the retry cannot be connected to the original business intent, add the missing operation identity before relying on dashboards. If a repair cannot explain its evidence, add the durable transition or link it needs.</p>
 <h2>Resources</h2>
 <ul>
 <li>[DOC] <a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry: Signals</a><ul>
-<li>Focus: How traces, metrics, logs, and related signals fit together.</li>
+<li>Focus: How traces, metrics, logs, and related signals complement rather than replace each other.</li>
 </ul>
 </li>
 <li>[PAPER] <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</a><ul>
-<li>Focus: Why distributed tracing exists and how request paths are reconstructed across services.</li>
+<li>Focus: Why distributed tracing exists and how request paths are reconstructed across service boundaries.</li>
 </ul>
 </li>
 <li>[BOOK] <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Site Reliability Engineering: Monitoring Distributed Systems</a><ul>
-<li>Focus: Practical monitoring signals, alerting, and the limits of summaries.</li>
+<li>Focus: Practical monitoring signals, alerting, and the limits of aggregate summaries.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Observability is the ability to reconstruct distributed behavior from retained evidence.</li>
-<li>Logs, metrics, traces, and durable events answer different questions and need shared identity.</li>
-<li>Instrument workflows around user-visible promises, side effects, queues, retries, and repair paths.</li>
-<li>More telemetry is not automatically better; the trade-off is preserving useful evidence without creating noise, cost, or privacy risk.</li>
+<li>Observability reconstructs a user-visible promise from joinable evidence across requests, queues, services, and durable records.</li>
+<li>Request ids, trace ids, operation ids, and business ids describe different things; preserving their relationships makes retries and repair safe to investigate.</li>
+<li>Logs, traces, metrics, and durable events have distinct jobs and should be designed together at system boundaries.</li>
+<li>The right telemetry set supports a safe repair decision without creating unnecessary cost, noise, or privacy exposure.</li>
 </ul>
 </section>
 
@@ -220,7 +284,7 @@ missing fact that must be queryable:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 13:15 UTC | @jepemo | Built with
+        Generated on 2026-06-20 17:09 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

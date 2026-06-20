@@ -79,105 +79,154 @@
 <section class="stack-block lesson-content-shell">
   <h1>Backpressure, Load, and Cascading Failure</h1>
 <h2>Core Insight</h2>
-<p>Imagine a cafe kitchen that can cook 100 meals per hour. One day 300 orders arrive in an hour. If the cashier keeps accepting every order with a cheerful promise, the kitchen has not become more capable. It has created a growing pile of commitments it cannot keep.</p>
-<p>Distributed systems behave the same way under overload. A queue, worker pool, database, or downstream API has finite capacity. If callers keep adding work faster than the system can finish it, latency rises, timeouts start, retries multiply, and a local slowdown can become a system-wide failure.</p>
-<p><strong>Backpressure</strong> is how a system signals that incoming work must slow down before overload spreads. It may reject work, delay work, reduce concurrency, return <code>429</code>, ask a producer to send fewer items, shed optional features, or degrade to a smaller response.</p>
-<p>The goal is not to avoid every error. The goal is to preserve the most important promises when capacity is limited. The trade-off is uncomfortable: refusing or degrading some work early can be more reliable than accepting everything and collapsing later.</p>
-<h2>When A Queue Stops Helping</h2>
-<p>Use a worker queue that writes to a database:</p>
-<div class="codehilite"><pre><span></span><code>clients -&gt; API -&gt; queue -&gt; workers -&gt; database
+<p>At noon, a report-generation service receives a burst of requests. Its workers read from a database that normally completes 200 reports per minute. A queue absorbs the first minute of extra demand, and nothing looks alarming. Then the database slows after a storage incident. Workers can finish only 80 reports per minute while clients keep submitting 240 reports per minute.</p>
+<p>If the API accepts every request, it has not made more capacity. It has created a growing list of promises it cannot keep. Every minute the queue gains roughly 160 reports. Waiting time rises, reports become stale, callers hit their timeouts, and retries add more requests to a system that is already behind.</p>
+<p><strong>Backpressure</strong> is the set of controls that tells demand to slow down, wait elsewhere, accept a smaller result, or be rejected before overload spreads. It can appear as an admission decision, a bounded queue, a concurrency cap, a rate limit, a <code>429</code> response, a <code>Retry-After</code> hint, or a graceful reduction in optional features.</p>
+<p>The aim is not to make every request succeed during an incident. It is to protect the highest-value promises and preserve a recovery path. Refusing a low-priority report early can be more reliable than accepting it, letting it wait for twenty minutes, and then consuming the capacity needed for a critical transaction.</p>
+<h2>Load Is A Rate And A Waiting Budget</h2>
+<p>The most useful starting point is to compare arrival rate with completion rate.</p>
+<div class="codehilite"><pre><span></span><code>arrival rate:    240 reports/minute
+completion rate:  80 reports/minute
+net queue growth: 160 reports/minute
 </code></pre></div>
 
-<p>At first, the queue is helpful. If clients send a short burst of requests, the queue smooths the burst and workers catch up.</p>
-<div class="codehilite"><pre><span></span><code>brief burst:
-  arrival rate &gt; service rate for 10 seconds
-  queue grows briefly
-  workers catch up
+<p>When arrivals exceed completions only briefly, a queue can smooth the burst. The service drains the accumulated work later. When the mismatch persists, queue length and queue age both grow. A queue is then recording unkept promises, not providing extra capacity.</p>
+<p>The age matters as much as the count. A report requested two seconds ago may still be valuable. A report requested thirty minutes ago may be irrelevant, or worse, may cause a user to act on stale information. Each workload needs a waiting budget:</p>
+<div class="codehilite"><pre><span></span><code>report deadline:       5 minutes
+queue capacity budget: 2,000 jobs
+database concurrency:  40 active queries
+retry budget:          5% extra requests per minute
 </code></pre></div>
 
-<p>Now change the situation. The database slows down for thirty minutes. Workers can finish only 100 jobs per minute, but clients are adding 300 jobs per minute.</p>
-<div class="codehilite"><pre><span></span><code>sustained overload:
-  arrivals: 300/min
-  completions: 100/min
-  queue growth: 200/min
+<p>These numbers are policies rather than universal defaults. They say when a queued job becomes too old to be useful, how much work the system is willing to hold, how much parallelism the protected dependency can tolerate, and how much extra load retries may create.</p>
+<h2>Worked Trace: Break The Overload Loop</h2>
+<p>The report API follows this path:</p>
+<div class="codehilite"><pre><span></span><code>clients -&gt; report API -&gt; bounded queue -&gt; workers -&gt; database
 </code></pre></div>
 
-<p>The queue no longer represents resilience. It represents unkept promises. Jobs get older. Clients time out. Callers retry. Workers hold connections longer. The database receives more pressure from repeated attempts. A buffer that absorbed variation becomes storage for failure.</p>
-<p>That is the first useful mental model: queues are good shock absorbers and bad capacity plans.</p>
-<h2>Controls That Apply Pressure Back</h2>
-<p>Backpressure is not one mechanism. It is a family of controls that keep demand closer to capacity.</p>
-<p><strong>Admission control</strong> decides whether new work is allowed in. If the queue is too deep or the dependency is unhealthy, the system can reject early instead of accepting work it probably cannot finish.</p>
-<p><strong>Concurrency limits</strong> cap how many requests, jobs, or database operations run at once. This protects a dependency from being flooded by every caller at the same time.</p>
-<p><strong>Rate limits</strong> bound how quickly a caller, tenant, user, or service may send work. They make overload less likely to be caused by one noisy source.</p>
-<p><strong>Load shedding</strong> drops or degrades lower-priority work to preserve critical paths. A checkout might skip recommendations before it fails payment authorization.</p>
-<p><strong>Retry budgets</strong> limit how much extra traffic retries may create. A retry can help with a temporary error. A retry storm can double or triple load during the exact moment when the system is weakest.</p>
-<p>The controls work best when they are tied to product priorities:</p>
-<div class="codehilite"><pre><span></span><code>preserve:
-  payment commit
-  order receipt
-  account security action
+<p>The database becomes slow at <code>12:00</code>. Follow the system through the choices it can make.</p>
+<h3>1. Accepting Everything Creates A Hidden Failure</h3>
+<p>At first, the API accepts all 240 requests per minute. Workers start more database queries as the queue grows.</p>
+<div class="codehilite"><pre><span></span><code>12:01
+queue depth: 160
+oldest job:  40 seconds
+database:    80 active queries, rising latency
 
-degrade first:
-  recommendations
-  analytics enrichment
-  noncritical notifications
+12:05
+queue depth: 800
+oldest job:  4 minutes
+database:    connection pool exhausted
 </code></pre></div>
 
-<p>This is why overload policy is not only infrastructure. It decides which promises survive pressure.</p>
-<h2>Cascading Failure</h2>
-<p>A <strong>cascading failure</strong> happens when one overloaded part causes other parts to overload too.</p>
-<p>Consider this path:</p>
-<div class="codehilite"><pre><span></span><code>API -&gt; payment service -&gt; provider
-</code></pre></div>
-
-<p>The provider becomes slow. Payment requests take longer. API threads wait longer. Users time out and retry. Each retry creates another payment attempt or status check. Payment workers spend more time on work that may already be stale. The provider receives even more traffic. Soon the API, payment service, and provider are all under stress.</p>
-<p>The original problem may have been one slow dependency. The cascade comes from the feedback loop:</p>
-<div class="codehilite"><pre><span></span><code>slow dependency
-  -&gt; longer waits
-  -&gt; caller timeouts
+<p>More workers do not help when the database is the bottleneck. They can make it worse by increasing contention, holding more connections, and causing every query to run longer. The API now returns timeouts. Some clients retry immediately. The system's observed arrival rate becomes larger than the original user demand.</p>
+<div class="codehilite"><pre><span></span><code>slow database
+  -&gt; longer requests
+  -&gt; client timeouts
   -&gt; retries
-  -&gt; more load
-  -&gt; even slower dependency
+  -&gt; more queued work and active queries
+  -&gt; even slower database
 </code></pre></div>
 
-<p>Backpressure breaks that loop. It can stop new work, cap concurrency, return a clear retry-after response, shed optional work, or move the workflow into a pending state with repair. The response may be less pleasant than success, but it is better than letting every path fail together.</p>
-<h2>Designing Overload Behavior</h2>
-<p>A healthy overload design names behavior before the incident.</p>
-<p>For each important path, ask:</p>
+<p>This positive feedback loop is a <strong>cascading failure</strong>. The initial problem was one slow dependency. The cascade happens when waiting and retries amplify it into overload across callers, workers, and connection pools.</p>
+<h3>2. Bound The Queue And Close Admission Early</h3>
+<p>The service gives the queue a capacity and age limit. When either limit is crossed, new low-priority report requests are not accepted.</p>
+<div class="codehilite"><pre><span></span><code>admission rule:
+  if queue_depth &gt; 2,000
+     or oldest_job_age &gt; 5 minutes
+     or database health is degraded:
+       reject new standard reports with Retry-After
+</code></pre></div>
+
+<p>The rejection is useful information. It prevents the API from claiming it will deliver a report that has little chance of meeting its deadline. A user can be told that reports are delayed, offered an older cached report, or asked to try later. The response is less pleasant than immediate success, but it is honest and bounded.</p>
+<p>Admission should be selective. A monthly accounting close may be more important than an optional dashboard refresh. One noisy tenant should not consume every slot. A system can reserve part of the queue or concurrency budget for high-priority work rather than applying one undifferentiated rule to all traffic.</p>
+<h3>3. Protect The Database With Concurrency Limits</h3>
+<p>The workers reduce active database work from 80 to a tested limit of 40. A limit does not make the database faster by itself. It prevents overload from turning one slow query into hundreds of competing slow queries.</p>
+<div class="codehilite"><pre><span></span><code>worker policy:
+  at most 40 active database queries
+  remaining jobs stay in the bounded queue
+  do not start more work merely because workers are idle
+</code></pre></div>
+
+<p>This is a <strong>concurrency limit</strong>. It is different from a queue: the queue limits waiting work; the concurrency limit limits work already stressing the dependency. Both are needed. An unbounded queue can hide a bad rate mismatch. Unlimited concurrency can collapse the dependency before the queue has a chance to help.</p>
+<h3>4. Shed Work And Enforce Deadlines</h3>
+<p>As the incident continues, the system drops jobs that can no longer be useful and degrades optional features. Cached reports may be served for a dashboard. Analytics enrichment can pause. Critical security and billing actions keep their protected capacity.</p>
+<div class="codehilite"><pre><span></span><code>preserve first:
+  payment confirmation
+  account security actions
+  committed order receipts
+
+degrade or delay first:
+  dashboard refresh
+  recommendations
+  optional analytics
+  expired report jobs
+</code></pre></div>
+
+<p><strong>Load shedding</strong> means deliberately refusing or simplifying lower-priority work to protect the path that matters most. A job that has exceeded its deadline is not a free future task; it may be harmful work consuming recovery capacity. The system should discard it with a traceable reason or send it to a repair path if the business requires later completion.</p>
+<h3>5. Make Retries Part Of The Capacity Plan</h3>
+<p>Retries are necessary for some transient errors, but they must be constrained. The API uses exponential backoff with jitter, an overall deadline, and a retry budget. A <code>Retry-After</code> response makes callers wait instead of retrying in synchronized waves.</p>
+<div class="codehilite"><pre><span></span><code>retry policy:
+  retry only retryable failures
+  wait with randomized backoff
+  stop at the request deadline
+  do not exceed the retry budget
+  reuse idempotency keys for state-changing work
+</code></pre></div>
+
+<p>Without jitter, many callers retry at exactly the same interval and create a second spike. Without a budget, every dependency slowdown can multiply traffic. Without an idempotency key, retries may duplicate a payment or order. Backpressure is therefore part of correctness as well as capacity management.</p>
+<h3>6. Recover Gradually</h3>
+<p>At <code>12:20</code>, database latency improves. The system does not instantly reopen every gate. It first confirms that active-query latency, queue age, and error rates are returning to safe ranges. It drains still-useful work, discards expired jobs, increases admission in steps, and restores optional features after the core path is stable.</p>
+<div class="codehilite"><pre><span></span><code>recovery order:
+  stabilize protected dependency
+  drain useful high-priority work
+  raise admission gradually
+  restore optional work last
+</code></pre></div>
+
+<p>Reopening all gates at once can recreate the very surge that caused the incident. Recovery is a controlled transition, not a binary switch.</p>
+<h2>Controls Apply Pressure At Different Boundaries</h2>
+<p><strong>Admission control</strong> answers whether a new request may enter. It protects the whole path from promises the system cannot keep.</p>
+<p><strong>Rate limits</strong> answer how quickly one user, tenant, or upstream service may submit work. They prevent a noisy producer from consuming shared capacity.</p>
+<p><strong>Concurrency limits</strong> answer how much active work may reach a dependency. They protect the dependency's connection pool, CPU, memory, and tail latency.</p>
+<p><strong>Bounded queues</strong> absorb short variation but force a policy once waiting work is too large or too old.</p>
+<p><strong>Load shedding and degraded modes</strong> decide which features can return a smaller answer or no answer so critical paths survive.</p>
+<p><strong>Retry budgets and deadlines</strong> stop recovery behavior from becoming a new source of load.</p>
+<p>None of these controls is sufficient alone. A rate limit cannot prevent a database from slowing. A queue cannot make a persistent rate mismatch disappear. A concurrency cap can protect the database while still leaving callers to wait forever if no deadline exists. The controls form a layered response to the same pressure.</p>
+<h2>Failure Modes And Operational Signals</h2>
+<p>The obvious failure is accepting every request until the system stops serving anything well. It often looks friendly at the API boundary and hostile to users later, after a long wait and an ambiguous timeout.</p>
+<p>Another failure is protecting the wrong workload. If recommendation jobs retain full concurrency while payment confirmation waits, the system has made an implicit product decision without naming it. Priority classes should be explicit, tested, and visible in the admission rules.</p>
+<p>A third failure is treating queue depth alone as health. A shallow queue can contain jobs that are already too old, and a deep queue can be safe for a short burst. Queue age, deadline expiry, completion rate, and dependency latency show whether the buffer is absorbing variation or accumulating failure.</p>
+<p>Useful signals include:</p>
 <ul>
-<li>What is the capacity limit we are protecting?</li>
-<li>Which work is highest priority?</li>
-<li>Which work can be delayed?</li>
-<li>Which work becomes worthless after a deadline?</li>
-<li>Which callers may retry, and how much?</li>
-<li>What response should users see when admission closes?</li>
+<li>arrival and completion rates by priority class;</li>
+<li>queue depth, oldest-job age, expiration, and discard rates;</li>
+<li>active concurrency, connection-pool saturation, and dependency tail latency;</li>
+<li>admission rejection and <code>Retry-After</code> rates;</li>
+<li>retries per original request, retry-budget exhaustion, and idempotency collisions; and</li>
+<li>recovery ramp rate and time to restore optional features.</li>
 </ul>
-<p>Deadlines matter because old work can become harmful. Sending a confirmation email two seconds late may be fine. Charging a stale payment attempt after the user has canceled may not be. A queue should know when work has expired.</p>
-<p>Recovery also needs a policy. When load drops, the system should not instantly reopen every gate and recreate the overload. It may drain useful work, discard expired work, ramp admission gradually, and keep lower-priority features degraded until core paths are stable.</p>
-<p>Good backpressure makes overload visible. Metrics such as queue age, queue depth, concurrency, rejection rate, retry rate, and deadline expiration show whether the system is protecting itself or merely delaying collapse.</p>
-<h2>Failure Modes And Trade-offs</h2>
-<p>The representative failure is accepting too much work. The system tries to be available by saying yes, but it accumulates so much delayed work that eventually it cannot serve anything well.</p>
-<p>Another failure is unbounded retries. Callers trying to be helpful multiply the work. Without jitter, budgets, and deadlines, many callers retry together and turn a slowdown into a surge.</p>
-<p>A third failure is shedding the wrong work. If optional background jobs keep running while checkout fails, the system is preserving the wrong promise. Priority should be explicit, tested, and visible in dashboards.</p>
-<p>The trade-off is between completeness and survival under pressure. Serving every request at full fidelity is ideal when capacity exists. Under overload, a smaller honest promise can be more correct: reject early, degrade optional work, preserve critical state transitions, and repair later when necessary.</p>
-<h2>Practice Prompt</h2>
-<p>Pick one path: checkout, search, login, video upload, report generation, notification send, or background import. Fill in these lines:</p>
+<p>Deadlines must travel with the work. If the caller has only two seconds left, handing a job to a queue that will wait for five minutes does not preserve the caller's promise. The worker needs to know the remaining budget and decline a database call that cannot finish before it expires. Likewise, a downstream call should receive a shorter deadline than its caller, leaving time for the caller to record a useful outcome or return a controlled pending response. This prevents a request from surviving independently in every layer after it has already become useless to the user.</p>
+<p>For state-changing work, the expiration policy must also distinguish “safe to drop” from “must reconcile.” An expired dashboard refresh can be discarded. An expired payment authorization may need a compensating void or a status check before it disappears from the queue. Backpressure does not remove responsibility for side effects; it makes the system decide which delayed work still has an obligation attached to it.</p>
+<p>The trade-off is completeness versus survival. Under normal load, serving every request at full fidelity may be correct. Under sustained overload, a smaller, explicit promise—reject, defer, cache, or degrade—can protect the state transitions that must remain trustworthy.</p>
+<h2>Design Check</h2>
+<p>Choose one path: checkout, search, login, video upload, report generation, notification send, or background import. Without looking back, write:</p>
 <div class="codehilite"><pre><span></span><code>protected dependency:
-normal capacity:
-overload signal:
-admission rule:
+normal arrival and completion rates:
+maximum useful queue age and capacity:
+concurrency limit:
+admission rule and user response:
 work to preserve:
 work to shed or degrade:
-retry budget:
-deadline or expiration rule:
-recovery rule:
+retry deadline, backoff, and budget:
+idempotency requirement:
+recovery ramp and metric that permits it:
 </code></pre></div>
 
-<p>If the answer says "queue everything," add the point where the system stops accepting work that can no longer keep its promise.</p>
+<p>Then increase arrivals above completions for ten minutes. If the design has no point where it stops accepting work that cannot meet its promise, it is postponing overload rather than controlling it.</p>
 <h2>Resources</h2>
 <ul>
 <li>[BOOK] <a href="https://sre.google/sre-book/handling-overload/">Site Reliability Engineering: Handling Overload</a><ul>
-<li>Focus: Load shedding, graceful degradation, and practical overload behavior.</li>
+<li>Focus: Load shedding, graceful degradation, and operational choices during overload.</li>
 </ul>
 </li>
 <li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/">Using Load Shedding to Avoid Overload</a><ul>
@@ -185,16 +234,16 @@ recovery rule:
 </ul>
 </li>
 <li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
-<li>Focus: Retry budgets, backoff, jitter, and their connection to overload.</li>
+<li>Focus: Retry budgets, backoff, jitter, and the feedback loops they prevent.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Backpressure protects limited capacity by slowing, rejecting, or degrading incoming work.</li>
-<li>Queues smooth short bursts, but sustained queue growth is evidence of an unkept promise.</li>
-<li>Cascading failure often comes from feedback loops: slow dependencies, timeouts, retries, and more load.</li>
-<li>Overload policy is a product decision because it chooses which promises survive under pressure.</li>
+<li>Queues absorb short bursts; sustained arrival rates above completion rates create growing, aging promises rather than capacity.</li>
+<li>Backpressure combines bounded admission, queue and concurrency limits, priority, deadlines, load shedding, and retry budgets.</li>
+<li>Cascades arise when slow dependencies create waits and retries that add more load; early controls break that feedback loop.</li>
+<li>Overload policy is a product decision because it chooses which promises retain capacity under pressure.</li>
 </ul>
 </section>
 
@@ -224,7 +273,7 @@ recovery rule:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-19 13:15 UTC | @jepemo | Built with
+        Generated on 2026-06-20 17:09 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
