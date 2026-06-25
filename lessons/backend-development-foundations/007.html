@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SQL Query Shape, Indexes, and Transactions - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/backend-development-foundations.html" aria-label="Exit lesson and return to Backend Development Foundations">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>SQL Query Shape, Indexes, and Transactions</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/architecture-and-platforms.html">Architecture And Platforms</a>
+    /
+    <a href="../../tracks/backend-development-foundations.html">Backend Development Foundations</a>
+    /
+    007
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/backend-development-foundations.html">Backend Development Foundations</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">007</span>
+    <span class="meta-chip">25 min</span>
+    <span class="meta-chip">beginner</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>SQL Query Shape, Indexes, and Transactions</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong>
+Trace a backend SQL query from handler input to database work; explain when an index can reduce scanned rows; and decide which writes must share one transaction to keep state correct.</p>
+<p><strong>Idea in one sentence.</strong> SQL is not just text sent to a database; the query shape tells the database what rows to find, indexes change how it can find them, and transactions define which changes become true together.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Imagine the orders API from the previous lesson is now live. The data model is reasonable: <code>customers</code>, <code>orders</code>, <code>order_items</code>, and <code>products</code> are separate tables with keys and constraints. In staging, the endpoint <code>GET /customers/42/orders?status=open</code> returns instantly. In production, after a few months of real orders, support says the customer page sometimes takes eight seconds to load.</p>
+<p>The handler code looks simple. It receives a customer ID, builds a SQL query, and returns rows. Nothing in the route name says "scan a million orders." But the database does not execute the route name. It executes the query shape: which table starts the work, which predicates filter rows, which joins connect tables, which ordering is required, and which rows must be protected while a write is in progress.</p>
+<p>SQL query shape is the practical bridge between backend code and database behavior. A small handler can cause a targeted lookup or a broad scan. A missing predicate can make the database inspect far more rows than the response returns. A useful index can make the lookup cheap. A wrong index can add write cost without helping the query. A transaction can protect a multi-step change, or its absence can let two correct-looking handlers produce impossible state together.</p>
+<p>The common beginner shortcut is "the database is slow" or "add an index." Both are too vague. A database is doing specific work for a specific query under specific concurrency. The useful question is: what rows might this query have to inspect, what path can the database use to find them, and which changes must commit or roll back as one unit?</p>
+<p>The central trade-off is <strong>fast targeted reads and correct grouped writes versus index maintenance, lock contention, and design discipline</strong>. Indexes and transactions are powerful because they move work into the database engine. They also cost something. Every index must be maintained when rows change. Every transaction holds some view of state and may block or conflict with other work. Backend engineers need enough of the mechanism to spend those tools deliberately.</p>
+<h2>The Visible Pieces</h2>
+<p>Use one recurring scenario: the customer order page asks for open orders for one customer, newest first, with enough product detail to display a support summary.</p>
+<p>The tables are simplified:</p>
+<div class="codehilite"><pre><span></span><code>customers(customer_id, email)
+orders(order_id, customer_id, status, created_at)
+order_items(order_item_id, order_id, product_id, quantity, unit_price_cents_at_purchase)
+products(product_id, sku, name, active)
+</code></pre></div>
+
+<p>A handler might issue:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span>
+<span class="w">  </span><span class="n">o</span><span class="p">.</span><span class="n">order_id</span><span class="p">,</span>
+<span class="w">  </span><span class="n">o</span><span class="p">.</span><span class="n">status</span><span class="p">,</span>
+<span class="w">  </span><span class="n">o</span><span class="p">.</span><span class="n">created_at</span><span class="p">,</span>
+<span class="w">  </span><span class="n">p</span><span class="p">.</span><span class="n">sku</span><span class="p">,</span>
+<span class="w">  </span><span class="n">p</span><span class="p">.</span><span class="n">name</span><span class="p">,</span>
+<span class="w">  </span><span class="n">oi</span><span class="p">.</span><span class="n">quantity</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">o</span>
+<span class="k">JOIN</span><span class="w"> </span><span class="n">order_items</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">oi</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">oi</span><span class="p">.</span><span class="n">order_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">o</span><span class="p">.</span><span class="n">order_id</span>
+<span class="k">JOIN</span><span class="w"> </span><span class="n">products</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">p</span><span class="p">.</span><span class="n">product_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">oi</span><span class="p">.</span><span class="n">product_id</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">o</span><span class="p">.</span><span class="n">customer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">o</span><span class="p">.</span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">o</span><span class="p">.</span><span class="n">created_at</span><span class="w"> </span><span class="k">DESC</span>
+<span class="k">LIMIT</span><span class="w"> </span><span class="mi">20</span><span class="p">;</span>
+</code></pre></div>
+
+<p>Read the query as a path, not as decoration:</p>
+<ul>
+<li><code>FROM orders AS o</code> names the main row set.</li>
+<li><code>WHERE o.customer_id = 42 AND o.status = 'open'</code> says which orders matter.</li>
+<li><code>JOIN order_items</code> expands each order into its lines.</li>
+<li><code>JOIN products</code> attaches product display facts.</li>
+<li><code>ORDER BY o.created_at DESC</code> requires the newest orders first.</li>
+<li><code>LIMIT 20</code> says only twenty final order rows are needed, but it does not automatically make the earlier work cheap.</li>
+</ul>
+<p>The formal term <strong>predicate</strong> means a condition used to filter rows, such as <code>customer_id = 42</code> or <code>status = 'open'</code>. The query's predicates are the first place to look when a read is unexpectedly expensive. They decide whether the database can go straight to a narrow subset or must inspect a broad table and discard most rows.</p>
+<h2>What Work Does the Query Cause?</h2>
+<p>Pretend the <code>orders</code> table has 2,000,000 rows. Customer <code>42</code> has 85 orders. Only 9 are open. The response needs the 20 newest open orders, but there are only 9.</p>
+<p>Without a helpful index, the database may have to do work shaped like this:</p>
+<div class="codehilite"><pre><span></span><code>start at orders table
+  -&gt; inspect many order rows
+  -&gt; keep rows where customer_id = 42
+  -&gt; keep rows where status = &#39;open&#39;
+  -&gt; sort the remaining rows by created_at
+  -&gt; join each kept order to order_items
+  -&gt; join each item to products
+  -&gt; return rows
+</code></pre></div>
+
+<p>The exact planner behavior depends on the database, statistics, and available indexes, but the beginner mental model is sound: if there is no cheap path to the rows you asked for, the database must find them the hard way.</p>
+<p>Now add a composite index:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_orders_customer_status_created</span>
+<span class="k">ON</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="p">(</span><span class="n">customer_id</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">created_at</span><span class="w"> </span><span class="k">DESC</span><span class="p">);</span>
+</code></pre></div>
+
+<p>That index is like a separate ordered lookup structure maintained by the database. It does not store every column, and it does not change the meaning of the table. It gives the database another path:</p>
+<div class="codehilite"><pre><span></span><code>start at index entries for customer_id = 42
+  -&gt; narrow to status = &#39;open&#39;
+  -&gt; read entries already ordered by created_at DESC
+  -&gt; find matching order rows
+  -&gt; join to order_items and products
+  -&gt; stop once enough relevant rows are found
+</code></pre></div>
+
+<p>This is why the order of columns in a composite index matters. The query filters first by <code>customer_id</code>, then by <code>status</code>, and orders by <code>created_at</code>. An index on only <code>created_at</code> might help with sorting newest orders globally, but it does not first narrow to one customer. An index on only <code>status</code> may still leave many open orders across all customers. A useful index matches the access pattern: the predicates and ordering the backend actually uses.</p>
+<p>Quick check: if a support page always asks for <code>WHERE customer_id = ? AND status = ? ORDER BY created_at DESC</code>, which index is more likely to help: <code>(customer_id, status, created_at)</code> or <code>(created_at)</code>?</p>
+<p>Answer: <code>(customer_id, status, created_at)</code> is more likely to help because it starts with the equality filters that narrow the result before using the order. The single-column <code>created_at</code> index may still require scanning recent orders for many customers and statuses.</p>
+<h2>Joins Are Relationship Work</h2>
+<p>The previous lesson separated facts into tables. Joins are how a query reconstructs the needed view. A join is not inherently bad. It is the database following relationships you modeled.</p>
+<p>The important question is whether each join has a clear key path. In the order summary query:</p>
+<div class="codehilite"><pre><span></span><code>orders.order_id -&gt; order_items.order_id
+order_items.product_id -&gt; products.product_id
+</code></pre></div>
+
+<p>Those are natural foreign-key relationships. If <code>order_items.order_id</code> is indexed, the database can find line items for a small set of orders efficiently. If it is not indexed, the database may need to inspect many order item rows for each order or choose a more expensive plan.</p>
+<p>A common backend failure is the N+1 query pattern. Instead of one query that joins order items and products, the code does this:</p>
+<div class="codehilite"><pre><span></span><code>query 1: fetch 20 orders
+for each order:
+  query 2..21: fetch order_items for that order
+  for each item:
+    query more: fetch product
+</code></pre></div>
+
+<p>The response may be correct, but the database round trips multiply with the result size. Frameworks and ORMs can hide this by turning property access into extra queries. The fix is not always "write raw SQL." The fix is to notice the shape: one request should not accidentally become dozens or hundreds of database queries when one intentional query or preloading strategy would express the relationship clearly.</p>
+<p>So far, query shape is the visible request your backend makes of the database. Indexes can improve the path for a specific shape. Joins let normalized facts become a response. The next question is what happens when a request changes more than one row.</p>
+<h2>Transactions Define One Unit of Truth</h2>
+<p>Consider <code>POST /orders/1001/cancel</code>. Canceling an order may need several changes:</p>
+<div class="codehilite"><pre><span></span><code>orders.status: open -&gt; canceled
+inventory.available_count: add back each reserved item
+payments.status: authorization -&gt; voided
+order_events: append &quot;order_canceled&quot;
+</code></pre></div>
+
+<p>If the handler updates the order status and then crashes before restoring inventory, the system now says the order is canceled but the items are still reserved. Each individual SQL statement might have been valid. The grouped business change is invalid.</p>
+<p>A <strong>transaction</strong> is the database mechanism for treating multiple operations as one unit of work. The classic promise is often summarized as ACID:</p>
+<ul>
+<li>Atomicity: all changes in the transaction commit, or none do.</li>
+<li>Consistency: database constraints must still hold.</li>
+<li>Isolation: concurrent transactions are kept from seeing or causing certain intermediate states.</li>
+<li>Durability: committed changes survive database failure according to the database's guarantees.</li>
+</ul>
+<p>For this lesson, focus on the plain version: a transaction draws a boundary around changes that must become true together.</p>
+<p>The cancel flow should look like:</p>
+<div class="codehilite"><pre><span></span><code>BEGIN
+  read order 1001
+  verify status is open
+  update orders set status = canceled
+  restore inventory for each item
+  void payment authorization or record void intent
+  insert order_events row
+COMMIT
+</code></pre></div>
+
+<p>If a required database step fails before <code>COMMIT</code>, the transaction can roll back. The durable state returns to the previous version instead of leaving half the cancellation visible.</p>
+<p>Transactions also matter when two requests race. Suppose two support agents try to cancel the same order at the same time. The handler must not restore inventory twice. A transaction can combine the state check and the state change so only one request successfully moves <code>open -&gt; canceled</code>.</p>
+<p>One common pattern is a conditional update:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">UPDATE</span><span class="w"> </span><span class="n">orders</span>
+<span class="k">SET</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;canceled&#39;</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">order_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1001</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>Then the handler checks how many rows changed. If one row changed, this request owned the transition. If zero rows changed, someone else already moved the order, or the order was not cancelable. That row-count signal is a small but powerful piece of evidence.</p>
+<h2>Locks, Isolation, and Cost</h2>
+<p>Transactions are not free. While a transaction is open, the database may hold locks or maintain a snapshot so it can protect isolation. A lock is a coordination mechanism that prevents conflicting work from changing or reading state in an unsafe way, depending on the database and isolation level.</p>
+<p>You do not need to master every isolation level as a beginner. You do need the design habit: keep transactions as short as the correctness boundary allows. Do the database changes that must be atomic inside the transaction. Avoid slow network calls, long user interactions, or unrelated work while holding database state open.</p>
+<p>For the cancellation flow, calling an external payment provider inside the same database transaction can be dangerous. The provider may take seconds or fail in an ambiguous way. During that time, the database transaction may hold locks. A more careful design may record a local cancellation intent and process the external void through a separate reliable workflow. That topic grows into queues and sagas later. The beginner lesson is simpler: a database transaction protects database state, but it cannot magically make an outside service commit atomically with your database.</p>
+<p>The trade-off is direct. Stronger grouping gives clearer correctness. Longer or broader grouping increases contention and failure impact. A good backend transaction is wide enough to protect the invariant and narrow enough to finish quickly.</p>
+<p>Quick check: should a handler begin a database transaction, call a slow shipping API, wait six seconds, and then update one row?</p>
+<p>Answer: usually no. If the shipping call does not need database locks held open, do it outside the transaction or record an intent and process it separately. Keep the transaction focused on the database state that must change together.</p>
+<h2>Failure Modes and Signals</h2>
+<p>SQL performance and correctness problems usually leave clues:</p>
+<ul>
+<li>A slow endpoint has a query that scans far more rows than it returns.</li>
+<li>A query filters by columns that are not indexed for that access pattern.</li>
+<li>A response triggers N+1 queries through an ORM or convenience helper.</li>
+<li>An index exists but does not match the predicate order or sort the query needs.</li>
+<li>A transaction covers too much work and causes lock waits.</li>
+<li>Missing transaction boundaries let half-finished business changes become visible.</li>
+<li>Concurrent requests both pass a read check before either writes the state transition.</li>
+</ul>
+<p>The operational signals include query duration, rows scanned versus rows returned, query plans, lock waits, deadlocks, connection pool saturation, and handler latency. Backend logs should connect route, query name, duration, and request ID. Database tools such as <code>EXPLAIN</code> are useful because they show the plan the database expects to use: scan type, join strategy, estimated rows, and indexes considered.</p>
+<p><code>EXPLAIN</code> is not a magic answer. It is evidence. Combine it with the query shape and the product behavior. If the route usually asks for one customer's open orders, optimize for that access pattern. If a report intentionally scans a month of orders, the right answer may be a reporting index, a read model, or a background job rather than making the customer page pay that cost.</p>
+<h2>Readiness Check</h2>
+<p>Close the lesson and review this backend change:</p>
+<div class="codehilite"><pre><span></span><code>Endpoint: GET /products?active=true&amp;search=charger
+Current table: products(product_id, sku, name, active, created_at)
+Current index: products(created_at)
+Observed behavior: response returns 20 rows but slows down as product count grows.
+</code></pre></div>
+
+<p>Use this rubric:</p>
+<ul>
+<li>Identify the predicates.</li>
+<li>State why the existing index may not help.</li>
+<li>Propose one index or query-shape investigation.</li>
+<li>Name one signal that would confirm the problem.</li>
+<li>Say whether a transaction is the main tool for this read path.</li>
+</ul>
+<p>A solid answer might say: the predicates are <code>active = true</code> and a search condition on <code>name</code> or related searchable text. The <code>created_at</code> index does not directly narrow by active status or search term. The team should inspect the actual SQL and <code>EXPLAIN</code> plan, then consider an index that matches active filtering and the database's search strategy, such as a text-search-specific index if supported. Useful signals include rows scanned, query duration, and whether the plan uses an index or full scan. A transaction is not the main tool for this read path; query shape and indexing are.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/indexes.html">PostgreSQL Documentation: Indexes</a><ul>
+<li>Focus: Use this to connect index types, multicolumn indexes, and ordering to real query access paths.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/using-explain.html">PostgreSQL Documentation: Using EXPLAIN</a><ul>
+<li>Focus: Read plans as evidence of scans, joins, estimated rows, and chosen indexes.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/tutorial-transactions.html">PostgreSQL Documentation: Transactions</a><ul>
+<li>Focus: Use this for the basic transaction boundary: commit all related changes or roll them back.</li>
+</ul>
+</li>
+<li>[DOC] <a href="https://www.sqlite.org/queryplanner.html">SQLite Query Planning</a><ul>
+<li>Focus: Compare another database's explanation of how indexes reduce search work.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>SQL query shape is the database work requested by your handler: predicates, joins, ordering, limits, and writes all matter.</li>
+<li>Indexes help when they match a real access pattern, but they add maintenance cost and do not fix every slow query.</li>
+<li>Joins are how normalized facts become useful responses; accidental N+1 query shapes are the common hidden failure.</li>
+<li>Transactions define which database changes become true together, but broader transactions can increase contention and should stay focused.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="006.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Relational Data Modeling for CRUD Systems</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="008.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Web Frameworks and the Request Handler Pipeline</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/backend-development-foundations.html">← Back to Backend Development Foundations</a></p>
+  <p><a href="../../classifications/architecture-and-platforms.html">← Back to Architecture And Platforms</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-06-25 13:49 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
