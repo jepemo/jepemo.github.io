@@ -77,169 +77,313 @@
 <section class="stack-block lesson-content-shell">
   <h1>Consistency Models and User Guarantees</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
 <ul>
 <li>
-<p>translate a user-facing promise into a concrete consistency guarantee;</p>
+<p>translate a user-facing surprise into a specific consistency guarantee.</p>
 </li>
 <li>
-<p>trace how a minimum-version read prevents a stale replica from breaking read-your-writes;</p>
+<p>trace how a minimum-version read prevents a stale replica from breaking "saved."</p>
 </li>
 <li>
-<p>choose when a workflow needs session guarantees, causal order, or linearizability instead of eventual convergence alone.</p>
+<p>compare eventual convergence, read-your-writes, monotonic reads, causal consistency, and linearizability.</p>
 </li>
 </ul>
-<p><strong>Idea in one sentence:</strong> Consistency models are promises about what observers may see after writes, so the useful design question is not "is the database consistent?" but "which stale or reordered observation must this workflow forbid?"</p>
+<p><strong>Idea in one sentence:</strong> A consistency model is a promise about what an observer is allowed to see after writes.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Mina edits the bio on her profile from “Researcher” to “Independent researcher.” The app shows <strong>Saved</strong>, then immediately reloads the profile. The new wording matters less than the expectation it creates: after the app says the change succeeded, Mina should not be shown the older bio as if the save never happened.</p>
-<p>The service stores profiles in several regions. The write goes to the profile owner in Madrid, while the reload may be routed to a nearby follower in Frankfurt. At that moment, the important question is not how many replicas exist. It is what that second read is allowed to observe. If the follower has only applied an older version, a fast response can still violate the meaning of “Saved.”</p>
-<p>A <strong>consistency model</strong> is a promise about observations: which results a read may return after one or more writes, and for whom that promise holds. The promise can be narrow, such as “the person who made the edit sees it on their next read.” Or it can be broad, such as “once a credential change succeeds, every later authentication check sees the new rule.” Those are different guarantees with different costs.</p>
-<p>The useful design move is to start with the surprise that must not happen. Then choose the least expensive mechanism that prevents it. “Use a consistent database” is not a usable requirement. “After this user saves their bio, their session must see version 52 or newer” is one. It names the actor, the state, and the forbidden observation.</p>
-<h2>Name The Observation Before The Guarantee</h2>
-<p>For Mina's profile, the relevant state is a small record with a version:</p>
-<div class="codehilite"><pre><span></span><code>profile/mina
-  version 51: bio = &quot;Researcher&quot;
-  version 52: bio = &quot;Independent researcher&quot;
+<p>Nora opens a food delivery app at work.</p>
+<p>Her saved delivery address is:</p>
+<div class="codehilite"><pre><span></span><code>Office, 10 Market Street
 </code></pre></div>
 
-<p>The system has several visible pieces:</p>
-<div class="codehilite"><pre><span></span><code>Mina&#39;s app       sends a write and later reads
-profile owner    accepts the official next version
-followers        apply copies of that version, possibly later
-router           chooses where each read goes
-session token    carries evidence of what Mina has already seen
+<p>Before ordering dinner, she changes it to:</p>
+<div class="codehilite"><pre><span></span><code>Home, 42 River Road
 </code></pre></div>
 
-<p>Before choosing a formal term, write the product sentence:</p>
-<div class="codehilite"><pre><span></span><code>After Mina is told that profile version 52 was saved,
-her later profile reads in this session must return version 52 or newer.
+<p>The app says:</p>
+<div class="codehilite"><pre><span></span><code>Address saved.
 </code></pre></div>
 
-<p>This sentence does not require every person on the internet to see version 52 immediately. It protects Mina's own experience. A visitor in another region might still see version 51 briefly if the product can tolerate that. The scope is part of the guarantee, not a detail to add later.</p>
-<p>Compare it with a password reset. If the system says an old password or API key has been revoked, allowing that old credential at a different authentication server is usually a security failure, not a mildly stale page. The product sentence is stronger:</p>
-<div class="codehilite"><pre><span></span><code>After password version 12 is confirmed,
-every later authentication decision for this account must reject version 11.
+<p>Then Nora goes to checkout. The checkout page reloads from a nearby replica that has not received the new address yet. It shows the old office address.</p>
+<p>The database may be behaving exactly as designed. The replica may be healthy. Replication may catch up two seconds later.</p>
+<p>But the product just broke a promise.</p>
+<p>After the app told Nora the address was saved, Nora should not immediately see the old address as if the save never happened. The technical question is not "is the database consistent?" That question is too vague. The useful question is:</p>
+<div class="codehilite"><pre><span></span><code>Which observation must this workflow forbid?
 </code></pre></div>
 
-<p>Both workflows use replication. They should not automatically use the same observation promise.</p>
-<p>Pause on the wording before moving on. If the forbidden observation names only Mina's own later reads, the guarantee can often travel with her session. If it names every authentication decision after a revocation, the guarantee must reach every path that can accept or reject the old credential. The same storage topology can therefore support two different promises.</p>
-<h2>Worked Trace: Carry A Minimum Version Through A Session</h2>
-<p>The profile service uses a leader or write owner plus followers. Its current replicated position for Mina's record is version 51.</p>
-<div class="codehilite"><pre><span></span><code>Madrid owner:       profile/mina at version 51
-Frankfurt follower: profile/mina at version 51
-Mina&#39;s app:         no minimum version yet
+<p>Plain meaning:</p>
+<p>A consistency model tells the system which stale or reordered results are allowed, and which ones are forbidden.</p>
+<p>In this scenario:</p>
+<p>Nora's checkout read must not return an address older than the version she just saved.</p>
+<p>Technical name:</p>
+<p>This is a <strong>consistency guarantee</strong>. The specific guarantee Nora needs is <strong>read-your-writes</strong>.</p>
+<h2>The Naive Idea: Read From Any Healthy Replica</h2>
+<p>The address service has one write owner and several read replicas.</p>
+<div class="codehilite"><pre><span></span><code>Madrid owner:
+  address/nora version 27 = Office
+
+Dublin replica:
+  address/nora version 27 = Office
+
+Lisbon replica:
+  address/nora version 27 = Office
 </code></pre></div>
 
-<h3>1. Accept The Write And Return Evidence</h3>
-<p>Mina submits the new bio. The Madrid owner records version 52 and returns a response only after the service's chosen write-durability rule has completed. The response includes the version Mina's app is now entitled to see.</p>
-<div class="codehilite"><pre><span></span><code>Mina -&gt; Madrid owner: PUT profile/mina, bio = &quot;Independent researcher&quot;
+<p>The naive read rule is:</p>
+<div class="codehilite"><pre><span></span><code>Send each read to the nearest healthy replica.
+</code></pre></div>
+
+<p>That rule is attractive. It is fast. It keeps traffic local. It avoids bothering the owner for every read.</p>
+<p>Then Nora saves her new address.</p>
+<div class="codehilite"><pre><span></span><code>Madrid owner:
+  version 27 -&gt; version 28
+  address = Home
+
+Dublin replica:
+  still at version 27 for a short time
+</code></pre></div>
+
+<p>If checkout reads from Dublin immediately, it may see version 27. That is a valid local copy, but it is not a valid answer for Nora's checkout after the app said "Address saved."</p>
+<p>The missing piece is not another replica. The missing piece is an observation rule.</p>
+<p><strong>Check:</strong> If Dublin is healthy but still at version 27, should it return the office address to Nora's checkout?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No, not if Nora's session has evidence that version 28 was saved. Dublin can wait, route to a fresher replica, or return a retryable response. It should not silently return version 27.</p>
+<h2>A Worked Trace: Carry The Saved Version</h2>
+<p>The system can protect Nora by carrying a minimum version through her session.</p>
+<p>Starting state:</p>
+<div class="codehilite"><pre><span></span><code>address/nora:
+  version 27 = Office
+
+Nora&#39;s app:
+  minimum address version = none
+</code></pre></div>
+
+<h3>1. The Write Returns Evidence</h3>
+<p>Nora saves Home.</p>
+<div class="codehilite"><pre><span></span><code>Nora app -&gt; Madrid owner:
+  PUT address/nora = Home
 
 Madrid owner:
-  version 51 -&gt; version 52
-  replicate version 52 to followers
+  version 27 -&gt; version 28
+  starts replication to followers
 
-response to Mina:
-  saved_version = 52
+Madrid owner -&gt; Nora app:
+  saved_version = 28
 </code></pre></div>
 
-<p>The app stores <code>saved_version = 52</code> in the session or attaches it to future reads. It is not a clock timestamp and does not claim that every follower has caught up. It is evidence of a requirement: this session must not be served a version older than 52 for this profile.</p>
-<h3>2. A Follower Receives The Later Read</h3>
-<p>Mina reloads from a network location that the router sends to Frankfurt. The follower is still at version 51.</p>
-<div class="codehilite"><pre><span></span><code>Mina -&gt; Frankfurt follower: GET profile/mina, minimum_version = 52
-
-Frankfurt follower:
-  applied version = 51
-  required version = 52
-  result: version 51 is not an allowed response
+<p>The response does not mean every replica has version 28. It means Nora's session now has evidence that version 28 exists and is relevant to her next reads.</p>
+<p>The app stores:</p>
+<div class="codehilite"><pre><span></span><code>minimum address version = 28
 </code></pre></div>
 
-<p>The follower now has a few correct choices. It can wait briefly for replication to apply version 52. It can route the read to the owner. Or it can return a retryable response that preserves the session guarantee. It must not quietly return version 51 just because it is locally available.</p>
-<div class="codehilite"><pre><span></span><code>Frankfurt applies version 52
-Frankfurt -&gt; Mina: version 52, &quot;Independent researcher&quot;
+<h3>2. Checkout Reads With A Requirement</h3>
+<p>Nora opens checkout.</p>
+<div class="codehilite"><pre><span></span><code>Nora app -&gt; checkout:
+  load delivery address
+  minimum_version = 28
 </code></pre></div>
 
-<p>This is <strong>read-your-writes</strong>: after a user's accepted write, that user's later reads observe that write or something newer. The mechanism can be session affinity, a minimum-version token, a leader read, or a quorum read. The formal name describes the observation; the implementation is a separate design choice.</p>
-<h3>3. Prevent The Session From Moving Backward</h3>
-<p>Later, Mina's app reads a newer profile version, 54, after changing another field. A load balancer then tries to use a different follower that has only applied version 52.</p>
-<div class="codehilite"><pre><span></span><code>Mina has already observed: version 54
-new follower can serve:   version 52
-allowed?                  no
+<p>The router sends the read to Dublin because it is nearby.</p>
+<div class="codehilite"><pre><span></span><code>Dublin replica:
+  local version = 27
+  required version = 28
 </code></pre></div>
 
-<p>Returning version 52 would make the profile appear to revert. <strong>Monotonic reads</strong> prevent that kind of time travel within an observation path: once a session has seen a newer version, later reads must not return an older one. A session can update its required minimum from 52 to 54 and use the same wait, route, or retry choices.</p>
-<p>This is not a promise that every user sees the newest value. It is a promise that one observer's view does not move backward. That narrower guarantee can often cost much less than making all reads globally current.</p>
-<p>Quick check: if Mina sees version 54 on her laptop, then opens the same profile from a phone whose session has no evidence of version 54, has the phone violated monotonic reads by showing version 52?</p>
-<p>Not necessarily. The answer depends on the scope of the observer. If the guarantee is per browser session, the phone has not yet joined that observation path. If the product promise says Mina's account view never moves backward across devices, the phone must receive or recover evidence of version 54 before it serves the profile.</p>
-<h2>Guarantees Protect Different Kinds Of Surprise</h2>
-<p>Consistency terms are easy to blur because they all restrict stale or reordered observations. Their protected experiences differ.</p>
-<p><strong>Read-your-writes</strong> protects the writer: “I saved it, so I should see it.” It is often scoped to a user session, device, or token. A profile editor is a common fit.</p>
-<p><strong>Monotonic reads</strong> protect an observer from regression: “Do not show me version 54, then version 52.” It matters for dashboards, document views, delivery tracking, and any interface where backward movement is confusing.</p>
-<p><strong>Causal consistency</strong> protects dependencies: “Do not show an effect without the cause it depends on.” If Mina's colleague reads her updated bio and then writes a comment saying “the new title looks good,” other observers should not see the comment before the profile update that motivated it. The system carries or reconstructs causal evidence so dependent events remain in a sensible order. It does not require unrelated edits to have one global order.</p>
-<p><strong>Linearizability</strong> protects a stronger claim: operations act as if they occur in one order consistent with real time. Once a successful write completes, every later read of that object sees the write or a newer one. It is useful when one official answer matters, such as a lock, an inventory decrement, an account balance decision, or a credential revocation.</p>
-<div class="codehilite"><pre><span></span><code>read-your-writes: &quot;my later read includes my accepted write&quot;
-monotonic reads:  &quot;my view does not go backward&quot;
-causal:           &quot;effects do not appear before their causes&quot;
-linearizable:     &quot;later operations see one real-time order&quot;
+<p>Dublin has several safe choices:</p>
+<div class="codehilite"><pre><span></span><code>wait until version 28 arrives
+route the read to Madrid
+ask another replica
+return &quot;retry later&quot; instead of old data
 </code></pre></div>
 
-<p>These are not interchangeable levels on a simple slider. A system can provide read-your-writes for profile editing, causal order for conversations, and a linearizable rule for password revocation. The scope may be a key, a session, a workflow, or a whole operation. State the scope before choosing a mechanism.</p>
-<h2>How The Promise Changes The Data Path</h2>
-<p>The placement design from the previous lesson tells us where data lives and which replica may answer. Consistency requirements tell the router and replicas when a particular answer is good enough.</p>
-<p>For Mina's profile session, a token or sticky route can make a follower wait until it reaches the needed version. This preserves a session-level promise while still allowing other ordinary reads to use nearby replicas.</p>
-<p>For causal order in a messaging product, a reply can carry metadata that identifies the message version it depends on. A replica that has the reply but not the earlier message waits, fetches the missing dependency, or withholds the reply. The cost is extra metadata and the possibility of waiting for an earlier event.</p>
-<p>For a credential reset, the service may route all decisions through an authoritative security store, require a coordinated commit before returning “reset complete,” or maintain a revocation check that every authentication path must consult. The cost is more coordination, higher tail latency, and reduced availability when the authority cannot be reached. The stronger response text must be earned by a stronger path.</p>
-<p>Eventual convergence is still useful. It means replicas that stop receiving new conflicting writes will eventually become the same. It does <strong>not</strong> by itself tell Mina what her next read may show, how long a follower can lag, or whether an authentication server can accept the old password. Convergence is a background property; user guarantees need an explicit observation rule.</p>
-<p>Another quick check: a shopping site has one item left. Two users click buy from different regions at nearly the same time. Which phrase is safer: "the cart will converge eventually" or "the inventory decrement is linearizable for this item"?</p>
-<p>The second phrase is safer for the guarded decision. The system may still replicate carts and recommendations eventually, but the decision that consumes the last item needs one official order that later operations respect.</p>
-<h2>Failure Modes And Trade-offs</h2>
-<p>The common failure is saying “Saved” after a write reaches one place, then routing the user's next read to an older copy. The data may converge later, but the interface has already broken its implied contract. Caches can create the same failure if a cache key has no version, no invalidation policy, and no way to respect the session's minimum version.</p>
-<p>Another failure is protecting only the original device. If Mina saves on a laptop, a session token on that device can enforce read-your-writes there. A security-sensitive change used by another device or service needs a broader guarantee. Do not claim that a local session mechanism solves a global revocation requirement.</p>
-<p>A third failure is paying for global order when the product does not need it. Requiring every profile view to coordinate with the owner may increase latency and reduce availability for a benefit that a session guarantee would provide more cheaply. Conversely, treating an exclusive purchase as an eventually convergent counter can create promises that repair cannot honor.</p>
-<p>Useful operational signals expose whether the chosen guarantee is practical:</p>
+<p>It has one unsafe choice:</p>
+<div class="codehilite"><pre><span></span><code>return version 27 as if it satisfies the read
+</code></pre></div>
+
+<p>When Dublin finally applies version 28, it can answer:</p>
+<div class="codehilite"><pre><span></span><code>Dublin -&gt; Nora app:
+  version 28 = Home
+</code></pre></div>
+
+<p>This is <strong>read-your-writes</strong>. After Nora's accepted write, Nora's later reads observe that write or a newer one.</p>
+<h3>3. The Session Must Not Move Backward</h3>
+<p>Later, Nora edits delivery instructions.</p>
+<div class="codehilite"><pre><span></span><code>version 29 = Home + &quot;Ring the side bell&quot;
+</code></pre></div>
+
+<p>If her app has already seen version 29, a later checkout read should not show version 28 unless the product explicitly says it is showing an old cached view.</p>
+<div class="codehilite"><pre><span></span><code>seen by Nora:          version 29
+replica can serve:     version 28
+allowed silently?      no
+</code></pre></div>
+
+<p>This is <strong>monotonic reads</strong>. Once an observer has seen a newer version, later reads in that observation path should not go backward.</p>
+<p>So far, the mechanism is simple:</p>
+<div class="codehilite"><pre><span></span><code>write response carries evidence
+later read carries a requirement
+replica checks whether its local state satisfies the requirement
+</code></pre></div>
+
+<p>The important design choice is the scope. Does the guarantee follow one browser tab, one device, one account, or every service that uses the address? That scope changes the cost.</p>
+<h2>What The Common Guarantees Forbid</h2>
+<p>Consistency models are easier to remember as forbidden surprises.</p>
+<p><strong>Eventual convergence</strong> says replicas that stop receiving new conflicting writes eventually become the same. It does not promise what Nora's next read will show. It is useful as a background property, but it is not enough for the checkout moment.</p>
+<p><strong>Read-your-writes</strong> forbids this surprise:</p>
+<div class="codehilite"><pre><span></span><code>&quot;I saved it, then I immediately could not see it.&quot;
+</code></pre></div>
+
+<p>It usually protects the writer's session, device, account, or token.</p>
+<p><strong>Monotonic reads</strong> forbids this surprise:</p>
+<div class="codehilite"><pre><span></span><code>&quot;I saw the new version, then the system showed me an older version.&quot;
+</code></pre></div>
+
+<p>It protects one observer from moving backward.</p>
+<p><strong>Causal consistency</strong> forbids this surprise:</p>
+<div class="codehilite"><pre><span></span><code>&quot;I saw the effect without the cause.&quot;
+</code></pre></div>
+
+<p>For example, suppose Nora saves the Home address and then adds delivery instructions: "Ring the side bell." Showing the instruction without the Home address can be confusing because the instruction depends on the address. Causal consistency keeps dependent events in an order that makes sense.</p>
+<p><strong>Linearizability</strong> forbids an even stronger surprise:</p>
+<div class="codehilite"><pre><span></span><code>&quot;A later operation missed a completed earlier operation.&quot;
+</code></pre></div>
+
+<p>Once a write completes, every later operation on that object behaves as if it sees one real-time order. This is useful for locks, inventory decrements, unique username claims, credential revocations, and other operations where one official answer matters.</p>
+<p>The guarantees are not a single moral ladder from bad to good. They are tools for different promises. A product may use read-your-writes for address editing, causal order for comments, linearizability for a gift-card balance, and eventual convergence for search indexing.</p>
+<h2>The Data Path Changes With The Promise</h2>
+<p>The placement lesson told us where state lives and which replicas may answer. Consistency guarantees tell replicas when a local answer is good enough.</p>
+<p>For Nora's address, a session token can carry:</p>
+<div class="codehilite"><pre><span></span><code>address/nora must be &gt;= version 28
+</code></pre></div>
+
+<p>The router can send the read to a follower. The follower can answer only if it has applied version 28 or newer. This preserves Nora's guarantee without forcing every address read to go to the owner.</p>
+<p>For causal order, writes may carry dependencies:</p>
+<div class="codehilite"><pre><span></span><code>instruction &quot;Ring the side bell&quot;
+depends on address version 28
+</code></pre></div>
+
+<p>A replica that has the instruction but not address version 28 should wait, fetch the missing dependency, or hide the instruction until the cause is present.</p>
+<p>For linearizability, the path is stricter. The read or write may need the owner, a quorum, a lease, or another coordination path that can defend one real-time order. That costs more latency and can reduce availability during uncertainty.</p>
+<p><strong>Check:</strong> A user changes their password and receives "Password changed." Which guarantee is usually closer: eventual convergence or linearizability for later login checks?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Linearizability, or a similarly strong coordinated rule, is usually closer. A later login check should not accept the old password just because one authentication replica has not caught up.</p>
+<h2>Worked Classification</h2>
+<p>Use the same question for every workflow:</p>
+<div class="codehilite"><pre><span></span><code>What observation would make the product feel wrong or unsafe?
+</code></pre></div>
+
+<p>For a delivery address update, the forbidden observation is narrow. Nora saves Home, then Nora's checkout sees Office. The smallest useful guarantee is often read-your-writes for Nora's session or account. The system can still allow another user, support tool, or analytics job to see a slightly old address if that path does not make a delivery decision.</p>
+<p>For a message reply, the forbidden observation is dependency order. A reply that says "yes, use the side door" makes little sense if the original message about the Home address is missing. The useful guarantee is causal consistency for the conversation: show dependent messages only after the messages they depend on.</p>
+<p>For a password change, the forbidden observation is broader. After the change is confirmed, a later login check should not accept the old password from any authentication path. A session token on Nora's phone is too narrow. The system needs a stronger authority path, often linearizable or close to it for the credential state.</p>
+<p>The method is the same each time. Name the surprise, name the observer, then choose the cheapest guarantee that forbids that surprise.</p>
+<h2>Trade-offs And Limits</h2>
+<p>The trade-off is that stronger guarantees prevent specific user-visible surprises, but they spend something.</p>
+<p>They may spend:</p>
 <ul>
-<li>replication lag by key or follower, especially the age of a version needed by session reads;</li>
-<li>reads delayed, rerouted, or rejected because their minimum version is not yet available;</li>
-<li>observed version regressions within a session, which should be treated as correctness bugs;</li>
-<li>causal dependency wait time and the number of buffered dependent events; and</li>
-<li>authentication decisions made against stale policy or revocation state.</li>
+<li>routing flexibility;</li>
+<li>session metadata;</li>
+<li>dependency metadata;</li>
+<li>waiting for a replica to catch up;</li>
+<li>coordination with an owner or quorum;</li>
+<li>availability when the needed evidence cannot be reached.</li>
 </ul>
-<p>The trade-off is specific rather than moral. Stronger guarantees reduce particular surprises, but they spend routing constraints, metadata, coordination, waiting, or availability. Weaker guarantees can make ordinary reads fast and resilient, but only when the product names the stale behavior honestly and has a safe repair story.</p>
-<h2>Design Check</h2>
-<p>Pick one workflow: profile editing, a message reply, a shopping-cart update, a bank transfer, a password reset, a dashboard metric, or notification read state. Without looking back, write:</p>
-<div class="codehilite"><pre><span></span><code>state and key:
-writer and later reader:
-forbidden observation:
-scope of the promise (session, users, services, or everyone):
-smallest suitable guarantee:
-evidence carried by the read or write:
-what a stale replica must do instead of returning bad data:
-latency or availability cost:
-metric that would reveal a violation:
+<p>Weaker guarantees can make ordinary reads fast and resilient. They are safe only when the product names the stale behavior honestly and has a repair story. Search results can be a little stale. A "recent activity" widget can lag. A delivery address shown after "Address saved" has a stricter expectation.</p>
+<p>The limit is scope. A session token can protect Nora's current checkout, but it may not protect a background fraud check, a restaurant tablet, or a courier dispatch service unless the evidence travels to those paths too.</p>
+<p>Useful signals include:</p>
+<ul>
+<li>replica lag for keys needed by recent writes;</li>
+<li>reads delayed or rerouted because a minimum version was not available;</li>
+<li>observed version regressions within a session;</li>
+<li>causal dependency wait time and buffered dependent events;</li>
+<li>stale credential or policy decisions after a confirmed update; and</li>
+<li>user reports that "saved" data disappeared.</li>
+</ul>
+<p>If these signals rise, the problem may not be storage durability. It may be that response wording and read guarantees do not match.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: Strong consistency is always better</h3>
+<p>Why it is tempting:</p>
+<p>"Strong" sounds safe and professional.</p>
+<p>Better model:</p>
+<p>Stronger guarantees protect stronger promises, but they cost latency, coordination, and sometimes availability. Use them where the forbidden surprise is expensive.</p>
+<h3>Confusion: Eventual convergence defines the next read</h3>
+<p>Why it is tempting:</p>
+<p>If replicas eventually become the same, it feels like the system is basically safe.</p>
+<p>Better model:</p>
+<p>Eventual convergence says what happens later if updates stop. It does not say what Nora's checkout may read immediately after "Address saved."</p>
+<h3>Confusion: Read-your-writes means everyone sees my write</h3>
+<p>Why it is tempting:</p>
+<p>The phrase sounds global.</p>
+<p>Better model:</p>
+<p>Read-your-writes usually protects the writer or a scoped observation path. Other users may still see an older value unless the product promises more.</p>
+<h2>Practice</h2>
+<p>Pick one workflow:</p>
+<div class="codehilite"><pre><span></span><code>delivery address update
+shopping cart update
+password change
+message reply
+bank transfer
+dashboard metric
+notification read state
 </code></pre></div>
 
-<p>Then change the scope. If the writer's own session is protected, ask whether a different device must also be protected. If the answer is yes, a session token alone is not enough. That distinction turns a consistency label into a defensible system contract.</p>
+<p>Fill in:</p>
+<div class="codehilite"><pre><span></span><code>state and key:
+write:
+later read or decision:
+forbidden stale or reordered observation:
+scope of the promise:
+smallest suitable guarantee:
+evidence the system must carry:
+what a stale replica should do:
+cost of the guarantee:
+signal that would reveal a violation:
+</code></pre></div>
+
+<p>Model answer for <code>message reply</code>:</p>
+<div class="codehilite"><pre><span></span><code>state and key:
+  conversation/launch
+
+write:
+  message 10: &quot;Deployment failed&quot;
+
+later read or decision:
+  message 11: &quot;I am rolling back&quot; replies to message 10
+
+forbidden observation:
+  seeing the reply without the message it depends on
+
+scope:
+  everyone reading that conversation
+
+smallest suitable guarantee:
+  causal consistency for replies and their parent messages
+
+evidence:
+  reply carries dependency on message 10
+
+stale replica action:
+  fetch message 10, wait, or withhold the reply
+
+cost:
+  dependency metadata and possible waiting
+
+signal:
+  buffered replies waiting for missing parent messages
+</code></pre></div>
+
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] <a href="https://jepsen.io/consistency">Jepsen: Consistency Models</a><ul>
-<li>Focus: Plain-language definitions and examples for the observation guarantees that applications can require.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a><ul>
-<li>Focus: The original definition of a real-time-consistent order for concurrent operations.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Replication lag, read-after-write behavior, causal dependencies, and the cost of stronger guarantees.</li>
-</ul>
-</li>
+<li>[ARTICLE] <a href="https://jepsen.io/consistency">Jepsen: Consistency Models</a> - Focus: Plain-language definitions and examples for observation guarantees.</li>
+<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a> - Focus: The original real-time ordering guarantee for concurrent operations.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> - Focus: Replication lag, read-after-write behavior, causal dependencies, and stronger consistency costs.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A consistency model is an observation promise: it specifies what a read may return after relevant writes and who receives that protection.</li>
-<li>A minimum-version token, leader read, or waiting follower can enforce read-your-writes without making every read globally current.</li>
-<li>Read-your-writes, monotonic reads, causal consistency, and linearizability prevent different user-visible surprises.</li>
-<li>Eventual convergence alone does not define the result of a user's next read; the product must state that rule explicitly.</li>
+<li>A consistency model is an observation promise, not a generic label for a whole database.</li>
+<li>Start by naming the stale or reordered observation the product must forbid.</li>
+<li>Read-your-writes, monotonic reads, causal consistency, and linearizability protect different surprises.</li>
+<li>A minimum-version read can let nearby replicas serve safely when they have caught up.</li>
+<li>Stronger guarantees cost metadata, routing constraints, waiting, coordination, or availability.</li>
 </ul>
 </section>
 
@@ -269,7 +413,7 @@ metric that would reveal a violation:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-28 16:52 UTC | @jepemo | Built with
+        Generated on 2026-06-28 18:31 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

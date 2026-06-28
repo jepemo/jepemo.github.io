@@ -77,165 +77,315 @@
 <section class="stack-block lesson-content-shell">
   <h1>Replication, Partitioning, and State Placement</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
 <ul>
 <li>
-<p>separate the physical copy of state from the authority to change that state;</p>
+<p>explain the difference between a copy of state and the authority to change it.</p>
 </li>
 <li>
-<p>trace how a key moves between shards without allowing two owners to write at once;</p>
+<p>trace how one key moves from one shard to another without creating two owners.</p>
 </li>
 <li>
-<p>identify the signals that reveal hot keys, stale routing, and unsafe failover.</p>
+<p>identify signals for hot keys, stale routing, replica lag, and unsafe failover.</p>
 </li>
 </ul>
-<p><strong>Idea in one sentence:</strong> Replication and partitioning only become safe when placement rules say where each key belongs, who may write it, which replicas may answer reads, and how authority changes without split ownership.</p>
+<p><strong>Idea in one sentence:</strong> Replication and partitioning are safe only when a placement rule says where each key lives, who may write it, and how that authority changes.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>When Maya opens a social app, it loads the timeline and settings for <code>user-42</code>. The request looks like one lookup. In the service, it is a chain of decisions: a router must find the right slice of data, an authoritative machine must accept a new post, and a nearby copy may answer a read without making Maya wait for a distant region.</p>
-<p>The chain becomes visible when <code>user-42</code> becomes popular. Their posts and notifications overload the machine that currently owns the account's timeline. The team wants to move that state to a less busy shard while users keep reading and posting. Simply copying the rows is not enough. While the copy is moving, new posts are still arriving. If both old and new machines accept writes, the two histories can diverge. If routing switches too early, the new machine may be missing a post that Maya was just told was saved.</p>
-<p><strong>State placement</strong> is the set of rules that makes this path safe: where a key belongs, who is allowed to make official changes, which copies may serve which reads, and how those facts change over time. <strong>Partitioning</strong> divides keys into manageable ownership units. <strong>Replication</strong> keeps additional copies for survival, locality, read capacity, or recovery. Neither term, by itself, says who has authority.</p>
-<p>The key idea is that a replica is a copy of state, while an owner is a right to change state. A good placement design turns that distinction into a visible protocol. For each key, it can answer: “Where do I send this request?”, “Which version is safe to read?”, “Who may write now?”, and “How do we move the answer without losing or duplicating work?”</p>
-<h2>Follow One Key Through The Placement Map</h2>
-<p>Start with one account rather than a whole cluster. The service uses a placement map that routers cache and refresh.</p>
-<div class="codehilite"><pre><span></span><code>placement map, epoch 84
-
-key range:      users 40,000–49,999
-shard:          timeline-7
-write owner:    Madrid leader
-read replicas:  Madrid follower, Frankfurt follower
-state position: log entry 900
+<p>A project-management app stores each team's board as a key:</p>
+<div class="codehilite"><pre><span></span><code>board/acme-launch
 </code></pre></div>
 
-<p>The map is a routing and authority contract. A request for <code>user-42</code> is assigned to <code>timeline-7</code> because a partitioning rule places that user-id range there. A timeline write goes to the Madrid leader because it is the current write owner. A timeline read may go to the Frankfurt follower only if the product permits the follower's current lag.</p>
-<p>The terms describe different layers:</p>
-<ul>
-<li>A <strong>key</strong> is the item being located: <code>user-42</code>, an account id, an order id, or a document id.</li>
-<li>A <strong>partition</strong> or <strong>shard</strong> is a group of keys managed together. It gives the system a unit for ownership, movement, and load measurement.</li>
-<li>A <strong>replica</strong> is a machine holding a copy of that shard's state.</li>
-<li>The <strong>owner</strong> is the replica, or group acting through a leader, that has authority to accept the writes that matter.</li>
-<li>A <strong>placement epoch</strong> is a version number for the map. It lets the system tell an old routing decision from a new one.</li>
-</ul>
-<p>These pieces work together. The router uses the key and epoch to find the shard. The owner serializes or coordinates changes for that shard. Replicas apply those changes and report how far they have caught up. If a router does not know the current epoch, it must refresh, be redirected, or fail safely. Guessing creates split ownership.</p>
-<h2>Partitioning Spreads Work, Not Every Kind Of Load</h2>
-<p>Partitioning prevents every key from landing on one machine. A simple rule can be a hash:</p>
-<div class="codehilite"><pre><span></span><code>shard = hash(user_id) mod 16
-
-user-42 -&gt; timeline-7
-user-43 -&gt; timeline-2
+<p>The board has cards, comments, assignments, and an activity log. During a launch review, the whole company opens the board. Reads spike. Comments spike. Card moves spike. The shard that owns <code>board/acme-launch</code> starts falling behind.</p>
+<p>A tempting fix is:</p>
+<div class="codehilite"><pre><span></span><code>Copy the board to a bigger shard.
+Send new traffic to the bigger shard.
 </code></pre></div>
 
-<p>Hashing usually distributes a large population of ordinary users reasonably well. A range rule instead groups adjacent values, such as account ids from 40,000 to 49,999. Ranges can make scans and locality easier to reason about, but a busy range may concentrate traffic. A directory can map a tenant to a chosen shard, which is useful when tenants have very different sizes but adds metadata that must itself remain correct.</p>
-<p>None of these rules removes skew. If <code>user-42</code> receives millions of reads or creates a very active live room, one key can overload one owner even when the rest of the cluster is balanced. That is a <strong>hot key</strong>. Adding read replicas may absorb read traffic. It does not automatically spread writes when one authority must still serialize the account's official timeline. The solution might need a different data model: split a large feed, precompute fan-out, rate-limit a tenant, or give a hot account specialized placement.</p>
-<p>Partitioning also chooses what is kept together. Keeping a user's profile, settings, and timeline on one shard can make local updates simple. Separating them can spread load but turns a workflow such as “publish a post and update the profile's activity” into a cross-shard operation. Placement is therefore an application boundary, not merely a capacity setting.</p>
-<h2>Replication Gives Copies A Job Description</h2>
-<p>The Frankfurt follower in the map has a copy of <code>timeline-7</code>, but “it has a copy” is not enough to safely use it. The service needs a job description for every replica.</p>
-<div class="codehilite"><pre><span></span><code>Madrid leader:
-  may accept timeline writes at epoch 84
-  publishes ordered changes to followers
-
-Frankfurt follower:
-  may serve timeline reads up to its applied position
-  may not accept official writes
-  may become a candidate owner only after it catches up and is elected
+<p>Copying sounds like the important part. It is not enough.</p>
+<p>While the copy is running, people are still moving cards. If the old shard and the new shard both accept writes, the board can split into two histories. If routers switch too early, the new shard may be missing a card move that a user already saw as saved. If a replica answers a read without knowing its lag, the app can show an old board and call it current.</p>
+<p>The hard part is not only where bytes are stored. The hard part is authority.</p>
+<p>Plain meaning:</p>
+<p>A system needs a visible rule for where a key belongs and which copy is allowed to make official changes.</p>
+<p>In this scenario:</p>
+<p><code>board/acme-launch</code> may have several copies, but only one owner should accept official card moves at a time.</p>
+<p>Technical name:</p>
+<p>The rule is <strong>state placement</strong>. It combines partitioning, replication, routing, ownership, and a versioned handoff protocol.</p>
+<h2>The Moving Parts</h2>
+<p>Start with one key. A whole cluster is too much to inspect at once.</p>
+<div class="codehilite"><pre><span></span><code>key:             board/acme-launch
+partition rule:  boards by hash(board_id)
+shard:           boards-03
+write owner:     Madrid leader
+read replicas:   Madrid follower, Dublin follower
+log position:    1840
+placement epoch: 12
 </code></pre></div>
 
-<p>For a low-risk timeline view, the app may allow Frankfurt to answer from position 895 while the leader has reached 900. The screen is slightly behind, but the product can tolerate that. For an action whose result must be immediately visible, the client might read from the leader, send a minimum required position such as <code>900</code>, or wait until the follower catches up. The next lesson names these as user-visible consistency guarantees; placement supplies the machinery that makes them possible.</p>
-<p>Replication improves several things at once, but it spends work as well. Extra copies can keep data available after a machine loss, place reads near users, and provide a source for repair. They also create replication lag, transfer traffic, lag monitoring, and a decision about which copy is authoritative after failure. A stale follower may be useful for a feed and unsafe for a password check. Freshness is a policy, not a property acquired by making a second copy.</p>
-<h2>Worked Trace: Move <code>user-42</code> Without Split Ownership</h2>
-<p>The Madrid leader for <code>timeline-7</code> is saturated. The system will move the shard's range, including <code>user-42</code>, to a new shard named <code>timeline-12</code>. The central rule is simple: at every moment, the protocol identifies one write authority.</p>
-<h3>1. Prepare A Destination That Cannot Yet Write</h3>
-<p>The controller creates a new placement plan but leaves epoch 84 active for clients. <code>timeline-12</code> receives a snapshot of <code>timeline-7</code> at log position 900.</p>
-<div class="codehilite"><pre><span></span><code>active map:      epoch 84 -&gt; timeline-7 owns writes
-
-source:          timeline-7 at position 900
-destination:     timeline-12 imports snapshot at position 900
-client routing:  still goes to timeline-7
+<p>Each word has a job.</p>
+<p>A <strong>key</strong> is the item being located. It might be a board id, order id, account id, document id, tenant id, or room id.</p>
+<p>A <strong>partition</strong> or <strong>shard</strong> is a group of keys managed together. Partitioning gives the system a unit for routing, ownership, movement, and load measurement.</p>
+<p>A <strong>replica</strong> is a copy of a shard's state. It may be useful for reads, recovery, or failover.</p>
+<p>An <strong>owner</strong> is the copy, or the leader for a group of copies, that may accept official writes.</p>
+<p>A <strong>placement epoch</strong> is a version number for the placement rule. It tells the system whether a router or writer is using an old view of ownership.</p>
+<p>These pieces answer different questions:</p>
+<div class="codehilite"><pre><span></span><code>Where should this request go?
+Which copy may write?
+Which copy may read?
+How fresh must that read be?
+What happens if ownership moves?
 </code></pre></div>
 
-<p>The destination is a replica during this phase, not an owner. New posts continue to go to <code>timeline-7</code>. The source streams the new log entries to <code>timeline-12</code>: 901, 902, 903, and so on. This avoids a long write outage while data is copied.</p>
-<h3>2. Catch Up And Verify The Same History</h3>
-<p>At one moment, the source has reached position 916 and the destination has applied through 912. The move is not ready. The controller can measure the gap, checksum a snapshot segment, and verify that the destination is applying the same ordered changes. When the destination reaches a chosen handoff point, it is safe to consider changing authority.</p>
-<div class="codehilite"><pre><span></span><code>source position:       916
-destination position:  916
-verification:          checksums and log order agree
-still authoritative:   timeline-7, epoch 84
+<h2>The Naive Copy</h2>
+<p>Suppose <code>boards-03</code> is overloaded. The team creates <code>boards-09</code>, a new shard with more capacity.</p>
+<p>The naive plan is:</p>
+<div class="codehilite"><pre><span></span><code>1. copy board/acme-launch from boards-03 to boards-09
+2. update routers to send new traffic to boards-09
+3. delete the old copy later
 </code></pre></div>
 
-<p>The important detail is that being caught up is necessary but not sufficient. The destination has the data; it has not yet received permission to create the next official entry.</p>
-<h3>3. Hand Off The Right To Write</h3>
-<p>The system briefly fences the old owner: it stops accepting new writes at epoch 84 after a final entry, say 917. It makes sure <code>timeline-12</code> applies that entry. Then the controller commits a new map.</p>
-<div class="codehilite"><pre><span></span><code>final source entry: 917
-destination applied: 917
+<p>This works only if the board is frozen during the copy. Real systems often cannot freeze a busy board for long.</p>
+<p>Imagine the copy starts at log position 1840.</p>
+<div class="codehilite"><pre><span></span><code>boards-03:
+  position 1840
+  card &quot;Deploy API&quot; is in Doing
 
-new active map, epoch 85
-  key range users 40,000–49,999 -&gt; timeline-12
-  write owner -&gt; timeline-12 leader
-  timeline-7 -&gt; follower or forwarding source only
+boards-09:
+  imports snapshot at position 1840
 </code></pre></div>
 
-<p>The formal tool behind this is often called <strong>fencing</strong>. The new epoch acts like a newer authorization token. Storage and replicas reject a write that claims the old epoch after the handoff. A delayed message from the former owner cannot quietly become a valid new write just because it arrived late.</p>
-<p>Clients with epoch 84 do not need to create a second history. They can be redirected to the new owner, forwarded through a controlled path, or receive an error that makes them refresh the placement map and retry with the same idempotency key. The protocol must define which behavior it uses. What it must not do is let an old client write to <code>timeline-7</code> while a new client writes independently to <code>timeline-12</code>.</p>
-<h3>4. Drain, Observe, And Keep A Repair Path</h3>
-<p>Once traffic uses epoch 85, the old shard keeps a replica long enough to serve controlled forwarding, verify that the new owner remains caught up, and provide a rollback or repair source. Only after the system observes stable routing, replica health, and no old-epoch writes can it remove the old copy or reuse its capacity.</p>
-<div class="codehilite"><pre><span></span><code>key -&gt; router with epoch 85 -&gt; timeline-12 owner -&gt; followers
-                                   |
-                                   -&gt; replication, metrics, repair
+<p>Then three users act before the router switch finishes:</p>
+<div class="codehilite"><pre><span></span><code>1841: Lina moves &quot;Deploy API&quot; to Review
+1842: Arun adds comment &quot;Waiting on smoke tests&quot;
+1843: Bea assigns herself to the rollback card
 </code></pre></div>
 
-<p>The move is successful not when the copy finishes, but when requests, authority, and evidence all agree on the new location. This choreography is why state placement is a live protocol rather than a static diagram.</p>
-<h2>Failover Uses The Same Authority Discipline</h2>
-<p>Movement is planned; failure is not. If the Madrid leader disappears, promoting the nearest follower immediately may preserve availability, but it risks choosing a follower that lacks recent writes or overlaps with a slow-to-detect former leader.</p>
-<p>A safer failover procedure checks which replicas have an acceptable state position, chooses a new owner through the system's membership or consensus rule, and advances the ownership epoch. The old leader, if it returns, sees that its epoch is obsolete and becomes a follower instead of resuming writes. This is why “replica B is the backup” is not a complete failover plan. The plan must state how staleness is measured, who decides promotion, and how the old authority is fenced off.</p>
-<p>There is a trade-off. Conservative failover may wait for evidence and temporarily reject writes. Aggressive failover restores service faster but can expose stale state or force more repair. The right balance depends on the promise attached to the shard: a social timeline, a payment ledger, and a password store should not use the same promotion rule by default.</p>
-<h2>Failure Modes And Operational Signals</h2>
-<p>Three failures reveal weak placement design. A hot shard appears when one key, tenant, or range consumes a disproportionate share of CPU, queue depth, or write capacity. Replicating the hot data may ease reads but leaves a single write authority saturated.</p>
-<p>Routing drift appears when some routers still use epoch 84 after epoch 85 is active. If old routing is not redirected or fenced, requests can reach an owner that no longer has authority. Replica lag appears when a follower's applied position stays behind the leader, making it unsafe for a promised-fresh read or a rapid failover.</p>
+<p>If <code>boards-09</code> accepts writes after only the snapshot, it may create entry 1841 with a different card move. Now both shards have entry numbers that look official, but they do not describe the same history.</p>
+<p>The problem is not copying. The problem is changing authority without a handoff.</p>
+<p><strong>Check:</strong> If <code>boards-09</code> has a complete snapshot at position 1840, can it safely accept official write 1841?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. A snapshot gives it data through position 1840. It does not give it authority to create the next official entry. The old owner may already be accepting entry 1841.</p>
+<h2>The Mechanism: Placement With Epochs</h2>
+<p>A safer system treats placement as a protocol.</p>
+<p>The placement map says:</p>
+<div class="codehilite"><pre><span></span><code>epoch 12:
+  key range:    boards hash bucket 03
+  write owner:  boards-03 Madrid leader
+  followers:    boards-03 Madrid follower, boards-03 Dublin follower
+</code></pre></div>
+
+<p>Routers attach the epoch they used:</p>
+<div class="codehilite"><pre><span></span><code>update card:
+  key = board/acme-launch
+  placement_epoch = 12
+  idempotency_key = move-7f3
+</code></pre></div>
+
+<p>The owner rejects writes with an epoch that is too old or too new for its authority. That check is a fence. It prevents a delayed request from quietly writing to the wrong owner after a move.</p>
+<p>Replication gives copies a job description:</p>
+<div class="codehilite"><pre><span></span><code>leader:
+  may accept writes for epoch 12
+  produces ordered log entries
+
+follower:
+  applies log entries from the leader
+  may serve reads only within the product&#39;s allowed lag
+  may become a candidate owner only after it catches up and is chosen
+</code></pre></div>
+
+<p>A replica is not a backup owner by default. It is a copy with specific permissions.</p>
+<h2>A Worked Trace: Move One Board</h2>
+<p>The controller will move <code>board/acme-launch</code> from <code>boards-03</code> to <code>boards-09</code>.</p>
+<h3>1. Prepare A Destination That Cannot Write</h3>
+<p>The active placement map remains unchanged:</p>
+<div class="codehilite"><pre><span></span><code>active map:
+  epoch 12 -&gt; boards-03 owns board/acme-launch
+
+source:
+  boards-03 at log position 1840
+
+destination:
+  boards-09 imports snapshot at position 1840
+  boards-09 is not allowed to write
+</code></pre></div>
+
+<p>New user edits still go to <code>boards-03</code>. The source streams entries 1841, 1842, 1843, and later entries to <code>boards-09</code>.</p>
+<p>This gives the destination a copy without creating a second authority.</p>
+<h3>2. Catch Up And Verify</h3>
+<p>At one moment:</p>
+<div class="codehilite"><pre><span></span><code>source position:       1860
+destination position:  1856
+</code></pre></div>
+
+<p>The move is not ready. The destination is behind.</p>
+<p>Later:</p>
+<div class="codehilite"><pre><span></span><code>source position:       1872
+destination position:  1872
+verification:          checksums and log order match
+still authoritative:   boards-03, epoch 12
+</code></pre></div>
+
+<p>Being caught up is necessary. It is still not enough. The destination has the same history, but it still needs a placement change before it can create entry 1873.</p>
+<h3>3. Fence The Old Owner And Commit The New Epoch</h3>
+<p>The controller chooses a handoff point.</p>
+<div class="codehilite"><pre><span></span><code>final source entry: 1873
+destination applied: 1873
+</code></pre></div>
+
+<p>Then it commits a new placement map:</p>
+<div class="codehilite"><pre><span></span><code>epoch 13:
+  key range:    boards hash bucket 03
+  write owner:  boards-09 Madrid leader
+  old owner:    boards-03 may forward or reject old-epoch writes
+</code></pre></div>
+
+<p>After this point, a write using epoch 12 cannot create a new official entry. It must be rejected, redirected, or retried after refreshing the map. The client can safely retry with the same idempotency key so the user does not create a duplicate card move.</p>
+<div class="codehilite"><pre><span></span><code>old request arrives:
+  key = board/acme-launch
+  epoch = 12
+  idempotency_key = move-7f3
+
+boards-03 response:
+  stale placement; refresh and retry
+</code></pre></div>
+
+<p>This is fencing. The old owner is prevented from acting as owner after its authority expires.</p>
+<h3>4. Drain And Watch</h3>
+<p>After routers use epoch 13, <code>boards-03</code> stays around for a while.</p>
+<p>It may forward old requests, serve as a repair source, or provide a rollback path. It should not accept new official writes for the moved key.</p>
+<p>The move is complete when three things agree:</p>
+<div class="codehilite"><pre><span></span><code>requests route to boards-09
+boards-09 has the required state
+epoch 13 is the only write authority
+</code></pre></div>
+
+<p>So far, we have seen that moving state is not "copy then switch." It is copy, catch up, verify, hand off authority, fence stale writers, and observe the drain.</p>
+<h2>Partitioning And Replication Do Different Jobs</h2>
+<p>Partitioning spreads keys across owners.</p>
+<div class="codehilite"><pre><span></span><code>shard = hash(board_id) mod 32
+</code></pre></div>
+
+<p>That helps when many ordinary boards exist. It does not automatically solve a single hot board. If one board receives most of the writes, that key can still overload one owner.</p>
+<p>Replication creates copies.</p>
+<p>Copies can help with nearby reads, recovery, and failover. They do not automatically increase write capacity for a key that needs one official order. If every card move for <code>board/acme-launch</code> must appear in one ordered activity log, one owner still serializes those writes.</p>
+<p>The design options depend on the product promise. The team might split one huge board into sections with separate owners. It might keep one owner for writes but add read replicas. It might rate-limit comments during an incident. It might move the board to stronger hardware. Each option changes cost, locality, and the meaning of "saved."</p>
+<h2>Failover Uses The Same Discipline</h2>
+<p>Movement is planned. Failure is not.</p>
+<p>If the Madrid leader for <code>boards-09</code> disappears, the system may want to promote a follower. The unsafe version says:</p>
+<div class="codehilite"><pre><span></span><code>nearest follower becomes leader immediately
+</code></pre></div>
+
+<p>That can lose recent writes if the follower is behind. It can also create split ownership if the old leader is only slow or disconnected, not dead.</p>
+<p>A safer failover checks:</p>
+<div class="codehilite"><pre><span></span><code>which replicas have the needed log position?
+who is allowed to decide promotion?
+what new epoch fences the old leader?
+what should old clients do when they retry?
+</code></pre></div>
+
+<p>The trade-off is visible. Conservative failover waits for evidence and may reject writes for a while. Aggressive failover restores service faster but may expose stale state or require repair.</p>
+<p><strong>Check:</strong> A follower has applied through 1868. The old leader may have accepted entries through 1873. Should the follower become owner without extra evidence?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not for a workflow that cannot lose writes. The follower is missing possible official entries. Promotion needs a rule that proves the chosen owner has the required history or that missing writes are safe to repair.</p>
+<h2>Trade-offs And Limits</h2>
+<p>Placement rules improve routing, movement, failover, and ownership clarity.</p>
+<p>They cost metadata, controller logic, epoch checks, monitoring, and operational care. More shards increase flexibility, but also increase map size and rebalancing work. More replicas improve read locality and recovery options, but create lag and failover decisions.</p>
+<p>Placement does not solve every load problem. A hot key can still bottleneck. A shard move can still fail halfway. A stale router can still send traffic to the wrong place if the system does not fence old epochs. A read replica can still be too stale for a promise that requires fresh state.</p>
 <p>Useful signals include:</p>
 <ul>
-<li>per-shard read/write rate, queue depth, and tail latency, to find hot keys and ranges;</li>
-<li>placement-map age and the number of requests rejected or redirected for an old epoch;</li>
-<li>replication lag in bytes, log entries, and elapsed time;</li>
-<li>time spent in snapshot copy and catch-up phases during a move;</li>
-<li>failed checksum or state-verification counts; and</li>
-<li>old-epoch write attempts after a handoff.</li>
+<li>per-shard read rate, write rate, queue depth, and tail latency;</li>
+<li>top hot keys or tenants by traffic;</li>
+<li>placement-map age at routers;</li>
+<li>old-epoch write attempts after a handoff;</li>
+<li>replication lag by shard and replica;</li>
+<li>time spent copying, catching up, and draining during moves; and</li>
+<li>failed verification or checksum counts.</li>
 </ul>
-<p>The main trade-off is between a simple, stable ownership rule and flexible distribution. One owner per key is easy to explain and protects authority, but it can bottleneck. More replicas, finer partitions, and frequent movement improve locality and capacity, but require better metadata, fencing, monitoring, and recovery. The best placement plan is not the one with the most copies; it is the one whose copies and transitions have clear responsibilities.</p>
-<h2>Design Check</h2>
-<p>Choose one key from a system you know: <code>user_id</code>, <code>tenant_id</code>, <code>account_id</code>, <code>order_id</code>, <code>room_id</code>, or <code>document_id</code>. Without looking back, write a placement record and a move plan:</p>
-<div class="codehilite"><pre><span></span><code>key and partitioning rule:
-current placement epoch:
-write owner and why it has authority:
-replicas and the reads each may serve:
-maximum acceptable replica lag:
-condition that permits failover:
-handoff point when the key moves:
-how an old owner is fenced:
-signal that reveals a hot key or stale routing:
+<p>You can see the boundary when adding copies no longer improves the bottleneck. If the bottleneck is one write owner for one hot key, replication alone will not fix it.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: A replica is a backup owner</h3>
+<p>Why it is tempting:</p>
+<p>The replica has the data, so it feels ready to take over.</p>
+<p>Better model:</p>
+<p>A replica is a copy with a job description. It becomes an owner only after the system proves enough state, chooses it, and fences the old authority.</p>
+<h3>Confusion: More shards always fix hotspots</h3>
+<p>Why it is tempting:</p>
+<p>Partitioning spreads many keys, so more partitions sound like more balance.</p>
+<p>Better model:</p>
+<p>More shards help when load is spread across many keys. A single hot key may need a different data model, rate limit, specialized placement, or a split inside the key.</p>
+<h3>Confusion: Copying state is the same as moving state</h3>
+<p>Why it is tempting:</p>
+<p>The visible work looks like moving bytes.</p>
+<p>Better model:</p>
+<p>Moving state also moves authority. The safe handoff must say when the old owner stops, when the new owner starts, and what stale clients must do.</p>
+<h2>Practice</h2>
+<p>Pick one key from a system:</p>
+<div class="codehilite"><pre><span></span><code>order_id
+tenant_id
+document_id
+room_id
+account_id
+board_id
 </code></pre></div>
 
-<p>Then test the design with one delayed request sent under the old epoch. If it can create a new official write after the new owner starts, the handoff is incomplete. If it is rejected, forwarded, or made to refresh and retry safely, the authority boundary is explicit.</p>
+<p>Write a placement record:</p>
+<div class="codehilite"><pre><span></span><code>key:
+partition rule:
+current shard:
+write owner:
+read replicas and allowed lag:
+placement epoch:
+signal that would show this key is hot:
+</code></pre></div>
+
+<p>Then write a move plan:</p>
+<div class="codehilite"><pre><span></span><code>snapshot position:
+catch-up condition:
+handoff entry:
+new epoch:
+how old owners are fenced:
+how old clients retry safely:
+metric that proves the drain is complete:
+</code></pre></div>
+
+<p>Model answer for <code>document_id</code>:</p>
+<div class="codehilite"><pre><span></span><code>key:
+  document/spec-14
+
+partition rule:
+  hash(document_id) mod 64
+
+current shard:
+  docs-18
+
+write owner:
+  docs-18 leader, because it owns epoch 44
+
+read replicas and allowed lag:
+  Dublin follower can serve reads up to 2 seconds stale for viewers;
+  editors require version &gt;= last saved version
+
+move plan:
+  copy snapshot at position 9800;
+  stream log until destination reaches chosen handoff 9842;
+  commit epoch 45 to make docs-27 the owner;
+  reject or redirect epoch 44 writes;
+  retry edits with idempotency keys
+</code></pre></div>
+
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
-<li>Focus: Partitioning, replication, versioning, and repair in a highly available key-value store.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf">Bigtable: A Distributed Storage System for Structured Data</a><ul>
-<li>Focus: Tablet assignment, serving, splitting, and the operational movement of structured data.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Partitioning, replication, leader/follower replication, and the trade-offs behind rebalancing.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a> - Focus: Partitioning, replication, versioning, and repair in a highly available key-value store.</li>
+<li>[PAPER] <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf">Bigtable: A Distributed Storage System for Structured Data</a> - Focus: Tablet assignment, serving, splitting, and operational movement of structured data.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> - Focus: Partitioning, replication, leader/follower replication, and rebalancing trade-offs.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Placement maps connect a key to a shard, a write authority, permitted read replicas, and a versioned routing decision.</li>
-<li>Replication creates copies; it does not grant those copies authority to write or prove that they are fresh enough for every read.</li>
-<li>A safe rebalance copies and catches up state before changing authority, then fences the old owner with a newer placement epoch.</li>
-<li>Hot keys, replica lag, and stale routing are operational evidence that placement rules need attention.</li>
+<li>Partitioning chooses which group of keys belongs together; replication creates copies; placement assigns routing and authority.</li>
+<li>A replica can read, recover, or become a candidate owner only according to its job description.</li>
+<li>A safe move copies state, catches up, verifies history, changes epoch, fences the old owner, and drains old traffic.</li>
+<li>More replicas do not automatically fix a hot write owner.</li>
+<li>Hot keys, stale routing, replica lag, and old-epoch writes are signals that placement rules need attention.</li>
 </ul>
 </section>
 
@@ -265,7 +415,7 @@ signal that reveals a hot key or stale routing:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-28 16:52 UTC | @jepemo | Built with
+        Generated on 2026-06-28 18:31 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
