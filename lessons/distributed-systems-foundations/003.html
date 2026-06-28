@@ -77,211 +77,377 @@
 <section class="stack-block lesson-content-shell">
   <h1>Network Boundaries, Latency, and Partial Failure</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
 <ul>
 <li>
-<p>trace what a caller and receiver can each know across a slow network boundary;</p>
+<p>trace what each participant can know across a slow network boundary.</p>
 </li>
 <li>
-<p>explain why tail latency can turn a successful remote operation into an unknown caller outcome;</p>
+<p>explain why tail latency can turn success into an unknown caller outcome.</p>
 </li>
 <li>
-<p>choose an honest timeout, deadline, and user-visible state for partial failure.</p>
+<p>choose honest timeout, deadline, and pending-state behavior for partial failure.</p>
 </li>
 </ul>
-<p><strong>Idea in one sentence:</strong> A network boundary turns direct-looking work into message exchange, so latency and partial failure must be handled as evidence problems rather than simple success-or-failure events.</p>
+<p><strong>Idea in one sentence:</strong> A network boundary turns direct-looking work into message exchange, so latency and partial failure must be handled as evidence problems.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine changing your display name in an app. You type a new name, press <strong>Save</strong>, wait for a second, and the page says the update failed. A few moments later you refresh the profile page, and the new name is there.</p>
-<p>The product seemed to give two answers: "it failed" and "it worked." That contradiction is not just a bad error message. It is a sign that a network boundary turned one user action into several local observations. The browser saw a slow response. The gateway saw its timer expire. The profile service may have written the update. The database may have committed version <code>52</code>. None of those facts is exactly the same as the user's question: "Was my name saved?"</p>
-<p>A <strong>network boundary</strong> is the place where one participant must send a message to another participant instead of using local memory and one call stack. A <strong>latency</strong> measurement is how long the message path takes: sending, waiting, processing, queuing, writing, and returning. A <strong>partial failure</strong> happens when some parts of the path are slow, overloaded, isolated, or broken while other parts keep working.</p>
-<p>The non-obvious point is that latency and failure are connected. A request that is merely slow can become indistinguishable from a failed request from the caller's point of view. A timeout proves only that the caller stopped waiting. It does not prove the remote operation never happened. Good distributed design treats that uncertainty as a normal state that needs policy, evidence, and a safe next step.</p>
-<h2>What Actually Crosses The Boundary</h2>
-<p>Use the profile update as the recurring example. The visible user action is simple: save a display name. Internally, the action crosses at least two boundaries.</p>
-<div class="codehilite"><pre><span></span><code>browser -&gt; gateway: save display name &quot;Nora&quot;
-gateway -&gt; profile service: update user-17 to &quot;Nora&quot;
-profile service -&gt; database: write profile version 52
+<p>Imagine uploading a profile photo.</p>
+<p>You choose an image, press <strong>Upload</strong>, and wait. The page spins for a few seconds. Then it says:</p>
+<div class="codehilite"><pre><span></span><code>Upload failed. Try again.
 </code></pre></div>
 
-<p>The happy path is easy to read:</p>
-<div class="codehilite"><pre><span></span><code>browser -&gt; gateway: save name
-gateway -&gt; profile: update user-17, op-413
-profile -&gt; database: write version 52
-database -&gt; profile: committed
-profile -&gt; gateway: success, version 52
+<p>You refresh the page. The photo is there.</p>
+<p>That is not just a confusing message. It is a network-boundary story.</p>
+<p>The browser knows it waited and did not receive a useful answer. The API gateway may know its timer expired. The media service may know it stored the image object. The database may know it wrote the photo metadata. The thumbnail worker may know nothing yet.</p>
+<p>Several true facts exist at once, and none of them is the whole answer.</p>
+<p>The naive idea is:</p>
+<div class="codehilite"><pre><span></span><code>If the upload succeeds, show success.
+If the upload fails, show failure.
+</code></pre></div>
+
+<p>The network breaks that tidy model. A remote operation can keep running after the caller stops waiting. A response can be lost after the side effect succeeds. One part can be healthy while another part is saturated. The result is not always <code>success</code> or <code>failure</code>. Sometimes the honest result is:</p>
+<div class="codehilite"><pre><span></span><code>the caller does not know yet
+</code></pre></div>
+
+<p>Plain meaning:</p>
+<p>The caller and receiver are separated by time, queues, and messages.</p>
+<p>In this scenario:</p>
+<p>The browser can time out while the media service has already stored the image.</p>
+<p>Technical name:</p>
+<p>This is partial failure at a network boundary. Some participants keep working while another participant cannot get the evidence it needs.</p>
+<h2>The Moving Parts</h2>
+<p>Use this small upload workflow:</p>
+<div class="codehilite"><pre><span></span><code>browser
+  -&gt; gateway
+  -&gt; media service
+  -&gt; object storage
+  -&gt; metadata database
+  -&gt; thumbnail worker
+</code></pre></div>
+
+<p>Each participant sees a different piece:</p>
+<div class="codehilite"><pre><span></span><code>browser:
+  user selected photo-8.jpg
+  upload request started
+  no final response yet
+
+gateway:
+  request arrived
+  request forwarded to media service
+  timeout set to 2 seconds
+
+media service:
+  received upload
+  wrote image bytes to object storage
+  wrote metadata row
+
+thumbnail worker:
+  may receive work later
+</code></pre></div>
+
+<p>The boundary is not only the cable or Wi-Fi. The boundary is the fact that one participant cannot directly inspect or change another participant's local state. It must send a message and wait for evidence.</p>
+<p>That evidence may be late, missing, duplicated, or stale.</p>
+<h2>The Naive Timeline</h2>
+<p>The happy path is easy:</p>
+<div class="codehilite"><pre><span></span><code>browser -&gt; gateway: upload photo request
+gateway -&gt; media: store photo
+media -&gt; object storage: write bytes
+object storage -&gt; media: stored
+media -&gt; database: write metadata
+database -&gt; media: committed
+media -&gt; gateway: upload complete
 gateway -&gt; browser: saved
 </code></pre></div>
 
-<p>The important detail is that every arrow is a message and every box has its own local view. The browser knows what it sent and what it received. The gateway knows its timer, outbound request, and inbound response. The profile service knows whether it attempted the database write. The database knows whether it committed version <code>52</code>.</p>
-<p>Now delay the response from the profile service:</p>
-<div class="codehilite"><pre><span></span><code>gateway -&gt; profile: update user-17, op-413
-profile -&gt; database: write version 52
-database -&gt; profile: committed
-
-gateway timer expires at 800 ms
-profile -&gt; gateway: success arrives at 1100 ms
+<p>The browser sees a clean result. The system has enough evidence to say "saved."</p>
+<p>Now add one delay:</p>
+<div class="codehilite"><pre><span></span><code>time ------------------------------------------------------------&gt;
+browser:  send upload ---------------- waits ---------- timeout
+gateway:  forward request ------------ waits ---------- timeout
+media:          receive -&gt; write object -&gt; write metadata -&gt; respond
+network:                                                     response late
 </code></pre></div>
 
-<p>From the gateway's point of view, the operation crossed its waiting limit. From the profile service's point of view, the update completed. Both observations can be true. The boundary did not create one clean global event called "failed." It created local evidence that must be interpreted.</p>
-<p>That is why a remote call is not just a slow function call. A local function call usually stops being relevant if the caller abandons the stack. A remote participant can keep working after the caller has timed out. The work may later succeed, fail, or send a response that nobody is still waiting to receive.</p>
-<blockquote>
-<p><strong>Pause and predict:</strong> In the delayed-response trace, which participant owns the stronger evidence that version <code>52</code> exists: the gateway or the database?</p>
-<p><strong>Check:</strong> The database owns the durable commit fact. The gateway owns the waiting fact. Treating the gateway timeout as proof that no database write happened would confuse caller evidence with owner evidence.</p>
-</blockquote>
-<h2>Latency Is A Distribution, Not One Number</h2>
-<p>Latency is often discussed as if a service has one speed: "the profile service takes 100 ms." Real systems have a spread of timings. Most requests may be fast, while a small percentage are much slower because of garbage collection, disk flushes, queueing, lock contention, packet loss, cold caches, overloaded workers, or a slow downstream dependency.</p>
-<p>That spread matters because users and callers experience individual requests, not averages. A service with a 100 ms average can still have a 2 second tail. The <strong>tail</strong> is the slower end of the latency distribution, often described with percentiles such as p95 or p99. p99 latency means 99 percent of requests are faster than that number, and 1 percent are slower.</p>
-<p>For the profile save, a simplified latency distribution might look like this:</p>
-<div class="codehilite"><pre><span></span><code>profile update latency
-
-p50:   80 ms   typical successful request
-p95:  300 ms   slow but acceptable request
-p99: 1200 ms   rare tail request
-max: 5000 ms   incident or severe overload
+<p>Nothing exotic happened. No machine exploded. The media service may have done useful work. The caller still timed out.</p>
+<p>That is why a remote call is not a slow function call. With a local function, the caller and callee usually share one process fate. Across a network boundary, the receiver can continue after the caller has stopped waiting.</p>
+<p><strong>Check:</strong> In the delayed upload timeline, what does the browser timeout prove?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It proves that the browser did not receive a useful response before its waiting rule ended. It does not prove that object storage or the database failed.</p>
+<h2>A Worked Trace</h2>
+<p>Here is the same upload as a state table.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Participant</th>
+<th>Local state</th>
+<th>Message or decision</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Browser</td>
+<td>User selected <code>photo-8.jpg</code>.</td>
+<td>Sends upload request <code>upload-77</code>.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Gateway</td>
+<td>Request accepted; deadline is 2 seconds away.</td>
+<td>Forwards <code>upload-77</code> to media.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Media service</td>
+<td>Receives bytes for <code>upload-77</code>.</td>
+<td>Writes object <code>obj-551</code>.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Object storage</td>
+<td><code>obj-551</code> exists.</td>
+<td>Returns stored.</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Media service</td>
+<td>Object exists; metadata still missing.</td>
+<td>Writes row <code>photo_id=ph-22</code>.</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Database</td>
+<td>Metadata row exists.</td>
+<td>Returns committed.</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Gateway</td>
+<td>Its timeout already fired.</td>
+<td>Records <code>upload_outcome_unknown</code>.</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Browser</td>
+<td>Gateway returned uncertainty or failure.</td>
+<td>Needs honest user state.</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Media service</td>
+<td>Sends success late.</td>
+<td>Response may be ignored or used for repair.</td>
+</tr>
+</tbody>
+</table>
+<p>The input was one user action. The transition was a message crossing the gateway-to-media boundary. The intermediate states matter:</p>
+<div class="codehilite"><pre><span></span><code>object stored, metadata missing
+object stored, metadata committed
+caller timed out, owner succeeded
+thumbnail not yet generated
 </code></pre></div>
 
-<p>If the gateway timeout is <code>800 ms</code>, the p99 request can look like a failure even though the profile service eventually writes the database row. If the timeout is <code>5000 ms</code>, fewer successful writes will be mistaken for failures, but many gateway workers may sit idle waiting during overload. Those waiting workers consume memory, connections, and concurrency slots that other users need.</p>
-<p>The design trade-off is therefore not "short timeout good" or "long timeout good." A timeout spends from a shared latency budget. The budget is the amount of time the whole user-visible operation can take before the product experience becomes unacceptable.</p>
-<div class="codehilite"><pre><span></span><code>profile save budget: 2000 ms
-
-browser and network:          200 ms
-gateway validation:           100 ms
-profile service attempt:      700 ms
-read-after-timeout check:     250 ms
-render final response:        150 ms
-slack for jitter and queues:  600 ms
+<p>The output should match evidence. If the UI says "failed" after step 7, it may be lying. If it says "saved" without checking the owner, it may also be lying. A better state is:</p>
+<div class="codehilite"><pre><span></span><code>We are checking whether your photo finished uploading.
 </code></pre></div>
 
-<p>The exact numbers are product choices. The habit is the important part. Do not let every downstream dependency spend the full user-facing budget. If each hop gets the full two seconds, a chain of calls can exceed the promise before the system notices.</p>
-<blockquote>
-<p><strong>Pause and predict:</strong> If most profile updates finish in <code>80 ms</code> but p99 is <code>1200 ms</code>, can a timeout at <code>800 ms</code> still create user-visible uncertainty?</p>
-<p><strong>Check:</strong> Yes. The average request may be healthy, but the tail request crosses the caller's waiting rule. The user-visible design has to handle that tail, not only the typical case.</p>
-</blockquote>
-<h2>Timeouts, Deadlines, And What They Mean</h2>
-<p>A <strong>timeout</strong> is a local rule: "I will stop waiting after this much time." A timeout chooses the caller's next behavior. It does not decide the remote truth.</p>
-<p>A <strong>deadline</strong> is an end time for the whole operation: "After this moment, the answer is no longer useful for this request." Deadlines are often better than independent timeouts because they carry the remaining budget through the call chain.</p>
-<p>Without a deadline, each service may accidentally restart the waiting clock:</p>
-<div class="codehilite"><pre><span></span><code>browser budget: 2000 ms
-gateway waits up to 1800 ms for profile
-profile waits up to 1800 ms for database
-database stalls for 1200 ms
-
-total user wait can exceed the original product budget
+<p>So far, the key idea is simple: latency creates time for participants to diverge. Partial failure is what that divergence feels like from the outside.</p>
+<h2>Latency Is A Shape</h2>
+<p>People often talk as if a dependency has one speed:</p>
+<div class="codehilite"><pre><span></span><code>media upload takes 300 ms
 </code></pre></div>
 
-<p>With a propagated deadline, the downstream service can see how much useful time remains:</p>
-<div class="codehilite"><pre><span></span><code>browser deadline: 19:30:02.000
-gateway receives request at 19:30:00.150
-gateway sends deadline to profile
-profile receives request at 19:30:00.220
-profile sees about 1780 ms remain
-profile avoids starting work that cannot finish in time
+<p>Real latency has a shape. Most uploads may be fast. Some are slower because of large files, object-storage hiccups, queueing, garbage collection, network retransmits, or overloaded database connections.</p>
+<p>A simplified distribution might look like this:</p>
+<div class="codehilite"><pre><span></span><code>photo metadata write latency
+
+p50:   120 ms   common case
+p95:   700 ms   slow but expected
+p99:  2400 ms   rare tail request
+max:  9000 ms   incident or severe overload
 </code></pre></div>
 
-<p>Deadlines do not remove uncertainty. They make the uncertainty bounded. A service can reject work early, return <code>deadline_exceeded</code>, or skip expensive optional work when the answer would arrive too late to help.</p>
-<p>The most important wording stays simple:</p>
-<div class="codehilite"><pre><span></span><code>timeout means:
-  the caller stopped waiting
+<p>If the gateway timeout is <code>2000 ms</code>, some p99 requests will cross the timeout even though the media service eventually succeeds.</p>
+<p>If the timeout is <code>9000 ms</code>, fewer successful uploads will become unknown to the caller. But the gateway will keep more requests open during overload. Those waiting requests consume memory, sockets, worker slots, and user patience.</p>
+<p>The trade-off is not "short timeout good" or "long timeout good." The trade-off is:</p>
+<div class="codehilite"><pre><span></span><code>shorter timeout:
+  protects caller resources
+  creates more unknown outcomes
 
-timeout does not mean:
-  the remote operation failed
-  the remote operation succeeded
-  the remote operation stopped running
+longer timeout:
+  reduces some unknown outcomes
+  consumes more resources while waiting
 </code></pre></div>
 
-<p>That distinction prevents many unsafe follow-up decisions. The gateway may need to show <code>save_pending</code>, perform a read-after-timeout check, or schedule reconciliation. It should not claim "profile update failed" unless it has evidence from the owner of the profile state.</p>
-<h2>Partial Failure: Alive Enough To Confuse You</h2>
-<p>Total failure is often easier to reason about than partial failure. If the profile service is completely down, callers fail fast, alerts fire, and the product can enter a clear degraded mode. Partial failure is messier because the system is still alive enough to create ambiguous evidence.</p>
-<p>The profile service might accept requests but respond slowly. The database might commit writes but return slowly. The gateway might reach one profile instance but not another. A load balancer might keep routing to an instance with a saturated connection pool. Health checks might pass while real user requests time out.</p>
-<p>That last case is common. A service can answer <code>/health</code> quickly because the health endpoint does almost no work, while the real update path is stuck waiting for database connections:</p>
-<div class="codehilite"><pre><span></span><code>health check:
-  gateway -&gt; profile /health
-  profile -&gt; gateway: 200 OK in 10 ms
-
-real request:
-  gateway -&gt; profile update user-17
-  profile waits for database connection
-  gateway timeout fires at 800 ms
+<p><strong>Check:</strong> If average upload latency is healthy, can p99 latency still break the user experience?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Yes. Users experience individual requests. A rare slow request can cross the caller timeout and create an unknown outcome even when the average looks fine.</p>
+<h2>Timeouts And Deadlines</h2>
+<p>A timeout is local:</p>
+<div class="codehilite"><pre><span></span><code>I will stop waiting after this much time.
 </code></pre></div>
 
-<p>From an infrastructure dashboard, the profile service may look "up." From the user's point of view, saves are failing. From the database point of view, some writes may still be committing. Partial failure means those views can disagree without any one observer lying.</p>
-<p>This is why distributed systems need more than binary up/down thinking. They need signals that show latency, saturation, errors, and in-flight work. A service that is technically alive but has p99 latency above the caller timeout is not healthy for that workflow.</p>
+<p>A deadline is shared across the operation:</p>
+<div class="codehilite"><pre><span></span><code>This work is only useful until this time.
+</code></pre></div>
+
+<p>Without a deadline, each hop can accidentally restart the clock:</p>
+<div class="codehilite"><pre><span></span><code>browser waits up to 4 seconds
+gateway waits up to 4 seconds for media
+media waits up to 4 seconds for object storage
+object storage waits on internal work
+</code></pre></div>
+
+<p>The user-facing promise may be broken before the last participant notices.</p>
+<p>With a deadline, each participant sees the remaining useful time:</p>
+<div class="codehilite"><pre><span></span><code>browser deadline: 14:03:10.000
+gateway receives request at 14:03:06.300
+gateway passes deadline to media
+media receives request at 14:03:06.450
+media knows about 3550 ms remain
+</code></pre></div>
+
+<p>The media service can make better decisions. It may skip thumbnail generation, reject early when overloaded, or store the object and mark thumbnail work as pending.</p>
+<p>Deadlines do not remove partial failure. They bound the waiting and make the system more honest about what can still finish in time.</p>
 <h2>Designing The Unknown State</h2>
-<p>The profile update needs a state for the moment after the gateway timeout and before the system knows the profile owner's truth.</p>
-<p>A naive design has only two UI states:</p>
-<div class="codehilite"><pre><span></span><code>saved
+<p>The upload workflow needs more than two states.</p>
+<p>Too small:</p>
+<div class="codehilite"><pre><span></span><code>uploaded
 failed
 </code></pre></div>
 
-<p>That is too small for the evidence. The gateway may not know enough to choose either. A better design separates user communication from internal evidence:</p>
-<div class="codehilite"><pre><span></span><code>internal state:
-  op-413 outcome_unknown
-  caller timed out at 800 ms
-  profile owner not yet checked after timeout
-
-user state:
-  &quot;Still checking your change&quot;
-  or &quot;Saved locally; confirming with the server&quot;
-  or &quot;We could not confirm yet. Refresh in a moment.&quot;
+<p>Better:</p>
+<div class="codehilite"><pre><span></span><code>uploading
+stored_object
+metadata_committed
+thumbnail_pending
+outcome_unknown_to_caller
+confirmed_uploaded
+failed_before_storage
+failed_after_storage_needs_cleanup
 </code></pre></div>
 
-<p>The exact wording depends on the product. The system design needs the internal state either way.</p>
+<p>You do not always expose all of those states to the user. But the system should be able to represent them internally.</p>
 <p>A safe policy might be:</p>
-<div class="codehilite"><pre><span></span><code>if profile responds before deadline:
-  return saved with committed version
+<div class="codehilite"><pre><span></span><code>if media returns before deadline:
+  show uploaded
 
 if gateway timeout fires:
-  record outcome_unknown for op-413
-  ask the profile owner for user-17 version
-  if version 52 is visible: return saved
-  if owner says no write happened: allow retry
-  if owner cannot answer: return pending and schedule repair
+  record upload_outcome_unknown
+  ask the media owner about upload-77
+
+if owner says metadata committed:
+  show uploaded, maybe thumbnail pending
+
+if owner says no object and no metadata:
+  allow retry
+
+if owner cannot answer:
+  show checking state and schedule repair
 </code></pre></div>
 
-<p>This is not a retry lesson yet; the next lesson handles idempotency and retry policy in depth. The point here is narrower: the boundary creates an unknown state, and the system must not erase that state by guessing.</p>
-<h2>Operational Signals For The Boundary</h2>
-<p>When a boundary is healthy, the caller's expectations and the receiver's behavior line up. When the boundary becomes unhealthy, the first clue is often not an error rate spike. It is a latency shape change.</p>
-<p>Useful signals include:</p>
+<p>This lesson is not yet the retry lesson. The next lesson handles retries and idempotency directly. Here, the important move is to avoid pretending unknown means failed.</p>
+<h2>What This Changes</h2>
+<p>Before this model, it is tempting to design the upload as one blocking action:</p>
+<div class="codehilite"><pre><span></span><code>call media service
+wait
+return uploaded or failed
+</code></pre></div>
+
+<p>After this model, the upload becomes a small state machine:</p>
+<div class="codehilite"><pre><span></span><code>start upload
+record the operation identity
+move through visible intermediate states
+ask the owner for evidence after uncertainty
+show the user a state that matches what the system knows
+</code></pre></div>
+
+<p>That changes product behavior. A timeout no longer has to become a scary final error. The UI can say "checking upload" while the system asks the media owner whether <code>upload-77</code> exists. Support can inspect the same operation id instead of guessing from one browser error. Operators can look for the boundary where time was spent.</p>
+<p>It also changes engineering behavior. The gateway should not own the truth of the uploaded photo. The media service or metadata database should own that fact. The gateway owns the waiting rule and the user-facing response. Those are different responsibilities.</p>
+<p>This separation is small, but it prevents a common incident pattern: a caller loses patience, labels the operation failed, and later the receiver proves that the side effect succeeded. Once you expect that shape, you can design the unknown state before production invents it for you.</p>
+<h2>Operational Signals</h2>
+<p>Partial failure often hides behind "the service is up."</p>
+<p>A health check can pass while the real upload path is unhealthy:</p>
+<div class="codehilite"><pre><span></span><code>health check:
+  gateway -&gt; media /health
+  media -&gt; gateway: 200 OK in 8 ms
+
+real upload:
+  gateway -&gt; media upload
+  media waits for object-storage connection
+  gateway timeout fires at 2000 ms
+</code></pre></div>
+
+<p>The service is alive. The workflow is not healthy.</p>
+<p>Useful signals are tied to the real boundary:</p>
 <ul>
-<li>request latency percentiles for each boundary, especially p95 and p99</li>
-<li>timeout counts by caller and dependency</li>
-<li>in-flight request counts and queue depth</li>
-<li>connection pool saturation</li>
-<li>retry volume, even if retries are handled in the next lesson</li>
-<li>disagreement between health checks and real endpoint success</li>
-<li>traces that show where the request spent time</li>
+<li>p95 and p99 latency for upload requests</li>
+<li>timeout count by caller and dependency</li>
+<li>in-flight upload count</li>
+<li>object-storage connection pool saturation</li>
+<li>queue depth for thumbnail work</li>
+<li>late-success count after gateway timeout</li>
+<li>traces that show where time was spent</li>
 </ul>
-<p>For the profile save, a useful trace might show:</p>
-<div class="codehilite"><pre><span></span><code>gateway validate request:        25 ms
-gateway -&gt; profile wait:        800 ms timeout
-profile handler queue:          600 ms
-profile database write:          90 ms
-profile response after timeout: 190 ms
+<p>A useful trace might say:</p>
+<div class="codehilite"><pre><span></span><code>gateway validation:             20 ms
+gateway -&gt; media wait:        2000 ms timeout
+media waiting for storage:    1700 ms
+object write:                  180 ms
+metadata write:                 40 ms
+media response after timeout:  120 ms
 </code></pre></div>
 
-<p>That trace explains the incident better than an error message alone. The gateway timeout was not random. The profile handler spent too long queued before it even reached the database. A team could respond by adjusting concurrency, protecting the database pool, changing routing, or returning overload earlier.</p>
-<p>Operationally, the goal is not to make every request fast forever. The goal is to see when a boundary stops meeting the promise and to know which side has the next useful evidence.</p>
-<h2>Failure Modes And Trade-Offs</h2>
-<p>The first failure mode is false certainty. The caller times out and reports "failed" even though the owner later commits the update. This confuses users and can trigger unsafe retries.</p>
-<p>The second failure mode is unbounded waiting. The caller waits too long because it wants a definite answer. During overload, those waiting requests consume scarce resources and can make unrelated workflows fail.</p>
-<p>The third failure mode is health-check optimism. A service reports healthy while the real path is saturated. The fix is to measure the boundary the product actually uses, not only a cheap endpoint.</p>
-<p>The fourth failure mode is missing ownership after timeout. If the gateway does not know which service owns the profile state, it cannot ask the right question after uncertainty appears.</p>
-<p>Every timeout policy buys a trade-off. Shorter waiting protects caller resources and responsiveness, but creates more unknown outcomes. Longer waiting can reduce ambiguity, but increases resource consumption and tail latency. A good design makes that trade-off explicit and gives the unknown state a repair path.</p>
-<h2>Practice Prompt</h2>
-<p>Pick one user action that crosses a network boundary: saving a profile, uploading a photo, joining a call, posting a comment, or reserving a seat. Close the lesson and write:</p>
+<p>That trace explains the boundary. The media service was not down. It was waiting for storage long enough that the caller's timeout fired.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Timeouts improve resource protection. They stop callers from waiting forever.</p>
+<p>They cost certainty. A timed-out caller often needs a later owner check, a pending state, or a repair job.</p>
+<p>Deadlines improve budget discipline. They help downstream participants avoid work that can no longer help the user.</p>
+<p>They do not guarantee correctness. A service can ignore the deadline, crash after a side effect, or return too late.</p>
+<p>Operational signals improve diagnosis. They reveal when a boundary is unhealthy even though individual participants are alive.</p>
+<p>They do not replace product policy. The system still needs to decide what to show while evidence is incomplete.</p>
+<p>You can see the boundary getting risky when p99 latency approaches the caller timeout, in-flight work rises, and users see ambiguous outcomes.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: Timeout means the remote work stopped</h3>
+<p>Why it is tempting:</p>
+<p>In local code, returning from a failed call often feels like the work is over.</p>
+<p>Better model:</p>
+<p>Across a network boundary, the receiver may keep running after the caller stops waiting.</p>
+<h3>Confusion: If health checks pass, the workflow is healthy</h3>
+<p>Why it is tempting:</p>
+<p>A green health check is easy to read.</p>
+<p>Better model:</p>
+<p>The real workflow can be slow or saturated while a cheap health endpoint still returns <code>200 OK</code>.</p>
+<h3>Confusion: Longer timeouts always make the system safer</h3>
+<p>Why it is tempting:</p>
+<p>Waiting longer can reduce some unknown outcomes.</p>
+<p>Better model:</p>
+<p>Longer timeouts also consume caller resources during overload. They can make the system slower for everyone.</p>
+<h2>Practice</h2>
+<p>Pick one action that crosses a network boundary: uploading a photo, joining a call, posting a comment, saving a document, or submitting a form.</p>
+<p>Write:</p>
 <div class="codehilite"><pre><span></span><code>caller:
 receiver:
 owner of the official state:
-user-facing latency budget:
+user-facing deadline:
 caller timeout:
 what the timeout proves:
 what the timeout does not prove:
-state shown while outcome is unknown:
+unknown state:
 signal that would reveal partial failure:
 </code></pre></div>
 
-<p>If "what the timeout proves" says anything stronger than "the caller stopped waiting," revise it. If the only signal is "service is up," add a latency or saturation signal for the real boundary.</p>
-<p>A strong answer names one state owner, one caller-local observation, one receiver-local observation, and one measurable signal that would show the boundary becoming unhealthy. For the profile example, <code>p99 profile update latency above the gateway timeout</code> is stronger evidence than a generic "profile service is up" check.</p>
+<p>Now change one parameter. Cut the caller timeout in half.</p>
+<p>Predict:</p>
+<div class="codehilite"><pre><span></span><code>what improves:
+what gets worse:
+what state becomes more common:
+what signal should you watch:
+</code></pre></div>
+
+<p>A good answer should say that shorter waiting protects caller resources but creates more unknown outcomes. It should name an owner check or pending state, not only "try again."</p>
 <h2>Resources</h2>
 <ul>
 <li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a><ul>
@@ -289,21 +455,21 @@ signal that would reveal partial failure:
 </ul>
 </li>
 <li>[ARTICLE] <a href="https://www.somethingsimilar.com/2013/01/14/notes-on-distributed-systems-for-young-bloods/">Notes on Distributed Systems for Young Bloods</a><ul>
-<li>Focus: Practical framing for slow networks, failure ambiguity, and defensive boundaries.</li>
+<li>Focus: Practical framing for latency, uncertainty, and defensive network boundaries.</li>
 </ul>
 </li>
 <li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Reliability, partial failure, and the limits of pretending remote calls behave like local calls.</li>
+<li>Focus: Reliability, partial failure, and why remote calls cannot be treated like local calls.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A network boundary turns a local-looking action into message exchange with incomplete evidence.</li>
-<li>Latency is a distribution; tail requests can cross caller timeouts even when averages look fine.</li>
-<li>A timeout proves the caller stopped waiting, not what the receiver did.</li>
-<li>Partial failure is hard because the system is alive enough for different observers to hold different true facts.</li>
-<li>Good boundary design uses latency budgets, deadlines, owner checks, unknown states, and operational signals.</li>
+<li>A network boundary turns direct-looking work into message exchange with incomplete evidence.</li>
+<li>A timeout proves the caller stopped waiting; it does not prove the receiver stopped working.</li>
+<li>Latency has a tail, and tail requests can cross caller timeouts even when averages look healthy.</li>
+<li>Partial failure means some participants keep working while others lack the evidence they need.</li>
+<li>Good boundary design uses deadlines, unknown states, owner checks, and signals tied to the real request path.</li>
 </ul>
 </section>
 
@@ -333,7 +499,7 @@ signal that would reveal partial failure:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-26 15:07 UTC | @jepemo | Built with
+        Generated on 2026-06-28 16:52 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
