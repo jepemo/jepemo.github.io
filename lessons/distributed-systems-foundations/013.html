@@ -77,187 +77,340 @@
 <section class="stack-block lesson-content-shell">
   <h1>Schemas, Contracts, and Versioned Messages</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
 <ul>
 <li>
-<p>trace why old producers, new producers, old consumers, new consumers, and queued messages must coexist during a safe rollout;</p>
+<p>trace a message change across old producers, new producers, old consumers, new consumers, and retained messages.</p>
 </li>
 <li>
-<p>distinguish schema shape compatibility from semantic compatibility;</p>
+<p>distinguish schema shape compatibility from semantic compatibility.</p>
 </li>
 <li>
-<p>choose a rollout order and retirement boundary for a versioned message change.</p>
+<p>design a safe rollout and retirement boundary for a versioned message contract.</p>
 </li>
 </ul>
-<p><strong>Idea in one sentence:</strong> A message contract lets services evolve independently only when every mixed-version reader, writer, and retained message can still be parsed and interpreted safely.</p>
+<p><strong>Idea in one sentence:</strong> A message contract is safe to change only when every participant that may still exist can parse the message and interpret its meaning correctly.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine an <code>order_created</code> event. The order service deploys a new version at 10:00. The invoice service will not deploy until 10:20. For twenty minutes, the system contains old consumers, new producers, old messages in queues, and new messages being written.</p>
-<p>If the new producer sends a shape that the old invoice service cannot read, the rollout breaks even though every service may look healthy on its own. The failure is not a CPU problem or a network problem. It is a contract problem.</p>
-<p>A <strong>message contract</strong> is the agreement that lets independently deployed participants keep understanding one another while they evolve. A <strong>schema</strong> describes the shape of a message: field names, types, optional fields, required fields, and sometimes defaults. A <strong>compatibility rule</strong> says which old and new participants can safely coexist.</p>
-<p>The trade-off is that safe evolution often turns one desired change into several releases. That feels slower than changing everything at once. It is also what lets a distributed system stay alive while different parts move at different times.</p>
-<h2>A Mixed-Version Rollout</h2>
-<p>Use an <code>order_created</code> event as the worked example.</p>
-<p>Version 1 contains two fields:</p>
-<div class="codehilite"><pre><span></span><code>order_created v1:
-  order_id
-  total
+<p>A digital library has a service that records ebook loans.</p>
+<p>When a reader borrows a book, the library service publishes this event:</p>
+<div class="codehilite"><pre><span></span><code>loan_started
+  loan_id
+  user_id
+  book_id
+  due_at
 </code></pre></div>
 
-<p>The team wants version 2 to include currency:</p>
-<div class="codehilite"><pre><span></span><code>order_created v2:
-  order_id
-  total
-  currency
+<p>Several services consume it.</p>
+<div class="codehilite"><pre><span></span><code>email service        -&gt; send a confirmation
+recommendation index -&gt; update &quot;recently borrowed&quot;
+late-fee service     -&gt; schedule reminders
+analytics pipeline   -&gt; count loans by day
 </code></pre></div>
 
-<p>Adding <code>currency</code> can be safe if three things are true:</p>
+<p>Now the product team wants family accounts. A child can borrow a book through a parent account. The team wants to add a borrower type:</p>
+<div class="codehilite"><pre><span></span><code>borrower_type: adult | child
+</code></pre></div>
+
+<p>That sounds like a small field. But the system is distributed. Not every service deploys at the same time. Some old <code>loan_started</code> events are still in queues. Some events may be replayed next month to rebuild the recommendation index.</p>
+<p>If the new library service publishes a message that an old consumer rejects, the rollout breaks. If a new consumer assumes every old event has <code>borrower_type</code>, old messages break. If a team silently changes the meaning of <code>user_id</code>, the message may parse while the business behavior becomes wrong.</p>
+<p>Plain meaning:</p>
+<p>A contract is the agreement that says, "When this message appears, this is its shape, this is what each field means, and these older and newer participants can safely coexist."</p>
+<p>In this scenario:</p>
+<p>The library service, email service, recommendation index, late-fee service, analytics pipeline, queued messages, and replay tools all need a safe interpretation of <code>loan_started</code>.</p>
+<p>Technical name:</p>
+<p>The message shape is a <strong>schema</strong>. The agreement about shape, meaning, compatibility, rollout, and retirement is a <strong>message contract</strong>.</p>
+<h2>The Naive Idea: Add The Field And Deploy</h2>
+<p>The first plan is tempting:</p>
+<div class="codehilite"><pre><span></span><code>1. Add borrower_type to loan_started.
+2. Deploy the library service.
+3. Update consumers later.
+</code></pre></div>
+
+<p>That might work in a single process. It is risky in a distributed system.</p>
+<p>At 10:00, the library service deploys.</p>
+<div class="codehilite"><pre><span></span><code>new producer writes:
+loan_started v2
+  loan_id: loan-8
+  user_id: user-parent-3
+  book_id: book-44
+  due_at: 2026-07-15
+  borrower_type: child
+</code></pre></div>
+
+<p>At 10:05, the email service is still old. It expects only v1 fields.</p>
+<p>There are several possible outcomes:</p>
 <ul>
-<li>old consumers ignore unknown optional fields;</li>
-<li>new consumers can still read old messages without <code>currency</code>;</li>
-<li>producers do not make <code>currency</code> mandatory before the fleet is ready.</li>
+<li>it ignores the unknown field and sends the email;</li>
+<li>it rejects the message because the schema is unknown;</li>
+<li>it sends the email but uses the wrong wording;</li>
+<li>it crashes and blocks the queue.</li>
 </ul>
-<p>The same change becomes unsafe if the old consumer rejects unknown fields, if the new consumer assumes <code>currency</code> always exists, or if the producer silently changes the meaning of <code>total</code>.</p>
-<p>The important deployment question is:</p>
-<div class="codehilite"><pre><span></span><code>Which combinations of old and new producers,
-old and new consumers,
-and old and new messages
-must coexist safely?
+<p>The important question is not "Did the producer deploy cleanly?"</p>
+<p>The important question is:</p>
+<div class="codehilite"><pre><span></span><code>Which old and new readers, writers, and stored messages must coexist?
 </code></pre></div>
 
-<p>That question matters because messages are not always read immediately. They can sit in queues, be retried after a deploy, move to a dead-letter queue, or be replayed months later during recovery.</p>
-<h2>Shape Compatibility And Meaning Compatibility</h2>
-<p>Schema tools are good at checking shape. They can often tell whether a field was removed, whether a type changed, whether a required field has no default, or whether a reader can ignore a new optional field.</p>
-<p>Shape is not the whole contract.</p>
-<p>Consider this change:</p>
-<div class="codehilite"><pre><span></span><code>before:
-  total = price before tax
-
-after:
-  total = price after tax
+<p><strong>Check:</strong> Why is "the new producer can write the new field" not enough to prove the rollout is safe?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Because the producer is only one participant. Old consumers may still read new messages, new consumers may still read old messages, and retained messages may reappear through queues, retries, dead-letter stores, or replay.</p>
+<h2>Shape And Meaning Are Different Contracts</h2>
+<p>A schema usually describes shape.</p>
+<div class="codehilite"><pre><span></span><code>field name: borrower_type
+field type: string or enum
+required?: no
+allowed values: adult, child
 </code></pre></div>
 
-<p>The field name and type stayed the same. A schema checker may be satisfied. The invoice service may still produce the wrong invoice because the meaning changed under the same name.</p>
-<p>That is <strong>semantic compatibility</strong>. It asks whether old and new participants attach the same meaning to the message. Renaming a field can break shape. Reusing a field with changed meaning can break trust more quietly.</p>
-<p>A useful contract review separates the two:</p>
-<div class="codehilite"><pre><span></span><code>shape:
-  Can the reader parse the message?
-
-meaning:
-  Will the reader interpret the message correctly?
+<p>Shape compatibility asks:</p>
+<div class="codehilite"><pre><span></span><code>Can this reader parse this message?
 </code></pre></div>
 
-<p>Both need to be true for safe evolution.</p>
-<h2>Rollout Order</h2>
-<p>A safe rollout usually prepares readers before writers depend on a new shape or meaning.</p>
-<p>For the <code>currency</code> change, the sequence might be:</p>
-<div class="codehilite"><pre><span></span><code>1. Deploy consumers that can read v1 and v2.
-2. Deploy producers that start sending currency.
-3. Wait until old messages have drained or remain readable.
-4. Make new behavior depend on currency only after the fleet is ready.
-5. Remove old compatibility code after the retention and replay window closes.
+<p>Shape matters. Removing a required field, changing a number into a string, or adding a required field without a default can break readers immediately.</p>
+<p>But shape is not enough.</p>
+<p>Imagine this change:</p>
+<div class="codehilite"><pre><span></span><code>v1 meaning:
+  user_id = the account that receives the loan
+
+v2 meaning:
+  user_id = the person who physically reads the book
 </code></pre></div>
 
-<p>This sequence protects mixed-version operation. At each step, the system can still process messages produced by the previous step.</p>
-<p>The same idea applies to request/response APIs, event streams, database records, and command payloads. The slower and more asynchronous the workflow, the more important compatibility becomes. A synchronous HTTP caller usually meets a callee in the same moment. An event may be written today and interpreted by future code later.</p>
-<p>Version numbers help only when they are attached to real behavior. A field called <code>schema_version = 2</code> is useful if readers know what version 2 means and what old versions may still appear. It is not magic.</p>
-<h2>Worked Trace: Add <code>currency</code> Without Breaking A Queue</h2>
-<p>Suppose the order service publishes to a queue and invoicing, analytics, and a repair worker consume the event. A message produced yesterday can still be delivered today.</p>
-<div class="codehilite"><pre><span></span><code>M1, produced by v1
-{ &quot;order_id&quot;: &quot;order-42&quot;, &quot;total&quot;: 25.00 }
-
-M2, produced by v2
-{ &quot;order_id&quot;: &quot;order-43&quot;, &quot;total&quot;: 25.00, &quot;currency&quot;: &quot;EUR&quot; }
+<p>The field name did not change. The field type did not change. A schema checker may be happy.</p>
+<p>The late-fee service may not be happy.</p>
+<p>If <code>user_id</code> used to identify the billing account and now identifies the child reader, reminders, limits, and permissions may go to the wrong place. The message parses, but the meaning changed under the same label.</p>
+<p>Semantic compatibility asks:</p>
+<div class="codehilite"><pre><span></span><code>Will old and new participants interpret the message the same safe way?
 </code></pre></div>
 
-<p>The safe rollout begins with readers. The new invoice consumer can read M1 with a documented legacy interpretation or an explicit <code>unknown</code> state, and it can read M2 when <code>currency</code> exists. It must not invent a default that could produce an incorrect invoice.</p>
-<div class="codehilite"><pre><span></span><code>new reader + old message -&gt; works while M1 exists
-new reader + new message -&gt; target behavior
+<p>For this feature, a safer design is to preserve the old meaning and add a new field:</p>
+<div class="codehilite"><pre><span></span><code>loan_started v2:
+  loan_id
+  account_user_id      # old user_id meaning, renamed only when safe
+  borrower_profile_id  # new reader identity
+  borrower_type
+  book_id
+  due_at
 </code></pre></div>
 
-<p>Only then does the producer send M2. Old consumers must ignore the unknown optional field or use a compatible decoder; otherwise the producer cannot safely emit M2 until those consumers are upgraded. This is why a version number is not the compatibility plan. The real plan is the coexistence matrix:</p>
-<div class="codehilite"><pre><span></span><code>old reader + old message -&gt; works
-new reader + old message -&gt; works
-old reader + new message -&gt; works until old readers are gone
-new reader + new message -&gt; works
+<p>If the old name cannot be removed yet, keep it with its old meaning and document the new field clearly:</p>
+<div class="codehilite"><pre><span></span><code>user_id = account that owns the loan
+borrower_profile_id = profile that will read the book
 </code></pre></div>
 
-<p>Shape compatibility is necessary but insufficient. <code>total: 25.00</code> must state whether it includes tax, shipping, discounts, and which currency applies. If the meaning changes, add <code>total_including_tax</code> rather than silently redefining <code>total</code>. A parser cannot catch a field whose name and type stayed the same while its business meaning changed.</p>
-<p>After all producers write <code>currency</code>, compatibility is still needed for queued messages, retries, dead-letter stores, backups, and replay tools. Remove the legacy reader path only after the retention and recovery window has passed and telemetry shows no v1 messages remain. A schema registry can enforce mechanical checks, but ownership, meaning, rollout order, and replay readiness are contract decisions that teams must make explicit.</p>
-<p>Useful evidence includes schema-validation rejections, unknown-field decode failures, missing-field fallback use, oldest queued message by version, and replay failures. The trade-off is more releases and temporary compatibility code in exchange for independent deployment and a safe operational recovery path.</p>
-<h2>Compatibility Is A Directional Promise</h2>
-<p>Teams often say that a schema is “compatible” without naming the direction. That leaves a gap precisely when an old queue item or an older consumer appears during a rollout.</p>
-<p><strong>Backward compatibility</strong> asks whether a new reader can interpret old data. In this example, it means the new invoice consumer can process M1, even though <code>currency</code> is missing. A default is safe only if it is a true, documented default. If the historical order may be in several currencies, the reader must obtain the currency from an authoritative record or stop and request repair.</p>
-<p><strong>Forward compatibility</strong> asks whether an old reader can tolerate data written by a new producer. It means the old analytics consumer ignores the new <code>currency</code> field rather than rejecting the entire event. Some formats support this naturally; some generated decoders need an explicit unknown-field rule. The contract needs a tested answer, not an assumption.</p>
-<p><strong>Full compatibility</strong> is the mixed-fleet promise that both directions hold while old and new writers, readers, and messages coexist. It costs more discipline, but it is usually the appropriate target for independently deployed event systems.</p>
-<div class="codehilite"><pre><span></span><code>new reader reads M1 -&gt; backward-compatible path
-old reader reads M2 -&gt; forward-compatible path
-both paths work      -&gt; mixed rollout can proceed
+<p>That is less tidy than a quick rename. It is safer because readers do not have to guess which meaning is hiding behind a familiar field.</p>
+<h2>Compatibility Has Direction</h2>
+<p>Teams often say, "This schema is compatible."</p>
+<p>That sentence is incomplete. Compatible in which direction?</p>
+<p><strong>Backward compatibility</strong> means new readers can read old messages.</p>
+<p>In the library example:</p>
+<div class="codehilite"><pre><span></span><code>new late-fee service reads old v1 message without borrower_type
 </code></pre></div>
 
-<p>The field type matters as well. Changing <code>total</code> from a decimal value to a formatted string such as <code>"EUR 25.00"</code> may look convenient to a user interface, but it breaks readers that calculate with a number. Adding a separate display field is safer. Replacing an enum value can similarly break old readers that assume the set is closed. When a reader cannot make a safe interpretation, it should reject the message into a visible repair path rather than silently inventing business data.</p>
-<h2>Quick Check: Which Promise Is Missing?</h2>
-<p>Pause on the <code>currency</code> change and classify each case before reading the answer:</p>
-<div class="codehilite"><pre><span></span><code>new invoice consumer reads M1 without currency
-old analytics consumer reads M2 with currency
-new consumer parses total but assumes it always includes tax
+<p>The new service needs a documented behavior:</p>
+<div class="codehilite"><pre><span></span><code>if borrower_type is missing:
+    treat as adult account loan
+    or look up borrower profile from durable loan record
+    or send to repair if the meaning is unsafe
 </code></pre></div>
 
-<p>The first case tests backward compatibility: new code must read old data. The second tests forward compatibility: old code must tolerate new data. The third is semantic compatibility: parsing succeeds, but the business meaning may be wrong. A rollout is not ready until all three have an explicit answer.</p>
-<h2>Replay Is A Contract Test, Not An Afterthought</h2>
-<p>The hardest consumer is often not the one currently deployed. It is tomorrow's incident tool reading last month's events. A replay can cross a schema migration, code deployment, and changed business rules all at once.</p>
-<p>Before retiring M1 support, rehearse a small replay: select a stored M1 event, run it through the current consumers, and verify the resulting invoice or order state. Do the same for M2. The test should include an old message from a retry or dead-letter queue, because those are exactly the records that return when normal assumptions have failed.</p>
-<p>Keep a written retirement date and an owner for that decision. Otherwise compatibility code tends either to disappear too early during cleanup or to stay indefinitely because nobody can prove the replay boundary has passed. The owner should review retained data, recovery tools, consumer metrics, and the documented meaning before approving removal.</p>
-<div class="codehilite"><pre><span></span><code>replay check:
-  M1 -&gt; current consumer -&gt; documented legacy outcome
-  M2 -&gt; current consumer -&gt; current outcome
-  duplicate delivery -&gt; idempotent outcome
-  malformed message -&gt; visible dead-letter and repair evidence
+<p>The answer depends on the product truth. A default is safe only if it is true for old data.</p>
+<p><strong>Forward compatibility</strong> means old readers can tolerate new messages.</p>
+<div class="codehilite"><pre><span></span><code>old email service reads v2 message with borrower_type
 </code></pre></div>
 
-<p>This exposes an important boundary: schema compatibility does not make processing idempotent. A reader may parse the same <code>order_created</code> event twice and still create two invoices unless the consumer uses <code>order_id</code> or an event id to recognize prior work. Contracts need both an interpretation rule and a processing rule.</p>
-<p>The operational signals become release gates. If legacy fallback is still used, if dead-letter volume rises after the producer deploys, or if a replay cannot explain an old record, the rollout is incomplete. The right response is to pause the writer change or extend compatibility, not to declare the old messages irrelevant because the current service looks healthy.</p>
-<p>This evidence also gives support and finance teams a concrete answer when a historical order must be reconstructed months after the original deployment.</p>
-<h2>Failure Modes And Trade-offs</h2>
-<p>The representative failure is an old consumer rejecting a new message and stopping a pipeline. The message is valid to the new producer, but not survivable for the mixed fleet.</p>
-<p>A quieter failure is a new consumer assuming a field is always present before all old producers can send it. The rollout may work in staging, then fail when one older producer emits a v1 message from a retry or delayed queue.</p>
-<p>Another failure is semantic drift. Two teams use the same field name but no longer mean the same thing. These bugs can pass parsers, tests, and dashboards while corrupting business behavior.</p>
-<p>The trade-off is discipline versus speed. Compatibility slows some refactors, keeps deprecated fields alive longer, and forces rollout planning. The payoff is that services can deploy independently without turning every contract change into an all-at-once event.</p>
-<h2>Practice Prompt</h2>
-<p>Pick one message or API payload: <code>order_created</code>, <code>user_updated</code>, <code>payment_authorized</code>, <code>inventory_reserved</code>, or <code>password_changed</code>. Fill in these lines:</p>
-<div class="codehilite"><pre><span></span><code>message:
-current required fields:
-current optional fields:
+<p>This is safe only if the old email service ignores unknown optional fields or uses a decoder that preserves them without rejecting the message.</p>
+<p><strong>Full compatibility</strong> means both directions hold during the mixed fleet:</p>
+<div class="codehilite"><pre><span></span><code>new reader + old message -&gt; safe
+old reader + new message -&gt; safe
+new reader + new message -&gt; safe
+old reader + old message -&gt; still safe
+</code></pre></div>
+
+<p>Version numbers help, but they are not the contract by themselves. A field called <code>schema_version = 2</code> is useful only if readers know what version 2 means, which old versions may still appear, and when old support can be removed.</p>
+<h2>A Worked Trace: Add Borrower Type Safely</h2>
+<p>Follow the rollout as a coexistence problem.</p>
+<h3>1. Input: The Desired Change</h3>
+<p>The product wants child profiles.</p>
+<p>Naive change:</p>
+<div class="codehilite"><pre><span></span><code>loan_started v2:
+  loan_id
+  user_id
+  book_id
+  due_at
+  borrower_type
+</code></pre></div>
+
+<p>Risk:</p>
+<p>Some consumers still run v1 code. Some old v1 messages still exist. Replay tools may read both versions later.</p>
+<h3>2. Transition: Prepare Readers First</h3>
+<p>Before the producer emits v2, deploy readers that can handle both forms.</p>
+<div class="codehilite"><pre><span></span><code>email service v2:
+  v1 message -&gt; send normal adult/account email
+  v2 adult  -&gt; send normal adult/account email
+  v2 child  -&gt; send parent-account wording
+
+late-fee service v2:
+  v1 message -&gt; use account-level policy
+  v2 message -&gt; use borrower_type if present
+</code></pre></div>
+
+<p>Intermediate state:</p>
+<div class="codehilite"><pre><span></span><code>producer: old
+some consumers: new
+messages: old shape only
+</code></pre></div>
+
+<p>This state is boring. Boring is good here. New readers are ready before new messages arrive.</p>
+<h3>3. Transition: Emit The New Optional Field</h3>
+<p>Now the producer starts sending <code>borrower_type</code>.</p>
+<div class="codehilite"><pre><span></span><code>producer: new
+consumers: mixed
+messages: old and new
+</code></pre></div>
+
+<p>The compatibility matrix must still work.</p>
+<div class="codehilite"><pre><span></span><code>old email + v2 message -&gt; ignores borrower_type, still sends safe generic email
+new email + v1 message -&gt; uses old account behavior
+new email + v2 message -&gt; uses borrower-specific behavior
+</code></pre></div>
+
+<p>Output:</p>
+<p>Family loans can begin, but the rollout does not require every consumer to switch behavior at the same moment.</p>
+<p>Naive failure contrast:</p>
+<p>If the producer had made <code>borrower_type</code> required before readers were ready, old messages would fail in new consumers. If old consumers rejected unknown fields, new messages would block old consumers. The small field would become a deployment incident.</p>
+<h3>4. Transition: Depend On The Field Only After Evidence</h3>
+<p>The team should not immediately write product rules that require <code>borrower_type</code> everywhere. First it checks evidence:</p>
+<div class="codehilite"><pre><span></span><code>oldest queued loan_started version
+percentage of consumers upgraded
+schema validation failures
+missing-field fallback count
+dead-letter count by schema version
+replay test result
+</code></pre></div>
+
+<p>Only after old producers are gone, queues have drained, and replay behavior is tested can the new behavior depend on the new field.</p>
+<h3>5. Output: Retire Old Support Deliberately</h3>
+<p>Removal is part of the contract.</p>
+<div class="codehilite"><pre><span></span><code>retire v1 reader path only after:
+  no v1 messages remain in live queues
+  retained event policy says v1 will not be replayed without translation
+  repair and replay tools can handle v1
+  consumers no longer report missing borrower_type fallback
+</code></pre></div>
+
+<p>Until then, compatibility code is not clutter. It is part of the system's ability to recover from old data.</p>
+<p><strong>Check:</strong> A new consumer reads an old <code>loan_started</code> message without <code>borrower_type</code>. Is that a forward-compatibility or backward-compatibility question?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Backward compatibility. New code is reading old data. The consumer needs a safe behavior for messages produced before the new field existed.</p>
+<h2>Replay Makes Old Contracts Current Again</h2>
+<p>Many message bugs wait until replay.</p>
+<p>The recommendation index may be rebuilt from last month's <code>loan_started</code> events. That replay can send old v1 events through today's code. If today's code assumes every message has <code>borrower_type</code>, the bug appears long after the deployment looked successful.</p>
+<p>A good rollout tests replay explicitly:</p>
+<div class="codehilite"><pre><span></span><code>replay sample:
+  v1 adult loan -&gt; current recommendation consumer
+  v2 adult loan -&gt; current recommendation consumer
+  v2 child loan -&gt; current recommendation consumer
+  malformed message -&gt; visible dead-letter and repair path
+</code></pre></div>
+
+<p>Replay also tests semantics. The consumer should not merely parse the old message. It should produce the documented old meaning. If old <code>user_id</code> means account owner, replay should not quietly reinterpret it as child profile.</p>
+<p>This is where contracts become operational evidence. The team should know:</p>
+<ul>
+<li>which schema versions are still stored;</li>
+<li>which consumers still use fallback paths;</li>
+<li>which messages fail validation;</li>
+<li>which dead-letter messages need repair;</li>
+<li>which replay tools can translate old events safely.</li>
+</ul>
+<h2>Common Confusions</h2>
+<h3>Confusion: Optional Means Harmless</h3>
+<p>Why it is tempting:</p>
+<p>An optional field does not force every producer to send it.</p>
+<p>Better model:</p>
+<p>Optional only solves one shape problem. The field can still change meaning, be rejected by old readers, be required too early by new readers, or be missing from replayed data.</p>
+<h3>Confusion: A Schema Registry Owns The Contract</h3>
+<p>Why it is tempting:</p>
+<p>Schema registries can enforce useful compatibility checks.</p>
+<p>Better model:</p>
+<p>A registry can check many shape rules. It cannot know every product meaning. It cannot decide whether <code>user_id</code> means account owner or child profile unless humans make that contract explicit.</p>
+<h3>Confusion: Version 2 Replaces Version 1 Immediately</h3>
+<p>Why it is tempting:</p>
+<p>After the deploy, the current code writes version 2.</p>
+<p>Better model:</p>
+<p>Old messages can survive in queues, logs, backups, dead-letter stores, and event archives. Version 1 is gone only when every retention and replay path says it is gone or translatable.</p>
+<h2>Trade-offs And Limits</h2>
+<p>Safe message evolution trades speed for independent deployment.</p>
+<p>The fast path is one big change: update the producer, update all consumers, rename fields, delete old code, and hope the rollout is perfectly synchronized.</p>
+<p>The safer path is slower:</p>
+<ul>
+<li>define the field meaning;</li>
+<li>prepare readers before writers depend on the new shape;</li>
+<li>keep temporary compatibility code;</li>
+<li>monitor old and new message versions;</li>
+<li>retire old behavior only after retention and replay boundaries are clear.</li>
+</ul>
+<p>The trade-off is real. Compatibility code adds branches, tests, documentation, and cleanup work. It can become permanent if nobody owns retirement.</p>
+<p>But the payoff is large: services can deploy independently, queues can drain safely, and incident recovery can replay old data without turning old messages into new failures.</p>
+<p>This idea does not solve every data problem. A compatible schema can still carry wrong facts. A well-versioned message can still be processed twice unless the consumer is idempotent. A safe rollout can still fail if a hidden consumer exists outside the known contract.</p>
+<p>You can see the boundary when validation succeeds but business behavior is wrong. That is the signal to review semantic meaning, not just schema shape.</p>
+<p>Another boundary is ownership. A contract without an owner tends to decay. New consumers appear, old replay jobs keep running, and nobody knows which version can still be removed. Versioned messages need a named owner for compatibility decisions, not just a file in a repository.</p>
+<h2>Practice: Review A Message Change</h2>
+<p>Review this proposed change:</p>
+<div class="codehilite"><pre><span></span><code>message: loan_started
+current fields:
+  loan_id
+  user_id
+  book_id
+  due_at
+
 proposed change:
-old consumer reading new message:
-new consumer reading old message:
-queued or replayed message risk:
-semantic meaning that must not change silently:
-safe rollout order:
+  add borrower_type
+  start using user_id as the borrower profile id
 </code></pre></div>
 
-<p>If you cannot say what old consumers will do with the new shape, the rollout is not ready.</p>
+<p>Fill in:</p>
+<div class="codehilite"><pre><span></span><code>old consumer reading new message:
+new consumer reading old message:
+shape risk:
+semantic risk:
+safe rollout order:
+retirement evidence:
+</code></pre></div>
+
+<p>Model answer:</p>
+<div class="codehilite"><pre><span></span><code>old consumer reading new message:
+  must ignore borrower_type or remain on v1 until it can tolerate it
+
+new consumer reading old message:
+  must handle missing borrower_type with a documented safe behavior
+
+shape risk:
+  old readers may reject unknown fields; new readers may require borrower_type too early
+
+semantic risk:
+  changing user_id from account owner to borrower profile silently breaks old meaning
+
+safe rollout order:
+  preserve user_id meaning, add borrower_profile_id and borrower_type, deploy tolerant readers, then emit new fields
+
+retirement evidence:
+  no live v1 messages, replay path tested, fallback count near zero, owner approves old support removal
+</code></pre></div>
+
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://avro.apache.org/docs/current/specification/#schema-resolution">Apache Avro: Schema Resolution</a><ul>
-<li>Focus: How readers and writers with different schemas resolve fields and defaults.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html">Confluent Schema Registry: Schema Evolution and Compatibility</a><ul>
-<li>Focus: Backward, forward, and full compatibility rules for event schemas.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Schema evolution, data encoding, and compatibility across independently deployed systems.</li>
-</ul>
-</li>
+<li>[REFERENCE] <a href="https://avro.apache.org/docs/current/specification/#schema-resolution">Apache Avro: Schema Resolution</a> - Focus: How readers and writers with different schemas resolve fields and defaults.</li>
+<li>[ARTICLE] <a href="https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html">Confluent Schema Registry: Schema Evolution and Compatibility</a> - Focus: Backward, forward, and full compatibility rules for event schemas.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> - Focus: Schema evolution, data encoding, and compatibility across independently deployed systems.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Message contracts let independently deployed services keep understanding one another while they evolve.</li>
-<li>Compatibility must cover mixed producers, mixed consumers, queued messages, retries, and replay.</li>
-<li>Shape compatibility is not enough; semantic meaning can break even when the schema parses.</li>
-<li>Safe rollout usually prepares readers before writers depend on a new message form.</li>
+<li>A schema describes message shape; a contract also includes meaning, rollout, retention, and retirement.</li>
+<li>Compatibility has direction: new readers reading old messages is different from old readers reading new messages.</li>
+<li>Safe rollout usually prepares tolerant readers before producers depend on a new message shape.</li>
+<li>Semantic compatibility can break even when the message parses correctly.</li>
+<li>Old messages remain relevant while queues, archives, dead-letter stores, and replay tools can still surface them.</li>
 </ul>
 </section>
 
@@ -287,7 +440,7 @@ safe rollout order:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-28 18:31 UTC | @jepemo | Built with
+        Generated on 2026-06-29 07:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

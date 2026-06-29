@@ -77,198 +77,374 @@
 <section class="stack-block lesson-content-shell">
   <h1>Observability and Debugging Distributed Systems</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
 <ul>
 <li>
-<p>explain why local service health does not prove that a distributed user promise succeeded;</p>
+<p>trace one user-visible promise across requests, queues, workers, and durable records.</p>
 </li>
 <li>
-<p>trace one checkout attempt across request ids, trace ids, queue messages, and durable business records;</p>
+<p>separate logs, traces, metrics, and business state by the questions each one answers.</p>
 </li>
 <li>
-<p>choose the minimum evidence a workflow needs so retries and repairs are safe.</p>
+<p>design the minimum evidence needed to debug retries, partial side effects, and safe repair.</p>
 </li>
 </ul>
-<p><strong>Idea in one sentence:</strong> Observability lets engineers reconstruct a user-visible promise from joined evidence across system boundaries, but the evidence must be deliberately designed around identities, side effects, and repair decisions.</p>
+<p><strong>Idea in one sentence:</strong> Observability is the ability to reconstruct what happened to a user promise from joined evidence across system boundaries.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>A buyer reports: “Checkout spun for twenty seconds, my bank shows a charge, and the site said the order failed.” The checkout path crosses a web service, inventory, a payment provider, a queue, an order worker, and an email service. Each component can report that it is mostly healthy. None of those local statements answers the buyer's question: <em>was my order created, charged, both, or neither?</em></p>
-<p>Distributed systems divide work and therefore divide evidence. One service sees an HTTP request. Another sees a payment authorization. A queue sees a message wait. A worker sees an attempt to create an order. A database sees a durable state transition. If those facts cannot be joined, an incident becomes a collection of plausible stories rather than an investigation.</p>
-<p><strong>Observability</strong> is the ability to reconstruct a user-visible promise from the evidence a system retains. It is more than a dashboard and more than “having logs.” It means that an engineer can ask what happened to one order, across time and boundaries, distinguish a fact from an inference, and find the safe repair action.</p>
-<p>The trade-off is real. Logs, traces, metrics, labels, and retained event payloads consume storage, CPU, bandwidth, attention, and privacy budget. Good observability does not collect every possible datum. It deliberately preserves the evidence required to explain important state changes, retries, queue crossings, ownership changes, and repair decisions.</p>
-<h2>Start With The Promise And Its Identities</h2>
-<p>The checkout promise is not “the request got a 200 response.” It is closer to: “the buyer receives one truthful outcome for the intended purchase, and the system can repair any partial completion without charging twice.” That promise needs several identifiers because one identifier cannot represent every part of the workflow.</p>
-<div class="codehilite"><pre><span></span><code>order_id:             order-42       durable business object
-payment_operation_id: pay:order-42   one intended charge; used for idempotency
-request_id:           req-A          one HTTP attempt
-trace_id:             trace-81       one observed execution path
-message_id:           msg-551        one queued delivery attempt
+<p>Maya uploads a contract PDF to a collaboration app.</p>
+<p>The app says:</p>
+<div class="codehilite"><pre><span></span><code>Upload complete.
+Shared with Legal.
 </code></pre></div>
 
-<p>These ids are related, not interchangeable. The buyer may retry after a timeout. The retry gets a new <code>request_id</code> and perhaps a new trace, but it must retain <code>payment_operation_id: pay:order-42</code> so the payment service can recognize the same intended charge. A queue may redeliver one message and assign a new delivery attempt while the business order remains <code>order-42</code>.</p>
-<p>This distinction prevents two common mistakes. If every retry receives a new payment operation id, a timeout can become a double charge. If every asynchronous worker creates a new anonymous identity, investigators cannot connect a late order confirmation to the checkout that created it.</p>
+<p>Five minutes later, Legal opens the link and sees:</p>
+<div class="codehilite"><pre><span></span><code>File not available.
+</code></pre></div>
+
+<p>The dashboard says the upload API is healthy. Object storage shows normal latency. The preview worker has no obvious error spike. Each local statement may be true. None of them answers Maya's question:</p>
+<div class="codehilite"><pre><span></span><code>Did my contract upload succeed?
+If not, where did it stop?
+Can the system repair it safely?
+</code></pre></div>
+
+<p>Distributed systems divide work. They also divide evidence.</p>
+<p>One service sees the upload request. Object storage sees bytes written. A metadata database sees a file record. A queue sees a scan job. A worker sees virus-scan status. A sharing service sees permissions. A preview service sees whether the PDF can be rendered.</p>
+<p>If those facts cannot be joined, debugging becomes a pile of plausible stories.</p>
+<p>Plain meaning:</p>
+<p>Observability means the system keeps enough connected evidence to reconstruct an important workflow after the fact.</p>
+<p>In this scenario:</p>
+<p>An engineer should be able to start from Maya's report and find the upload attempt, stored object, metadata record, scan job, sharing decision, preview job, and repair path.</p>
+<p>Technical name:</p>
+<p>This is <strong>observability</strong> for a distributed workflow. It is not just logs, metrics, or traces. It is the ability to answer a question about a user-visible promise.</p>
+<h2>The Naive Idea: Check Whether Services Are Healthy</h2>
+<p>The first instinct is to open dashboards.</p>
+<div class="codehilite"><pre><span></span><code>upload API:       99.9% success
+object storage:   normal p95 latency
+scan workers:     mostly healthy
+preview workers:  low CPU
+sharing service:  no error spike
+</code></pre></div>
+
+<p>This is useful, but incomplete. Local health does not prove the workflow succeeded.</p>
+<p>The failed upload may be one rare path:</p>
+<div class="codehilite"><pre><span></span><code>bytes stored
+metadata insert succeeded
+scan message delayed
+share link created before scan passed
+preview worker could not find the file version
+</code></pre></div>
+
+<p>No single component owns the whole story. The user promise crosses boundaries. Observability has to preserve the evidence at those boundaries.</p>
+<p><strong>Check:</strong> If the upload API returned <code>200 OK</code>, does that prove Legal can open the file?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It proves only that one request path returned success. Legal also needs durable bytes, a metadata record, scan status, sharing permission, and whatever availability rule the product promises before a link is usable.</p>
+<h2>Start With The Promise And The Identities</h2>
+<p>The product promise is not "one HTTP request returned success." A better promise is:</p>
+<div class="codehilite"><pre><span></span><code>After the app says &quot;Upload complete and shared,&quot;
+the intended recipients can open the exact uploaded file,
+or the system can explain and repair the failed step.
+</code></pre></div>
+
+<p>That promise needs several identifiers.</p>
+<div class="codehilite"><pre><span></span><code>file_id:            file-913          durable business object
+upload_session_id:  upload-77         one intended upload
+object_key:         obj/contracts/913 stored bytes
+request_id:         req-A             one HTTP attempt
+trace_id:           trace-44          one observed execution path
+scan_message_id:    msg-scan-301      queued scan attempt
+preview_job_id:     job-prev-82       preview-generation attempt
+share_id:           share-legal-12    permission decision
+</code></pre></div>
+
+<p>These ids are related, not interchangeable.</p>
+<p>Maya may retry after a timeout. The retry should get a new request id because it is a new network attempt. It should keep the same upload session if it represents the same intended file upload. The scan queue may redeliver a message. That should not create a second file. The preview worker may run twice. That should not make two different official file records.</p>
+<p>Stable identities let separate local facts join into one investigation.</p>
 <h2>The Evidence Has Different Jobs</h2>
-<p>Observability signals answer different questions. Treating them as substitutes loses useful information.</p>
-<p><strong>Structured logs</strong> record local facts at an event boundary: a request arrived, a dependency timed out, a message was accepted, or an idempotency key matched existing work. A useful checkout log includes the relevant ids, result, reason, and component. It should not need to include a full card number, address, or unbounded payload to be useful.</p>
-<p><strong>Traces</strong> connect work across calls. A trace is a tree or graph of spans that shows which operation waited on which dependency and for how long. A queue producer can put trace context in message headers; the worker can continue or link the trace when it consumes the message. The trace explains the path and timing, not whether a business transition was made durable.</p>
-<p><strong>Metrics</strong> summarize many executions. Queue depth, age of the oldest message, payment-provider latency, timeout rate, retry rate, and order-confirmation lag can show whether one incident is part of a broader condition. Metrics are excellent for detecting a pattern and poor at explaining the fate of <code>order-42</code> by themselves.</p>
-<p><strong>Durable business records and events</strong> answer authoritative state questions: did <code>pay:order-42</code> authorize, did the order become confirmed, was a refund issued, and did a repair job record its decision? They are the source of truth for critical side effects. A trace may suggest that a payment call returned success; the durable payment record establishes whether the system has recognized an authorization it must reconcile.</p>
-<p>The design goal is a joinable evidence set:</p>
-<div class="codehilite"><pre><span></span><code>request/trace evidence  -&gt; timing and local path
-queue evidence          -&gt; handoff and delay
-business records        -&gt; durable state and repair decision
-metrics                 -&gt; whether the path is systematically under pressure
+<p>Different observability signals answer different questions.</p>
+<p><strong>Structured logs</strong> record local facts at important boundaries:</p>
+<div class="codehilite"><pre><span></span><code>req-A received
+object write started
+metadata insert committed
+scan message published
+share link created
+preview job failed
 </code></pre></div>
 
-<p>Quick check: if an engineer only has CPU metrics and one web-service log line for <code>req-A</code>, what can they know? They can know that one request attempt reached the web service and whether the web process looked locally busy. They cannot know whether <code>order-42</code> was charged, queued, confirmed, or safely repaired. That answer needs identities that cross the workflow and durable facts about side effects.</p>
-<h2>Worked Trace: A Timed-Out Checkout With A Late Authorization</h2>
-<p>At <code>12:00:00</code>, the buyer presses <strong>Place order</strong>. The web service allocates the identities above and begins <code>trace-81</code>.</p>
-<div class="codehilite"><pre><span></span><code>req-A, trace-81, order-42, pay:order-42
-
-web span: checkout.request started
-inventory record: sku-9 reserved for order-42
-payment span: authorize pay:order-42 started
+<p>Good logs include the ids needed to join the story. They do not need to log the full PDF contents.</p>
+<p><strong>Traces</strong> show timing and waiting across calls. A trace can reveal that upload spent 120 ms in the API, 900 ms writing bytes, 40 ms inserting metadata, and 3 seconds waiting to publish a queue message. Traces explain path and latency. They do not replace durable business records.</p>
+<p><strong>Metrics</strong> show patterns across many workflows. Scan queue depth, oldest scan age, preview failure rate, object-store write latency, and share-link open failures tell whether Maya's case is isolated or part of a broad condition. Metrics detect shape. They rarely explain one file alone.</p>
+<p><strong>Durable records and events</strong> answer state questions:</p>
+<div class="codehilite"><pre><span></span><code>file record exists?
+object checksum matches?
+scan passed?
+share permission committed?
+preview generated?
+repair action recorded?
 </code></pre></div>
 
-<h3>1. The Edge Deadline Ends The First Attempt</h3>
-<p>The payment provider is slow. The web service has a five-second deadline so it does not wait forever and consume all its request threads.</p>
-<div class="codehilite"><pre><span></span><code>12:00:05.000
-web log:
+<p>For critical side effects, durable records are the stronger evidence. A trace span saying "metadata insert" is not the same as the committed metadata row.</p>
+<p>The goal is not maximum telemetry. The goal is a joinable evidence set:</p>
+<div class="codehilite"><pre><span></span><code>logs:       local boundary facts
+traces:     path and timing
+metrics:    systemic pressure
+records:    durable workflow state
+</code></pre></div>
+
+<h2>A Worked Trace: The Missing File Link</h2>
+<p>Follow Maya's upload.</p>
+<h3>1. The Upload Request Starts</h3>
+<div class="codehilite"><pre><span></span><code>09:15:00.000
+request:
   request_id=req-A
-  order_id=order-42
-  result=timeout_waiting_for_payment
-
-response to buyer:
-  &quot;We could not confirm your order yet. Do not retry payment manually.&quot;
+  trace_id=trace-44
+  upload_session_id=upload-77
+  file_id=file-913
 </code></pre></div>
 
-<p>This is a fact: the web layer stopped waiting and returned an uncertain outcome. It is not proof that payment failed. A correct user response should preserve that uncertainty instead of saying “payment rejected” without evidence.</p>
-<h3>2. Payment Finishes After The Caller Has Given Up</h3>
-<p>At <code>12:00:09</code>, the provider responds. The payment service stores a durable authorization under <code>pay:order-42</code> and emits a business event through its outbox or queue boundary.</p>
-<div class="codehilite"><pre><span></span><code>12:00:09.240
-payment record:
-  operation_id=pay:order-42
-  status=authorized
-  provider_reference=provider-774
-
-outbox event:
-  payment_authorized for order-42
-  trace context: trace-81
+<p>The upload API receives bytes and writes them to object storage.</p>
+<div class="codehilite"><pre><span></span><code>09:15:00.840
+object record:
+  object_key=obj/contracts/913
+  checksum=abc123
+  size=4.8 MB
+  status=stored
 </code></pre></div>
 
-<p>This creates an important split: the buyer saw a timeout, but the system now has an authorized payment. Any subsequent action must use the same operation id rather than creating a second authorization.</p>
-<h3>3. The Queue Shows A Systemic Delay</h3>
-<p>The event reaches an order-confirmation queue, but workers are slow because their database dependency is saturated. Metrics show that the queue is not a one-off anomaly.</p>
-<div class="codehilite"><pre><span></span><code>12:00:10
-queue metric:
-  depth = 1,400
-  oldest message age = 8 minutes
-
-queue record:
-  message_id=msg-551
-  order_id=order-42
-  state=waiting_for_worker
+<p>This proves bytes were stored. It does not prove the file is safe to share, indexed, previewable, or visible to Legal.</p>
+<h3>2. Metadata And Scan Work Are Created</h3>
+<p>The API commits a file record.</p>
+<div class="codehilite"><pre><span></span><code>09:15:00.910
+file metadata:
+  file_id=file-913
+  object_key=obj/contracts/913
+  owner=maya
+  state=awaiting_scan
 </code></pre></div>
 
-<p>The metric alone cannot say what happened to <code>order-42</code>; it has no per-order identity. The queue record can. Together they explain both the individual delay and the operational pressure causing it.</p>
-<h3>4. The Buyer Retries Without Creating A New Charge</h3>
-<p>At <code>12:00:12</code>, the buyer refreshes checkout. The web service creates <code>req-B</code> and perhaps <code>trace-82</code>, but it reuses <code>pay:order-42</code> after finding the existing order attempt.</p>
-<div class="codehilite"><pre><span></span><code>req-B -&gt; payment service
-payment_operation_id = pay:order-42
-
-payment service response:
-  existing authorization found
-  do not contact provider again
+<p>Then it publishes a scan message.</p>
+<div class="codehilite"><pre><span></span><code>09:15:00.980
+queue:
+  scan_message_id=msg-scan-301
+  file_id=file-913
+  object_key=obj/contracts/913
+  trace_context=trace-44
 </code></pre></div>
 
-<p>This is where observability supports correctness. The log and trace for <code>req-B</code> are new because it is a new request attempt. The durable payment operation is the same because it represents the same business intent. An investigator can see that the buyer retried; the payment record can prove whether the retry was safely deduplicated.</p>
-<h3>5. A Worker Reconstructs And Repairs The State</h3>
-<p>At <code>12:08</code>, a worker consumes <code>msg-551</code>, creates the order record, and records <code>order_confirmed</code>. If the reservation has expired or the order can no longer be completed, a repair workflow can instead release the reservation and initiate a refund or void using <code>provider-774</code>.</p>
-<div class="codehilite"><pre><span></span><code>worker trace span linked to trace-81
-
-order record:
-  order-42 = confirmed
-
-or repair record:
-  order-42 = payment_authorized_but_unfulfillable
-  action = void_or_refund
+<p>The queue boundary matters. If the metadata exists but no scan message exists, the system is stuck before scanning. If the message exists but is old, the scan worker may be delayed. If the worker consumed it and failed, the file needs a different repair.</p>
+<h3>3. The App Creates The Share Too Early</h3>
+<p>The sharing service creates the Legal permission before the scan result arrives.</p>
+<div class="codehilite"><pre><span></span><code>09:15:01.100
+share record:
+  share_id=share-legal-12
+  file_id=file-913
+  recipient=legal-team
+  state=created
 </code></pre></div>
 
-<p>The exact outcome is a design decision. What observability must guarantee is that the decision and the evidence behind it are queryable. The investigation should not end at “the page timed out.” It should answer where the workflow stopped, which side effect occurred, and which repair is safe.</p>
-<h2>Build A Timeline, Then Separate Facts From Inferences</h2>
-<p>An incident timeline organizes evidence without pretending that wall-clock order is perfect proof of causality.</p>
-<div class="codehilite"><pre><span></span><code>12:00:00.000  fact: web received req-A for order-42
-12:00:00.080  fact: inventory reserved sku-9
-12:00:05.000  fact: web returned timeout to the buyer
-12:00:09.240  fact: payment record shows pay:order-42 authorized
-12:00:10.000  fact: msg-551 entered the confirmation queue
-12:00:12.000  fact: req-B reused pay:order-42
-12:08:00.000  fact: worker confirmed order-42
+<p>The UI says "shared." But the file state is still <code>awaiting_scan</code>.</p>
+<p>This may be a product bug, not only an infrastructure bug. If the product promise says recipients can open the file after "shared," then the response text was too strong. It should have said "upload received, scanning" or waited for the scan state.</p>
+<h3>4. The Scan Worker Fails Without A Durable Result</h3>
+<p>The scan worker consumes the message.</p>
+<div class="codehilite"><pre><span></span><code>09:15:05.300
+worker log:
+  scan_message_id=msg-scan-301
+  file_id=file-913
+  result=object_fetch_timeout
 </code></pre></div>
 
-<p>“The buyer probably retried because the page timed out” is an inference until <code>req-B</code> or client telemetry confirms it. “The provider charged the buyer” should be tied to the durable provider result, not only to a trace span. “The queue caused the delay” is a hypothesis supported by queue age, worker latency, and the message's timestamps; it can be strengthened by comparing other orders in the same period.</p>
-<p>This discipline matters because distributed telemetry is incomplete. Clocks drift, traces are sampled, logs can be dropped, and messages can be delivered more than once. A good timeline labels what is known, what is missing, and what repair action is safe under that uncertainty.</p>
+<p>But it crashes before writing a durable scan result or requeue decision.</p>
+<p>Now the trace may show a failed worker span. That is useful. The durable state is more important:</p>
+<div class="codehilite"><pre><span></span><code>file metadata:
+  state=awaiting_scan
+  last_scan_result=none
+</code></pre></div>
+
+<p>An engineer can distinguish:</p>
+<div class="codehilite"><pre><span></span><code>not scanned yet
+scanned and failed
+scanned and clean
+scan result missing after worker attempt
+</code></pre></div>
+
+<p>Those states lead to different repair actions.</p>
+<h3>5. Legal Opens The Link</h3>
+<div class="codehilite"><pre><span></span><code>09:20:00
+Legal -&gt; file service:
+  share_id=share-legal-12
+  file_id=file-913
+</code></pre></div>
+
+<p>The file service sees:</p>
+<div class="codehilite"><pre><span></span><code>share exists: yes
+metadata exists: yes
+object exists: yes
+scan passed: no evidence
+preview exists: no
+</code></pre></div>
+
+<p>A safe response might be:</p>
+<div class="codehilite"><pre><span></span><code>File is still processing.
+</code></pre></div>
+
+<p>or:</p>
+<div class="codehilite"><pre><span></span><code>File unavailable because scan did not complete.
+</code></pre></div>
+
+<p>The unsafe response is a vague "file not found" when the real state is "bytes exist, scan result missing." That hides the repair path.</p>
+<p>So far, observability has turned one complaint into a precise state:</p>
+<div class="codehilite"><pre><span></span><code>bytes stored
+metadata committed
+share created too early
+scan result missing after worker attempt
+recipient sees unavailable file
+</code></pre></div>
+
+<h2>Build A Timeline, Then Mark Facts And Inferences</h2>
+<p>An incident timeline should separate what is known from what is guessed.</p>
+<div class="codehilite"><pre><span></span><code>09:15:00.000  fact: req-A started upload-77 for file-913
+09:15:00.840  fact: object obj/contracts/913 stored with checksum abc123
+09:15:00.910  fact: metadata file-913 committed as awaiting_scan
+09:15:00.980  fact: scan message msg-scan-301 published
+09:15:01.100  fact: share share-legal-12 created
+09:15:05.300  fact: worker logged object_fetch_timeout
+09:20:00.000  fact: Legal opened share and saw unavailable
+</code></pre></div>
+
+<p>"Object storage caused the problem" is an inference until storage logs, worker retries, and object availability support it. "The scan never ran" is false if the worker log proves one attempt ran. "The user uploaded the wrong file" is an inference unless checksum, size, or client telemetry supports it.</p>
+<p>This discipline matters because telemetry is imperfect. Clocks drift. Logs may be sampled. Workers can crash before writing final state. Messages can be delivered more than once. Good observability says which facts are durable, which facts are local, and which facts are missing.</p>
+<p><strong>Check:</strong> Which evidence is stronger for "the file can be shared": a trace span named <code>create_share</code> or a durable file record with <code>scan_status=clean</code> and a committed share record?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The durable records are stronger. The trace helps explain the path and timing, but the durable records prove the state that later services should rely on.</p>
 <h2>Instrument Boundaries, Not Just Services</h2>
-<p>A dashboard showing normal CPU for the web service does not prove checkout is healthy. The workflow crosses boundaries where information and responsibility change hands: HTTP requests, downstream calls, transaction commits, queue publish, worker consume, retry, and repair.</p>
-<p>At each boundary, preserve enough context to answer four questions:</p>
+<p>Distributed failures often hide at boundaries.</p>
+<p>For the upload workflow, important boundaries include:</p>
+<div class="codehilite"><pre><span></span><code>client -&gt; upload API
+upload API -&gt; object storage
+upload API -&gt; metadata database
+metadata database -&gt; scan queue
+scan queue -&gt; scan worker
+scan worker -&gt; file state
+file state -&gt; sharing service
+sharing service -&gt; recipient open
+</code></pre></div>
+
+<p>At each boundary, preserve enough context to answer:</p>
 <div class="codehilite"><pre><span></span><code>what logical operation is this?
 which business object does it affect?
-what outcome or error occurred?
+what outcome occurred?
 what evidence proves the next handoff or state transition?
 </code></pre></div>
 
-<p>For a queue, this usually means storing the business ids in the message body or headers, propagating trace context, recording enqueue and consume time, and making delivery attempts visible. For a retry, it means a new request id plus the same idempotency or operation id. For a repair job, it means a durable record that names the reason, source evidence, and chosen action.</p>
-<p>Absence must be observable too. If there is no <code>order_confirmed</code> event after a payment authorization, the system should let an engineer query that gap. Otherwise the team cannot distinguish “the event was never written,” “it is waiting in a queue,” “a consumer failed,” and “the event name changed.” Missing evidence is often the actual debugging clue.</p>
-<h2>Failure Modes And Trade-offs</h2>
-<p>The representative failure is every component reporting health while the user workflow is broken. A queue can be growing, a provider can be slow, retries can inflate load, and a final business event can be missing even though CPU and error-rate dashboards look ordinary.</p>
-<p>Another failure is lost identity at an asynchronous boundary. If <code>msg-551</code> omits <code>order-42</code>, the worker starts a separate story. If a retry changes <code>pay:order-42</code>, the system may create a duplicate charge. Correlation data is a correctness aid, not just debugging decoration.</p>
-<p>More telemetry is not automatically safer. High-cardinality metric labels can exhaust a monitoring system. Logging full request bodies can expose payment or personal data. Sampling can hide the rare failing trace that matters most. Retaining every payload forever creates cost and privacy obligations. Systems often sample routine success paths but retain errors, slow operations, or traces tied to high-value workflows more aggressively.</p>
-<p>Useful operational signals include:</p>
+<p>For a queue, record enqueue time, message id, business id, delivery attempts, and final worker decision. For a retry, keep the same upload session or idempotency id if it is the same intended file. For repair, record why the repair ran, what evidence it used, and what state it changed.</p>
+<p>Absence must be queryable. If a file has metadata but no scan result after ten minutes, the system should let an engineer find that gap directly. Missing evidence is often the clue.</p>
+<h2>Trade-offs And Limits</h2>
+<p>The trade-off is evidence versus cost.</p>
+<p>Useful observability costs storage, CPU, bandwidth, indexing, attention, and privacy budget. Logging full documents or personal data is dangerous. High-cardinality labels can overload a metrics system. Sampling may hide a rare trace that matters. Retaining every payload forever creates operational and legal risk.</p>
+<p>Good observability is designed around recovery. Keep the smallest set of facts needed to:</p>
 <ul>
-<li>success, timeout, and uncertain-outcome rates for the checkout promise;</li>
-<li>payment authorization age without a matching order or repair record;</li>
-<li>queue depth, oldest-message age, worker latency, and redelivery count;</li>
-<li>retries per payment operation and idempotency-key reuse rate;</li>
-<li>trace-context propagation failures at queue and worker boundaries; and</li>
-<li>cardinality, sampling, retention, and sensitive-field redaction health for telemetry itself.</li>
+<li>detect that a user promise broke;</li>
+<li>connect local evidence across boundaries;</li>
+<li>identify durable side effects;</li>
+<li>choose a safe repair action;</li>
+<li>explain the outcome later.</li>
 </ul>
-<p>The trade-off is evidence versus cost, but the decision should be tied to recovery. Preserve the smallest safe set of facts needed to detect a broken promise, identify side effects, and choose the repair path. Everything retained beyond that should justify its operational and privacy cost.</p>
-<h2>Design Check</h2>
-<p>Choose one workflow: checkout, password reset, file upload, message send, seat booking, or account deletion. Without looking back, write:</p>
+<p>It can still fail when ids are inconsistent, events are emitted before commits, trace context is dropped at queues, logs omit business ids, or repair jobs do not record their decisions.</p>
+<p>Rare paths deserve deliberate retention rules, because routine sampling can hide exactly the evidence needed for repair.</p>
+<p>Useful signals include:</p>
+<ul>
+<li>uploads with metadata but no stored object;</li>
+<li>uploads with object and metadata but no scan result after a deadline;</li>
+<li>scan queue depth, oldest message age, retry count, and dead-letter count;</li>
+<li>share links created before scan completion;</li>
+<li>recipient open failures grouped by file state;</li>
+<li>trace-context propagation failures across queues; and</li>
+<li>sensitive-field redaction and telemetry retention health.</li>
+</ul>
+<p>If dashboards say every service is healthy but these workflow signals are bad, the user promise is still broken.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: Logs equal observability</h3>
+<p>Why it is tempting:</p>
+<p>Logs feel like the raw truth of what happened.</p>
+<p>Better model:</p>
+<p>Logs are local evidence. Observability requires joinable logs, traces, metrics, and durable records that answer a workflow question.</p>
+<h3>Confusion: A trace proves the business state</h3>
+<p>Why it is tempting:</p>
+<p>A trace looks like the whole path.</p>
+<p>Better model:</p>
+<p>A trace shows observed execution and timing. Durable records prove whether important state transitions actually committed.</p>
+<h3>Confusion: More telemetry is always better</h3>
+<p>Why it is tempting:</p>
+<p>When debugging hurts, collecting everything feels safe.</p>
+<p>Better model:</p>
+<p>Telemetry has cost and privacy risk. Keep evidence that supports detection, diagnosis, and safe repair.</p>
+<h2>Practice</h2>
+<p>Choose one workflow:</p>
+<div class="codehilite"><pre><span></span><code>file upload
+password reset
+message send
+seat booking
+account deletion
+webhook delivery
+</code></pre></div>
+
+<p>Fill in:</p>
 <div class="codehilite"><pre><span></span><code>user-visible promise:
 durable business id:
-idempotency or operation id:
+operation or idempotency id:
 per-attempt request id:
-trace context across synchronous and asynchronous boundaries:
-durable state transitions that prove side effects:
+trace context boundaries:
+durable state transitions:
 queue or worker evidence:
-metric that detects a systemic version of the failure:
+metric that detects a systemic version:
 missing fact that must be queryable:
 safe repair action if the workflow stops midway:
 </code></pre></div>
 
-<p>Then imagine a caller retries after a timeout. If the retry cannot be connected to the original business intent, add the missing operation identity before relying on dashboards. If a repair cannot explain its evidence, add the durable transition or link it needs.</p>
+<p>Model answer for <code>message send</code>:</p>
+<div class="codehilite"><pre><span></span><code>user-visible promise:
+  after &quot;sent&quot;, the message is durably stored or the sender can see a clear failure
+
+durable business id:
+  message_id=msg-44
+
+operation id:
+  send_operation_id=send-abc
+
+request id:
+  one id per HTTP attempt
+
+trace boundaries:
+  API request, storage write, fanout queue publish, delivery worker
+
+durable transitions:
+  accepted, stored, queued_for_delivery, delivered_or_failed
+
+queue evidence:
+  fanout message id, enqueue time, attempts, final result
+
+systemic metric:
+  oldest undelivered fanout message age
+
+missing fact:
+  messages stored but never queued for delivery
+
+safe repair:
+  republish delivery job using message_id, not create a new message
+</code></pre></div>
+
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry: Signals</a><ul>
-<li>Focus: How traces, metrics, logs, and related signals complement rather than replace each other.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</a><ul>
-<li>Focus: Why distributed tracing exists and how request paths are reconstructed across service boundaries.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Site Reliability Engineering: Monitoring Distributed Systems</a><ul>
-<li>Focus: Practical monitoring signals, alerting, and the limits of aggregate summaries.</li>
-</ul>
-</li>
+<li>[REFERENCE] <a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry: Signals</a> - Focus: How traces, metrics, logs, and related signals complement each other.</li>
+<li>[PAPER] <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</a> - Focus: Why distributed tracing exists and how request paths are reconstructed across boundaries.</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Site Reliability Engineering: Monitoring Distributed Systems</a> - Focus: Monitoring signals, alerting, and the limits of aggregate summaries.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Observability reconstructs a user-visible promise from joinable evidence across requests, queues, services, and durable records.</li>
-<li>Request ids, trace ids, operation ids, and business ids describe different things; preserving their relationships makes retries and repair safe to investigate.</li>
-<li>Logs, traces, metrics, and durable events have distinct jobs and should be designed together at system boundaries.</li>
-<li>The right telemetry set supports a safe repair decision without creating unnecessary cost, noise, or privacy exposure.</li>
+<li>Observability reconstructs a user-visible promise from joined evidence across service boundaries.</li>
+<li>Request ids, trace ids, operation ids, object ids, queue ids, and business ids answer different questions.</li>
+<li>Logs, traces, metrics, and durable records have distinct jobs; none replaces the others.</li>
+<li>The best telemetry set is the smallest one that detects broken promises, identifies side effects, and supports safe repair.</li>
 </ul>
 </section>
 
@@ -298,7 +474,7 @@ safe repair action if the workflow stops midway:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-28 18:31 UTC | @jepemo | Built with
+        Generated on 2026-06-29 07:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
