@@ -77,158 +77,300 @@
 <section class="stack-block lesson-content-shell">
   <h1>Command Line, Processes, and Environment Variables</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong>
-Explain what a backend process receives when it starts; separate command-line arguments, environment variables, files, ports, standard streams, and exit status; and diagnose why a service runs on one machine but fails somewhere else.</p>
-<p><strong>Idea in one sentence.</strong> A backend service is a process with an explicit startup contract, and reliable systems make that contract visible instead of depending on hidden machine state.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace how a backend service starts from a command into a running process.</p>
+</li>
+<li>
+<p>Separate command-line arguments, environment variables, files, ports, streams, and exit status.</p>
+</li>
+<li>
+<p>Diagnose startup failures such as missing config, wrong ports, bad working directories, and misleading exit codes.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A backend service is not just code on disk; it is a process started with an explicit contract, and many deployment bugs come from that contract being hidden or wrong.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the same small API from the previous lesson. Yesterday you traced a browser request from the client through the edge and into the backend. Today the backend does not even start on a teammate's laptop. It works on yours with <code>npm run dev</code>, but on theirs it exits immediately with <code>database url missing</code>. In staging, the container starts, listens on the wrong port, and the proxy returns <code>502 Bad Gateway</code>.</p>
-<p>This is not yet a web-framework problem. Before an API can receive requests, the operating system must start a process. A process is a running program with a process ID, memory, open file descriptors, environment variables, command-line arguments, current working directory, permissions, and a parent process that started it. Your web framework lives inside that process. If the process starts with the wrong inputs, the handler code may never get a chance to run.</p>
-<p>The beginner shortcut is to say "run the app." That is fine while learning locally, but it hides the startup contract. Which command starts the service? Which port should it bind? Which environment variables must exist? Which files does it expect relative to the current directory? Where should logs go? What exit code means a clean shutdown versus a startup failure?</p>
-<p>The central trade-off is <strong>simple process contracts versus hidden machine-specific assumptions</strong>. A simple process contract can be repeated by a shell, a test runner, a container entrypoint, or a deployment platform. Hidden assumptions are faster at first: your laptop has the right <code>.env</code> file, your shell already exports a variable, your current directory is correct, your database is running locally. Those assumptions break as soon as the service moves.</p>
-<h2>What Starts a Backend</h2>
-<p>Use one scenario through the lesson. The service is an orders API. A developer starts it like this:</p>
-<div class="codehilite"><pre><span></span><code>PORT=3000 DATABASE_URL=postgres://localhost/orders ./orders-api --mode dev
+<p>In the previous lesson, a proxy returned:</p>
+<div class="codehilite"><pre><span></span><code>502 Bad Gateway
+error=connection_refused
+upstream=auth-service:8080
 </code></pre></div>
 
-<p>That line looks like one thing, but it creates several distinct inputs:</p>
+<p>The request reached the proxy, but it probably did not reach the backend handler. The next question is not "which route is broken?" The next question is smaller:</p>
+<div class="codehilite"><pre><span></span><code>Is there a process listening where the proxy expects one?
+</code></pre></div>
+
+<p>That question moves us from request paths to process startup.</p>
+<p>Imagine the same orders API. On your laptop it works:</p>
+<div class="codehilite"><pre><span></span><code>npm run dev
+</code></pre></div>
+
+<p>On a teammate's laptop it exits with:</p>
+<div class="codehilite"><pre><span></span><code>DATABASE_URL is required
+</code></pre></div>
+
+<p>In staging, the container starts, but the proxy still returns <code>502</code>. The platform expected the service to listen on port <code>8080</code>; the service printed:</p>
+<div class="codehilite"><pre><span></span><code>Listening on 3000
+</code></pre></div>
+
+<p>The naive idea is:</p>
+<div class="codehilite"><pre><span></span><code>Run the app.
+</code></pre></div>
+
+<p>That phrase hides the hard part. Before an API can handle a request, the operating system must start a process. That process receives inputs. It reads configuration. It opens files. It binds a port. It reports success or failure. If any of those startup steps are wrong, the handler may never run.</p>
+<p>The useful model is:</p>
+<div class="codehilite"><pre><span></span><code>parent starts process -&gt; process receives startup inputs -&gt; app validates contract -&gt; app binds port or exits
+</code></pre></div>
+
+<p>This lesson makes that startup mechanism visible.</p>
+<h2>The Moving Parts</h2>
+<p>Use one small service through the lesson:</p>
+<div class="codehilite"><pre><span></span><code>PORT=8080 DATABASE_URL=postgres://db/orders ./orders-api --mode web
+</code></pre></div>
+
+<p>That line looks like one command. It is really several inputs crossing one boundary.</p>
+<p>The parent is the thing that starts the service. Locally, the parent may be your shell. In production, it may be Docker, Kubernetes, <code>systemd</code>, a process manager, a test runner, or a platform launcher.</p>
+<p>The child is the backend process.</p>
+<p>The child receives:</p>
 <ul>
-<li><code>./orders-api</code> is the executable path.</li>
-<li><code>--mode dev</code> is command-line argument data.</li>
-<li><code>PORT=3000</code> and <code>DATABASE_URL=...</code> are environment variables.</li>
-<li>The shell has a current working directory where <code>./orders-api</code> is resolved.</li>
-<li>The process inherits standard input, standard output, and standard error.</li>
-<li>The operating system gives the process permissions, a process ID, and a parent.</li>
-<li>The service chooses to bind a network port and open a database connection.</li>
+<li>an executable path, such as <code>./orders-api</code></li>
+<li>command-line arguments, such as <code>--mode web</code></li>
+<li>environment variables, such as <code>PORT=8080</code></li>
+<li>a working directory, used for relative paths</li>
+<li>permissions and user identity</li>
+<li>standard input, standard output, and standard error</li>
+<li>signals, such as a request to stop</li>
+<li>a parent that can observe exit status</li>
 </ul>
-<p>The shell is just one possible parent. A test runner, <code>systemd</code>, Docker, Kubernetes, a platform-as-a-service launcher, or an IDE can also start the process. That is why it is useful to think in terms of process contract instead of "the command I type."</p>
-<p>A process contract is the set of startup expectations the program needs in order to run correctly. For a backend service, it usually includes:</p>
-<div class="codehilite"><pre><span></span><code>executable + arguments + environment + working directory
-  + readable files + writable locations + network ports
-  + standard streams + signal handling + exit status
+<p>Plain meaning:</p>
+<p>A startup contract is the list of things the process needs from its parent before it can do its job.</p>
+<p>In this scenario:</p>
+<p>The orders API needs a valid <code>PORT</code>, a valid <code>DATABASE_URL</code>, a mode, access to any required files, and a clear way to report whether startup succeeded.</p>
+<p>Technical name:</p>
+<p>We will call this the <strong>process startup contract</strong>.</p>
+<p>This is a boundary, just like the boundaries in the request path. The proxy cannot forward to a service that did not start, did not bind the expected port, or exited while the platform thought it was healthy.</p>
+<h2>The Mechanism Step By Step</h2>
+<p>Follow the command from text to listening service.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  PORT=8080 DATABASE_URL=postgres://db/orders ./orders-api --mode web
+
+Step 1: parent prepares the launch
+  parent decides executable, arguments, environment, working directory, streams
+
+Step 2: operating system creates a process
+  process gets a process id, memory, file descriptors, permissions
+
+Step 3: program starts running
+  runtime exposes args, env vars, working directory, stdout, stderr
+
+Step 4: app reads startup inputs
+  mode=web
+  PORT=8080
+  DATABASE_URL=postgres://db/orders
+
+Step 5: app validates required inputs
+  port must be an integer from 1 to 65535
+  database URL must exist and parse as a database connection string
+
+Step 6: app opens required resources
+  create logger
+  connect or prepare connection pool
+  load required files if any
+
+Step 7: app binds the network port
+  listen on 0.0.0.0:8080 or another configured interface
+
+Output:
+  success: process stays alive and reports ready
+  failure: process writes a clear error and exits nonzero
 </code></pre></div>
 
-<p>The contract is not a separate technology. It is the boundary between "some parent starts my service" and "my service can now accept requests." If the boundary is clear, you can move the service from your laptop to a container without rediscovering every local habit.</p>
-<h2>A Startup Walkthrough</h2>
-<p>Follow the orders API from shell command to listening service.</p>
-<div class="codehilite"><pre><span></span><code>developer types command
-  -&gt; shell parses text
-  -&gt; shell creates environment for child process
-  -&gt; operating system starts executable
-  -&gt; process reads arguments and environment
-  -&gt; process validates required configuration
-  -&gt; process opens logs and dependencies
-  -&gt; process binds PORT
-  -&gt; process reports ready or exits with failure
+<p>The important detail is that startup has intermediate states. A service can exist as a process but still not be ready. It may be running, but not listening. It may be listening on the wrong port. It may be listening, but using fallback configuration that points to the wrong database.</p>
+<p>That is why "the container is running" is not the same as "the backend is ready."</p>
+<p>So far, the mechanism is:</p>
+<div class="codehilite"><pre><span></span><code>start process -&gt; validate contract -&gt; bind expected port -&gt; report readiness
 </code></pre></div>
 
-<p>Step by step:</p>
-<ol>
-<li>The shell receives a line of text. It expands paths, handles quoting, and decides which program should run.</li>
-<li>The shell asks the operating system to create a child process for <code>./orders-api</code>.</li>
-<li>The new process receives an argument vector. In many languages this appears as <code>argv</code>: the program name plus values such as <code>--mode</code> and <code>dev</code>.</li>
-<li>The new process receives an environment. This is a map of string keys to string values, such as <code>PORT=3000</code> and <code>DATABASE_URL=postgres://localhost/orders</code>.</li>
-<li>The process starts in a working directory. Relative paths such as <code>./config/routes.json</code> are resolved from there.</li>
-<li>The process inherits standard streams: <code>stdin</code> for input, <code>stdout</code> for normal output, and <code>stderr</code> for diagnostic output.</li>
-<li>The application validates its required settings before accepting traffic.</li>
-<li>If validation passes, it opens dependencies and binds a port. If validation fails, it writes a useful message and exits with a nonzero status.</li>
-</ol>
-<p>That last point is more important than it looks. A backend that starts with missing configuration and fails later under traffic is harder to diagnose than a backend that refuses to start. Startup validation turns an ambiguous runtime failure into a clear process-contract failure.</p>
-<p>Quick check: if <code>DATABASE_URL</code> is missing, should the service start and wait for the first request to fail?</p>
-<p>Answer: usually no. If the database is required for normal service behavior, the process should fail fast with a clear message and a nonzero exit status. That lets the parent process, deploy system, or developer see that startup did not satisfy the contract.</p>
-<h2>Arguments, Environment, and Files</h2>
-<p>Arguments, environment variables, and files can all configure a backend, but they are not interchangeable.</p>
-<p>Command-line arguments are good for explicit mode and one-off choices:</p>
-<div class="codehilite"><pre><span></span><code>./orders-api --mode dev --migrate
+<h2>Arguments, Environment, And Files</h2>
+<p>Command-line arguments, environment variables, and files can all configure a backend. They are not the same tool.</p>
+<p>Command-line arguments are good for visible choices for this run:</p>
+<div class="codehilite"><pre><span></span><code>./orders-api --mode web --workers 4
 </code></pre></div>
 
-<p>They are visible in the command that starts the process. They are useful when the parent is intentionally choosing behavior for this run. They are less suitable for secrets because process listings and logs can accidentally expose them.</p>
+<p>They are easy to see in the command. They are useful for choices like mode, one-time maintenance actions, or worker count. They are a poor fit for secrets because command text may appear in shell history, process listings, logs, or error reports.</p>
 <p>Environment variables are good for deploy-time configuration:</p>
-<div class="codehilite"><pre><span></span><code>PORT=3000
-DATABASE_URL=postgres://db.internal/orders
+<div class="codehilite"><pre><span></span><code>PORT=8080
+DATABASE_URL=postgres://db/orders
 LOG_LEVEL=info
 </code></pre></div>
 
-<p>They let the same artifact run in development, staging, and production with different external settings. But they are strings, so the program must parse and validate them. <code>PORT=abc</code> is still an environment value; it becomes a configuration error only when your code checks that it is a valid port.</p>
-<p>Files are good for structured data that is versioned or mounted deliberately:</p>
+<p>They let the same artifact run in different places. The code can be the same in development, staging, and production while the parent supplies different values. The cost is that environment variables are strings. <code>PORT=abc</code> is still an environment variable. It becomes a useful setting only after the app parses and validates it.</p>
+<p>Files are good for structured data that is deliberately packaged or mounted:</p>
 <div class="codehilite"><pre><span></span><code>config/routes.json
 schema.sql
-public/logo.png
+certificates/ca.pem
 </code></pre></div>
 
-<p>They carry richer structure than environment variables, but they introduce path and packaging questions. Is the file in the image? Is it mounted by the platform? Is the current working directory what you expect? Can the process read it with its permissions?</p>
-<p>A common failure is mixing these roles. For example, a developer keeps <code>DATABASE_URL</code> in an untracked local <code>.env</code> file and forgets that the deployment platform will not have it. Another developer stores the port in source code, so staging and production fight over the same assumption. The cleaner design is to decide which values are part of the artifact and which values are supplied by the environment that runs it.</p>
-<h2>The Small Contract That Prevents Drift</h2>
-<p>Now make the contract concrete. A minimal orders API contract might say:</p>
-<div class="codehilite"><pre><span></span><code>Required environment:
-  PORT: integer from 1 to 65535
-  DATABASE_URL: database connection string
-  LOG_LEVEL: debug, info, warn, or error
-
-Expected files:
-  ./migrations exists if --migrate is used
-
-Startup behavior:
-  validate configuration before binding PORT
-  print startup errors to stderr
-  print readiness line to stdout
-  exit 0 on intentional clean shutdown
-  exit nonzero on missing config or failed startup dependency
+<p>Files bring their own questions. Is the file present in the container image? Is it mounted by the platform? Is the working directory what the app expects? Can the process read it with its permissions?</p>
+<p>The design decision is not "arguments versus environment versus files forever." The decision is:</p>
+<div class="codehilite"><pre><span></span><code>Which parent supplies this value?
+When should the app reject it?
+How will a human see what happened?
 </code></pre></div>
 
-<p>This contract can be checked locally:</p>
-<div class="codehilite"><pre><span></span><code>PORT=3000 DATABASE_URL=postgres://localhost/orders LOG_LEVEL=info ./orders-api
+<h2>A Worked Startup Trace</h2>
+<p>Now trace a failure that explains the <code>502</code> from the previous lesson.</p>
+<p>The deploy platform starts the process like this:</p>
+<div class="codehilite"><pre><span></span><code>PORT=8080 DATABASE_URL=postgres://db/orders ./orders-api --mode web
 </code></pre></div>
 
-<p>It can be checked in a container:</p>
-<div class="codehilite"><pre><span></span><code>docker run -e PORT=3000 -e DATABASE_URL=postgres://db/orders orders-api
+<p>The proxy is configured to forward to:</p>
+<div class="codehilite"><pre><span></span><code>orders-service:8080
 </code></pre></div>
 
-<p>It can be checked by a deployment platform that injects environment values and watches exit status. The exact parent changes, but the contract remains inspectable.</p>
-<p>The process should also separate normal output from diagnostic output. <code>stdout</code> is useful for ordinary status or structured logs, depending on the runtime convention. <code>stderr</code> is the right place for startup errors. Exit status matters because parents automate decisions. A status of <code>0</code> usually means success. A nonzero status means failure. If a process prints "failed" but exits <code>0</code>, automation may treat a broken startup as healthy.</p>
-<p>Quick check: a service prints <code>Listening on 3000</code>, but the deploy platform expected it to listen on the port in <code>PORT=8080</code>. Which contract was violated?</p>
-<p>Answer: the service ignored its runtime environment and used a hard-coded or default port. The fix is not in the proxy first; the process must read and validate the port supplied by its parent.</p>
-<h2>Failure Modes</h2>
-<p>The most common failures are small but expensive because they hide behind the phrase "works on my machine."</p>
-<ul>
-<li>Hidden environment: the service depends on a variable exported in one developer's shell, but the value is not documented or checked at startup.</li>
-<li>Wrong working directory: a relative path works in an IDE but fails in a container because the process starts from a different directory.</li>
-<li>Silent defaults: the service falls back to development settings in production when a required value is missing.</li>
-<li>Bad exit status: the service reports failure in text but exits successfully, so automation continues as if it is healthy.</li>
-<li>Mixed secrets and logs: startup diagnostics print full connection strings or tokens, creating a security problem while trying to debug.</li>
-</ul>
-<p>The corrective mental model is simple: every value the process needs should come from one of a few explicit places, and the service should say clearly whether those values were acceptable. That does not mean every setting needs a complex configuration system. It means the required minimum is named, validated, and observable.</p>
-<p>There is also a limit. Environment variables are a process boundary, not a complete secrets-management strategy. They can carry secret references or secret values, but rotation, access control, auditing, and leak prevention need more care. Later lessons will handle secrets and deployment boundaries in more depth. Here the goal is narrower: make the process start predictably.</p>
-<h2>Readiness Check</h2>
-<p>Close the lesson and design a startup contract for this tiny service:</p>
+<p>The application code accidentally ignores <code>PORT</code> and uses a hard-coded default:</p>
+<div class="codehilite"><pre><span></span><code>listen_port = 3000
+</code></pre></div>
+
+<p>The trace looks like this:</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  parent supplies PORT=8080
+  proxy expects orders-service:8080
+
+Transition:
+  process starts successfully
+  app reads DATABASE_URL
+  app ignores PORT
+  app binds 0.0.0.0:3000
+
+Intermediate state:
+  process is running
+  port 3000 is listening
+  port 8080 is not listening
+
+Output:
+  app prints &quot;Listening on 3000&quot;
+  platform sees a process
+  proxy connection to 8080 is refused
+  user sees 502 Bad Gateway
+
+Naive failure contrast:
+  &quot;The app is running, so the proxy must be wrong.&quot;
+
+Better diagnosis:
+  The process exists, but it violated the startup contract.
+  It did not listen on the port supplied by its parent.
+</code></pre></div>
+
+<p>This is the small trap. A process can be alive and still unusable by the rest of the system. The startup contract connects the process boundary to the request boundary.</p>
+<p><strong>Check:</strong> If the proxy says <code>connection_refused</code> for <code>orders-service:8080</code>, and the app log says <code>Listening on 3000</code>, should you change the route handler first?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The request has not reached the handler. The first fix is in the startup contract: the app must read and validate the parent-supplied port, or the proxy must be configured to the port the app actually binds.</p>
+<h2>Fail Fast, Then Report Clearly</h2>
+<p>Some startup failures should stop the process immediately.</p>
+<p>If <code>DATABASE_URL</code> is required for normal requests, this is a bad startup behavior:</p>
+<div class="codehilite"><pre><span></span><code>DATABASE_URL missing
+using development fallback database
+Listening on 8080
+exit status: still running
+</code></pre></div>
+
+<p>The process is alive, but it is now dangerous. It may accept real traffic while pointing at the wrong database.</p>
+<p>A better behavior is:</p>
+<div class="codehilite"><pre><span></span><code>stderr:
+  startup error: DATABASE_URL is required
+
+exit status:
+  nonzero
+</code></pre></div>
+
+<p>This gives the parent a clear signal. A deploy platform, process manager, or test runner can treat nonzero exit status as startup failure. A human can read <code>stderr</code> and see the missing input.</p>
+<p>Use this startup rule:</p>
+<div class="codehilite"><pre><span></span><code>If the service cannot keep its basic promise, fail before accepting traffic.
+</code></pre></div>
+
+<p>That rule is not about being dramatic. It is about avoiding ambiguous failures later. A missing database URL discovered at startup is one clear problem. A missing database URL discovered after users send traffic becomes many symptoms: 500s, retries, noisy logs, and maybe corrupted assumptions.</p>
+<p><strong>Check:</strong> A service prints <code>missing PORT</code>, then exits with status <code>0</code>. What is wrong with that signal?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Exit status <code>0</code> usually means success. If startup failed, the process should exit nonzero so automation can detect the failure. Text alone is not enough when another program is supervising the service.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: "Environment variables are configuration, so they must be valid"</h3>
+<p>Why it is tempting:</p>
+<p>The parent supplied a value, so it feels official.</p>
+<p>Better model:</p>
+<p>Environment variables are untrusted strings until the app parses and validates them. <code>PORT=8080</code> may be valid. <code>PORT=eight</code> is just text. The app owns the validation boundary.</p>
+<h3>Confusion: "A running process means the service is ready"</h3>
+<p>Why it is tempting:</p>
+<p>Process lists, container dashboards, and local terminals often show whether something is running.</p>
+<p>Better model:</p>
+<p>Running only means the operating system has a live process. Ready means the process has satisfied the startup contract and can accept the kind of work its parent or proxy will send. A service can be running while listening on the wrong port, missing a required file, or failing dependency setup.</p>
+<h3>Confusion: "Local <code>.env</code> files are the contract"</h3>
+<p>Why it is tempting:</p>
+<p>Local <code>.env</code> files are convenient. They make the app start quickly while developing.</p>
+<p>Better model:</p>
+<p>A <code>.env</code> file can help local development, but the contract is the named set of required inputs and validations. If production does not have the same file, or if the file is untracked and undocumented, the real contract is hidden in one machine.</p>
+<h2>Trade-offs And Limits</h2>
+<p>The main trade-off is <strong>portable startup versus local convenience</strong>.</p>
+<p>Explicit startup contracts make services easier to move from laptop to test runner to container to production. They also require discipline. You need to name required inputs, validate them, choose good defaults carefully, document how the parent supplies them, and avoid logging secrets while explaining failures.</p>
+<p>This helps when:</p>
+<div class="codehilite"><pre><span></span><code>the same service must start in more than one environment
+automation must decide whether startup succeeded
+humans need clear failure messages
+</code></pre></div>
+
+<p>It costs:</p>
+<div class="codehilite"><pre><span></span><code>more validation code
+more startup tests
+less tolerance for &quot;it works on my shell&quot;
+</code></pre></div>
+
+<p>It does not solve every configuration problem. Environment variables are not a full secrets-management system. They do not handle rotation, access control, audit trails, or secret leakage by themselves. Later lessons will return to configuration and secrets with more care.</p>
+<p>The signal that you are near the boundary is simple: people start saying "but it works on my machine." That often means the process contract is living in one machine instead of in the service's explicit startup behavior.</p>
+<h2>Practice</h2>
+<p>Design a startup contract for this service:</p>
 <div class="codehilite"><pre><span></span><code>image-resizer --workers 4
 </code></pre></div>
 
-<p>It reads jobs from a queue, writes resized images to object storage, and exposes a health endpoint.</p>
-<p>Use this rubric:</p>
+<p>The service reads jobs from a queue, writes resized images to object storage, and exposes a health endpoint for the platform.</p>
+<p>Write a small contract with:</p>
 <ul>
-<li>Name two required environment variables.</li>
-<li>Name one command-line argument and why it belongs there.</li>
-<li>Name one startup validation check.</li>
-<li>Name what should go to <code>stderr</code> if startup fails.</li>
-<li>Name one exit-status rule that a parent process could rely on.</li>
+<li>two required environment variables</li>
+<li>one command-line argument</li>
+<li>one file or permission assumption</li>
+<li>one startup validation rule</li>
+<li>one readiness signal</li>
+<li>one nonzero-exit rule</li>
 </ul>
-<p>A solid answer might say: require <code>QUEUE_URL</code> and <code>OBJECT_STORE_BUCKET</code> as environment variables because they vary by deployment; use <code>--workers 4</code> as an explicit runtime sizing choice; validate that <code>workers</code> is a positive integer and that required environment values exist before accepting work; print missing configuration to <code>stderr</code> without dumping secrets; exit nonzero on startup failure and <code>0</code> on intentional shutdown.</p>
+<p>A good answer should mention:</p>
+<ul>
+<li><code>QUEUE_URL</code> as a required environment variable, because the queue location changes by deployment.</li>
+<li><code>OBJECT_STORE_BUCKET</code> or <code>OBJECT_STORE_URL</code> as a required environment variable, because output storage is external.</li>
+<li><code>--workers 4</code> as a command-line argument, because worker count is a visible run choice.</li>
+<li>A validation rule such as "workers must be a positive integer" and "required environment variables must exist before work starts."</li>
+<li>A readiness signal such as "listen on <code>$PORT</code> and return healthy only after configuration validates."</li>
+<li>A nonzero exit if required configuration is missing or invalid, with a clear message to <code>stderr</code> that does not print secrets.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
 <li>[DOC] <a href="https://www.gnu.org/software/bash/manual/html_node/Shell-Commands.html">GNU Bash Manual: Shell Commands</a><ul>
+<li>Link: https://www.gnu.org/software/bash/manual/html_node/Shell-Commands.html</li>
 <li>Focus: Read for how a shell turns text into commands, arguments, and process execution.</li>
 </ul>
 </li>
 <li>[DOC] <a href="https://docs.python.org/3/using/cmdline.html">Python documentation: Command line and environment</a><ul>
-<li>Focus: Notice the separation between command-line options and environment variables.</li>
+<li>Link: https://docs.python.org/3/using/cmdline.html</li>
+<li>Focus: Notice how one runtime exposes command-line options and environment variables.</li>
 </ul>
 </li>
 <li>[DOC] <a href="https://nodejs.org/api/process.html#processenv">Node.js documentation: process.env</a><ul>
-<li>Focus: Use this as a concrete example of how a backend runtime exposes environment variables to code.</li>
+<li>Link: https://nodejs.org/api/process.html#processenv</li>
+<li>Focus: Use this as a concrete example of how backend code reads environment variables as strings.</li>
 </ul>
 </li>
 <li>[ARTICLE] <a href="https://12factor.net/config">The Twelve-Factor App: Config</a><ul>
+<li>Link: https://12factor.net/config</li>
 <li>Focus: Read the argument for separating deploy-time configuration from source code.</li>
 </ul>
 </li>
@@ -236,9 +378,10 @@ Startup behavior:
 <h2>Key Takeaways</h2>
 <ul>
 <li>A backend service starts as an operating-system process before it becomes a request handler.</li>
-<li>Arguments, environment variables, files, streams, ports, signals, and exit status form the startup contract.</li>
-<li>Hidden local assumptions make services hard to move; startup validation makes failures explicit.</li>
-<li>Good process contracts keep deployment flexibility without letting machine-specific state silently control behavior.</li>
+<li>A process startup contract includes executable, arguments, environment, working directory, files, streams, ports, and exit status.</li>
+<li>A running process is not automatically a ready service; it must bind the expected port and satisfy required inputs.</li>
+<li>Startup validation turns hidden machine state into a clear success or failure signal.</li>
+<li>Good startup failures use <code>stderr</code> and nonzero exit status without leaking secrets.</li>
 </ul>
 </section>
 
@@ -268,7 +411,7 @@ Startup behavior:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-28 18:31 UTC | @jepemo | Built with
+        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

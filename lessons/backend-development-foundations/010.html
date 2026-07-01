@@ -77,200 +77,381 @@
 <section class="stack-block lesson-content-shell">
   <h1>Authentication, Authorization, and Session State</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong>
-Separate authentication from authorization; trace how session state turns a login into repeated backend requests; and identify where stale roles, missing resource checks, and unsafe token handling create security bugs.</p>
-<p><strong>Idea in one sentence.</strong> Authentication proves who the caller is, authorization decides what that caller may do, and session state carries that evidence between requests with trade-offs around scale, revocation, and freshness.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Distinguish authentication, authorization, and session state in one backend request.</p>
+</li>
+<li>
+<p>Trace how a login becomes identity evidence on later requests.</p>
+</li>
+<li>
+<p>Recognize bugs caused by stale roles, missing resource checks, and unsafe token handling.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Authentication proves who the caller is, authorization decides what that caller may do, and session state carries identity evidence between requests with trade-offs around revocation, scale, and freshness.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the orders API now has a staff dashboard. A staff member signs in and sees <code>POST /admin/products</code>, <code>DELETE /admin/products/:id</code>, and <code>GET /admin/orders/:id</code>. The team added login, so every admin request must include a session cookie or bearer token. During a review, someone finds a bug: a logged-in support user can delete products even though only catalog admins should do that.</p>
-<p>The login check worked. The caller was real. The failure was that the backend confused "we know who this is" with "this person may do this action." Those are different decisions. Authentication answers, "Who is the caller, and how did they prove it?" Authorization answers, "Given that caller, this action, this resource, and current policy, should the backend allow it?"</p>
-<p>Session state is the bridge between those questions across requests. HTTP requests are independent at the protocol level. A user does not send their password with every click. Instead, after login, the system gives the client some session evidence: often a cookie-backed server session, a signed token, or an opaque bearer token. Later requests present that evidence so the backend can recover identity and apply policy.</p>
-<p>The beginner shortcut is to look for one "auth" step. Real systems need several boundaries: credential proof at login, session transport, token or session validation on each request, authorization for the requested action, resource-level checks, and audit context for later investigation. A request can pass one boundary and fail the next.</p>
-<p>The central trade-off is <strong>stateless scaling versus revocation and policy freshness</strong>. A self-contained signed token can be validated without a database lookup, which helps scaling. But if a user is disabled or loses a role, the token may still carry old claims until it expires unless the system checks freshness somewhere. A server-side session can be revoked centrally, but it adds storage and availability concerns. There is no magic choice. There is only a boundary you must understand.</p>
-<h2>The Visible Pieces</h2>
-<p>Use one recurring scenario: the staff dashboard sends this request:</p>
+<p>The previous lesson designed JSON errors that help clients understand failures such as <code>401</code> and <code>403</code>.</p>
+<p>Now we need to explain what those failures mean.</p>
+<p>Imagine the orders API has a staff dashboard:</p>
+<div class="codehilite"><pre><span></span><code>POST   /admin/products
+DELETE /admin/products/:id
+GET    /admin/orders/:id
+</code></pre></div>
+
+<p>A staff member signs in. Later, they call:</p>
+<div class="codehilite"><pre><span></span><code>DELETE /admin/products/prod_9
+</code></pre></div>
+
+<p>During review, the team finds a bug: a logged-in support user can delete products, even though only catalog admins should do that.</p>
+<p>The login worked. The caller was real. The session was valid.</p>
+<p>The failure was different:</p>
+<div class="codehilite"><pre><span></span><code>The backend proved who the caller was.
+It did not prove that this caller may delete this product.
+</code></pre></div>
+
+<p>The naive idea is:</p>
+<div class="codehilite"><pre><span></span><code>If the user is logged in, the request is allowed.
+</code></pre></div>
+
+<p>That is not enough.</p>
+<p>A better model separates three questions:</p>
+<div class="codehilite"><pre><span></span><code>Authentication: Who is this caller, and how did they prove it?
+Authorization: May this caller perform this action on this resource?
+Session state: What evidence carries identity between requests?
+</code></pre></div>
+
+<p>These questions often run near each other in a framework pipeline. They are not the same decision.</p>
+<h2>The Small Situation</h2>
+<p>Use one request:</p>
 <div class="codehilite"><pre><span></span><code><span class="err">DELETE /admin/products/prod_9</span>
 <span class="err">Cookie: session_id=sess_abc123</span>
 </code></pre></div>
 
-<p>The intended rule is narrow:</p>
-<div class="codehilite"><pre><span></span><code>Only an active staff user with the catalog_admin role may delete a product,
-and the product must not have shipped order history that requires preservation.
+<p>The product rule is narrow:</p>
+<div class="codehilite"><pre><span></span><code>Only an active staff user with catalog_admin permission may deactivate a product.
+Physical deletion is not allowed if the product appears in shipped order history.
 </code></pre></div>
 
 <p>The visible pieces are:</p>
 <ul>
-<li><strong>Credentials</strong>: proof supplied at login, such as password plus a second factor, SSO assertion, or another login mechanism.</li>
+<li><strong>Credentials</strong>: proof used at login, such as password plus a second factor, SSO, or another login method.</li>
 <li><strong>Principal</strong>: the authenticated actor, such as <code>staff_user_id=17</code>.</li>
-<li><strong>Session evidence</strong>: a cookie, token, or session ID presented on later requests.</li>
-<li><strong>Claims</strong>: facts carried or looked up about the principal, such as user ID, tenant, roles, or token expiry.</li>
-<li><strong>Policy</strong>: the rule that decides whether an action is allowed.</li>
+<li><strong>Session evidence</strong>: a cookie, session ID, or bearer token sent on later requests.</li>
+<li><strong>Claims</strong>: facts about the principal, such as user ID, roles, tenant, or expiry.</li>
+<li><strong>Policy</strong>: the rule used to decide allow or deny.</li>
 <li><strong>Resource</strong>: the thing being acted on, such as product <code>prod_9</code>.</li>
-<li><strong>Audit context</strong>: evidence recorded for later review, such as actor, action, resource, decision, request ID, and time.</li>
+<li><strong>Context</strong>: request-time facts, such as route, method, request ID, IP risk, time, or tenant.</li>
+<li><strong>Audit event</strong>: a record of actor, action, resource, decision, and evidence safe enough for later review.</li>
 </ul>
-<p>Authentication can establish the principal. It does not automatically prove the policy decision. Authorization usually needs at least four inputs:</p>
-<div class="codehilite"><pre><span></span><code>actor -&gt; action -&gt; resource -&gt; context
-</code></pre></div>
-
-<p>For the delete request:</p>
-<div class="codehilite"><pre><span></span><code>actor: staff_user_id=17, roles=[support_agent]
-action: delete_product
-resource: product prod_9
-context: admin dashboard request, request_id=req_610
-decision: deny
-</code></pre></div>
-
-<p>The support agent may be authenticated and still denied. That is not a system failure. That is the system enforcing a boundary.</p>
-<h2>A Request Walkthrough</h2>
+<p>Plain meaning:</p>
+<p>Authentication gets an identity into the request.</p>
+<p>In this scenario:</p>
+<p>The session cookie may let the backend recover <code>staff_user_id=17</code>.</p>
+<p>Technical name:</p>
+<p>That identity proof step is <strong>authentication</strong>.</p>
+<p>Plain meaning:</p>
+<p>Authorization decides whether an authenticated actor may do one specific thing.</p>
+<p>In this scenario:</p>
+<p><code>staff_user_id=17</code> may view orders but may not delete products.</p>
+<p>Technical name:</p>
+<p>That permission decision is <strong>authorization</strong>.</p>
+<h2>A Worked Request Trace</h2>
 <p>Trace a successful catalog admin request:</p>
-<div class="codehilite"><pre><span></span><code>HTTP request
-  -&gt; DELETE /admin/products/prod_9
-  -&gt; session cookie: sess_abc123
+<div class="codehilite"><pre><span></span><code>Input:
+  DELETE /admin/products/prod_9
+  Cookie: session_id=sess_abc123
+
+Step 1: read session evidence
+  request includes sess_abc123
+  at this point, it is only a string from the client
+
+Step 2: validate the session
+  session exists
+  session is signed or stored correctly
+  session is not expired
+  session is not revoked
+
+Intermediate state:
+  backend can attach principal staff_user_id=17
+
+Step 3: load current actor facts
+  staff user is active
+  roles or permissions are loaded
+  tenant or organization boundary is known if relevant
+
+Step 4: identify action and resource
+  action = deactivate_product
+  resource = product prod_9
+
+Step 5: evaluate policy
+  actor has catalog_admin permission
+  product exists
+  product can be deactivated under business rules
+
+Intermediate state:
+  decision = allow
+
+Step 6: run handler
+  handler changes product state
+  handler records audit event
+
+Output:
+  safe response and audit trail
 </code></pre></div>
 
-<p>The backend path might run:</p>
-<div class="codehilite"><pre><span></span><code>parse request
-  -&gt; read session cookie
-  -&gt; find session record
-  -&gt; verify session is active and not expired
-  -&gt; load principal staff_user_id=17
-  -&gt; load current roles or permissions
-  -&gt; route says action is delete_product
-  -&gt; load product prod_9
-  -&gt; evaluate policy
-  -&gt; if allowed, call handler
-  -&gt; write audit event
-  -&gt; return response
+<p>Now compare the broken path:</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  DELETE /admin/products/prod_9
+  Cookie: session_id=sess_support_8
+
+Step 1: validate session
+  session is valid
+
+Step 2: attach principal
+  staff_user_id=21
+  role=support_agent
+
+Step 3: run handler
+  product is deleted
+
+Naive failure:
+  the request was authenticated
+  but no authorization decision checked delete_product on prod_9
 </code></pre></div>
 
-<p>Make the intermediate states visible:</p>
-<ol>
-<li>Before authentication, the backend has only a request with a cookie value. A cookie value is not yet a user.</li>
-<li>Session validation checks whether <code>sess_abc123</code> is known, signed or stored correctly, unexpired, and not revoked.</li>
-<li>If valid, the backend has a principal: for example, <code>staff_user_id=17</code>.</li>
-<li>The route and method identify the intended action: <code>delete_product</code>.</li>
-<li>The backend loads the resource so policy can consider the actual product.</li>
-<li>Authorization evaluates actor, action, resource, and context.</li>
-<li>The handler runs only after the decision is allow.</li>
-<li>The audit event records what decision happened and why enough to investigate later.</li>
-</ol>
-<p>Now compare a broken path:</p>
-<div class="codehilite"><pre><span></span><code>parse request
-  -&gt; read session cookie
-  -&gt; verify session is active
-  -&gt; load principal staff_user_id=21
-  -&gt; handler deletes product
+<p>This bug can hide in testing because unauthenticated users are blocked. The missing case is an authenticated user without the right permission.</p>
+<p>So far, the important distinction is:</p>
+<div class="codehilite"><pre><span></span><code>Authentication says &quot;we know who this is.&quot;
+Authorization says &quot;this known actor may do this action here.&quot;
 </code></pre></div>
 
-<p>This path authenticates the caller but never checks whether that caller has the right permission for this product. The bug can hide because local tests often use an admin fixture for every dashboard route. The system seems protected because unauthenticated users are blocked. Authenticated but underprivileged users are the missing case.</p>
-<p>So far, the useful distinction is plain: authentication gets an identity into the request; authorization uses that identity to decide on one specific action.</p>
-<h2>Session State Choices</h2>
-<p>A backend needs a way to remember login across requests. Three common shapes are server-side sessions, signed cookies, and bearer tokens.</p>
-<p>With a server-side session, the client stores an opaque ID:</p>
-<div class="codehilite"><pre><span></span><code>client cookie: sess_abc123
+<p><strong>Check:</strong> A logged-in support user can delete products, but only catalog admins should do that. Which boundary failed?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Authorization. Authentication proved the caller was a real support user. Authorization should have denied the <code>delete_product</code> action for that actor and resource.</p>
+<h2>Session State Carries Evidence</h2>
+<p>HTTP requests are separate. The user does not send their password with every click.</p>
+<p>After login, the backend gives the client some session evidence. Later requests present that evidence.</p>
+<p>Common shapes:</p>
+<div class="codehilite"><pre><span></span><code>server-side session
+  client stores opaque session_id
+  server stores session data
+
+signed or encrypted cookie
+  client stores protected session data
+  server verifies the cookie
+
+bearer token
+  client sends token in Authorization header
+  server validates or introspects token
+</code></pre></div>
+
+<p>With a server-side session:</p>
+<div class="codehilite"><pre><span></span><code>client cookie:
+  session_id=sess_abc123
+
 server store:
   sess_abc123 -&gt; user_id=17, expires_at, revoked=false
 </code></pre></div>
 
-<p>The cookie alone does not contain the user's roles. Each request can look up the session and then load current user state. Revocation is straightforward: mark the session revoked or delete it. The cost is that each request depends on the session store, so the store must be fast and available.</p>
-<p>With a signed or encrypted cookie, the cookie may carry session facts protected by cryptography. The server can verify the cookie without a central lookup. That can be efficient, but large or stale cookies create risk. If roles are embedded and a user loses a role, old cookies may still say the user has it until expiry unless the system adds freshness checks.</p>
-<p>With a bearer token, such as an access token sent in an <code>Authorization</code> header, the rule is simple: whoever presents the token can use it until it expires or is rejected. Some tokens are opaque and require lookup or introspection. Some are self-contained signed tokens. Bearer tokens are common for APIs, but they demand careful storage, short lifetimes for sensitive contexts, and safe logging practices. Never log raw tokens.</p>
-<p>The trade-off is visible:</p>
-<div class="codehilite"><pre><span></span><code>server-side session -&gt; easier central revocation, more shared state
-self-contained token -&gt; easier stateless validation, harder immediate revocation
-short lifetime -&gt; limits stale access, more refresh complexity
-long lifetime -&gt; smoother UX, more damage if stolen or stale
+<p>This makes central revocation easier. Mark the session revoked, and later requests fail. The cost is that requests depend on a session store.</p>
+<p>With a self-contained signed token:</p>
+<div class="codehilite"><pre><span></span><code>token contains:
+  user_id=17
+  roles=[&quot;catalog_admin&quot;]
+  expires_at=...
 </code></pre></div>
 
-<p>Quick check: a user loses the <code>catalog_admin</code> role, but their token still contains <code>roles=["catalog_admin"]</code> for another six hours. What kind of problem is this?</p>
-<p>Answer: policy freshness. The token may be valid cryptographically while its authorization claims are stale. The system needs shorter expiry, role lookup, revocation, token versioning, or another freshness check for sensitive actions.</p>
-<h2>Authorization Is More Than Roles</h2>
-<p>Roles are a common starting point: <code>support_agent</code>, <code>catalog_admin</code>, <code>finance_admin</code>. They group permissions so teams do not assign every action one by one. Roles are useful, but they are not enough for every policy.</p>
-<p>Consider these two requests:</p>
+<p>The server may validate it without a session database lookup. That can scale well. The cost is freshness. If the user loses <code>catalog_admin</code>, the old token may still say they have it until the token expires or the backend checks freshness elsewhere.</p>
+<p>With bearer tokens, remember the plain rule:</p>
+<div class="codehilite"><pre><span></span><code>Whoever presents the token can act as that token until it expires or is rejected.
+</code></pre></div>
+
+<p>That means raw tokens should not appear in ordinary logs, error messages, analytics events, screenshots, or support tickets.</p>
+<p>The trade-off is visible:</p>
+<div class="codehilite"><pre><span></span><code>server-side session -&gt; easier revocation, more shared state
+self-contained token -&gt; easier stateless validation, harder immediate revocation
+short lifetime -&gt; less stale access, more refresh complexity
+long lifetime -&gt; smoother UX, more risk if stolen or stale
+</code></pre></div>
+
+<p><strong>Check:</strong> A user loses <code>catalog_admin</code>, but their token still contains <code>roles=["catalog_admin"]</code> for six hours. What is the main problem?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Policy freshness. The token may be valid cryptographically while its authorization claims are stale. The system needs shorter expiry, role lookup, revocation, token versioning, or another freshness check for sensitive actions.</p>
+<h2>Authorization Needs Resource Context</h2>
+<p>Roles are useful. They are not the whole policy.</p>
+<p>Consider:</p>
 <div class="codehilite"><pre><span></span><code>GET /customers/cus_42/orders
 DELETE /admin/products/prod_9
+PATCH /admin/users/17/roles
 </code></pre></div>
 
-<p>The first might be allowed for a customer only when <code>cus_42</code> is their own account. The second might be allowed for catalog admins, but only if the product has no shipped order history or if deletion actually means deactivation. These are resource-level rules. They depend on the object, not just the user's role.</p>
-<p>A healthy authorization check asks:</p>
-<ul>
-<li>Who is the actor?</li>
-<li>What action are they trying to perform?</li>
-<li>Which resource is affected?</li>
-<li>What current state matters?</li>
-<li>Which policy owns the decision?</li>
-<li>What evidence should be recorded?</li>
-</ul>
-<p>This is why putting <code>if user.is_admin</code> inside scattered handlers becomes fragile. One handler checks role. Another forgets resource ownership. A third uses old policy names. Centralizing policy decisions, or at least using consistent policy helpers, makes the boundary reviewable.</p>
-<p>For the product delete request, a policy sketch might be:</p>
-<div class="codehilite"><pre><span></span><code>allow delete_product when:
-  actor is active staff
-  actor has catalog_admin permission
-  product exists
-  product has no shipped order references requiring history
-
-otherwise:
-  deny with safe error
-  record actor, action, resource, decision, request_id
+<p>Each request needs more than "is the caller logged in?"</p>
+<p>For customer orders:</p>
+<div class="codehilite"><pre><span></span><code>actor = customer cus_42
+action = read_orders
+resource = customer cus_42 orders
+decision = allow
 </code></pre></div>
 
-<p>The handler should not run until this decision is made. If deletion is not truly safe, the policy may choose <code>deactivate_product</code> instead of physical deletion. Authorization protects actions, and good domain modeling defines what the action actually means.</p>
-<h2>Failure Modes and Signals</h2>
+<p>But if the same actor changes the URL:</p>
+<div class="codehilite"><pre><span></span><code>GET /customers/cus_99/orders
+</code></pre></div>
+
+<p>the policy should ask whether this actor may read orders for <code>cus_99</code>. If not, deny or hide the resource according to the API's rule.</p>
+<p>For product deletion:</p>
+<div class="codehilite"><pre><span></span><code>actor = staff_user_id=17
+action = deactivate_product
+resource = product prod_9
+context = admin dashboard request
+decision = allow or deny
+</code></pre></div>
+
+<p>For role changes:</p>
+<div class="codehilite"><pre><span></span><code>actor = staff_user_id=21
+action = grant_catalog_admin
+resource = staff_user_id=17 role set
+context = request_id, organization, current actor permissions
+decision = usually deny unless actor has a very specific permission
+</code></pre></div>
+
+<p>A good authorization check has this shape:</p>
+<div class="codehilite"><pre><span></span><code>actor -&gt; action -&gt; resource -&gt; context -&gt; decision
+</code></pre></div>
+
+<p>Putting <code>if user.is_admin</code> inside many handlers is fragile. One handler checks only a broad role. Another forgets ownership. A third uses old policy vocabulary. Consistent policy helpers or a central policy layer make the boundary easier to review and test.</p>
+<p><strong>Check:</strong> A customer changes <code>/customers/cus_42/orders</code> to <code>/customers/cus_99/orders</code> and sees another customer's orders. Which check failed?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Resource-level authorization. The backend authenticated a real customer, but it did not verify that this actor may read orders for <code>cus_99</code>.</p>
+<h2>Errors, Audits, and Signals</h2>
+<p>Authentication and authorization should connect to the error contract from the previous lesson.</p>
+<p>Common mapping:</p>
+<div class="codehilite"><pre><span></span><code>missing or invalid identity evidence -&gt; 401-style authentication response
+known caller without permission       -&gt; 403-style authorization response
+resource hidden by policy             -&gt; sometimes 404 by project rule
+</code></pre></div>
+
+<p>The exact response policy is a project decision. The important part is consistency. Clients should know whether to sign in, stop, refresh visible state, or ask for a different permission.</p>
+<p>Operators need different evidence. Do not expose sensitive detail to the client, but do record enough safe audit context:</p>
+<div class="codehilite"><pre><span></span><code>request_id
+actor id
+action
+resource id
+decision allow/deny
+policy name or reason category
+timestamp
+session/token family, not raw secret
+</code></pre></div>
+
 <p>Authentication and authorization bugs usually come from boundary confusion:</p>
 <ul>
 <li>Treating "logged in" as enough for admin actions.</li>
-<li>Checking a broad role but missing resource ownership or tenant boundary.</li>
-<li>Trusting role claims in a long-lived token after policy changed.</li>
-<li>Logging session IDs or bearer tokens in request logs.</li>
-<li>Returning different error details that let attackers learn which accounts exist.</li>
+<li>Checking a broad role but missing resource ownership.</li>
+<li>Trusting stale role claims in a long-lived token.</li>
+<li>Logging session IDs or bearer tokens.</li>
+<li>Applying authorization in the UI but not the API.</li>
 <li>Forgetting to audit sensitive allow and deny decisions.</li>
-<li>Applying authorization only in the UI while the API still accepts direct calls.</li>
 </ul>
-<p>Operational signals should separate the stages. Track authentication failures, expired sessions, revoked sessions, authorization denies by action, suspicious repeated denies, token validation failures, and sensitive action audit events. During an incident, ask which boundary failed: credential proof, session validation, current user loading, policy evaluation, or resource-specific rule.</p>
-<p>The error contract matters too. Missing or invalid authentication usually maps to <code>401 Unauthorized</code>. A known caller without permission usually maps to <code>403 Forbidden</code>. Many systems intentionally return <code>404</code> for resources the caller should not know exist. Choose a project rule and apply it consistently so clients and operators know what the response means.</p>
-<p>Quick check: a customer changes the URL from <code>/customers/cus_42/orders</code> to <code>/customers/cus_99/orders</code> and sees another customer's orders. Which check failed?</p>
-<p>Answer: resource-level authorization. Authentication identified a real customer, but authorization did not verify that the actor may read orders for <code>cus_99</code>.</p>
-<h2>Readiness Check</h2>
-<p>Close the lesson and review this request:</p>
-<div class="codehilite"><pre><span></span><code>PATCH /admin/users/17/roles
-Cookie: session_id=sess_support_8
-Body: {&quot;add&quot;: [&quot;catalog_admin&quot;]}
+<p>Useful operational signals include authentication failures, expired sessions, revoked sessions, authorization denies by action, suspicious repeated denies, token validation failures, and audit events for sensitive actions.</p>
+<h2>A Small Boundary Table</h2>
+<p>When a backend request feels confusing, name the boundary before changing code.</p>
+<p>Use this table:</p>
+<div class="codehilite"><pre><span></span><code>Boundary          Input it trusts carefully          Output it produces
+authentication    credential or session evidence     principal or no principal
+session state     cookie, session id, token           reusable identity evidence
+authorization     actor, action, resource, context    allow or deny decision
+audit             safe request and decision facts     reviewable event
 </code></pre></div>
 
-<p>Use this rubric:</p>
+<p>The rows should happen in a deliberate order.</p>
+<p>Authentication should not quietly grant broad permission. Its output is an actor the backend can reason about. If the request has no valid identity evidence, the handler should not have to guess who the caller is.</p>
+<p>Session state should not be treated as a permanent source of truth. It is evidence that must be validated. For low-risk pages, the backend may accept cached identity facts. For sensitive changes, it may reload fresh roles, check token version, require a recent login, or ask a policy service.</p>
+<p>Authorization should sit close to the protected action. It needs the real resource, not just the route name. A check that runs before loading <code>prod_9</code> may know the caller is a catalog admin, but it cannot know whether this particular product can be deactivated under business rules.</p>
+<p>Audit should record the decision without leaking secrets. A useful audit event says that actor <code>17</code> attempted <code>deactivate_product</code> on <code>prod_9</code> and the policy allowed or denied it. It should not store raw bearer tokens, passwords, full session cookies, or unnecessary personal data.</p>
+<p>This table is also a testing checklist. Good backend tests should include:</p>
 <ul>
-<li>Identify the authentication evidence.</li>
-<li>Name the actor, action, and resource.</li>
-<li>Decide which policy question must be answered before the handler runs.</li>
-<li>Name one session freshness risk.</li>
-<li>Name one audit field that should be recorded.</li>
+<li>no session evidence,</li>
+<li>invalid or expired session evidence,</li>
+<li>authenticated actor without permission,</li>
+<li>authenticated actor with permission on the wrong resource,</li>
+<li>authenticated actor with permission on the right resource,</li>
+<li>stale role or revoked-session case for sensitive actions.</li>
 </ul>
-<p>A solid answer might say: the authentication evidence is the session cookie, but it must be validated before it proves an actor. The actor is the staff user behind <code>sess_support_8</code>, the action is changing roles, and the resource is user <code>17</code> plus their role set. The policy must decide whether this actor can grant <code>catalog_admin</code>, not merely whether they are logged in. A freshness risk is that the actor's own roles may have changed after the session or token was issued. The audit event should include actor ID, target user ID, action, old and new role intent, decision, request ID, and timestamp.</p>
+<p>That checklist keeps the next lesson grounded. Testing backend behavior is not only about happy paths. It is about proving that each boundary fails closed when its input is missing, stale, or not enough for the requested action.</p>
+<h2>Trade-offs and Limits</h2>
+<p>This model improves clarity because each boundary has a job:</p>
+<div class="codehilite"><pre><span></span><code>authentication -&gt; establish identity
+authorization  -&gt; decide permission
+session state   -&gt; carry evidence between requests
+audit           -&gt; preserve safe decision evidence
+</code></pre></div>
+
+<p>It costs design discipline. Every protected action needs a policy decision. Every session style has revocation and freshness trade-offs. Every log line must avoid secrets while still preserving enough investigation context.</p>
+<p>This lesson does not solve full identity architecture. It does not choose OAuth, SAML, cookies, JWTs, passkeys, or a specific authorization framework for you. It gives the beginner backend model you need before choosing those tools.</p>
+<p>You can see the boundary when:</p>
+<ul>
+<li>a valid user gets <code>403</code>,</li>
+<li>a missing session gets <code>401</code>,</li>
+<li>a stale token still carries an old role,</li>
+<li>a customer can access another customer's resource,</li>
+<li>an audit log cannot explain who did what.</li>
+</ul>
+<p>Those are not one generic "auth problem." They are different boundary failures.</p>
+<h2>Practice</h2>
+<p>Review this request:</p>
+<div class="codehilite"><pre><span></span><code><span class="err">PATCH /admin/users/17/roles</span>
+<span class="err">Cookie: session_id=sess_support_8</span>
+<span class="err">Content-Type: application/json</span>
+
+<span class="err">{&quot;add&quot;: [&quot;catalog_admin&quot;]}</span>
+</code></pre></div>
+
+<p>A good answer should mention:</p>
+<ul>
+<li>The session cookie is authentication evidence, but it must be validated before it proves an actor.</li>
+<li>The actor is the staff user behind <code>sess_support_8</code>.</li>
+<li>The action is granting <code>catalog_admin</code>.</li>
+<li>The resource is user <code>17</code> and their role set.</li>
+<li>The policy question is whether this actor may grant this specific role.</li>
+<li>A freshness risk is that the actor's own roles may have changed after the session or token was issued.</li>
+<li>The audit event should include actor ID, target user ID, action, role change intent, decision, request ID, and timestamp.</li>
+</ul>
+<p>Model answer:</p>
+<p>First validate the session cookie and load the actor. Being logged in is not enough. The backend must ask whether this actor may grant <code>catalog_admin</code> to user <code>17</code>. That is a sensitive authorization decision, not normal profile editing. If the actor's permissions were embedded in a long-lived token, they may be stale, so the backend may need a current permission lookup or token freshness check. Whether the decision is allow or deny, record safe audit evidence without logging the raw session ID.</p>
+<h2>Connections</h2>
+<p>The previous lesson used <code>401</code> and <code>403</code> as API error categories. This lesson explains the backend decisions behind those responses.</p>
+<p>The next lesson turns these boundaries into test questions: which unit, integration, or contract test would catch a missing policy call, stale token assumption, or wrong error contract?</p>
 <h2>Resources</h2>
 <ul>
-<li>[GUIDE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html">OWASP Authorization Cheat Sheet</a><ul>
-<li>Focus: Use this for the rule that authorization should be checked on every request and at the right granularity.</li>
+<li>[REFERENCE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html">OWASP Authorization Cheat Sheet</a><ul>
+<li>Link: https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html</li>
+<li>Focus: Use this for the principle that authorization should be checked on every request and at the right granularity.</li>
 </ul>
 </li>
-<li>[GUIDE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">OWASP Session Management Cheat Sheet</a><ul>
+<li>[REFERENCE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">OWASP Session Management Cheat Sheet</a><ul>
+<li>Link: https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html</li>
 <li>Focus: Read for session identifiers, expiration, renewal, transport, and storage risks.</li>
 </ul>
 </li>
-<li>[DOC] <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Authentication">MDN: HTTP authentication</a><ul>
-<li>Focus: Connect <code>401</code>, credentials, and authentication schemes to HTTP behavior.</li>
+<li>[DOC] <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Authentication">MDN: HTTP Authentication</a><ul>
+<li>Link: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Authentication</li>
+<li>Focus: Connect credentials, challenges, and <code>401</code> behavior to HTTP.</li>
 </ul>
 </li>
-<li>[DOC] <a href="https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics">OAuth 2.0 Security Best Current Practice</a><ul>
-<li>Focus: Skim for token handling, bearer-token risks, and modern OAuth security guidance.</li>
+<li>[REFERENCE] <a href="https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics">OAuth 2.0 Security Best Current Practice</a><ul>
+<li>Link: https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics</li>
+<li>Focus: Skim for bearer-token risks, token handling, and modern OAuth security guidance.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Authentication proves an identity; authorization decides whether that identity may perform one action on one resource.</li>
-<li>Session state carries identity evidence between requests, but each storage style trades off scale, revocation, and freshness.</li>
-<li>Roles are useful shortcuts, but sensitive systems also need resource-level and context-aware policy checks.</li>
-<li>Good auth systems log safe audit evidence and keep secrets such as session IDs and bearer tokens out of ordinary logs.</li>
+<li>Authentication proves identity; authorization decides whether that identity may perform one action on one resource.</li>
+<li>Session state is evidence carried between requests, not permission by itself.</li>
+<li>Roles help, but sensitive actions usually need actor, action, resource, and context.</li>
+<li>Session and token designs trade off scale, revocation, freshness, and theft impact.</li>
+<li>Safe audit evidence helps operators investigate decisions without exposing secrets.</li>
 </ul>
 </section>
 
@@ -300,7 +481,7 @@ Body: {&quot;add&quot;: [&quot;catalog_admin&quot;]}
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-28 18:31 UTC | @jepemo | Built with
+        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

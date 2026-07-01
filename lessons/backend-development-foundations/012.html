@@ -77,18 +77,59 @@
 <section class="stack-block lesson-content-shell">
   <h1>Configuration, Secrets, and Twelve-Factor Boundaries</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong>
-Separate code from deploy-time configuration; identify which values are secrets; and design startup validation that catches missing, wrong, or drifted configuration before a backend handles traffic.</p>
-<p><strong>Idea in one sentence.</strong> Configuration is the deploy-time information a release needs to run in one environment, while secrets are sensitive configuration that need controlled storage, rotation, and careful logging boundaries.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Separate code, deploy-time configuration, and secrets in a backend service.</p>
+</li>
+<li>
+<p>Trace startup configuration loading from raw strings to a safe readiness decision.</p>
+</li>
+<li>
+<p>Recognize configuration drift, unsafe secret logging, and rotation risks before a service handles traffic.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Configuration is deploy-time input for one environment; secrets are sensitive configuration that need stricter storage, logging, and rotation boundaries.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the orders API passes tests and deploys to production. A worker starts processing checkout jobs. It connects successfully, logs look normal, and then payment authorizations begin failing. After an hour of investigation, the team discovers the production worker is using the staging payment API key. The code was correct. The build artifact was correct. The deploy-time configuration was wrong.</p>
-<p>This is a different kind of backend failure from a bad SQL query or missing authorization check. The behavior changed because a value outside the source code pointed the same code at a different dependency. A backend service may need database URLs, payment provider keys, feature flags, allowed origins, log levels, queue names, token issuers, and timeout values. Those values often vary by local development, test, staging, and production.</p>
-<p>Configuration is how one codebase runs in different places without editing the code for each place. That is powerful. It is also risky because the difference between "safe staging behavior" and "real production money movement" may be one environment variable or secret reference.</p>
-<p>The beginner mistake is to treat configuration as a bag of strings the app reads whenever it needs them. A healthier model is a boundary. At startup, the service should load its required configuration, validate shape and meaning, refuse impossible combinations, and make safe summaries visible to operators. Secrets should be loaded through a controlled path and never printed as ordinary diagnostic data.</p>
-<p>The central trade-off is <strong>flexible deployment versus configuration drift</strong>. Moving deploy-time choices out of code lets the same artifact run in many environments. It also means environments can silently diverge. The goal is not to hard-code everything. The goal is to make variation explicit, validated, observable, and safe to rotate.</p>
-<h2>The Visible Pieces</h2>
-<p>Use one recurring scenario: the orders service needs to run locally, in staging, and in production.</p>
+<p>The previous lesson asked: which test boundary catches this failure?</p>
+<p>Now the orders API passes its tests. The artifact deploys. Production starts.</p>
+<p>Then checkout begins failing.</p>
+<p>The worker logs look normal at first:</p>
+<div class="codehilite"><pre><span></span><code>worker started
+queue connected
+payment client initialized
+</code></pre></div>
+
+<p>Payment authorizations fail for real customers. After an hour, the team finds the cause:</p>
+<div class="codehilite"><pre><span></span><code>APP_ENV=production
+PAYMENT_API_BASE_URL=https://staging-payments.example
+PAYMENT_API_KEY=staging key
+</code></pre></div>
+
+<p>The code was correct.
+The tests were correct for the code they exercised.
+The deploy-time configuration was wrong.</p>
+<p>This is a different backend failure from a bad SQL query, a missing authorization check, or a provider contract mismatch. The same code changed behavior because values outside the source code pointed it at the wrong environment.</p>
+<p>The naive idea is:</p>
+<div class="codehilite"><pre><span></span><code>Configuration is just a bag of strings the app reads when it needs them.
+</code></pre></div>
+
+<p>That is too loose.</p>
+<p>A better model is:</p>
+<div class="codehilite"><pre><span></span><code>Configuration is a startup boundary.
+The service receives deploy-time instructions.
+It parses them.
+It validates them.
+It refuses unsafe combinations.
+It reports safe evidence.
+Only then should it become ready.
+</code></pre></div>
+
+<p>Secrets fit inside that model, but they need tighter handling. A payment key, database password, or session signing secret is not just another string. Possession may grant access.</p>
+<h2>The Small Situation</h2>
+<p>Use one service: <code>orders-worker</code>.</p>
+<p>It processes checkout jobs and calls a payment provider.</p>
 <p>It needs values like:</p>
 <div class="codehilite"><pre><span></span><code>APP_ENV=production
 DATABASE_URL=postgres://...
@@ -105,118 +146,241 @@ REQUEST_TIMEOUT_MS=3000
 <ul>
 <li><strong>Code</strong> is the source and built artifact: handlers, policies, SQL, tests, and runtime package.</li>
 <li><strong>Configuration</strong> is deploy-time input that changes behavior without changing code.</li>
-<li><strong>Secrets</strong> are sensitive values, such as API keys, private keys, database passwords, and signing secrets.</li>
-<li><strong>Environment</strong> is the deployment context where the service runs: local, test, staging, production, or a preview environment.</li>
-<li><strong>Startup validation</strong> is the app's check that required configuration exists and makes sense before serving traffic.</li>
-<li><strong>Rotation</strong> is replacing a secret safely without breaking running systems.</li>
+<li><strong>Secrets</strong> are sensitive configuration, such as API keys, private keys, database passwords, and signing secrets.</li>
+<li><strong>Environment</strong> is where the service runs: local, test, staging, production, or preview.</li>
+<li><strong>Startup validation</strong> is the service refusing missing, malformed, or unsafe configuration before it handles work.</li>
+<li><strong>Rotation</strong> is replacing a secret safely while old clients, sessions, or workers may still exist.</li>
 </ul>
-<p>The Twelve-Factor App guideline "store config in the environment" is often summarized as using environment variables. The deeper idea is separation: config that varies between deploys should not be baked into source code. Environment variables are one common interface. Secret managers, deployment manifests, and platform configuration systems can also feed that boundary.</p>
-<p>The important question is: what does this release need to know at deploy time, and which system is authoritative for that value?</p>
+<p>Plain meaning:</p>
+<p>Configuration tells the same release how to run in one place.</p>
+<p>In this scenario:</p>
+<p><code>PAYMENT_API_BASE_URL</code> tells the worker which payment provider endpoint to call in production.</p>
+<p>Technical name:</p>
+<p>This is <strong>deploy-time configuration</strong>. The Twelve-Factor App guideline says configuration that varies between deploys should be separated from code. Environment variables are one common interface, but the deeper idea is the boundary: code and deploy-specific values should not be tangled together.</p>
+<p>Plain meaning:</p>
+<p>A secret is a configuration value that must not be casually exposed.</p>
+<p>In this scenario:</p>
+<p><code>PAYMENT_API_KEY</code> and <code>SESSION_COOKIE_SECRET</code> are secrets because they can authorize sensitive actions or protect authentication evidence.</p>
+<p>Technical name:</p>
+<p>These values need <strong>secret management</strong>: controlled storage, injection, access limits, redaction, and rotation.</p>
 <h2>A Startup Configuration Trace</h2>
-<p>Trace the worker start from process launch to readiness:</p>
-<div class="codehilite"><pre><span></span><code>process starts
-  -&gt; read environment variables and secret references
-  -&gt; parse values into typed settings
-  -&gt; validate required settings
-  -&gt; reject unsafe combinations
-  -&gt; initialize clients
-  -&gt; report safe config summary
-  -&gt; become ready for work
-</code></pre></div>
+<p>Trace the worker from process launch to readiness.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  raw environment variables
+  secret references from deployment platform
 
-<p>Make the intermediate states visible.</p>
-<p>First, the process receives raw strings. <code>REQUEST_TIMEOUT_MS="3000"</code> is a string until parsed. <code>FEATURE_NEW_CHECKOUT="false"</code> is a string until converted to a boolean. <code>PAYMENT_API_KEY</code> may be absent, empty, or accidentally set to a staging key.</p>
-<p>Second, the app should parse into a typed settings object:</p>
-<div class="codehilite"><pre><span></span><code>Settings:
+Step 1: process starts
+  no checkout jobs should run yet
+
+Step 2: read raw values
+  APP_ENV=&quot;production&quot;
+  REQUEST_TIMEOUT_MS=&quot;3000&quot;
+  FEATURE_NEW_CHECKOUT=&quot;false&quot;
+  PAYMENT_API_KEY is present from secret manager
+
+Intermediate state:
+  values are still strings or secret handles
+
+Step 3: parse typed settings
   app_env = production
-  payment_api_base_url = https://api.payments.example
-  payment_api_key = present secret
-  order_queue_name = orders-production
   request_timeout_ms = 3000
   new_checkout_enabled = false
-</code></pre></div>
+  payment_api_key = present secret
 
-<p>Third, validation should check more than presence:</p>
-<div class="codehilite"><pre><span></span><code>required:
+Step 4: validate required values
   DATABASE_URL exists
+  PAYMENT_API_BASE_URL exists
   PAYMENT_API_KEY exists
   SESSION_COOKIE_SECRET exists
 
-type and range:
-  REQUEST_TIMEOUT_MS is an integer between 100 and 30000
-  LOG_LEVEL is one of debug, info, warn, error
+Step 5: validate meaning
+  timeout is within allowed range
+  log level is allowed
+  production does not point at staging payment URL
+  production queue name matches production environment
 
-environment consistency:
-  APP_ENV=production does not use staging payment base URL
-  production queue name does not end with &quot;-staging&quot;
-  debug logging is not enabled in production by accident
+Step 6: initialize clients
+  database client created
+  payment client created
+  queue client created
+
+Step 7: emit safe startup evidence
+  app_env=production
+  payment_base=api.payments.example
+  payment_key=present version=payments-prod-v4
+  order_queue=orders-production
+  timeout_ms=3000
+
+Output:
+  service becomes ready for work
 </code></pre></div>
 
-<p>Fourth, the app should expose a safe readiness result. It might log:</p>
-<div class="codehilite"><pre><span></span><code>config loaded: app_env=production payment_base=api.payments.example
-order_queue=orders-production timeout_ms=3000 payment_key=present
+<p>Now compare the broken path:</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  APP_ENV=production
+  PAYMENT_API_BASE_URL=https://staging-payments.example
+  PAYMENT_API_KEY=staging key
+
+Naive startup:
+  every variable exists
+  worker becomes ready
+  checkout jobs call staging provider
+  production payments fail
 </code></pre></div>
 
-<p>It should not log:</p>
-<div class="codehilite"><pre><span></span><code>PAYMENT_API_KEY=sk_live_full_secret_value_here
-SESSION_COOKIE_SECRET=...
+<p>The missing check was not "is the value present?"</p>
+<p>The missing check was:</p>
+<div class="codehilite"><pre><span></span><code>Are these values coherent for this environment?
 </code></pre></div>
 
-<p>So far, the mechanism is a boundary at startup. The service turns raw deploy input into validated settings, refuses unsafe states, and reveals enough non-secret evidence to debug environment mismatch.</p>
+<p>That is why startup validation should check presence, type, range, and unsafe combinations.</p>
+<p><strong>Check:</strong> <code>APP_ENV=production</code> and <code>PAYMENT_API_BASE_URL=https://staging-payments.example</code> are both present and parseable. Should startup validation pass?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The values exist, but they are incoherent. A production worker should not silently call a staging payment provider unless there is an explicit, controlled exception.</p>
 <h2>Secrets Need Different Handling</h2>
-<p>All secrets are configuration, but not all configuration is secret. <code>LOG_LEVEL=info</code> is config but usually not secret. <code>PAYMENT_API_KEY</code> is both config and secret. Treating them the same creates avoidable risk.</p>
-<p>Secrets require different handling because possession often grants access. A leaked database password may allow data access. A leaked signing secret may allow forged sessions. A leaked payment key may move money or expose transaction data.</p>
+<p>All secrets are configuration.</p>
+<p>Not all configuration is secret.</p>
+<p><code>LOG_LEVEL=info</code> is configuration, but it is usually not secret. <code>PAYMENT_API_KEY</code> is configuration and secret. Treating both the same creates risk.</p>
+<p>Secrets need stricter handling because possession often grants power:</p>
+<ul>
+<li>a database password may allow data access,</li>
+<li>a payment API key may move money or reveal transaction data,</li>
+<li>a session signing secret may allow forged sessions,</li>
+<li>a private key may impersonate a service.</li>
+</ul>
 <p>Good secret handling includes:</p>
 <ul>
-<li>Store secrets outside source control.</li>
-<li>Inject secrets through deployment or a secret manager.</li>
-<li>Do not print secrets in logs, error messages, metrics labels, or test output.</li>
-<li>Keep separate secrets for local, staging, and production.</li>
-<li>Rotate secrets with a planned overlap when clients and servers need time to switch.</li>
-<li>Limit each secret to the permissions it needs.</li>
+<li>store secrets outside source control,</li>
+<li>inject secrets through deployment or a secret manager,</li>
+<li>avoid printing secrets in logs, errors, metrics labels, test output, or screenshots,</li>
+<li>keep separate secrets for local, staging, and production,</li>
+<li>limit each secret to the permissions it needs,</li>
+<li>rotate secrets with a planned transition.</li>
 </ul>
-<p>Rotation is where many beginner designs break. Suppose <code>SESSION_COOKIE_SECRET</code> signs user sessions. If you replace it instantly, every existing session may become invalid. That may be acceptable during an incident, but not for routine rotation. A rotation-friendly design might allow a new signing key and one or more old verification keys:</p>
-<div class="codehilite"><pre><span></span><code>sign with: key_2026_06
-verify with: key_2026_06, key_2026_05
-after old sessions expire: remove key_2026_05
+<p>Safe logs should describe secret state without revealing secret material.</p>
+<p>Prefer:</p>
+<div class="codehilite"><pre><span></span><code>payment_api_key=present version=payments-prod-v4
+session_cookie_secret=present version=session-2026-07
 </code></pre></div>
 
-<p>For payment provider keys, the plan may be different: deploy support for reading <code>PAYMENT_API_KEY_NEW</code>, switch traffic, verify success, then revoke the old key. The exact mechanism depends on provider and platform. The constant idea is that rotation is a workflow, not just editing a value.</p>
-<p>Quick check: should startup logs print the first eight characters of a production API key to help debugging?</p>
-<p>Answer: usually no. Even partial secrets can become sensitive when combined with other leaks or provider conventions. Prefer safe presence checks, secret version IDs, or secret manager metadata that does not reveal key material.</p>
-<h2>Environment Drift and Feature Flags</h2>
-<p>Configuration drift means environments differ in ways nobody intended or can quickly explain. Local may use one timeout. Staging may use a different provider URL. Production may have an old feature flag. Drift is not always bad; environments are supposed to differ. The danger is untracked or unvalidated difference.</p>
-<p>Feature flags are a common source of drift. A flag such as <code>FEATURE_NEW_CHECKOUT=true</code> can be useful for gradual rollout. It can also mean staging and production are testing different code paths. A backend team should know which flags affect critical paths, who owns them, when they expire, and what evidence proves which value was active during an incident.</p>
-<p>For the checkout worker, safe operational evidence might include:</p>
+<p>Avoid:</p>
+<div class="codehilite"><pre><span></span><code>PAYMENT_API_KEY=sk_live_full_secret_value_here
+SESSION_COOKIE_SECRET=full_secret_here
+</code></pre></div>
+
+<p>Even partial secrets can be risky. Printing the first eight characters may feel harmless, but providers sometimes encode meaning in prefixes, and partial leaks can combine with other evidence. Use secret version IDs, names, or metadata instead.</p>
+<p><strong>Check:</strong> Should startup logs print the first eight characters of a production API key to help debugging?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Usually no. Prefer safe presence checks and secret version metadata. Logs should help operators debug without leaking key material.</p>
+<h2>Rotation Is a Workflow</h2>
+<p>Changing a secret is not always one edit.</p>
+<p>Suppose <code>SESSION_COOKIE_SECRET</code> signs user sessions.</p>
+<p>If you replace it instantly, every existing session may fail verification. That may be acceptable during an incident. It is usually too disruptive for routine rotation.</p>
+<p>A rotation-friendly design might use one key for signing and multiple keys for verification:</p>
+<div class="codehilite"><pre><span></span><code>before:
+  sign with: key_2026_06
+  verify with: key_2026_06
+
+during rotation:
+  sign with: key_2026_07
+  verify with: key_2026_07, key_2026_06
+
+after old sessions expire:
+  sign with: key_2026_07
+  verify with: key_2026_07
+</code></pre></div>
+
+<p>Payment keys may need a different workflow:</p>
+<div class="codehilite"><pre><span></span><code>1. create new provider key with the right permissions
+2. deploy support for reading the new secret version
+3. switch traffic to the new key
+4. verify payment success and error rates
+5. revoke the old key
+</code></pre></div>
+
+<p>The constant idea is:</p>
+<div class="codehilite"><pre><span></span><code>Rotation changes live behavior.
+Plan overlap.
+Verify success.
+Remove old access.
+</code></pre></div>
+
+<p>Rotation is also a testing and deployment concern. If the app only supports one signing key, routine rotation becomes a user-facing logout event. If workers cache secrets forever, rotation may not take effect until every worker restarts.</p>
+<h2>Drift, Flags, and Safe Evidence</h2>
+<p>Configuration drift means environments differ in ways the team cannot quickly explain.</p>
+<p>Some differences are intended:</p>
+<div class="codehilite"><pre><span></span><code>local uses local database
+staging uses staging payment provider
+production uses live payment provider
+</code></pre></div>
+
+<p>The dangerous differences are untracked or unvalidated:</p>
+<div class="codehilite"><pre><span></span><code>production has an old timeout
+staging uses a different feature flag
+one worker has a stale secret version
+debug logging is accidentally enabled in production
+</code></pre></div>
+
+<p>Feature flags are configuration too. A flag such as <code>FEATURE_NEW_CHECKOUT=true</code> can help gradual rollout. It can also make staging and production exercise different code paths. For critical paths, know who owns the flag, when it expires, and what evidence shows which value was active.</p>
+<p>Good operational evidence is safe and specific:</p>
 <div class="codehilite"><pre><span></span><code>app_env=production
 release_sha=abc123
-config_version=orders-prod-2026-06-25
+config_version=orders-prod-2026-07-01
 new_checkout_enabled=false
 payment_provider=live
 payment_api_key_version=payments-prod-v4
 </code></pre></div>
 
-<p>This evidence is not a substitute for secret protection. It is a way to debug without exposing secrets. When payment failures rise, operators can quickly see whether production is pointed at the live provider, whether a rollout flag changed, and whether a new secret version was deployed.</p>
-<p>The trade-off is noise. If every config value is logged on every request, logs become expensive and risky. Prefer startup summaries, metrics dimensions for safe low-cardinality values, and deployment records that connect release, environment, and config version.</p>
-<p>This also makes rollback decisions faster.</p>
-<h2>Failure Modes and Signals</h2>
-<p>Configuration failures usually look like ordinary runtime failures until you ask what varied at deploy time:</p>
+<p>This evidence does not replace secret protection. It helps operators answer:</p>
 <ul>
-<li>Production uses a staging API key or base URL.</li>
-<li>A required environment variable is missing and defaults to unsafe behavior.</li>
-<li>A string value such as <code>"false"</code> is treated as truthy by careless parsing.</li>
-<li>Local development relies on a <code>.env</code> value that deployment never sets.</li>
-<li>A secret is committed to source control or printed in logs.</li>
-<li>A rotated secret breaks old sessions or background workers.</li>
-<li>Staging and production use different feature flags without a recorded reason.</li>
-<li>A timeout is set too high or too low for one environment.</li>
+<li>Which release is running?</li>
+<li>Which environment is this?</li>
+<li>Which config version was loaded?</li>
+<li>Which safe feature flag values were active?</li>
+<li>Which secret version, not secret value, was used?</li>
 </ul>
-<p>The operational signals include startup validation failures, readiness probe failures, safe config summaries, secret version metadata, deployment change records, error rates by environment, and alerts when required config is absent. A service should fail fast for missing required configuration. Running with a silent fallback such as <code>PAYMENT_API_KEY=""</code> is worse than refusing to start.</p>
-<p>The limit is that configuration validation cannot prove every dependency is healthy. A syntactically valid database URL may still point to a down database. That belongs to connection checks and readiness. The configuration boundary proves the service received coherent instructions; health checks prove dependencies are usable enough to serve.</p>
-<p>Quick check: <code>APP_ENV=production</code> and <code>PAYMENT_API_BASE_URL=https://staging-payments.example</code> are both present and parseable. Should startup validation pass?</p>
-<p>Answer: no. This is an unsafe environment combination. Validation should reject production pointed at a staging payment endpoint unless there is an explicit, controlled exception.</p>
-<h2>Readiness Check</h2>
-<p>Close the lesson and review this deployment configuration:</p>
+<p>Do not log every configuration value on every request. That creates noise and risk. Prefer startup summaries, deployment records, readiness state, and safe metrics dimensions with low cardinality.</p>
+<h2>A Small Decision Table</h2>
+<p>When reviewing a new setting, ask what kind of value it is before deciding where it belongs.</p>
+<div class="codehilite"><pre><span></span><code>Value                         Kind                         Handling
+APP_ENV                       config                       validate allowed value
+REQUEST_TIMEOUT_MS            config                       parse integer and range
+FEATURE_NEW_CHECKOUT          config                       record owner and expiry
+PAYMENT_API_BASE_URL          config                       validate environment match
+PAYMENT_API_KEY               secret config                inject securely, redact logs
+SESSION_COOKIE_SECRET         secret config                support rotation overlap
+DATABASE_URL                  sensitive config             restrict access, avoid logs
+</code></pre></div>
+
+<p>This table helps because "configuration" is not one storage bucket. A timeout, a feature flag, and a signing secret all arrive through the deploy boundary, but they do not deserve the same treatment.</p>
+<p>A timeout should be easy to see in safe startup evidence because it affects behavior and helps debugging. A feature flag should have ownership because it changes which code path runs. A payment key should be present and versioned, but not visible. A session signing secret should have a rotation plan because old sessions may still need verification.</p>
+<p>The design review question is:</p>
+<div class="codehilite"><pre><span></span><code>If this value is wrong, when do we want to find out?
+</code></pre></div>
+
+<p>For required values, the answer is usually startup. Missing <code>DATABASE_URL</code> or malformed <code>REQUEST_TIMEOUT_MS</code> should stop readiness before the service handles work.</p>
+<p>For dangerous combinations, the answer is also startup. Production pointed at staging payments is not a runtime surprise we should let customers discover.</p>
+<p>For values that intentionally vary, the answer is safe evidence. Operators should be able to see that <code>FEATURE_NEW_CHECKOUT=false</code> was active for release <code>abc123</code> without exposing secrets or dumping every environment variable.</p>
+<p>This connects back to testing. A unit test can prove the parser rejects <code>"ten_seconds"</code>. An integration or deployment smoke test can prove the service refuses readiness with incoherent production settings. But the operational habit is bigger than one test: make configuration reviewable as a boundary.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Separating code from configuration makes deployment flexible. The same artifact can run locally, in staging, and in production.</p>
+<p>It also creates a new failure mode: the artifact may be correct while the environment instructions are wrong.</p>
+<p>The main trade-off is <strong>flexible deployment versus configuration drift</strong>.</p>
+<p>Moving values out of code means one release can run in many environments. That is useful. It also means two environments can quietly diverge until the wrong value causes a production failure.</p>
+<p>Startup validation improves safety because the service fails before handling traffic. It costs discipline. Teams must maintain a schema for settings, reject unsafe combinations, and keep environment rules current.</p>
+<p>Secret management reduces leak risk. It costs operational work: access control, rotation planning, audit trails, and platform integration.</p>
+<p>Safe config evidence improves debugging. It costs judgment because too much detail leaks information or creates noisy logs.</p>
+<p>This lesson does not prove dependencies are healthy. A valid <code>DATABASE_URL</code> can still point to a down database. Configuration validation answers:</p>
+<div class="codehilite"><pre><span></span><code>Did the service receive coherent instructions?
+</code></pre></div>
+
+<p>Readiness and health checks answer:</p>
+<div class="codehilite"><pre><span></span><code>Can the service use what it needs right now?
+</code></pre></div>
+
+<p>The signal that this boundary is weak is an incident where the code and tests are fine, but a deploy-time value makes the service behave like the wrong environment.</p>
+<h2>Practice</h2>
+<p>Review this deployment configuration:</p>
 <div class="codehilite"><pre><span></span><code>APP_ENV=production
 DATABASE_URL=postgres://orders-prod
 PAYMENT_API_BASE_URL=https://staging-payments.example
@@ -224,42 +388,55 @@ PAYMENT_API_KEY=present
 SESSION_COOKIE_SECRET=present
 LOG_LEVEL=debug
 REQUEST_TIMEOUT_MS=ten_seconds
+FEATURE_NEW_CHECKOUT=true
 </code></pre></div>
 
-<p>Use this rubric:</p>
+<p>A good answer should mention:</p>
 <ul>
-<li>Identify which values are config and which are secrets.</li>
-<li>Name at least two startup validation failures.</li>
-<li>State what should be logged safely.</li>
-<li>State whether the service should become ready.</li>
-<li>Name one rotation concern.</li>
+<li>All values are deploy-time configuration.</li>
+<li><code>DATABASE_URL</code>, <code>PAYMENT_API_KEY</code>, and <code>SESSION_COOKIE_SECRET</code> are sensitive or secret-bearing values.</li>
+<li>Startup validation should reject production using a staging payment base URL.</li>
+<li><code>REQUEST_TIMEOUT_MS=ten_seconds</code> should fail type parsing because the app expects an integer.</li>
+<li><code>LOG_LEVEL=debug</code> in production should be rejected or require an explicit controlled exception.</li>
+<li>The service should not become ready.</li>
+<li>Logs may safely show environment, config version, provider family, timeout parse failure, and secret version metadata, but not raw secret values.</li>
+<li>A rotation concern is that changing <code>SESSION_COOKIE_SECRET</code> may invalidate existing sessions unless old verification keys remain during a transition.</li>
 </ul>
-<p>A solid answer might say: all values are deploy-time configuration; <code>DATABASE_URL</code>, <code>PAYMENT_API_KEY</code>, and <code>SESSION_COOKIE_SECRET</code> include secret or sensitive connection material. Startup validation should reject production using the staging payment base URL, <code>REQUEST_TIMEOUT_MS</code> not being an integer, and possibly <code>LOG_LEVEL=debug</code> in production. Logs can safely say the payment key is present and name a secret version, but not print the key. The service should not become ready. A rotation concern is that changing the session cookie secret may invalidate existing sessions unless the system supports old verification keys during a transition.</p>
+<p>Model answer:</p>
+<p>This service should not become ready. The values are present, but the production environment points at the staging payment provider, the timeout is not parseable as an integer, and debug logging in production is risky unless explicitly approved. The startup summary can say <code>payment_key=present</code> and name a secret version, but it should not print the key. For session secret rotation, the service should support signing with the new key while verifying old sessions until they expire.</p>
+<h2>Connections</h2>
+<p>Lesson 011 asked what a test boundary can prove. This lesson shows a failure that tests may miss if the wrong values are injected at deploy time.</p>
+<p>The next lesson uses the same boundary thinking for containers: what belongs in the deployable image, and what must stay outside as runtime configuration or external dependency state.</p>
 <h2>Resources</h2>
 <ul>
-<li>[GUIDE] <a href="https://12factor.net/config">The Twelve-Factor App: Config</a><ul>
-<li>Focus: Use this for the core distinction between code and deploy-specific configuration.</li>
+<li>[REFERENCE] <a href="https://12factor.net/config">The Twelve-Factor App: Config</a><ul>
+<li>Link: https://12factor.net/config</li>
+<li>Focus: Use this for the separation between code and deploy-specific configuration.</li>
 </ul>
 </li>
-<li>[DOC] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html">OWASP Secrets Management Cheat Sheet</a><ul>
+<li>[REFERENCE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html">OWASP Secrets Management Cheat Sheet</a><ul>
+<li>Link: https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html</li>
 <li>Focus: Read for secret storage, access control, rotation, and leakage risks.</li>
 </ul>
 </li>
 <li>[DOC] <a href="https://kubernetes.io/docs/concepts/configuration/secret/">Kubernetes: Secrets</a><ul>
+<li>Link: https://kubernetes.io/docs/concepts/configuration/secret/</li>
 <li>Focus: Use this as a concrete platform example of injecting sensitive configuration.</li>
 </ul>
 </li>
 <li>[DOC] <a href="https://docs.doppler.com/docs/secrets-rotation">Doppler: Secrets Rotation</a><ul>
-<li>Focus: Compare a product-oriented explanation of rotation workflows and operational concerns.</li>
+<li>Link: https://docs.doppler.com/docs/secrets-rotation</li>
+<li>Focus: Compare one product-oriented explanation of rotation workflows and operational concerns.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Configuration is deploy-time input; secrets are sensitive configuration that need stricter storage, logging, and rotation rules.</li>
-<li>A backend should parse and validate configuration at startup, then refuse unsafe or incoherent environment combinations.</li>
-<li>Separating code from config enables flexible deployment, but it also creates drift unless values are versioned, validated, and observable.</li>
-<li>Safe operational evidence should reveal environment and config state without exposing secret material.</li>
+<li>Configuration is deploy-time input; secrets are sensitive configuration with stricter handling rules.</li>
+<li>Startup validation should parse values, check required settings, and reject unsafe environment combinations before readiness.</li>
+<li>Safe operational evidence should reveal environment, config version, and secret version metadata without exposing secret material.</li>
+<li>Secret rotation is a workflow with overlap, verification, and old-access removal.</li>
+<li>Separating code from config enables flexible deployment, but it also creates drift unless values are validated and observable.</li>
 </ul>
 </section>
 
@@ -289,7 +466,7 @@ REQUEST_TIMEOUT_MS=ten_seconds
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-06-28 18:31 UTC | @jepemo | Built with
+        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
