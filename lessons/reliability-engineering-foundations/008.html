@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dependency Failure and Graceful Degradation - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/reliability-engineering-foundations.html" aria-label="Exit lesson and return to Reliability Engineering Foundations">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Dependency Failure and Graceful Degradation</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/reliability-and-observability.html">Reliability And Observability</a>
+    /
+    <a href="../../tracks/reliability-engineering-foundations.html">Reliability Engineering Foundations</a>
+    /
+    008
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/reliability-engineering-foundations.html">Reliability Engineering Foundations</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">008</span>
+    <span class="meta-chip">25 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Dependency Failure and Graceful Degradation</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Classify dependencies by the part of the user promise they can break.</p>
+</li>
+<li>
+<p>Design a degraded mode that preserves the most important promise when a dependency fails.</p>
+</li>
+<li>
+<p>Review a dependency outage plan for fallback behavior, timeouts, retries, and honest user communication.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Graceful degradation means choosing a smaller honest promise before a dependency failure turns into total failure.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>The checkout service has learned several reliability habits.</p>
+<p>It has a user promise. It has SLIs and SLOs. It pages on symptoms. It watches capacity, saturation, and safety margin.</p>
+<p>Then the payment provider starts timing out.</p>
+<p>At first, checkout is still "up." The API responds. The database is healthy. CPU is fine.</p>
+<p>But every checkout request waits on the payment provider.</p>
+<div class="codehilite"><pre><span></span><code>user clicks Pay
+  -&gt; checkout API validates cart
+  -&gt; checkout API reserves inventory
+  -&gt; checkout API calls payment provider
+  -&gt; payment provider times out
+  -&gt; checkout API waits, retries, waits again
+  -&gt; user sees spinner
+  -&gt; user clicks Pay again
+</code></pre></div>
+
+<p>One external dependency is failing, but the local service is now at risk too.</p>
+<p>Workers stay occupied. Queues grow. Retries add load. Users lose a clear result. Duplicate-charge risk rises.</p>
+<p>The naive design says:</p>
+<div class="codehilite"><pre><span></span><code>If payment is down, checkout is down.
+</code></pre></div>
+
+<p>Sometimes that is true. You cannot honestly say an order is paid if payment is unknown.</p>
+<p>But "we cannot complete the ideal path" does not always mean "we must fail everything." A better design asks:</p>
+<div class="codehilite"><pre><span></span><code>What smaller promise can we keep safely?
+</code></pre></div>
+
+<p>For checkout, the smaller promise might be:</p>
+<div class="codehilite"><pre><span></span><code>If payment confirmation is unavailable, give the user a clear pending state
+within 2 minutes, do not charge twice, and reconcile later.
+</code></pre></div>
+
+<p>That is graceful degradation.</p>
+<p>Plain meaning:</p>
+<p><strong>Graceful degradation</strong> means the service keeps a reduced, honest behavior when one part fails, instead of collapsing into confusing or unsafe behavior.</p>
+<p>In this scenario:</p>
+<p>Checkout stops promising "paid now" when the provider is unhealthy. It promises "safely pending, no duplicate charge, clear next state."</p>
+<p>Technical name:</p>
+<p>That reduced operating behavior is a <strong>degraded mode</strong>.</p>
+<h2>The Naive Dependency Model</h2>
+<p>A simple dependency diagram often looks like this:</p>
+<div class="codehilite"><pre><span></span><code>checkout -&gt; payment provider
+checkout -&gt; inventory service
+checkout -&gt; fraud service
+checkout -&gt; email service
+</code></pre></div>
+
+<p>The naive model treats each arrow as equally required.</p>
+<div class="codehilite"><pre><span></span><code>If a dependency is used by checkout, checkout needs it.
+If checkout needs it, failure should fail the request.
+If failure fails the request, the only answer is to wait or retry.
+</code></pre></div>
+
+<p>That model creates two problems.</p>
+<p>First, it hides different kinds of promises.</p>
+<p>Payment authorization is not the same as sending a receipt email.</p>
+<p>Inventory reservation is not the same as fraud enrichment.</p>
+<p>A user-facing final state is not the same as an internal analytics event.</p>
+<p>Second, it makes retries look like the only reliability tool.</p>
+<p>Retries can help when a failure is brief and independent. They can hurt when the dependency is slow or overloaded. A retry that waits too long can consume local workers. A retry loop can turn one dependency failure into local saturation.</p>
+<p>A better model classifies each dependency by the promise it protects.</p>
+<table>
+<thead>
+<tr>
+<th>Dependency</th>
+<th>If it fails, what promise is at risk?</th>
+<th>Can checkout degrade?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Payment provider</td>
+<td>User must not be charged incorrectly; checkout needs a truthful payment state.</td>
+<td>Yes, if checkout can move to a safe pending state and reconcile later.</td>
+</tr>
+<tr>
+<td>Inventory service</td>
+<td>User should not buy unavailable items.</td>
+<td>Maybe, if inventory was reserved earlier or the product allows backorder.</td>
+</tr>
+<tr>
+<td>Fraud service</td>
+<td>Risk checks may be incomplete.</td>
+<td>Often yes, by using stricter limits, manual review, or disabling high-risk orders.</td>
+</tr>
+<tr>
+<td>Email service</td>
+<td>Receipt may be delayed.</td>
+<td>Yes, show receipt in app and send email later.</td>
+</tr>
+<tr>
+<td>Analytics pipeline</td>
+<td>Business event may be delayed.</td>
+<td>Yes, buffer or drop according to policy; do not block checkout.</td>
+</tr>
+</tbody>
+</table>
+<p>The design question is not:</p>
+<div class="codehilite"><pre><span></span><code>Can this dependency fail?
+</code></pre></div>
+
+<p>It can.</p>
+<p>The design question is:</p>
+<div class="codehilite"><pre><span></span><code>When it fails, what exact user promise do we still keep?
+</code></pre></div>
+
+<h2>Strong, Weak, and Optional Dependencies</h2>
+<p>A useful reliability review separates dependencies into three groups.</p>
+<p><strong>Strong dependency</strong></p>
+<p>The service cannot keep the core promise without this dependency.</p>
+<p>Example:</p>
+<div class="codehilite"><pre><span></span><code>Checkout cannot say &quot;paid&quot; without a trustworthy payment result.
+</code></pre></div>
+
+<p>Strong does not always mean "block forever." It means the ideal response is impossible without the dependency.</p>
+<p><strong>Weak dependency</strong></p>
+<p>The service can keep a smaller promise without this dependency.</p>
+<p>Example:</p>
+<div class="codehilite"><pre><span></span><code>Checkout cannot finish payment confirmation, but it can create a pending order
+with an idempotency key and reconcile later.
+</code></pre></div>
+
+<p>Weak dependencies are where graceful degradation usually lives.</p>
+<p><strong>Optional dependency</strong></p>
+<p>The service can keep the user promise without this dependency.</p>
+<p>Example:</p>
+<div class="codehilite"><pre><span></span><code>Email receipt can be sent later.
+Analytics can be buffered.
+Recommendations can be hidden.
+</code></pre></div>
+
+<p>Optional dependencies should almost never block the core path during a failure.</p>
+<p><strong>Check:</strong> The fraud service is timing out. Low-risk orders can be marked pending for later review, but high-risk orders must not proceed. Is the fraud service strong, weak, or optional?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It is weak for some traffic and strong for other traffic. The degraded mode can allow low-risk orders into pending review while rejecting or delaying high-risk orders. Dependency strength can depend on request type and risk.</p>
+<h2>A Worked Degradation Plan</h2>
+<p>Design the degraded mode for a payment-provider outage.</p>
+<p>Start with the normal promise:</p>
+<div class="codehilite"><pre><span></span><code>Normal checkout promise:
+  Users receive a clear result within 2 minutes:
+  paid, declined, or safely pending.
+
+Correctness promise:
+  Users are not charged twice for one checkout attempt.
+</code></pre></div>
+
+<p>Now state the failure:</p>
+<div class="codehilite"><pre><span></span><code>Dependency failure:
+  payment provider timeout rate is above 30%
+  provider p95 latency is above 8 seconds
+  clear-result SLI is beginning to burn
+</code></pre></div>
+
+<p>The naive path is:</p>
+<div class="codehilite"><pre><span></span><code>try payment
+  -&gt; wait
+  -&gt; timeout
+  -&gt; retry
+  -&gt; wait
+  -&gt; retry
+  -&gt; user waits
+  -&gt; worker stays occupied
+  -&gt; user retries manually
+  -&gt; duplicate risk increases
+</code></pre></div>
+
+<p>That path is dangerous because it creates both latency and correctness risk.</p>
+<p>Now design the degraded path.</p>
+<table>
+<thead>
+<tr>
+<th>Design choice</th>
+<th>Degraded behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>User promise</td>
+<td>"We received your order attempt. Payment confirmation is pending. You will not be charged twice for this checkout attempt."</td>
+</tr>
+<tr>
+<td>Timeout</td>
+<td>Stop waiting for provider confirmation after a short bounded timeout, such as 2 seconds on the user request path.</td>
+</tr>
+<tr>
+<td>Retry policy</td>
+<td>Do not retry many times in the user request. Move reconciliation to a controlled background process with idempotency keys and retry limits.</td>
+</tr>
+<tr>
+<td>State</td>
+<td>Store <code>payment_pending</code> with order ID, idempotency key, provider attempt ID when available, and next reconciliation time.</td>
+</tr>
+<tr>
+<td>User response</td>
+<td>Show a clear pending result, not an endless spinner and not a fake success.</td>
+</tr>
+<tr>
+<td>Alert</td>
+<td>Page on clear-result SLO burn or duplicate-charge risk, not only on provider timeout rate.</td>
+</tr>
+<tr>
+<td>Recovery</td>
+<td>Reconciler checks provider state later and moves order to <code>paid</code>, <code>declined</code>, or <code>needs_support_review</code>.</td>
+</tr>
+<tr>
+<td>Stop condition</td>
+<td>If pending queue age grows beyond the promise, pause new payment attempts or disable the promotion.</td>
+</tr>
+</tbody>
+</table>
+<p>Trace one request.</p>
+<p>Input:</p>
+<div class="codehilite"><pre><span></span><code>User U submits checkout attempt A with idempotency key K.
+</code></pre></div>
+
+<p>Transition:</p>
+<div class="codehilite"><pre><span></span><code>Checkout validates the cart and writes an order attempt.
+Checkout calls payment provider with key K.
+Provider does not answer within the bounded timeout.
+</code></pre></div>
+
+<p>Intermediate state:</p>
+<div class="codehilite"><pre><span></span><code>Order state:
+  payment_pending
+
+Stored evidence:
+  user ID
+  order ID
+  idempotency key K
+  provider attempt ID if known
+  timeout reason
+  next reconciliation time
+</code></pre></div>
+
+<p>Output:</p>
+<div class="codehilite"><pre><span></span><code>User sees:
+  &quot;Payment is pending. Do not retry this checkout.
+   We will update the order when confirmation arrives.&quot;
+</code></pre></div>
+
+<p>Later transition:</p>
+<div class="codehilite"><pre><span></span><code>Reconciler asks provider about attempt K.
+If provider accepted payment, order becomes paid.
+If provider declined payment, order becomes declined.
+If provider state is still unknown after a limit, order goes to support review.
+</code></pre></div>
+
+<p>Naive failure contrast:</p>
+<div class="codehilite"><pre><span></span><code>Without the degraded mode, the request waits too long, retries too much,
+occupies workers, and invites the user to retry manually.
+That can break latency, availability, and correctness at the same time.
+</code></pre></div>
+
+<p>The degraded mode does not make the provider healthy. It protects the local promise from becoming dishonest or unsafe.</p>
+<h2>Circuit Breakers, Fallbacks, and Honest Responses</h2>
+<p>Three design tools often appear in degraded modes.</p>
+<p><strong>Timeout</strong></p>
+<p>A timeout says:</p>
+<div class="codehilite"><pre><span></span><code>We will not wait forever.
+</code></pre></div>
+
+<p>Without a timeout, a slow dependency can consume workers until the local service saturates.</p>
+<p><strong>Circuit breaker</strong></p>
+<p>A circuit breaker says:</p>
+<div class="codehilite"><pre><span></span><code>This dependency is failing enough that we should stop sending normal traffic
+for a short period.
+</code></pre></div>
+
+<p>It protects the dependency from more load and protects the caller from waiting on a path that is probably unhealthy.</p>
+<p>For checkout:</p>
+<div class="codehilite"><pre><span></span><code>If provider timeouts exceed the threshold,
+open the circuit for normal payment attempts.
+
+While open:
+  create safe pending states
+  do not run repeated user-path retries
+  allow controlled probe requests to test recovery
+</code></pre></div>
+
+<p><strong>Fallback</strong></p>
+<p>A fallback says:</p>
+<div class="codehilite"><pre><span></span><code>Here is the alternative behavior while the normal path is unavailable.
+</code></pre></div>
+
+<p>A fallback must be honest.</p>
+<p>Bad fallback:</p>
+<div class="codehilite"><pre><span></span><code>&quot;Payment succeeded&quot; when the payment state is unknown.
+</code></pre></div>
+
+<p>Good fallback:</p>
+<div class="codehilite"><pre><span></span><code>&quot;Payment is pending. We will confirm soon. Do not retry.&quot;
+</code></pre></div>
+
+<p>The fallback should preserve the most important part of the promise.</p>
+<p>For checkout, correctness is more important than pretending everything is fast. A clear pending state is less convenient than immediate success, but it is safer than duplicate charges or ambiguous failure.</p>
+<p><strong>Check:</strong> Why is "show success and fix it later" a bad fallback for an unknown payment result?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It lies about state. If the payment later fails, the user saw a false success. If the user retries, the system may create duplicate risk. A degraded mode must be smaller than the normal promise, but still truthful.</p>
+<h2>Designing the Degraded Promise</h2>
+<p>A degraded mode needs a written promise.</p>
+<p>Use this shape:</p>
+<div class="codehilite"><pre><span></span><code>When &lt;dependency or capability&gt; is unhealthy,
+the service will still &lt;preserved promise&gt;,
+but it will not &lt;normal capability that is unavailable&gt;,
+and users/operators will see &lt;honest signal&gt;.
+</code></pre></div>
+
+<p>For checkout:</p>
+<div class="codehilite"><pre><span></span><code>When the payment provider is timing out,
+checkout will still give users a clear pending state within 2 minutes
+and protect idempotency for the checkout attempt,
+but it will not promise immediate paid or declined status,
+and users will see pending payment with a clear next step.
+</code></pre></div>
+
+<p>Now connect that promise to controls.</p>
+<table>
+<thead>
+<tr>
+<th>Control</th>
+<th>Why it exists</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Short user-path timeout</td>
+<td>Prevents one slow dependency from consuming local workers.</td>
+</tr>
+<tr>
+<td>Idempotency key</td>
+<td>Prevents duplicate charge attempts for one checkout action.</td>
+</tr>
+<tr>
+<td>Pending state</td>
+<td>Gives the user an honest result instead of a spinner.</td>
+</tr>
+<tr>
+<td>Background reconciler</td>
+<td>Moves uncertain payment state toward a final state later.</td>
+</tr>
+<tr>
+<td>Retry cap</td>
+<td>Prevents recovery work from becoming overload.</td>
+</tr>
+<tr>
+<td>Circuit breaker</td>
+<td>Stops sending normal traffic into a dependency that is probably failing.</td>
+</tr>
+<tr>
+<td>Queue-age alert</td>
+<td>Detects when the degraded mode itself is falling behind.</td>
+</tr>
+<tr>
+<td>Support review state</td>
+<td>Handles cases that remain ambiguous after automated reconciliation.</td>
+</tr>
+</tbody>
+</table>
+<p>This is design work, not only operations work.</p>
+<p>The degraded behavior must exist before the incident. During the incident, the team should be choosing and operating known modes, not inventing the state machine under pressure.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Graceful degradation improves reliability because it avoids all-or-nothing behavior.</p>
+<p>It can preserve a smaller but valuable promise while a dependency is slow, overloaded, or unavailable. It can also prevent retries from turning an external failure into local saturation.</p>
+<p>It costs product clarity and engineering complexity.</p>
+<p>You need extra states, user messages, reconciliation logic, idempotency, dashboards, and support flows. You also need to test the degraded path. An untested degraded mode is often just a hopeful diagram.</p>
+<p>It does not solve every dependency failure.</p>
+<p>Some dependencies are truly strong for some promises. If payment cannot be trusted, checkout cannot honestly say "paid." If inventory cannot be known for a scarce item, the service may need to stop selling that item.</p>
+<p>You can see the boundary when:</p>
+<div class="codehilite"><pre><span></span><code>the degraded queue grows without catching up
+support cannot explain pending states to users
+the fallback hides important risk
+reconciliation creates duplicate or contradictory states
+the dependency failure lasts longer than the business can tolerate
+</code></pre></div>
+
+<p>The trade-off is:</p>
+<div class="codehilite"><pre><span></span><code>Failing closed protects correctness but may hurt availability.
+Failing open preserves flow but may hurt correctness.
+Graceful degradation chooses the smallest honest promise for the situation.
+</code></pre></div>
+
+<h2>Common Confusions</h2>
+<h3>Confusion: "Graceful degradation means users do not notice"</h3>
+<p>Why it is tempting:</p>
+<p>The word "graceful" can sound like invisible.</p>
+<p>Better model:</p>
+<p>Users may notice a reduced experience. The goal is not invisibility. The goal is honest, bounded, safer behavior.</p>
+<h3>Confusion: "Fallback means fake the normal result"</h3>
+<p>Why it is tempting:</p>
+<p>Teams want the product to feel smooth.</p>
+<p>Better model:</p>
+<p>A fallback must be truthful. It can return cached, partial, delayed, or pending information, but it should not claim certainty the system does not have.</p>
+<h3>Confusion: "Retries are the degraded mode"</h3>
+<p>Why it is tempting:</p>
+<p>Retries are easy to add and sometimes fix transient failures.</p>
+<p>Better model:</p>
+<p>Retries are one control. A degraded mode also needs timeouts, limits, state, user communication, observability, and a recovery path.</p>
+<h3>Confusion: "Every dependency can be made optional"</h3>
+<p>Why it is tempting:</p>
+<p>Optional dependencies make architecture feel safer.</p>
+<p>Better model:</p>
+<p>Some promises require specific dependencies. Reliability design is about naming which promises can shrink and which promises must stop rather than lie.</p>
+<h2>Practice</h2>
+<p>Review this dependency outage plan.</p>
+<div class="codehilite"><pre><span></span><code>Dependency:
+  fraud scoring service
+
+Failure:
+  timeout rate above 40%
+
+Current plan:
+  retry fraud scoring three times in the user request
+  if all retries fail, approve the order
+  send an alert to the fraud team later
+</code></pre></div>
+
+<p>Answer:</p>
+<ol>
+<li>What promise is at risk?</li>
+<li>What is unsafe about the current plan?</li>
+<li>What degraded mode would be safer?</li>
+<li>What signal should show that the degraded mode is reaching its limit?</li>
+</ol>
+<p>Model answer:</p>
+<div class="codehilite"><pre><span></span><code>1. The promise at risk is not only checkout speed. It is also safe ordering:
+   the service should not approve high-risk orders without enough evidence.
+
+2. The current plan waits too long in the user path and then fails open for
+   every order. That may preserve short-term availability but can damage
+   correctness, fraud risk, and business trust.
+
+3. A safer degraded mode could approve only low-risk orders under stricter
+   limits, move uncertain orders to manual review or pending review, reject
+   clearly high-risk orders, and avoid repeated user-path retries.
+
+4. Useful limit signals include pending-review queue age, percentage of orders
+   entering degraded review, fraud-service timeout rate, and SLO burn for clear
+   checkout result. If the pending-review queue grows too old, the degraded
+   mode is no longer preserving the promise.
+</code></pre></div>
+
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] Site Reliability Engineering: Handling Overload<ul>
+<li>Link: <a href="https://sre.google/sre-book/handling-overload/">https://sre.google/sre-book/handling-overload/</a></li>
+<li>Focus: Connect dependency pressure, load shedding, and protecting the caller from overload.</li>
+</ul>
+</li>
+<li>[BOOK] Site Reliability Engineering: Addressing Cascading Failures<ul>
+<li>Link: <a href="https://sre.google/sre-book/addressing-cascading-failures/">https://sre.google/sre-book/addressing-cascading-failures/</a></li>
+<li>Focus: Watch how retries and waiting can spread a failure across services.</li>
+</ul>
+</li>
+<li>[ARTICLE] AWS Builders Library: Timeouts, retries, and backoff with jitter<ul>
+<li>Link: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/</a></li>
+<li>Focus: Use it to reason about bounded retries and why retry storms happen.</li>
+</ul>
+</li>
+<li>[BOOK] Release It!: Design and Deploy Production-Ready Software<ul>
+<li>Link: <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">https://pragprog.com/titles/mnee2/release-it-second-edition/</a></li>
+<li>Focus: Read for stability patterns such as circuit breakers, timeouts, bulkheads, and integration failure.</li>
+</ul>
+</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>A dependency failure should trigger the question: "What smaller honest promise can we still keep?"</li>
+<li>Graceful degradation is not fake success; it is a reduced behavior with truthful state, bounded waiting, and a recovery path.</li>
+<li>Classify dependencies by promise impact: strong, weak, optional, and sometimes different by request type.</li>
+<li>Timeouts, circuit breakers, fallback states, idempotency, retry caps, and reconciliation work together; retries alone are not a degraded mode.</li>
+<li>A degraded mode needs its own signals, especially queue age, pending state age, duplicate-risk signals, and SLO burn.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="007.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Capacity, Saturation, and Safety Margins</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="009.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Incident Interfaces, Triage, and Handoff Boundaries</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/reliability-engineering-foundations.html">← Back to Reliability Engineering Foundations</a></p>
+  <p><a href="../../classifications/reliability-and-observability.html">← Back to Reliability And Observability</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-02 12:38 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
