@@ -76,81 +76,335 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Health Checks, Load Balancing, and Traffic Steering</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain the difference between liveness, readiness, and request-specific health.</p>
+</li>
+<li>
+<p>Map health signals to routing actions such as serve, drain, shed, or fail closed.</p>
+</li>
+<li>
+<p>Review a load-balancing policy for overconfidence, overreaction, and partition-sensitive behavior.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Health is a traffic promise, not a heartbeat; routing is the act of choosing where a request is safe to go with incomplete evidence.</p>
+</blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the learning platform has three progress-service replicas behind a load balancer. One replica is alive as a process, but its database connection pool is exhausted. Another replica is healthy but draining because a deploy is rolling through. A third can serve read-only progress summaries, but should not accept completion writes because it cannot reach the authoritative storage path.</p>
-<p>From outside, all three machines may look "up." From the user's point of view, only some of them are safe destinations for some kinds of traffic. That gap is why health checks and load balancing are not just traffic distribution features. They are how the system turns partial, local health signals into routing decisions while failures are still ambiguous.</p>
-<p>A load balancer cannot magically know whether a service is semantically correct. It can only act on signals the system exposes: readiness checks, liveness checks, error rates, latency, connection state, deployment metadata, and operator policy. If those signals are too shallow, traffic steering will confidently send requests to the wrong place.</p>
-<p>The useful design shift is to treat health as a contract between the service and the routing layer. The trade-off is speed of reaction versus correctness of diagnosis: aggressive checks can remove capacity too quickly, while weak checks can keep broken replicas in rotation until users discover the problem for you.</p>
-<h2>Health Is More Than Process Liveness</h2>
-<p>A service can be running and still be unsafe for user traffic. A process may respond to a simple HTTP ping while its queue is full, its dependency credentials are expired, or its local data is too stale for the operation being routed to it.</p>
-<p>That is why production systems usually separate liveness from readiness:</p>
+<p>The previous lesson showed that a replica can be alive but not authoritative during a partition. This lesson moves from failure theory to traffic control.</p>
+<p>Imagine the learning platform has three progress-service replicas behind a load balancer:</p>
+<div class="codehilite"><pre><span></span><code>P1: process is running, but its database connection pool is exhausted
+P2: process is healthy, but it is draining during a deploy
+P3: can serve cached progress reads, but cannot reach authoritative storage for writes
+</code></pre></div>
+
+<p>From far away, all three may look "up." They answer a simple ping. They have open ports. They may even return <code>200 OK</code> from a shallow endpoint.</p>
+<p>From the user's point of view, they are not equal.</p>
+<p>The naive idea is:</p>
+<blockquote>
+<p>If a replica is up, send it traffic.</p>
+</blockquote>
+<p>That is too coarse. A replica can be alive and still be unsafe for some traffic. It may be safe for reads but not writes. It may be safe for existing connections but not new work. It may be safe from one zone but unreachable from another.</p>
+<p>Health checks and load balancing are not just traffic distribution features. They are how a system turns partial evidence into routing decisions while failure is still ambiguous.</p>
+<h2>The Small Incident</h2>
+<p>During a deploy, learners start reporting that the lesson page loads, but completing a lesson sometimes hangs.</p>
+<p>The router sees this endpoint pool:</p>
+<div class="codehilite"><pre><span></span><code>progress-service endpoints
+  P1 zone A version v2
+  P2 zone B version v2 draining=true
+  P3 zone C version v1 read_only=true
+</code></pre></div>
+
+<p>The user request is:</p>
+<div class="codehilite"><pre><span></span><code>POST /complete-lesson
+learner_id=7
+lesson_id=3016
+idempotency_key=req-3016-a
+</code></pre></div>
+
+<p>If the router sends this write to P1, it may queue behind an exhausted database pool. If it sends the write to P2, it may interrupt deploy draining. If it sends the write to P3, the replica may accept traffic but fail later because it cannot reach authoritative storage.</p>
+<p>Plain meaning:</p>
+<p>Readiness means "this target is a responsible destination for this traffic."</p>
+<p>In this scenario:</p>
+<p>P3 might be ready for <code>GET /progress-summary</code> but not ready for <code>POST /complete-lesson</code>.</p>
+<p>Technical name:</p>
+<p>This is request-class-aware readiness. The health signal depends on what kind of request the router is about to send.</p>
+<h2>Liveness, Readiness, And The Traffic Promise</h2>
+<p>A service can be running and still be unsafe for user traffic.</p>
+<p>Separate these ideas:</p>
 <div class="codehilite"><pre><span></span><code>liveness: should the platform restart this process?
-readiness: should the load balancer send user traffic here?
+readiness: should the router send traffic here?
+startup: has the process finished becoming ready for checks?
+request-specific readiness: is this replica safe for this class of request?
 </code></pre></div>
 
-<p>For the progress service, liveness might only prove that the process can answer a local endpoint. Readiness should prove more: the service can accept the class of requests being routed to it, reach required dependencies, and stay inside latency or error bounds that make it a responsible traffic target.</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">readiness</span><span class="p">(</span><span class="n">dependencies_ok</span><span class="p">,</span> <span class="n">queue_depth</span><span class="p">,</span> <span class="n">draining</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">draining</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">False</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">dependencies_ok</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">False</span>
-    <span class="k">return</span> <span class="n">queue_depth</span> <span class="o">&lt;</span> <span class="mi">1000</span>
+<p>For the progress service:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Question</th>
+<th>Example action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Liveness</td>
+<td>Is the process stuck beyond repair?</td>
+<td>restart if deadlocked</td>
+</tr>
+<tr>
+<td>Readiness</td>
+<td>Should this replica receive normal traffic?</td>
+<td>remove from load balancer</td>
+</tr>
+<tr>
+<td>Startup</td>
+<td>Is initialization still in progress?</td>
+<td>wait before liveness kills it</td>
+</tr>
+<tr>
+<td>Write readiness</td>
+<td>Can this replica safely accept completion writes?</td>
+<td>route writes only to authoritative path</td>
+</tr>
+<tr>
+<td>Read readiness</td>
+<td>Can this replica serve progress summaries?</td>
+<td>allow cached reads with staleness limit</td>
+</tr>
+</tbody>
+</table>
+<p>A shallow health endpoint might say:</p>
+<div class="codehilite"><pre><span></span><code>GET /health -&gt; 200 OK
 </code></pre></div>
 
-<p>The exact thresholds depend on the workload. The important point is that readiness encodes a traffic promise. "Ready for any request" is a stronger claim than "ready for cached reads." If the service cannot express that distinction, the router has to choose between overconfidence and overreaction.</p>
-<p>A shallow readiness check makes the router overconfident. An overly strict readiness check can remove too many replicas during a noisy incident and make overload worse. A good check is specific enough to protect users but conservative enough that one flaky dependency probe does not empty the pool.</p>
+<p>A more useful traffic signal says:</p>
+<div class="codehilite"><pre><span></span><code>process_alive=true
+draining=false
+db_pool_available=false
+authoritative_storage_reachable=false
+cached_reads_allowed=true
+</code></pre></div>
+
+<p>The router cannot invent meaning from a shallow ping. It can only act on signals the service exposes.</p>
+<p><strong>Check:</strong> P3 can serve cached reads but cannot reach authoritative storage. Should the load balancer send <code>POST /complete-lesson</code> to P3?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. P3 may be ready for a read class, but not for an authoritative write class. One generic "up" signal is too broad.</p>
+<h2>A Worked Routing Trace</h2>
+<p>Follow one request through traffic steering.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  POST /complete-lesson
+  requires authoritative progress write
+  user deadline remaining = 500 ms
+
+Transition:
+  router reads endpoint health and metadata
+  P1: alive, db_pool_available=false
+  P2: alive, draining=true
+  P3: alive, read_only=true
+
+Intermediate state:
+  no endpoint is currently a safe write target
+
+Output or decision:
+  reject quickly, shed write traffic, or return retryable unavailable
+  do not route blindly to an &quot;up&quot; replica
+
+Naive failure contrast:
+  round-robin over alive endpoints sends writes to unsafe targets
+  request-aware routing fails closed for writes and may keep reads degraded
+</code></pre></div>
+
+<p>Here is the decision as a table:</p>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Alive?</th>
+<th>Ready for reads?</th>
+<th>Ready for writes?</th>
+<th>Routing decision</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P1</td>
+<td>yes</td>
+<td>maybe</td>
+<td>no, DB pool exhausted</td>
+<td>avoid writes, possibly shed</td>
+</tr>
+<tr>
+<td>P2</td>
+<td>yes</td>
+<td>no new work</td>
+<td>no, draining</td>
+<td>let in-flight finish</td>
+</tr>
+<tr>
+<td>P3</td>
+<td>yes</td>
+<td>yes, cached only</td>
+<td>no, no authoritative storage</td>
+<td>route bounded reads only</td>
+</tr>
+</tbody>
+</table>
+<p>The best action may be disappointing: do not accept the write right now. But a fast, honest unavailable response is often better than sending the write to a target that will hang, duplicate, or create ambiguous state.</p>
+<p>So far:</p>
+<ul>
+<li>liveness protects the process lifecycle</li>
+<li>readiness protects traffic routing</li>
+<li>request-class readiness protects semantics</li>
+<li>routing should use health as evidence, not as magic truth</li>
+</ul>
 <h2>Load Balancing Is A Policy Choice</h2>
-<p>Load balancing sounds like spreading requests evenly, but the real policy is more specific: choose a destination using imperfect information. Round-robin, least-connections, weighted routing, locality-aware routing, and request-class routing each optimize for a different pressure.</p>
+<p>Load balancing sounds like spreading requests evenly. In a real incident, it is more like choosing a destination under uncertainty.</p>
+<p>Different policies optimize for different pressures:</p>
 <div class="codehilite"><pre><span></span><code>round-robin: simple distribution
-least-connections: avoid already-busy replicas
-weighted routing: shift traffic during rollout or migration
+least-connections: avoid already-busy endpoints
+weighted routing: shift traffic during rollout
 locality-aware routing: prefer nearby healthy capacity
-request-class routing: separate reads, writes, or expensive operations
+request-class routing: separate reads, writes, and expensive operations
+outlier detection: reduce traffic to endpoints with bad behavior
 </code></pre></div>
 
-<p>Suppose the catalog service can serve cached lesson metadata from any zone, but progress writes need stricter routing to replicas near the authoritative storage path. Sending both request types through the same policy may be easy, but it hides different failure consequences. A stale catalog read is often tolerable. A duplicated or lost progress write changes the user's state.</p>
-<p>Load balancing also interacts with retries. If a gateway retries a timed-out request, it may choose another replica. That can be useful when one instance is slow. It can be dangerous for side-effecting writes unless the operation is idempotent or deduplicated. The router sees endpoints; the application still owns operation meaning.</p>
-<p>The trade-off is simplicity versus precision. One generic policy is easy to operate, but it may treat unlike requests as if they had the same risk. More precise routing can improve behavior under failure, but it adds configuration, testing, and debugging surface area. The extra precision is only worth it when the request classes really do have different safety or latency needs.</p>
+<p>The learning platform should not necessarily route every request the same way.</p>
+<table>
+<thead>
+<tr>
+<th>Request</th>
+<th>Routing concern</th>
+<th>Safe behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /lesson-metadata</code></td>
+<td>stale answer may be acceptable</td>
+<td>serve cached local read</td>
+</tr>
+<tr>
+<td><code>GET /progress-summary</code></td>
+<td>bounded staleness may be acceptable</td>
+<td>route to read-ready replica</td>
+</tr>
+<tr>
+<td><code>POST /complete-lesson</code></td>
+<td>changes user state</td>
+<td>require write-ready authoritative path</td>
+</tr>
+<tr>
+<td>certificate issuance</td>
+<td>user-visible authority</td>
+<td>fail closed without strong evidence</td>
+</tr>
+</tbody>
+</table>
+<p>This connects directly to the partition lesson. A replica can be healthy from one path and unsafe from another. Health checks should be read as observations from particular paths, not as universal truth.</p>
+<p>The trade-off is simplicity versus precision. One generic policy is easy to operate, but it treats unlike requests as if they had the same risk. More precise routing can improve behavior under failure, but it adds configuration, tests, and debugging work.</p>
+<p><strong>Check:</strong> A router retries a timed-out completion write on a different replica because that replica has fewer connections. What extra fact must the router or application know?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It must know whether the write is safe to repeat, usually through idempotency or deduplication, and whether the new replica is write-ready for the authoritative path.</p>
 <h2>Draining Protects Change</h2>
-<p>Healthy services still need to leave rotation during deploys, scale-downs, and maintenance. Connection draining is the controlled version of disappearance: stop sending new work to a replica, let in-flight work finish if possible, then remove the instance.</p>
+<p>Healthy replicas still need to leave rotation during deploys, scale-downs, and maintenance.</p>
+<p>Connection draining is controlled disappearance:</p>
 <div class="codehilite"><pre><span></span><code>mark draining
   -&gt; stop new requests
-  -&gt; finish in-flight requests
-  -&gt; close long-lived connections or let deadlines expire
+  -&gt; let in-flight requests finish until deadline
+  -&gt; close or migrate long-lived connections
   -&gt; terminate safely
 </code></pre></div>
 
-<p>Without draining, a rolling deploy can create avoidable failures. A replica disappears while users are mid-request. A long upload loses its connection. A retry starts against a new version with slightly different behavior. Draining does not remove all risk, but it gives the system a smaller and more predictable transition.</p>
-<p>The hard part is that not all work drains cleanly. Streaming responses, WebSockets, long-running jobs, and transactions may outlive the deploy budget. The system needs deadlines and fallback behavior, not infinite patience. Draining is a change-management policy, not a promise that every old connection can live forever.</p>
-<h2>Common Design Mistakes</h2>
-<p>One mistake is using a single shallow health endpoint for every decision. "Process is up" is not enough for readiness, routing, or deploy safety. Health checks should match the traffic the replica is being asked to serve.</p>
-<p>Another mistake is letting health checks synchronize failure. If every replica probes the same dependency at the same time, health checking can add load during an incident. Checks need sensible intervals, jitter, and failure thresholds.</p>
-<p>A third mistake is treating load balancers as if they understand product semantics. They can enforce routing policy, but they cannot decide whether a duplicate write is safe unless the application exposes that meaning through methods, headers, idempotency keys, or explicit route classes.</p>
-<p>This is also where the previous lesson on partitions matters. A replica can be healthy from one side of the network and unsafe from another. Health checks should therefore be read as observations from particular paths, not as universal truth about the whole system.</p>
+<p>Without draining, a rolling deploy can create avoidable failures. A replica disappears while users are mid-request. A retry lands on a new version with slightly different behavior. A long request loses its connection.</p>
+<p>Draining does not mean infinite patience. Streaming responses, long-running jobs, and slow writes may outlive the deploy budget. The system needs deadlines and a policy for what happens when work cannot finish in time.</p>
+<p>A good draining policy says:</p>
+<div class="codehilite"><pre><span></span><code>new requests: no
+in-flight idempotent reads: finish if within deadline
+in-flight writes: finish or return clear uncertain/retryable status
+long-lived streams: close with reconnect signal before shutdown deadline
+</code></pre></div>
+
+<p>The trade-off is deploy speed versus user disruption. Fast removal is simple but abrupt. Careful draining is gentler but requires more state and more patience.</p>
+<h2>Health Checks Can Also Cause Trouble</h2>
+<p>Health checks are not free. They create traffic, make decisions from imperfect signals, and can synchronize bad behavior.</p>
+<p>Common failure patterns:</p>
+<ul>
+<li>every replica probes the same dependency at the same time</li>
+<li>one flaky dependency causes all replicas to mark themselves unready</li>
+<li>strict readiness removes too much capacity and makes overload worse</li>
+<li>shallow readiness leaves broken replicas in rotation</li>
+<li>health from one network path is treated as global truth</li>
+</ul>
+<p>Use thresholds, jitter, and separate signals.</p>
+<div class="codehilite"><pre><span></span><code>bad:
+  one failed DB probe -&gt; unready immediately
+
+better:
+  several failed probes over time -&gt; degrade write readiness
+  cached reads may continue
+  overload signal can shed low-priority traffic
+</code></pre></div>
+
+<p>The goal is not to make health checks optimistic. The goal is to make them honest enough for routing and stable enough that they do not become a new incident source.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: "Liveness means ready"</h3>
+<p>Why it is tempting:</p>
+<p>Both signals often look like health checks, and both may return an HTTP status.</p>
+<p>Better model:</p>
+<p>Liveness asks whether the platform should restart the process. Readiness asks whether the router should send traffic. A process can be alive and not ready.</p>
+<h3>Confusion: "The load balancer understands the product"</h3>
+<p>Why it is tempting:</p>
+<p>Routers make important decisions, so it feels like they know whether a request is safe.</p>
+<p>Better model:</p>
+<p>Routers know endpoints, metadata, health, latency, and policy. Applications must expose operation meaning through methods, route classes, idempotency keys, or explicit readiness signals.</p>
+<h3>Confusion: "Removing unhealthy replicas always helps"</h3>
+<p>Why it is tempting:</p>
+<p>Taking bad targets out of rotation sounds obviously good.</p>
+<p>Better model:</p>
+<p>Removing replicas can protect users, but removing too many at once can reduce capacity and deepen overload. Health policy must balance speed of reaction with capacity preservation.</p>
+<h2>Practice</h2>
+<p>Review this endpoint pool:</p>
+<div class="codehilite"><pre><span></span><code>P1: alive=true, db_pool_available=false, draining=false, read_cache_fresh=true
+P2: alive=true, db_pool_available=true, draining=true, read_cache_fresh=true
+P3: alive=true, db_pool_available=false, draining=false, read_cache_fresh=false
+</code></pre></div>
+
+<p>Requests arriving now:</p>
+<div class="codehilite"><pre><span></span><code>A: GET /progress-summary
+B: POST /complete-lesson
+C: GET /lesson-metadata
+</code></pre></div>
+
+<p>Write a routing review:</p>
+<ol>
+<li>Which endpoints, if any, can receive <code>A</code>?</li>
+<li>Which endpoints, if any, can receive <code>B</code>?</li>
+<li>What should happen to P2?</li>
+<li>What signal is missing if the router must choose for <code>C</code>?</li>
+</ol>
+<p>Model answer:</p>
+<p><code>A</code> can go to a replica with fresh enough read data, so P1 may be acceptable if the product allows bounded staleness; P2 should not receive new requests while draining unless the policy explicitly allows a graceful read path. <code>B</code> should not go to P1 or P3 because neither has database capacity for authoritative writes, and P2 is draining, so the safer response may be fast unavailable or shed/retry later. P2 should stop new work and finish in-flight requests within a deadline. For <code>C</code>, the router needs metadata-specific readiness or a clear statement that lesson metadata can be served from a different service or cache.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Health checks improve routing only when they match the promise being routed. A shallow ping is useful for process survival. It is not enough for write safety, partition behavior, draining, or overloaded dependencies.</p>
+<p>Precise health improves correctness but adds operational surface area. Teams must design probes, thresholds, jitter, route classes, dashboards, and incident language. Too little signal makes routing overconfident. Too much fragile signal can make routing overreact.</p>
+<p>Load balancing can reduce user-visible failure, but it cannot remove application semantics. It does not know whether a duplicate write is safe unless the application exposes that fact. It does not know whether stale data is acceptable unless the product and service contract say so.</p>
+<p>You can see the boundary when a replica says "I am up" and the routing question is "up for what?"</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] Kubernetes Probes<ul>
-<li>Link: <a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/</a></li>
-<li>Focus: Compare liveness, readiness, and startup probes as separate operational signals.</li>
-</ul>
-</li>
-<li>[DOC] Envoy Load Balancing<ul>
-<li>Link: <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/overview">https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/overview</a></li>
-<li>Focus: Study load-balancing policy as a configurable decision under imperfect endpoint knowledge.</li>
-</ul>
-</li>
-<li>[BOOK] Site Reliability Engineering<ul>
-<li>Link: <a href="https://sre.google/sre-book/table-of-contents/">https://sre.google/sre-book/table-of-contents/</a></li>
-<li>Focus: Revisit overload, cascading failure, and service interaction as operational design problems.</li>
-</ul>
-</li>
+<li>[TUTORIAL] <a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Kubernetes Liveness, Readiness, and Startup Probes</a> - Compare process survival, traffic readiness, and startup grace as separate signals.</li>
+<li>[ARTICLE] <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/overview">Envoy Load Balancing Overview</a> - Study load-balancing policy as a configurable decision under imperfect endpoint knowledge.</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/table-of-contents/">Site Reliability Engineering</a> - Revisit overload, cascading failure, and service interaction as operational design problems.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
 <li>Liveness asks whether a process should be restarted; readiness asks whether it should receive traffic.</li>
+<li>A replica can be ready for reads, unready for writes, and draining for new work at the same time.</li>
 <li>Load balancing is a routing policy built from incomplete health, latency, locality, request-class, and rollout signals.</li>
-<li>Connection draining makes deploys and scale-downs less abrupt, but it still needs deadlines.</li>
-<li>Traffic steering improves resilience only when the service exposes health signals that match real request semantics.</li>
+<li>Connection draining makes deploys and scale-downs less abrupt, but it still needs deadlines and fallback behavior.</li>
+<li>Traffic steering improves resilience only when services expose health signals that match real request semantics.</li>
 </ul>
 </section>
 
@@ -180,7 +434,7 @@ request-class routing: separate reads, writes, or expensive operations
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

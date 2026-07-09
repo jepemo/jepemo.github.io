@@ -76,97 +76,468 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Observability Across Network Boundaries</h1>
-<h2>Core Insight</h2>
-<p>Imagine a learner reports that completing a lesson sometimes takes ten seconds. The frontend logs show a slow request. The API gateway shows one retry. The progress service shows a normal write. The database shows a brief queue spike. The service-discovery log shows that the first attempt went to a draining replica. No single component believes it failed.</p>
-<p>This is the observability problem created by network boundaries. Once a request crosses processes, proxies, regions, and queues, each participant sees only part of the path. A timeout may appear at the caller, a successful commit may appear at the server, and a retry may hide the first symptom unless the signals are connected.</p>
-<p>Good observability is not just more logs. It is a way to preserve request context across boundaries so engineers can reconstruct what happened, which layer made a decision, and where uncertainty entered the path. Metrics, logs, traces, events, and packet-level tools answer different questions, and the useful incident story usually combines several of them.</p>
-<p>The useful design shift is to instrument the path, not just the components. The trade-off is detail versus cost: rich telemetry makes incidents explainable, but high-cardinality labels, excessive spans, and noisy logs can make the system expensive and harder to search. Observability has to be designed with the same discipline as retries or routing.</p>
-<h2>Follow One Request Across Layers</h2>
-<p>A useful investigation starts by giving the request a durable identity. A request ID, trace ID, or correlation ID lets separate systems attach their local observations to one path. That identity needs to survive proxies, retries, async jobs, queue messages, and service-to-service calls.</p>
-<div class="codehilite"><pre><span></span><code>browser
-  -&gt; gateway
-      -&gt; progress service
-          -&gt; storage
-      -&gt; notification service
-</code></pre></div>
-
-<p>For each hop, the system should record a few basic facts: when the work started, how long it took, what decision was made, which status was returned, whether a retry happened, which endpoint was selected, which version answered, and how much deadline remained. Those facts are more useful than a thousand unconnected log lines.</p>
-<p>The same request can have different truths at different layers:</p>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
 <ul>
-<li>the browser saw a timeout</li>
-<li>the gateway retried once</li>
-<li>discovery sent the first attempt to a draining replica</li>
-<li>the first progress-service attempt still committed the write</li>
-<li>the second attempt was deduplicated</li>
-<li>the notification service was skipped because no deadline remained</li>
+<li>
+<p>Reconstruct one cross-service request from metrics, logs, traces, and network evidence.</p>
+</li>
+<li>
+<p>Decide which signal answers which incident question.</p>
+</li>
+<li>
+<p>Spot missing telemetry for retries, routing, stale discovery, deadlines, and degraded success.</p>
+</li>
 </ul>
-<p>Without shared context, those facts look contradictory. With shared context, they describe one coherent failure path.</p>
-<h2>Metrics, Logs, Traces, And Packets Answer Different Questions</h2>
-<p>Metrics are good for aggregates: error rate, latency percentiles, retry volume, queue depth, connection resets, and saturation. They answer "is this getting worse?" and "how many users are affected?"</p>
-<p>Logs are good for discrete facts: this request used idempotency key <code>abc</code>, this dependency returned <code>503</code>, this route selected region B, this retry was suppressed because the deadline expired.</p>
-<p>Traces are good for shape: which hops participated, where time was spent, which span retried, which route or endpoint was selected, and which service turned a downstream failure into a user-visible response.</p>
-<p>Packet captures and low-level network tools are good when the question is below the application: retransmissions, TLS handshake problems, DNS resolution behavior, connection resets, or unexpected routing.</p>
-<div class="codehilite"><pre><span></span><code>metric: p95 progress completion latency rose to 2.4s
-log: request abc retried after 504 from zone C
-trace: 1.9s spent waiting on storage from first attempt through endpoint P3
-packet view: TCP retransmissions increased on one path
+<p><strong>Idea in one sentence:</strong> Observability is the decision trail that lets you explain what each boundary saw, chose, retried, skipped, or could not know.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Imagine a learner clicks <strong>Complete lesson</strong> and waits ten seconds.</p>
+<p>The browser shows a spinner. Then it shows success.</p>
+<p>The frontend log says:</p>
+<div class="codehilite"><pre><span></span><code>POST /complete-lesson took 9800 ms
+final status = 200
 </code></pre></div>
 
-<p>The trade-off is abstraction versus evidence. Application telemetry explains semantics. Network telemetry explains movement. Real incidents often need both, but they should not be mixed into one vague bucket called "network problem."</p>
+<p>The gateway log says:</p>
+<div class="codehilite"><pre><span></span><code>first attempt timed out after 2500 ms
+retry attempt succeeded
+</code></pre></div>
+
+<p>The progress service log says:</p>
+<div class="codehilite"><pre><span></span><code>write committed normally
+idempotency key = req-3018-a
+</code></pre></div>
+
+<p>The database metric says:</p>
+<div class="codehilite"><pre><span></span><code>write queue p95 briefly rose to 1800 ms
+</code></pre></div>
+
+<p>The service-discovery event says:</p>
+<div class="codehilite"><pre><span></span><code>endpoint P3 was draining during the first attempt
+</code></pre></div>
+
+<p>No single component thinks it has the whole story. The browser saw a slow success. The gateway saw a timeout and retry. The progress service saw a normal commit. The database saw a short queue spike. Discovery saw a route to an endpoint that was leaving rotation.</p>
+<p>This is the observability problem created by network boundaries.</p>
+<p>Once a request crosses a browser, gateway, proxy, service, database, queue, and background worker, each participant sees only its local slice. A caller timeout does not prove that the server failed. A server commit does not prove that the caller received the answer. A retry may hide the first symptom. A successful final response may hide stale data, skipped work, or burned retry budget.</p>
+<p>Good observability is not "more logs." It is the ability to reconstruct the path:</p>
+<div class="codehilite"><pre><span></span><code>what was requested
+which boundary handled it
+which policy decision happened
+which endpoint was chosen
+which retry or fallback occurred
+which deadline remained
+which result became visible to the user
+</code></pre></div>
+
+<p>The useful design shift is to instrument the path, not just the components. A dashboard per service is useful, but a networked incident often lives between services, in the decisions made at boundaries.</p>
+<h2>The Naive Debugging Model</h2>
+<p>The naive model says:</p>
+<div class="codehilite"><pre><span></span><code>If the user saw a slow request, find the slow service.
+</code></pre></div>
+
+<p>Sometimes that works. Often it is too simple.</p>
+<p>For a networked request, "slow" may mean several different things:</p>
+<ul>
+<li>the browser waited for the gateway</li>
+<li>the gateway waited for a retry deadline</li>
+<li>the first upstream endpoint was draining</li>
+<li>the second upstream endpoint deduplicated an earlier write</li>
+<li>the database queue was briefly saturated</li>
+<li>an optional dependency was skipped to preserve the final deadline</li>
+<li>DNS, TLS, TCP, or packet loss delayed connection setup</li>
+</ul>
+<p>Those facts live in different places. If each place records only its own local outcome, the incident looks contradictory.</p>
+<p>Plain meaning:</p>
+<p>Observability is how you keep enough breadcrumbs to tell one request story after the request has crossed many boundaries.</p>
+<p>In this scenario:</p>
+<p>The request was slow because a first attempt hit a bad path, a retry succeeded, and the final success hid the cost.</p>
+<p>Technical name:</p>
+<p>This is cross-boundary observability: metrics, logs, traces, events, and sometimes packet-level evidence connected by shared context.</p>
+<h2>Shared Context Makes The Path Reconstructable</h2>
+<p>The first requirement is a durable request identity.</p>
+<p>That identity may be a request ID, trace ID, correlation ID, idempotency key, or a combination. The exact name matters less than the rule:</p>
+<div class="codehilite"><pre><span></span><code>The identity must survive boundaries.
+</code></pre></div>
+
+<p>For the learning platform, the request might travel like this:</p>
+<div class="codehilite"><pre><span></span><code>browser
+  -&gt; frontend server
+      -&gt; API gateway
+          -&gt; progress-service
+              -&gt; progress database
+          -&gt; notification queue
+              -&gt; notification worker
+</code></pre></div>
+
+<p>The trace or request context should survive:</p>
+<ul>
+<li>the browser request</li>
+<li>gateway routing</li>
+<li>service-to-service calls</li>
+<li>retries</li>
+<li>database work</li>
+<li>queue publication</li>
+<li>async worker processing</li>
+<li>fallback or degradation decisions</li>
+</ul>
+<p>If the progress service emits a completion event, but the notification worker starts a brand-new trace with no link to the original request, the story breaks exactly where delayed work begins.</p>
+<p>Useful context does not mean "put every value everywhere." Metrics should keep labels bounded. Logs and traces can carry unique request details. The trick is to put facts in the place that can carry them safely.</p>
+<p>For one completion request, useful fields include:</p>
+<div class="codehilite"><pre><span></span><code>trace_id = tr-3018-a
+request_id = req-3018-a
+operation_class = authoritative_write
+idempotency_key = lesson-3018-user-7
+caller_deadline_ms = 10000
+gateway_attempt = 1 or 2
+selected_endpoint = P3 or P1
+endpoint_version = v1 or v2
+route_reason = write_ready, retry_after_timeout, or draining_rejected
+deduplication_result = first_commit or duplicate_suppressed
+final_user_status = 200
+degraded_facts = notification_deferred
+</code></pre></div>
+
+<p>With those fields, separate local observations can become one incident timeline.</p>
+<h2>Metrics, Logs, Traces, Events, And Packets</h2>
+<p>Different signals answer different questions.</p>
+<p>Metrics answer aggregate questions:</p>
+<div class="codehilite"><pre><span></span><code>Is this getting worse?
+How many users are affected?
+Which dependency is saturated?
+Did retries increase after the deploy?
+Is one zone slower than the others?
+</code></pre></div>
+
+<p>Examples:</p>
+<div class="codehilite"><pre><span></span><code>progress_completion_latency_p95 = 9.8 s
+gateway_retry_rate = 14%
+db_write_queue_depth = 120
+zone_c_connection_reset_rate = elevated
+</code></pre></div>
+
+<p>Logs answer discrete fact questions:</p>
+<div class="codehilite"><pre><span></span><code>What did this component decide?
+Which idempotency key was used?
+Why was a retry allowed?
+Why was a fallback chosen?
+</code></pre></div>
+
+<p>Examples:</p>
+<div class="codehilite"><pre><span></span><code>request=req-3018-a attempt=1 route=P3 result=timeout deadline_remaining=7400ms
+request=req-3018-a attempt=2 route=P1 result=success dedupe=duplicate_suppressed
+</code></pre></div>
+
+<p>Traces answer shape and timing questions:</p>
+<div class="codehilite"><pre><span></span><code>Which hops participated?
+Where was time spent?
+Which span retried?
+Which endpoint answered?
+Which downstream work was skipped?
+</code></pre></div>
+
+<p>A useful trace can show:</p>
+<div class="codehilite"><pre><span></span><code>browser span: 9800 ms
+gateway span: retry after 2500 ms
+progress-service attempt 1: endpoint P3, timeout
+progress-service attempt 2: endpoint P1, deduplicated success
+notification span: skipped, deadline exhausted
+</code></pre></div>
+
+<p>Events answer state-change questions:</p>
+<div class="codehilite"><pre><span></span><code>When did P3 start draining?
+When did discovery remove P3?
+When did the deploy start?
+When did the circuit breaker open?
+</code></pre></div>
+
+<p>Packet captures and lower-level network tools answer movement questions below the application:</p>
+<div class="codehilite"><pre><span></span><code>Was DNS slow?
+Did TLS negotiation fail?
+Were packets retransmitted?
+Did connections reset?
+Was traffic unexpectedly crossing zones?
+</code></pre></div>
+
+<p>The trade-off is abstraction versus evidence. Application telemetry explains meaning. Network telemetry explains movement. A strong investigation can use both without mixing them into one vague phrase like "the network was slow."</p>
+<p><strong>Check:</strong> A trace shows the progress-service span waited 2.5 seconds, but it does not show DNS timing or TCP retransmissions. Can you conclude packet loss was not involved?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. An application trace can show where application time was spent, but lower-level network behavior may require resolver logs, proxy stats, connection metrics, or packet evidence.</p>
+<h2>A Worked Incident Trace</h2>
+<p>Now reconstruct the slow completion request.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  learner clicks Complete lesson
+  request_id = req-3018-a
+  operation = POST /complete-lesson
+  operation_class = authoritative_write
+  deadline = 10 seconds
+</code></pre></div>
+
+<p>The transition across boundaries looks like this:</p>
+<div class="codehilite"><pre><span></span><code>t0 browser sends request with trace_id=tr-3018-a
+t1 gateway resolves progress-service
+t2 discovery cache still includes P3
+t3 gateway routes attempt 1 to P3
+t4 P3 is draining and slow to reject new work
+t5 gateway times out attempt 1 after 2500 ms
+t6 gateway retries because idempotency key exists and deadline remains
+t7 discovery refresh removes P3
+t8 gateway routes attempt 2 to P1
+t9 P1 sees the same idempotency key and commits or deduplicates safely
+t10 notification work is deferred because little deadline remains
+t11 browser receives final 200 after 9800 ms
+</code></pre></div>
+
+<p>The intermediate state is not one clean success or failure:</p>
+<table>
+<thead>
+<tr>
+<th>Boundary</th>
+<th>Local observation</th>
+<th>Missing without shared context</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Browser</td>
+<td>slow <code>200 OK</code></td>
+<td>retry and deferred notification</td>
+</tr>
+<tr>
+<td>Gateway</td>
+<td>first attempt timed out, second succeeded</td>
+<td>whether the first attempt committed</td>
+</tr>
+<tr>
+<td>Discovery</td>
+<td>P3 was removed after refresh</td>
+<td>which requests used the stale cache</td>
+</tr>
+<tr>
+<td>Progress service</td>
+<td>idempotency key handled safely</td>
+<td>caller timeout and user-visible delay</td>
+</tr>
+<tr>
+<td>Database</td>
+<td>queue briefly rose</td>
+<td>which user requests felt it</td>
+</tr>
+<tr>
+<td>Notification worker</td>
+<td>no immediate job</td>
+<td>why the job was deferred</td>
+</tr>
+</tbody>
+</table>
+<p>The output or decision is:</p>
+<div class="codehilite"><pre><span></span><code>The system returned success, but it was degraded success.
+The write path survived because the retry had an idempotency key.
+The route to P3 was the likely first failure point.
+The notification side effect was deferred because the deadline was almost spent.
+</code></pre></div>
+
+<p>The naive failure contrast:</p>
+<div class="codehilite"><pre><span></span><code>Naive investigation:
+  &quot;The progress service returned 200, so it was fine.&quot;
+
+Better investigation:
+  &quot;The final response was 200, but the path used a retry, stale discovery,
+   endpoint draining, deduplication, and deferred async work.&quot;
+</code></pre></div>
+
+<p>So far:</p>
+<ul>
+<li>the user outcome was slow success</li>
+<li>the path included a failed first attempt</li>
+<li>the retry was safe only because the operation had idempotency</li>
+<li>stale discovery and draining were part of the route decision</li>
+<li>final success did not mean the system was healthy</li>
+</ul>
 <h2>Tail Latency Hides In Fan-Out</h2>
-<p>Many user requests call several dependencies. Even if each dependency is usually fast, the total path is exposed to the slowest required hop. A page that needs catalog, progress, recommendations, and certificates has more chances to hit a slow tail than a page that calls only one service.</p>
-<div class="codehilite"><pre><span></span><code>page request
-  -&gt; catalog: 80 ms
-  -&gt; progress: 120 ms
-  -&gt; recommendations: 900 ms
-  -&gt; certificates: skipped after deadline
+<p>Many user requests call several dependencies.</p>
+<p>The lesson page may need:</p>
+<div class="codehilite"><pre><span></span><code>catalog metadata
+progress summary
+recommendations
+certificate eligibility
+notification preferences
 </code></pre></div>
 
-<p>Observability should therefore capture dependency budgets, not only final response time. If the gateway has 800 ms for the whole page, a recommendation call that consumes 700 ms may be more important than a storage query that is merely above its local average.</p>
-<p>This is where earlier lessons connect. Timeouts and retries are policy decisions. Health checks and load balancers are routing decisions. Discovery and identity are control-plane decisions. Observability needs to show those decisions, not just their symptoms.</p>
+<p>Even if each dependency is usually fast, the page is exposed to the slow tail of the required work. A request that needs four dependencies has more chances to hit one slow dependency than a request that needs one.</p>
+<p>Example:</p>
+<div class="codehilite"><pre><span></span><code>page request deadline = 1000 ms
+
+catalog:         80 ms
+progress:       120 ms
+recommendation: 760 ms
+certificate:    skipped after deadline budget is almost gone
+</code></pre></div>
+
+<p>If the final page returns <code>200 OK</code>, the system can look healthy. But internally it spent most of the deadline on one optional dependency and skipped another. That is important even when the user did not see an error.</p>
+<p>Observability should therefore capture budgets and dependency contribution:</p>
+<div class="codehilite"><pre><span></span><code>total deadline
+time spent per dependency
+retries per dependency
+fallback chosen
+optional work skipped
+stale data used
+remaining deadline at each boundary
+</code></pre></div>
+
+<p>Without those facts, a team may optimize the wrong service. The problem may not be the slowest average dependency. It may be the dependency that sometimes consumes the whole tail.</p>
 <h2>Degraded Success Is Still A Signal</h2>
-<p>Some of the most important network failures do not return an error to the user. The page loads, but recommendations are omitted. The progress write succeeds, but only after a retry. The catalog response is served from stale cache because the origin timed out. The certificate job is deferred because the system could not confirm authoritative progress state.</p>
-<p>If observability records only final failures, all of those paths disappear. The system looks healthy while quietly spending retry budget, hiding optional dependencies, or serving older data than expected.</p>
+<p>Some network failures are hidden by good product behavior.</p>
+<p>The page loads, but recommendations are omitted. The catalog appears, but from a stale cache. The progress write succeeds, but only after a retry. The certificate job is deferred because the system cannot confirm authoritative progress state before the deadline.</p>
+<p>That may be the right user experience. But it is still a signal.</p>
 <div class="codehilite"><pre><span></span><code>final status: 200 OK
 degraded facts:
-  recommendations skipped
-  progress write retried once
-  catalog served from stale cache
-  certificate issuance deferred
+  recommendations_skipped=true
+  catalog_cache_age=45s
+  progress_retry_count=1
+  certificate_check_deferred=true
 </code></pre></div>
 
-<p>The user-facing outcome may be acceptable, but operators still need to see the degradation. Otherwise the first visible outage arrives after the system has been running hot for hours.</p>
-<p>The trade-off is signal versus noise. Not every fallback deserves a page. But degraded success should be measurable, searchable, and visible enough that teams can tell the difference between healthy success and success bought by burning resilience mechanisms.</p>
-<h2>Common Design Mistakes</h2>
-<p>One mistake is collecting telemetry only at service boundaries and not at policy boundaries. A proxy retry, gateway fallback, circuit-breaker open, or load-balancer choice can be the most important event in the path.</p>
-<p>Another mistake is creating high-cardinality labels without discipline. Labeling metrics by user ID, raw URL, or unbounded request key can make metrics systems expensive or unusable. Put unique values in traces or logs; keep metric dimensions bounded.</p>
-<p>A third mistake is treating traces as proof that the network was innocent. A trace can show where application spans waited, but lower-level failures such as DNS delay, TLS negotiation, or packet loss may need separate evidence.</p>
-<p>A fourth mistake is losing context at async boundaries. If the progress write emits a completion event and the notification worker starts a new trace with no link to the original request, the incident path breaks exactly where delayed work begins.</p>
+<p>If observability records only final failures, all of those facts disappear. The system looks healthy while it is spending retry budget, hiding optional dependency failures, or serving older data than expected.</p>
+<p>The trade-off is signal versus noise. Not every fallback deserves an alert. But degraded success should be measurable, searchable, and visible in dashboards or traces. Otherwise the first visible outage arrives after the resilience mechanisms have been quietly overloaded for hours.</p>
+<p><strong>Check:</strong> The completion page returns <code>200 OK</code>, but the trace shows one retry and <code>notification_deferred=true</code>. Should this count as completely healthy traffic?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The user-visible result succeeded, but the path consumed resilience mechanisms. It should be recorded as degraded success, even if it does not page anyone.</p>
+<h2>Design The Telemetry Around Decisions</h2>
+<p>A useful observability design asks:</p>
+<div class="codehilite"><pre><span></span><code>What decisions can change the request path?
+What evidence will prove each decision happened?
+</code></pre></div>
+
+<p>For this track, important decisions include:</p>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Evidence to record</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Deadline applied</td>
+<td>original deadline, remaining deadline at each boundary</td>
+</tr>
+<tr>
+<td>Retry allowed</td>
+<td>operation class, idempotency key, retry count, backoff reason</td>
+</tr>
+<tr>
+<td>Routing selected endpoint</td>
+<td>service name, endpoint, zone, version, route reason</td>
+</tr>
+<tr>
+<td>Discovery used cache</td>
+<td>discovery source, cache age, candidate set, rejected endpoints</td>
+</tr>
+<tr>
+<td>Health removed target</td>
+<td>readiness state, dependency check, draining flag</td>
+</tr>
+<tr>
+<td>Fallback chosen</td>
+<td>fallback type, skipped dependency, stale data age</td>
+</tr>
+<tr>
+<td>Identity checked</td>
+<td>intended service name, identity result, failure reason</td>
+</tr>
+</tbody>
+</table>
+<p>This connects directly to earlier lessons. Timeouts and retries are policy decisions. Health checks and load balancing are routing decisions. Discovery and identity are control-plane decisions. Partitions create uneven knowledge. Observability should show those decisions, not only their symptoms.</p>
+<p>Common design mistake:</p>
+<div class="codehilite"><pre><span></span><code>Record &quot;upstream failed.&quot;
+</code></pre></div>
+
+<p>Better:</p>
+<div class="codehilite"><pre><span></span><code>upstream=progress-service
+endpoint=P3
+attempt=1
+route_reason=cached_discovery_candidate
+result=timeout
+deadline_remaining_ms=7400
+next_action=retry_with_idempotency_key
+</code></pre></div>
+
+<p>The better version is longer, but it is not just more verbose. It preserves the decision trail.</p>
+<h2>Trade-offs And Limits</h2>
+<p>More telemetry is not automatically better.</p>
+<p>High-cardinality metric labels can make a metrics system expensive or unusable. User IDs, request IDs, raw URLs, and idempotency keys usually do not belong as metric labels. They are better suited for logs, traces, or sampled events.</p>
+<p>Tracing every span at full detail can cost too much. Sampling helps, but sampling can hide rare incidents unless errors, retries, slow paths, and degraded success are kept at higher sampling priority.</p>
+<p>Logs can preserve rich facts, but unstructured logs become hard to query. Structured logs with consistent names are easier to join with traces and metrics.</p>
+<p>Packet captures are powerful, but they are detailed, sensitive, and often hard to keep continuously. Use them when the question is below the application layer.</p>
+<p>The boundary is visible when engineers cannot answer:</p>
+<div class="codehilite"><pre><span></span><code>Which request path was affected?
+Which policy decision changed the path?
+Which layer observed the failure?
+Which layer guessed?
+Which evidence is missing?
+</code></pre></div>
+
+<p>Good observability does not remove failure. It reduces the time spent arguing about which local truth matters.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: A 200 Means The Request Was Healthy</h3>
+<p>Why it is tempting:</p>
+<p>The user got a successful response, so the incident seems over.</p>
+<p>Better model:</p>
+<p>A final <code>200 OK</code> can hide retries, stale reads, skipped optional work, deferred side effects, or a near-deadline path. Record degraded success separately from clean success.</p>
+<h3>Confusion: Traces Replace Metrics</h3>
+<p>Why it is tempting:</p>
+<p>Traces feel detailed because they show one path.</p>
+<p>Better model:</p>
+<p>Traces explain shape. Metrics explain scale. You usually need metrics to see that a problem is spreading and traces to understand one example path.</p>
+<h3>Confusion: The Network Is Slow</h3>
+<p>Why it is tempting:</p>
+<p>Many symptoms cross the network, so the network becomes the blame bucket.</p>
+<p>Better model:</p>
+<p>Separate application waiting, routing decisions, discovery staleness, dependency saturation, DNS/TLS/connection behavior, and packet movement. Each needs different evidence.</p>
+<h2>Practice</h2>
+<p>Review this incident report:</p>
+<div class="codehilite"><pre><span></span><code>Symptom:
+  3% of completion requests took more than 8 seconds.
+
+Known facts:
+  final status was usually 200
+  gateway retry rate rose from 1% to 12%
+  one zone had a deploy draining progress-service P3
+  database write queue p95 rose briefly
+  notification jobs fell behind by 4 minutes
+</code></pre></div>
+
+<p>Write a five-line observability plan:</p>
+<div class="codehilite"><pre><span></span><code>metric to check:
+trace field to require:
+log field to require:
+network or control-plane event to inspect:
+degraded success fact to record:
+</code></pre></div>
+
+<p>Model answer:</p>
+<div class="codehilite"><pre><span></span><code>metric to check: gateway retry rate by operation class and zone
+trace field to require: selected endpoint, attempt number, deadline remaining
+log field to require: idempotency key and deduplication result
+network or control-plane event to inspect: P3 draining and discovery cache age
+degraded success fact to record: notification_deferred and retry_count
+</code></pre></div>
+
+<p>The exact names can differ. The important habit is to connect each question to a signal.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] OpenTelemetry Concepts<ul>
-<li>Link: <a href="https://opentelemetry.io/docs/concepts/">https://opentelemetry.io/docs/concepts/</a></li>
-<li>Focus: Compare traces, metrics, logs, context propagation, and semantic conventions.</li>
-</ul>
-</li>
-<li>[BOOK] Site Reliability Engineering<ul>
-<li>Link: <a href="https://sre.google/sre-book/monitoring-distributed-systems/">https://sre.google/sre-book/monitoring-distributed-systems/</a></li>
-<li>Focus: Use monitoring as a way to detect symptoms and preserve service promises.</li>
-</ul>
-</li>
-<li>[DOC] Envoy Observability<ul>
-<li>Link: <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/observability">https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/observability</a></li>
-<li>Focus: Study what a network proxy can reveal about retries, routing, and upstream behavior.</li>
-</ul>
-</li>
+<li>[ARTICLE] <a href="https://opentelemetry.io/docs/concepts/">OpenTelemetry Concepts</a> - Compare traces, metrics, logs, context propagation, and semantic conventions.</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Site Reliability Engineering: Monitoring Distributed Systems</a> - Use monitoring to detect symptoms and preserve service promises.</li>
+<li>[ARTICLE] <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/observability">Envoy Observability</a> - Study what a network proxy can reveal about retries, routing, and upstream behavior.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
 <li>Networked incidents need path observability, not only per-service dashboards.</li>
-<li>Metrics, logs, traces, and packet-level evidence answer different questions.</li>
-<li>Trace context helps reconcile caller timeouts, server commits, retries, and deduplication into one story.</li>
-<li>Observability should show policy decisions such as routing, discovery, retry, fallback, and deadline exhaustion.</li>
-<li>Degraded success is still part of the failure signal when the system hides optional work, stale data, or retries from the user.</li>
+<li>Shared request context connects caller timeouts, server commits, retries, routing, and async work into one story.</li>
+<li>Metrics, logs, traces, events, and packet evidence answer different incident questions.</li>
+<li>Observability should record policy decisions such as retries, routing, discovery cache use, fallback, and deadline exhaustion.</li>
+<li>Degraded success is still a signal when final success hides retries, stale data, skipped dependencies, or deferred work.</li>
 </ul>
 </section>
 
@@ -196,7 +567,7 @@ degraded facts:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

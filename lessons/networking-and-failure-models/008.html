@@ -78,175 +78,641 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Network Failure Design Review</h1>
-<h2>Core Insight</h2>
-<p>Imagine the learning platform is preparing a launch week for a large cohort. The product must serve lesson pages, record progress, issue certificates, and send notifications while traffic rises and one region is known to have intermittent packet loss. The team asks for a "resilient network design."</p>
-<p>A convincing answer is not a diagram with every possible component. It is a set of explicit promises. Which requests may be stale? Which writes must not duplicate? Which services can fail open? Which operations must fail closed? Which retry policies are safe? Which health signals remove a replica from traffic? Which traces prove what happened after an incident?</p>
-<p>The hard part is that these promises cross several boundaries at once. A client deadline affects a gateway retry. A schema choice affects whether a receiver can deduplicate a write. A health check affects routing, but only if it measures the dependency that the request class actually needs. A trace can explain a timeout, but only if the request identity survives the retry and the async follow-up work.</p>
-<p>The network does not become reliable by wishing away ambiguity. It becomes manageable when each boundary says what it knows, what it cannot know, and what it is allowed to do next.</p>
-<p>The trade-off is resilience versus complexity. Every extra control surface can make failure easier to contain, but it can also become another thing to misconfigure, monitor, and debug.</p>
-<h2>Capstone Scenario</h2>
-<p>Design the network-facing behavior for the learning platform under these constraints:</p>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
 <ul>
-<li>Lesson catalog reads should stay fast and may use cached or slightly stale data.</li>
-<li>Progress writes must not be duplicated, even if the client or gateway retries.</li>
-<li>Certificate issuance must fail closed if authoritative progress state is uncertain.</li>
-<li>Recommendations may fail open and disappear from the page.</li>
-<li>The platform runs in three zones, with one zone occasionally losing connectivity to the others.</li>
-<li>Operators need enough telemetry to explain whether an incident was caused by routing, retries, dependency latency, partition, or application semantics.</li>
+<li>
+<p>Review a networked service design for unsafe timeout, retry, routing, and partition behavior.</p>
+</li>
+<li>
+<p>Write a short failure-design memo that connects each operation class to policy and evidence.</p>
+</li>
+<li>
+<p>Explain which remaining concerns belong in deeper protocol, HTTP, platform, reliability, or consensus tracks.</p>
+</li>
 </ul>
-<p>Your output should be a short design review memo. It should explain behavior under failure, not only list technologies.</p>
-<h2>Architecture Synthesis</h2>
-<p>Start at the application boundary. Separate operations by meaning:</p>
-<div class="codehilite"><pre><span></span><code>catalog read: may be stale, cacheable, safe to retry
-progress write: side effect, requires idempotency key
-certificate issue: authoritative, fail closed under uncertainty
-recommendation read: optional, may be skipped
+<p><strong>Idea in one sentence:</strong> A good network failure design says what each boundary can know, what it is allowed to do, and what evidence will prove the behavior during an incident.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Imagine the learning platform is preparing launch week for a large cohort.</p>
+<p>The product must:</p>
+<ul>
+<li>serve lesson pages</li>
+<li>record progress</li>
+<li>issue certificates</li>
+<li>send notifications</li>
+<li>show recommendations</li>
+</ul>
+<p>Traffic will rise sharply. One zone is known to have intermittent packet loss. The team asks for a "resilient network design."</p>
+<p>The naive answer is a diagram with more boxes:</p>
+<div class="codehilite"><pre><span></span><code>add a load balancer
+add retries
+add caches
+add health checks
+add tracing
 </code></pre></div>
 
-<p>Then attach communication policy to each class. Catalog reads can use short timeouts, local replicas, and fallback caches. Progress writes need explicit idempotency, retry budgets, and enough deadline to avoid repeated ambiguous work. Certificate issuance should require confirmed progress state and should not be routed through a partitioned minority. Recommendations can use a strict deadline and graceful omission.</p>
-<p>Next, design routing and health. Readiness checks should remove replicas that cannot reach required dependencies for the traffic they accept. A catalog replica that cannot reach the origin may still serve cached reads; a progress replica that cannot reach the authoritative store should not accept writes. Load balancing should distinguish request classes when their failure consequences differ. Draining should protect deploys from interrupting in-flight writes. Discovery should separate stable service names from changing endpoints, and service identity should prevent accidental trust in the wrong workload.</p>
-<p>Finally, define observability. A trace should show the caller deadline, gateway decision, retry attempt, selected upstream, idempotency key, response class, and fallback if one occurred. Metrics should show aggregate latency, retry volume, health-check failures, zone reachability, and per-operation error rates. Logs should preserve the few facts that explain individual ambiguity: request key, operation class, route, deduplication outcome, and why a retry or fallback was allowed.</p>
-<p>The result can be summarized as a policy matrix:</p>
+<p>Those pieces may help. But by themselves they do not describe safe behavior.</p>
+<p>A convincing design review starts with promises:</p>
+<div class="codehilite"><pre><span></span><code>Which requests may use stale data?
+Which writes must not duplicate?
+Which operations can fail open?
+Which operations must fail closed?
+Which retries are safe?
+Which health signal removes a replica from traffic?
+Which telemetry proves what happened after an incident?
+</code></pre></div>
+
+<p>The hard part is that these promises cross boundaries. A client deadline affects a gateway retry. A schema choice affects whether the receiver can deduplicate a write. A readiness check affects routing, but only if it checks the dependency needed by that request class. A trace can explain a timeout, but only if the request identity survives the retry and the async follow-up work.</p>
+<p>The network does not become reliable by pretending ambiguity is gone. It becomes manageable when each boundary says what it knows, what it cannot know, and what it is allowed to do next.</p>
+<p>This capstone asks you to produce that kind of design review.</p>
+<h2>Capstone Scenario</h2>
+<p>You are reviewing the network-facing behavior for the learning platform.</p>
+<p>The platform has these services:</p>
+<div class="codehilite"><pre><span></span><code>frontend
+  -&gt; gateway
+      -&gt; catalog-service
+      -&gt; progress-service
+      -&gt; certificate-service
+      -&gt; recommendation-service
+      -&gt; notification queue
+</code></pre></div>
+
+<p>It runs in three zones:</p>
+<div class="codehilite"><pre><span></span><code>zone A: normal
+zone B: normal
+zone C: intermittent packet loss and occasional partition from A/B
+</code></pre></div>
+
+<p>The product promises:</p>
+<ul>
+<li>Lesson catalog reads should stay fast. Slightly stale data is acceptable.</li>
+<li>Progress writes must not be duplicated, even if the client or gateway retries.</li>
+<li>Certificate issuance must fail closed if authoritative progress state is uncertain.</li>
+<li>Recommendations are optional. They may disappear from the page.</li>
+<li>Notifications may be delayed, but should not imply the progress write failed.</li>
+<li>Operators need enough telemetry to explain whether an incident came from routing, retries, dependency latency, stale discovery, partition, or application semantics.</li>
+</ul>
+<p>Your output is a short design review memo.</p>
+<p>It should explain behavior under failure. It should not only list technologies.</p>
+<h2>The Design Review Frame</h2>
+<p>Use this frame:</p>
+<div class="codehilite"><pre><span></span><code>1. Operation classes
+2. Deadline and retry policy
+3. Routing, health, discovery, and identity policy
+4. Partition and dependency-failure behavior
+5. Observability evidence
+6. Tests or game days that prove the design
+</code></pre></div>
+
+<p>Plain meaning:</p>
+<p>A design review is a structured way to ask, "What will this system do when the network gives each component only partial information?"</p>
+<p>In this scenario:</p>
+<p>The frontend, gateway, services, replicas, and operators all see different facts. The memo connects those facts into safe behavior.</p>
+<p>Technical name:</p>
+<p>This is a failure-mode design review: a review of expected behavior under delay, loss, retry, stale discovery, degraded dependencies, and partition.</p>
+<h2>Step 1: Classify Operations By Meaning</h2>
+<p>Start at the application boundary.</p>
+<p>Do not assign one network policy to every request. First, separate operations by what they mean.</p>
+<div class="codehilite"><pre><span></span><code>catalog read:
+  may be stale
+  safe to retry
+  may use cache
+
+progress write:
+  changes user state
+  needs idempotency key
+  retry only through deduplication
+
+certificate issue:
+  authoritative side effect
+  fail closed under uncertainty
+  no blind duplicate issuance
+
+recommendation read:
+  optional
+  tiny deadline
+  fail open by omission
+
+notification send:
+  async side effect
+  may be delayed
+  must be linked to original progress write
+</code></pre></div>
+
+<p>This step is where many weak designs fail. They talk about "requests" as if every request has the same risk.</p>
+<p>The same timeout has different meaning for each operation:</p>
 <table>
 <thead>
 <tr>
 <th>Operation</th>
-<th>Freshness</th>
-<th>Retry policy</th>
-<th>Routing policy</th>
-<th>Failure mode</th>
+<th>If it times out</th>
+<th>Safe default</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Catalog read</td>
-<td>Stale allowed</td>
-<td>Short retry budget</td>
-<td>Prefer local healthy cache</td>
-<td>Serve stale or return read error</td>
+<td>user may see older metadata</td>
+<td>serve bounded stale cache</td>
 </tr>
 <tr>
 <td>Progress write</td>
-<td>Fresh authoritative state</td>
-<td>Retry only with idempotency key</td>
-<td>Route to replica with write dependency</td>
-<td>Deduplicate or return ambiguous-write error</td>
+<td>caller does not know whether write committed</td>
+<td>retry only with idempotency key</td>
 </tr>
 <tr>
 <td>Certificate issue</td>
-<td>Fresh authoritative state</td>
-<td>No blind retry of issuance side effect</td>
-<td>Require confirmed progress authority</td>
-<td>Fail closed</td>
+<td>authority is uncertain</td>
+<td>fail closed</td>
 </tr>
 <tr>
-<td>Recommendations</td>
-<td>Best effort</td>
-<td>Tiny budget or no retry</td>
-<td>Any healthy optional dependency</td>
-<td>Omit from response</td>
+<td>Recommendation read</td>
+<td>optional feature missing</td>
+<td>omit recommendations</td>
+</tr>
+<tr>
+<td>Notification send</td>
+<td>async work delayed</td>
+<td>queue and expose delay</td>
 </tr>
 </tbody>
 </table>
-<p>This matrix is useful because it prevents accidental uniformity. The same network timeout means different things for different operations.</p>
-<h2>Failure Review Table</h2>
+<p><strong>Check:</strong> The gateway times out while issuing a certificate. Should it blindly retry certificate issuance because retry helped catalog reads?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. Catalog reads and certificate issuance have different semantics. Certificate issuance is authoritative and user-visible. The design should fail closed or retry only through an explicitly deduplicated issuance path.</p>
+<h2>Step 2: Attach Deadline And Retry Policy</h2>
+<p>Now turn operation meaning into communication policy.</p>
+<p>The policy should name:</p>
+<ul>
+<li>total deadline</li>
+<li>retry count</li>
+<li>retry condition</li>
+<li>backoff or jitter</li>
+<li>idempotency requirement</li>
+<li>what to do when the deadline is nearly gone</li>
+</ul>
+<p>A useful starting matrix:</p>
 <table>
 <thead>
 <tr>
-<th>Failure shape</th>
-<th>Safe behavior</th>
-<th>Required signal</th>
+<th>Operation</th>
+<th>Deadline</th>
+<th>Retry policy</th>
+<th>Stop condition</th>
+<th>User behavior</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Recommendation timeout</td>
-<td>Return page without recommendations</td>
-<td>Gateway span records skipped optional dependency</td>
+<td>Catalog read</td>
+<td>short</td>
+<td>one quick retry or cache fallback</td>
+<td>cache too old or deadline nearly gone</td>
+<td>show page or read error</td>
 </tr>
 <tr>
-<td>Progress write timeout</td>
-<td>Retry only with idempotency key and remaining deadline</td>
-<td>Logs link attempts by stable request key</td>
+<td>Progress write</td>
+<td>moderate</td>
+<td>retry only with idempotency key and remaining deadline</td>
+<td>no safe write target or ambiguous result</td>
+<td>show retryable/ambiguous state</td>
 </tr>
 <tr>
-<td>Two-node minority partition</td>
-<td>Reject authoritative writes on minority side</td>
-<td>Quorum or reachability signal blocks commit</td>
+<td>Certificate issue</td>
+<td>strict authority check</td>
+<td>no blind retry of side effect</td>
+<td>cannot confirm authoritative progress</td>
+<td>fail closed</td>
 </tr>
 <tr>
-<td>Replica dependency failure</td>
-<td>Remove from readiness for affected traffic</td>
-<td>Readiness check reflects dependency class</td>
+<td>Recommendation read</td>
+<td>tiny</td>
+<td>usually no retry</td>
+<td>optional budget spent</td>
+<td>omit block</td>
 </tr>
 <tr>
-<td>Deploy scale-down</td>
-<td>Drain before termination</td>
-<td>Router stops new traffic and tracks in-flight work</td>
-</tr>
-<tr>
-<td>Stale discovery entry</td>
-<td>Suppress unsafe writes to unknown endpoint</td>
-<td>Route decision records endpoint version and identity</td>
+<td>Notification send</td>
+<td>async budget</td>
+<td>retry from queue with idempotent job key</td>
+<td>poison or repeated failure</td>
+<td>delay and surface operational alert</td>
 </tr>
 </tbody>
 </table>
-<p>The table is intentionally concrete. It forces each failure response to name both behavior and evidence. A design that says "the platform retries" is not enough. A design that says "the gateway retries idempotent progress writes once, with jitter, only while 250 ms of deadline remains, and records both attempts under one request key" is testable.</p>
-<h2>Review Memo Structure</h2>
-<p>A good memo should be short enough to review but specific enough to test. One useful structure is:</p>
-<ol>
-<li>Name the operation classes and their semantics.</li>
-<li>Define deadlines, retry budgets, and idempotency requirements for each class.</li>
-<li>Explain routing, discovery, identity, readiness, and draining rules.</li>
-<li>Describe behavior under zone partition, dependency failure, deploy, and stale discovery.</li>
-<li>Name the telemetry that proves each behavior happened.</li>
-</ol>
-<p>For the launch-week platform, that memo should make a few uncomfortable choices explicit. A minority zone should not issue certificates if it cannot confirm authoritative progress. A progress write that timed out should be retried only through a deduplication path. A catalog page may be served from cache, but the response should say internally that stale data was used. Recommendations can disappear without breaking the page, but that omission should count as degraded success.</p>
-<h2>Readiness Check</h2>
-<p>A strong design review should answer these questions:</p>
+<p>Notice that "retry" is not one setting. It is attached to operation meaning.</p>
+<p>The design should also explain where retries happen. A client retry, gateway retry, service retry, queue retry, and worker retry can multiply each other. If all layers retry without a shared budget, recovery logic can become the outage amplifier from lesson 3.</p>
+<p>Capstone rule:</p>
+<div class="codehilite"><pre><span></span><code>Every retry needs a reason, a budget, and a way to avoid duplicate side effects.
+</code></pre></div>
+
+<h2>Step 3: Review Routing, Health, Discovery, And Identity</h2>
+<p>The next question is where traffic is allowed to go.</p>
+<p>For each operation class, ask:</p>
+<div class="codehilite"><pre><span></span><code>Which endpoint is a responsible destination for this request?
+</code></pre></div>
+
+<p>Do not let a shallow <code>200 OK</code> health endpoint answer that question alone.</p>
+<p>A progress replica may be alive but unable to reach authoritative storage. A catalog replica may be unable to reach origin but still able to serve bounded stale data. A certificate service may be reachable but running in a minority partition. A recommendation service may be slow, but optional.</p>
+<p>Review these routing rules:</p>
+<table>
+<thead>
+<tr>
+<th>Request class</th>
+<th>Required routing evidence</th>
+<th>Unsafe shortcut</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Catalog read</td>
+<td>local cache health, cache age, stale limit</td>
+<td>treating stale data as always acceptable</td>
+</tr>
+<tr>
+<td>Progress write</td>
+<td>write dependency reachable, idempotency accepted, identity valid</td>
+<td>routing to any alive replica</td>
+</tr>
+<tr>
+<td>Certificate issue</td>
+<td>authoritative progress state confirmed, no minority partition</td>
+<td>issuing from uncertain state</td>
+</tr>
+<tr>
+<td>Recommendation read</td>
+<td>optional dependency under tiny budget</td>
+<td>waiting long enough to consume page deadline</td>
+</tr>
+<tr>
+<td>Notification job</td>
+<td>queue health, dedupe key, worker identity</td>
+<td>assuming send failure means progress failed</td>
+</tr>
+</tbody>
+</table>
+<p>Discovery and identity belong here too.</p>
+<p>The service name <code>progress-service</code> is stable. The endpoint list behind it is temporary. A stale discovery cache may still include a draining endpoint. The router should record the service name, candidate endpoints, selected endpoint, rejected endpoints, route reason, and identity result.</p>
+<p>Useful routing evidence:</p>
+<div class="codehilite"><pre><span></span><code>service_name = progress-service
+selected_endpoint = P1
+endpoint_version = v2
+zone = A
+route_reason = write_ready and identity_valid
+rejected_endpoint = P3 draining
+discovery_cache_age = 4s
+identity_result = success
+</code></pre></div>
+
+<p>This is the bridge from lessons 5 and 6. Health supplies evidence. Discovery supplies candidates. Routing makes the request-specific choice. Identity prevents blind trust.</p>
+<h2>Step 4: Design For Partition And Packet Loss</h2>
+<p>Now handle the known launch risk: zone C has intermittent packet loss and occasional partition from zones A and B.</p>
+<p>During a partition, components can be alive and still disagree about the world.</p>
+<p>That means the design should separate local observation from global truth:</p>
+<div class="codehilite"><pre><span></span><code>local observation:
+  zone C can receive some traffic
+
+unsafe conclusion:
+  zone C is safe for all writes and certificate issuance
+
+better conclusion:
+  zone C may serve only operations whose semantics are safe under this uncertainty
+</code></pre></div>
+
+<p>A possible policy:</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Catalog reads</th>
+<th>Progress writes</th>
+<th>Certificate issuance</th>
+<th>Recommendations</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Zone C has packet loss but can reach authority</td>
+<td>allow with bounded latency and fallback</td>
+<td>allow if write dependency and idempotency path are healthy</td>
+<td>allow only with authority confirmed</td>
+<td>allow or omit</td>
+</tr>
+<tr>
+<td>Zone C is minority partition</td>
+<td>serve bounded stale catalog only</td>
+<td>reject or route to majority if reachable</td>
+<td>fail closed</td>
+<td>omit</td>
+</tr>
+<tr>
+<td>Discovery is stale in zone C</td>
+<td>refresh or suppress unsafe writes</td>
+<td>reject writes to draining/unknown endpoints</td>
+<td>fail closed</td>
+<td>omit if uncertain</td>
+</tr>
+</tbody>
+</table>
+<p>The design does not need full consensus depth. That belongs in downstream coordination tracks. But it must not confuse "the process is up" with "the operation is authoritative."</p>
+<p><strong>Check:</strong> Zone C can answer HTTP health checks but cannot reach the authoritative progress store. Which operations should it still serve?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It may serve bounded stale catalog reads and optional recommendation behavior if those policies allow it. It should not accept authoritative progress writes or issue certificates that depend on confirmed progress state.</p>
+<h2>Step 5: Make Evidence Part Of The Design</h2>
+<p>A failure design is weak if it says only what should happen.</p>
+<p>It also needs to say how operators will know what happened.</p>
+<p>For each important behavior, name the evidence:</p>
+<table>
+<thead>
+<tr>
+<th>Behavior</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Catalog served stale data</td>
+<td>trace field <code>catalog_cache_age</code>, log <code>fallback=stale_cache</code></td>
+</tr>
+<tr>
+<td>Progress write retried safely</td>
+<td>shared request ID, idempotency key, attempt count, dedupe result</td>
+</tr>
+<tr>
+<td>Certificate failed closed</td>
+<td>log reason <code>progress_authority_uncertain</code>, metric count</td>
+</tr>
+<tr>
+<td>Recommendation omitted</td>
+<td>trace span <code>recommendations_skipped</code>, degraded-success metric</td>
+</tr>
+<tr>
+<td>Zone C partition detected</td>
+<td>zone reachability metric, packet loss metric, route suppression event</td>
+</tr>
+<tr>
+<td>Draining endpoint avoided</td>
+<td>route log with rejected endpoint and draining reason</td>
+</tr>
+<tr>
+<td>Stale discovery caused first attempt</td>
+<td>discovery cache age, selected endpoint, refresh event</td>
+</tr>
+</tbody>
+</table>
+<p>This is the lesson 7 habit: observe decisions, not only symptoms.</p>
+<p>For launch week, the most useful trace might show:</p>
+<div class="codehilite"><pre><span></span><code>trace_id = tr-launch-42
+operation = complete_lesson
+deadline_ms = 10000
+attempt_1:
+  endpoint = P3
+  zone = C
+  route_reason = cached_discovery_candidate
+  result = timeout
+attempt_2:
+  endpoint = P1
+  zone = A
+  route_reason = write_ready
+  idempotency_key = req-42
+  dedupe_result = first_commit
+final:
+  user_status = 200
+  notification_deferred = true
+  degraded_success = true
+</code></pre></div>
+
+<p>That trace lets the team explain a slow success without pretending that success was clean.</p>
+<h2>A Worked Review: From Weak Design To Testable Design</h2>
+<p>Here is a weak design memo:</p>
+<div class="codehilite"><pre><span></span><code>We will make the platform resilient by adding retries, load balancing,
+health checks, service discovery, and observability. The gateway will retry
+failed requests. Services will be monitored. Traffic will go to healthy nodes.
+</code></pre></div>
+
+<p>It sounds reasonable, but it hides the hard decisions.</p>
+<p>Review it using the track vocabulary:</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  launch-week learning platform design
+  known packet loss in zone C
+  mixed operations: reads, writes, certificates, optional recommendations
+
+Transition:
+  classify operations
+  attach timeout/retry rules
+  inspect routing and health evidence
+  define partition behavior
+  require telemetry for each policy decision
+
+Intermediate state:
+  catalog reads are stale-tolerant
+  progress writes need idempotency
+  certificates need confirmed authority
+  recommendations are optional
+  zone C cannot be trusted for every operation during partition
+
+Output or decision:
+  approve only if policies and evidence are operation-specific
+  request changes if retry, health, routing, or observability are generic
+
+Naive failure contrast:
+  &quot;retry failed requests&quot; duplicates writes
+  &quot;route to healthy nodes&quot; sends writes to a replica without write dependency
+  &quot;monitor services&quot; misses degraded success and stale discovery
+</code></pre></div>
+
+<p>Now rewrite the weak memo into a testable one:</p>
+<div class="codehilite"><pre><span></span><code>Catalog reads use a 300 ms budget and may fall back to local cache if cache age
+is under 60 seconds. The trace records `catalog_cache_age` and `fallback=stale`.
+
+Progress writes require an idempotency key. The gateway may retry once with
+jitter only if at least 500 ms of deadline remains. The receiver stores the
+idempotency key and logs `first_commit` or `duplicate_suppressed`.
+
+Certificate issuance requires confirmed authoritative progress state. If the
+service is in a minority partition or cannot confirm authority, it fails closed
+and records `progress_authority_uncertain`.
+
+Recommendations use a 150 ms optional budget. If they time out, the page omits
+them and records degraded success, but the page request continues.
+
+Routing uses request-class readiness. A replica that cannot reach the progress
+store is not write-ready, even if it is alive. Discovery logs candidate
+endpoints, selected endpoint, cache age, and rejected draining endpoints.
+</code></pre></div>
+
+<p>The revised memo is not perfect. But it is reviewable. Each statement can be tested.</p>
+<h2>Capstone Task</h2>
+<p>Write your own design review memo for the launch-week platform.</p>
+<p>Use this structure:</p>
+<div class="codehilite"><pre><span></span><code>1. Operation classes
+2. Timeout and retry policy
+3. Routing, health, discovery, and identity policy
+4. Partition behavior
+5. Observability evidence
+6. Validation plan
+</code></pre></div>
+
+<p>Your memo should fit on one or two pages.</p>
+<p>It should include:</p>
 <ul>
-<li>Which operations are idempotent, and how does the receiver deduplicate them?</li>
-<li>Which request classes are optional, stale-tolerant, or authoritative?</li>
-<li>Which failures should remove a replica from readiness?</li>
-<li>Which routing decisions depend on locality, version, health, or operation type?</li>
-<li>What happens when discovery data is stale?</li>
-<li>Which telemetry proves that retries, fallbacks, and partitions behaved as expected?</li>
-<li>Which game-day or fault-injection test would demonstrate that the design works before launch?</li>
+<li>at least four operation classes</li>
+<li>one policy matrix</li>
+<li>one partition behavior rule</li>
+<li>one stale discovery behavior rule</li>
+<li>one degraded-success signal</li>
+<li>one game-day or fault-injection test</li>
+<li>one explicit boundary saying what this track does not cover</li>
 </ul>
-<p>If the design cannot answer these questions, the system may still run, but its failure behavior is accidental. The goal is not perfect prediction. The goal is to make the most important uncertainty visible before production forces the choice.</p>
+<p>The boundary matters. This track does not ask you to design TCP congestion control, a full consensus protocol, or a CDN strategy. It asks you to review application-level behavior at network boundaries.</p>
+<h2>Rubric</h2>
+<p>Use this rubric to evaluate the memo.</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>Strong answer</th>
+<th>Weak answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Operation semantics</td>
+<td>Separates stale reads, idempotent writes, authoritative side effects, and optional work</td>
+<td>Uses one generic request policy</td>
+</tr>
+<tr>
+<td>Retry safety</td>
+<td>Names budget, deadline, idempotency, and duplicate behavior</td>
+<td>Says "retry failures"</td>
+</tr>
+<tr>
+<td>Routing and health</td>
+<td>Uses request-class readiness and route evidence</td>
+<td>Routes to any alive endpoint</td>
+</tr>
+<tr>
+<td>Discovery and identity</td>
+<td>Separates service name, endpoint, freshness, and trust</td>
+<td>Treats lookup result as automatically safe</td>
+</tr>
+<tr>
+<td>Partition behavior</td>
+<td>Fails closed for authoritative operations under uncertainty</td>
+<td>Lets minority partition continue all writes</td>
+</tr>
+<tr>
+<td>Observability</td>
+<td>Records decision evidence and degraded success</td>
+<td>Records only final errors</td>
+</tr>
+<tr>
+<td>Scope control</td>
+<td>Defers protocol, HTTP/CDN, consensus, and reliability-program depth to later tracks</td>
+<td>Tries to solve every networking topic here</td>
+</tr>
+<tr>
+<td>Testability</td>
+<td>Includes game-day or fault-injection checks</td>
+<td>Cannot be tested before launch</td>
+</tr>
+</tbody>
+</table>
+<p>Minimum passing memo:</p>
+<div class="codehilite"><pre><span></span><code>The reader can point to each operation and answer:
+  What can fail?
+  What should the system do?
+  What evidence proves it did that?
+</code></pre></div>
+
+<h2>Validation Plan</h2>
+<p>A design review is stronger when it names how to test the behavior before launch.</p>
+<p>Choose a small set of game days:</p>
+<table>
+<thead>
+<tr>
+<th>Test</th>
+<th>Expected behavior</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Add packet loss in zone C</td>
+<td>optional dependencies degrade, authoritative work avoids unsafe paths</td>
+<td>zone metrics, route logs, degraded-success counters</td>
+</tr>
+<tr>
+<td>Drain progress endpoint P3</td>
+<td>new writes stop routing to P3, in-flight work finishes or rejects safely</td>
+<td>draining event, selected endpoint trace</td>
+</tr>
+<tr>
+<td>Delay progress database</td>
+<td>write readiness drops, retries remain within budget</td>
+<td>readiness metric, retry count, deadline remaining</td>
+</tr>
+<tr>
+<td>Expire discovery cache slowly</td>
+<td>stale endpoint is rejected or refreshed before unsafe write</td>
+<td>discovery cache age, rejected endpoint reason</td>
+</tr>
+<tr>
+<td>Duplicate progress write request</td>
+<td>receiver suppresses duplicate side effect</td>
+<td>idempotency log <code>duplicate_suppressed</code></td>
+</tr>
+<tr>
+<td>Partition certificate service from progress authority</td>
+<td>certificate issuance fails closed</td>
+<td>fail-closed metric and reason log</td>
+</tr>
+</tbody>
+</table>
+<p>You do not need dozens of tests. You need enough targeted tests to prove the design's promises.</p>
+<h2>Trade-off And Boundary</h2>
+<p>The trade-off is control versus complexity.</p>
+<p>More explicit network failure policy gives the team safer retries, clearer routing, better degraded behavior, and stronger incident evidence. It also creates more configuration, more telemetry fields, more tests, and more ownership. A route rule nobody understands can become a new failure mode. A retry budget that is not measured can drift into a hidden overload source. A trace field that is not used during incidents can become noise.</p>
+<p>That is why the capstone asks for a small memo, not a giant architecture catalog. The design should cover the few decisions that change safety:</p>
+<div class="codehilite"><pre><span></span><code>Can this operation be stale?
+Can this operation repeat?
+Can this endpoint answer responsibly?
+Can this zone prove authority?
+Can operators prove what happened?
+</code></pre></div>
+
+<p>It does not need to solve every network problem. Packet-level transport depth belongs in <code>network-protocols-and-transport-systems</code>. HTTP caching and CDN strategy belong in <code>http-protocol-and-content-delivery</code>. Formal agreement and leader election belong in <code>consensus-and-coordination</code>. Reliability-program ownership belongs in <code>reliability-engineering-foundations</code>.</p>
 <h2>Common Design Mistakes</h2>
-<p>One mistake is applying one retry and timeout policy to every dependency. Optional reads, idempotent writes, and authoritative side effects need different policies.</p>
-<p>Another mistake is letting the routing layer make decisions without application semantics. A proxy can enforce rules, but it needs method, route, idempotency, deadline, and health information to choose safely.</p>
-<p>A third mistake is instrumenting only errors. Under partial failure, successful responses can still hide retries, stale reads, fallback behavior, or skipped dependencies. The design should make degraded success visible.</p>
+<h3>Mistake: One Policy For Every Operation</h3>
+<p>Why it is tempting:</p>
+<p>It is simpler to configure one timeout, one retry count, and one health rule.</p>
+<p>Better model:</p>
+<p>Different operations carry different risk. Optional reads, side-effecting writes, and authoritative decisions need different behavior.</p>
+<h3>Mistake: Health Without Request Meaning</h3>
+<p>Why it is tempting:</p>
+<p>A single health endpoint is easy to wire into load balancing.</p>
+<p>Better model:</p>
+<p>Health means "responsible destination for this request." A replica can be alive and still unsafe for writes, certificates, or new work during draining.</p>
+<h3>Mistake: Observability Only After Something Fails</h3>
+<p>Why it is tempting:</p>
+<p>Teams often instrument errors first.</p>
+<p>Better model:</p>
+<p>Partial failure often appears as slow success, stale cache, retry, fallback, or skipped optional work. Those paths need evidence too.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Designing Data-Intensive Applications<ul>
-<li>Link: <a href="https://dataintensive.net/">https://dataintensive.net/</a></li>
-<li>Focus: Revisit replication, partitions, consistency, and operational trade-offs together.</li>
-</ul>
-</li>
-<li>[ARTICLE] Timeouts, Retries, and Backoff with Jitter<ul>
-<li>Link: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/</a></li>
-<li>Focus: Use retry behavior as a design surface rather than a library default.</li>
-</ul>
-</li>
-<li>[DOC] OpenTelemetry Concepts<ul>
-<li>Link: <a href="https://opentelemetry.io/docs/concepts/">https://opentelemetry.io/docs/concepts/</a></li>
-<li>Focus: Connect request context, traces, metrics, and logs to failure diagnosis.</li>
-</ul>
-</li>
-<li>[DOC] Kubernetes Services and Probes<ul>
-<li>Link: <a href="https://kubernetes.io/docs/concepts/services-networking/service/">https://kubernetes.io/docs/concepts/services-networking/service/</a></li>
-<li>Focus: Use service naming, endpoints, and health probes as routing inputs.</li>
-</ul>
-</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> - Revisit partitions, consistency, replication, and operational trade-offs as the deeper downstream context.</li>
+<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a> - Review retry behavior as a design surface rather than a library default.</li>
+<li>[ARTICLE] <a href="https://opentelemetry.io/docs/concepts/">OpenTelemetry Concepts</a> - Connect request context, traces, metrics, and logs to failure diagnosis.</li>
+<li>[TUTORIAL] <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Services</a> - Use service names, endpoints, and probes as concrete routing inputs.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Network resilience starts from operation semantics: optional reads, side-effecting writes, and authoritative decisions need different behavior.</li>
-<li>Timeouts, retries, routing, health checks, and observability must be designed as one failure policy.</li>
-<li>A good design review names both the safe behavior and the evidence that proves it happened.</li>
-<li>The final trade-off is control versus complexity: every network control surface needs ownership, tests, and incident visibility.</li>
+<li>Network resilience starts from operation semantics, not from adding generic infrastructure.</li>
+<li>Timeouts, retries, routing, health, discovery, identity, and observability form one failure policy.</li>
+<li>A good design review names both safe behavior and the evidence that proves it happened.</li>
+<li>Authoritative operations should fail closed when partitions or stale discovery make authority uncertain.</li>
+<li>The capstone skill is transfer: review a small networked system and explain what each boundary can know, decide, and prove.</li>
 </ul>
 </section>
 
@@ -276,7 +742,7 @@ recommendation read: optional, may be skipped
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -76,83 +76,304 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Network Partitions and Failure Models</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain why a timeout is a local observation, not global truth.</p>
+</li>
+<li>
+<p>Distinguish crash, delay, overload, packet loss, asymmetric reachability, and partition interpretations.</p>
+</li>
+<li>
+<p>Compare quorum refusal with writable divergence under a partition.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A failure model says what the system cannot know reliably, and that uncertainty decides which actions are safe.</p>
+</blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the learning platform running across three zones. The progress service in zone A can still talk to zone B, but not to zone C. The certificate service in C still answers some local reads. The load balancer sees intermittent health checks. No single machine has necessarily crashed, but different parts of the system now see different communication maps.</p>
-<p>That is what makes partitions hard. The danger is not simply that "the network is down." The danger is that the system no longer shares one reliable view of who can talk to whom, which writes can be coordinated, and which answers are still authoritative. A timeout from A to C is only a local symptom. It might mean crash, delay, overload, packet loss, asymmetric routing, or a partition.</p>
-<p>A failure model names the uncertainty the system is designed to survive. A protocol that assumes only crash failures can make different decisions from a protocol that must handle delayed messages, lost messages, or split reachability. Once the failure shape is clear, design choices that look mysterious become legible: quorum systems reject some writes, eventually consistent systems accept divergence, and user-facing services choose which answers are allowed to be stale.</p>
-<p>The useful shift is to stop asking whether the system "handles failure" in the abstract. Ask what the system can still know under a specific failure model, and what it is allowed to do when that knowledge is incomplete.</p>
-<h2>Local Observation Is Not Global Truth</h2>
-<p>Suppose an API server in zone A calls the certificate service in zone C and times out. The API server knows one thing: it did not receive a useful answer before its deadline. It does not know whether C is down, slow, overloaded, unreachable only from A, or still reachable from B.</p>
-<div class="codehilite"><pre><span></span><code>what A observes: no response from C before deadline
-
-possible realities:
-  C crashed
-  C is slow
-  A -&gt; C traffic is dropped
-  C -&gt; A replies are dropped
-  C is reachable from B but not A
+<p>The previous lesson ended with a careful warning: a timeout does not prove what happened on the server. Now widen that idea from one caller to a whole distributed system.</p>
+<p>Imagine the learning platform runs across three zones:</p>
+<div class="codehilite"><pre><span></span><code>zone A: API gateway and progress replica A
+zone B: progress replica B and metadata service
+zone C: progress replica C and certificate service
 </code></pre></div>
 
-<p>This is why failure models are models of uncertainty, not just lists of broken components. They define which observations can be misleading. In an asynchronous distributed system, a slow message and a lost message can look the same to the receiver until more evidence arrives. A missing heartbeat is not proof of death. It is proof that this node has not heard from that peer within the expected window.</p>
-<p>The practical consequence is language discipline. "Network issue" is too vague for design work. A useful incident review asks whether the system saw delay, loss, congestion, asymmetric reachability, a minority partition, a majority partition, or total isolation. Each shape makes different behavior safe.</p>
-<p>The trade-off is simplicity versus realism. A simpler failure model is easier to reason about, but it can make the system overconfident. A richer model is harder to implement against, but it prevents local symptoms from being mistaken for global facts.</p>
-<h2>Quorum Preserves Authority By Refusing Some Work</h2>
-<p>Now make the progress service replicated. It has five nodes, and a write must be accepted by at least three before it is considered committed. During a partition, two nodes can still talk to each other but cannot reach the other three. Those two nodes may be healthy in the ordinary sense: their disks work, their processes run, and their local network is alive. They still should not accept globally authoritative writes.</p>
+<p>During an incident, A can still talk to B. B can still talk to C. A cannot talk to C. The certificate service in C still answers local reads. The load balancer sees some health checks pass and some fail.</p>
+<p>No single machine has necessarily crashed. The harder problem is that different parts of the system now see different communication maps.</p>
+<p>The naive idea is:</p>
+<blockquote>
+<p>If one zone cannot reach another zone, the unreachable zone is down.</p>
+</blockquote>
+<p>That may be true. It may also be false. The unreachable zone may be alive but slow. Replies may be dropped in one direction. A firewall rule may affect A but not B. The path may be congested. A few packets may be lost. Or the system may be partitioned into groups that can still do local work but cannot coordinate globally.</p>
+<p>A failure model names the uncertainty the system is designed to survive. It does not say "bad things happen." It says which bad observations are possible and which assumptions the design is allowed to make.</p>
+<h2>The Small Situation</h2>
+<p>Start with one learner completing lesson <code>044</code>.</p>
+<p>The gateway in zone A receives:</p>
+<div class="codehilite"><pre><span></span><code>POST /complete-lesson
+learner_id=7
+lesson_id=044
+idempotency_key=req-44-a
+</code></pre></div>
+
+<p>The progress service is replicated across A, B, and C. A completion write is authoritative only after a quorum of replicas accepts it. With three replicas, quorum is two.</p>
+<p>For this request, A can reach B but not C:</p>
+<div class="codehilite"><pre><span></span><code>A -&gt; B works
+A -&gt; C times out
+B -&gt; C works sometimes
+C -&gt; A replies are dropped
+</code></pre></div>
+
+<p>From A's point of view, C looks bad. From B's point of view, C sometimes looks fine. From C's point of view, it may be healthy and confused about why A is not receiving replies.</p>
+<p>Plain meaning:</p>
+<p>A network partition is a communication split where some parts of the system can still run but cannot all talk to each other reliably.</p>
+<p>In this scenario:</p>
+<p>Zone A and zone C do not share the same view of reachability. They can each be locally alive while disagreeing about what the system can coordinate.</p>
+<p>Technical name:</p>
+<p>This is a partial failure with split reachability. It is not the same as total outage or simple process crash.</p>
+<h2>Local Observation Is Not Global Truth</h2>
+<p>The API server in A calls the certificate service in C and times out. The safe statement is narrow:</p>
+<div class="codehilite"><pre><span></span><code>A did not receive a useful response from C before its deadline.
+</code></pre></div>
+
+<p>That observation has several possible explanations:</p>
+<table>
+<thead>
+<tr>
+<th>Possible reality</th>
+<th>What A observes</th>
+<th>What may be true elsewhere</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C crashed</td>
+<td>timeout</td>
+<td>no one can reach C</td>
+</tr>
+<tr>
+<td>C is overloaded</td>
+<td>timeout</td>
+<td>C may answer some slower callers</td>
+</tr>
+<tr>
+<td>A -&gt; C packets are dropped</td>
+<td>timeout</td>
+<td>B may still reach C</td>
+</tr>
+<tr>
+<td>C -&gt; A replies are dropped</td>
+<td>timeout</td>
+<td>C may receive and process A's request</td>
+</tr>
+<tr>
+<td>A and C are partitioned</td>
+<td>timeout</td>
+<td>each side may still serve local work</td>
+</tr>
+<tr>
+<td>A's timeout is too short</td>
+<td>timeout</td>
+<td>a later response would have arrived</td>
+</tr>
+</tbody>
+</table>
+<p>This is why failure models are models of knowledge, not just lists of broken components. The system must decide what it can safely do when observations are incomplete.</p>
+<p>Plain meaning:</p>
+<p>A failure model is the set of failure shapes the design expects and handles.</p>
+<p>In this scenario:</p>
+<p>If the system only expects crashes, it may treat C as dead when A cannot reach it. If the system expects partitions and one-way loss, it will be more careful: A's failed call is evidence about one path, not proof about C's global state.</p>
+<p>Technical name:</p>
+<p>Crash failure, omission failure, delay, packet loss, asymmetric reachability, and partition are different failure assumptions. They support different safe designs.</p>
+<p><strong>Check:</strong> A times out while calling C. Which conclusion is safe?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> A can conclude only that A did not get a useful response from C before its deadline. It cannot conclude that C is dead, that C did no work, or that B cannot reach C.</p>
+<h2>A Worked Partition Trace</h2>
+<p>Now trace the progress write.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  A receives POST /complete-lesson for learner 7
+  quorum size = 2 of 3 progress replicas
+
+Transition:
+  A writes locally
+  A sends write to B
+  A sends write to C
+
+Intermediate state:
+  B acknowledges
+  C does not answer A before deadline
+  C may still be alive and reachable from B
+
+Output or decision:
+  A has acknowledgements from A and B
+  quorum = 2, so the write can commit
+
+Naive failure contrast:
+  if A required every replica, one unreachable path would block all writes
+  if A ignored quorum rules, isolated sides could create conflicting truth
+</code></pre></div>
+
+<p>Here is the same moment as a state table:</p>
+<table>
+<thead>
+<tr>
+<th>Replica</th>
+<th>Can A reach it?</th>
+<th>Local state after request</th>
+<th>What A can know</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td>yes</td>
+<td>completion written</td>
+<td>local write happened</td>
+</tr>
+<tr>
+<td>B</td>
+<td>yes</td>
+<td>completion written</td>
+<td>B acknowledged</td>
+</tr>
+<tr>
+<td>C</td>
+<td>no clear answer</td>
+<td>unknown to A</td>
+<td>C may be down, slow, isolated, or already updated later</td>
+</tr>
+</tbody>
+</table>
+<p>A quorum rule gives A a safe decision without requiring perfect knowledge. A does not need every replica. It needs enough overlap that future committed decisions cannot form a separate incompatible history.</p>
+<p>Now change the split:</p>
+<div class="codehilite"><pre><span></span><code>partition side 1: A only
+partition side 2: B and C
+quorum = 2
+</code></pre></div>
+
+<p>If A is alone, A is alive but not authoritative. It should reject new authoritative completion writes or return a clear unavailable result. B and C can still form a quorum.</p>
+<p>This is not because A is bad. It is because local health is not the same as coordinated authority.</p>
+<h2>Quorum Refuses Some Work To Preserve Authority</h2>
+<p>Quorum systems buy one kind of safety: they prevent two isolated groups from both claiming to be the only authoritative writer.</p>
+<p>With five replicas and quorum three:</p>
 <div class="codehilite"><pre><span></span><code>5-node group
 quorum = 3
 
-partition A: 2 nodes
-partition B: 3 nodes
+partition left: 2 nodes
+partition right: 3 nodes
 
-2-node side: alive, but not authoritative for new commits
-3-node side: enough overlap to commit
+left side: alive, but cannot commit authoritative writes
+right side: alive and can commit authoritative writes
 </code></pre></div>
 
-<p>The rule is not about punishing the isolated side. It is about avoiding split authority. If both sides accepted writes as the single truth, the system could heal into two incompatible histories. Quorum rules make sure a committed decision overlaps with future committed decisions, so the system has a defensible path back to one history.</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">can_commit</span><span class="p">(</span><span class="n">reachable_nodes</span><span class="p">,</span> <span class="n">quorum_size</span><span class="p">):</span>
-    <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">reachable_nodes</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">quorum_size</span>
+<p>The two-node side may have healthy processes, disks, and local network links. It still lacks enough overlapping agreement. If it accepted writes as authoritative, and the three-node side also accepted writes, the system could heal into two different histories.</p>
+<p>The rule is simple:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">can_commit</span><span class="p">(</span><span class="n">reachable_replicas</span><span class="p">,</span> <span class="n">quorum_size</span><span class="p">):</span>
+    <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">reachable_replicas</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">quorum_size</span>
 </code></pre></div>
 
-<p>The function is simple because it hides the important design point: local health is not the same as coordinated authority. A node can be alive and still not know enough to make a safe global decision.</p>
-<p>The trade-off is availability versus coordination safety. Quorum systems keep stronger guarantees about committed state, but they intentionally reject some work during communication uncertainty. That rejection is a feature when the alternative is conflicting truth.</p>
+<p>The design idea behind it is not simple:</p>
+<div class="codehilite"><pre><span></span><code>availability is reduced so authority stays coherent
+</code></pre></div>
+
+<p>The trade-off is availability versus coordination safety. A quorum system intentionally rejects some work during communication uncertainty. That rejection is not a bug when the alternative is split authority.</p>
+<p><strong>Check:</strong> A two-node minority side has healthy machines but cannot reach the other three replicas in a five-node quorum system. Should it accept authoritative writes?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It is locally alive, but it does not have enough overlapping agreement to make new writes authoritative without risking conflicting histories.</p>
 <h2>Staying Writable Means Owning Reconciliation</h2>
-<p>Not every subsystem should choose the same response. Suppose the platform tracks non-critical recommendation hints: which lessons a learner opened, which topics looked interesting, and which prompts were dismissed. During a partition, it may be acceptable for both sides to keep accepting these hints locally because losing responsiveness is worse than temporary divergence.</p>
-<p>That choice moves the cost. Instead of paying coordination cost before every write, the system pays merge cost after connectivity returns.</p>
+<p>Not every subsystem needs the same answer.</p>
+<p>The certificate issuer should probably fail closed during partition uncertainty. A certificate is a user-visible promise. It should not be issued from a side that cannot verify authoritative progress.</p>
+<p>Recommendation hints are different. If a learner opens a lesson, dismisses a prompt, or clicks an interest tag, the platform may accept those hints locally and merge them later. The user experience stays smoother, and a temporary duplicate hint is not catastrophic.</p>
+<p>That choice moves the cost:</p>
 <div class="codehilite"><pre><span></span><code>partition starts
-  -&gt; side A accepts local updates
-  -&gt; side B accepts local updates
+  -&gt; side A accepts local recommendation hints
+  -&gt; side C accepts local recommendation hints
   -&gt; histories diverge
 partition heals
-  -&gt; system merges or resolves the histories
+  -&gt; system merges, deduplicates, or resolves hints
 </code></pre></div>
 
-<p>The merge rule must match the domain. For a set of completed lessons, union may be reasonable. For a profile field, the system may need a version, timestamp, or explicit user confirmation. For money, certificates, quotas, or authorization, "just merge later" may be unacceptable because the intermediate state is itself a promise.</p>
-<p>This is the real meaning behind partition trade-offs. Remaining available is not free. It usually means accepting bounded staleness, divergent writes, conflict resolution, weaker immediate guarantees, or a narrower definition of what remains available.</p>
-<p>The trade-off is continuity versus semantic complexity. You keep more user or workflow paths alive during the partition, but you must explain what those paths guarantee and how the system repairs disagreement later.</p>
-<h2>Common Design Mistakes</h2>
-<p>One mistake is treating a timeout as proof that a peer is dead. The previous lesson showed why a timeout only tells the caller that waiting ended. In partitioned systems, that distinction becomes structural: one node's failed call may say more about the path than about the peer.</p>
-<p>Another mistake is treating partition tolerance as if it meant normal behavior continues. A system can preserve coordination by refusing writes, or preserve availability by accepting divergence and reconciliation work. It cannot pretend the partition imposed no cost.</p>
-<p>A third mistake is applying one failure response to every subsystem. A certificate issuer, a recommendation hint stream, and a public lesson catalog do not need identical guarantees. The better design names which state is authoritative, which state may be stale, which state may diverge, and which operations should fail closed.</p>
-<h2>Connections</h2>
-<p>Timeouts and retries are local tools for ambiguous observations. Failure models widen the lens: they ask what many nodes can and cannot know at the same time. A timeout policy that is sensible for a single call can still be unsafe if the larger system interprets many timeouts as proof that leadership changed.</p>
-<p>This lesson also opens the path to consensus and replication. Leader election, terms, quorum writes, read leases, and conflict-free data types are concrete mechanisms for surviving different communication failures while preserving different guarantees.</p>
+<p>The merge rule must match the data.</p>
+<table>
+<thead>
+<tr>
+<th>State type</th>
+<th>Partition behavior</th>
+<th>Repair rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>completed lesson set</td>
+<td>maybe accept only with quorum, or merge union for low-risk displays</td>
+<td>deduplicate by learner and lesson</td>
+</tr>
+<tr>
+<td>certificate issuance</td>
+<td>fail closed without authoritative progress</td>
+<td>retry after quorum evidence returns</td>
+</tr>
+<tr>
+<td>recommendation hints</td>
+<td>accept locally if hints are low-risk</td>
+<td>merge sets or keep latest bounded events</td>
+</tr>
+<tr>
+<td>account quota</td>
+<td>usually fail closed or require authority</td>
+<td>reconcile with audit trail</td>
+</tr>
+</tbody>
+</table>
+<p>Remaining writable is not free. It means accepting bounded staleness, divergent writes, conflict resolution, weaker immediate guarantees, or a narrower definition of what remains available.</p>
+<p>The useful question is not "CP or AP?" as a slogan. The useful question is:</p>
+<blockquote>
+<p>Which operations must preserve authority, and which operations can tolerate temporary divergence with a clear repair rule?</p>
+</blockquote>
+<h2>Common Confusions</h2>
+<h3>Confusion: "Partition means everything is down"</h3>
+<p>Why it is tempting:</p>
+<p>From one caller's view, a timeout can make a remote zone feel gone.</p>
+<p>Better model:</p>
+<p>A partition is split communication, not necessarily total failure. Each side may keep doing local work, which is exactly why authority and reconciliation become hard.</p>
+<h3>Confusion: "Healthy means authoritative"</h3>
+<p>Why it is tempting:</p>
+<p>Health checks often report whether a process is alive and dependencies respond locally.</p>
+<p>Better model:</p>
+<p>A replica can be alive and still not know enough to accept a globally authoritative write. Coordination requires reachability to enough peers, not just process liveness.</p>
+<h3>Confusion: "Availability through partition is free"</h3>
+<p>Why it is tempting:</p>
+<p>Keeping writes open sounds better than rejecting user work.</p>
+<p>Better model:</p>
+<p>Writable partitions move cost into staleness, divergent histories, merge rules, audit trails, and user-facing boundaries about what was really guaranteed.</p>
+<h2>Practice</h2>
+<p>Review this incident note:</p>
+<div class="codehilite"><pre><span></span><code>During a zone incident, gateway A timed out calling certificate service C.
+Progress replicas A and B could communicate.
+Progress replica C could communicate with B, but replies from C to A were dropped.
+Recommendation hints continued to be accepted in A and C.
+Certificates were temporarily disabled.
+</code></pre></div>
+
+<p>Answer these questions:</p>
+<ol>
+<li>What can A safely conclude from the timeout to C?</li>
+<li>Can A and B commit a progress write if quorum is 2 of 3?</li>
+<li>Why is disabling certificates a reasonable fail-closed choice?</li>
+<li>What repair rule do recommendation hints need after the partition heals?</li>
+</ol>
+<p>Model answer:</p>
+<p>A can conclude only that it did not receive a useful response from C before its deadline. It cannot prove that C is dead or that B cannot reach C. If A and B both acknowledge and quorum is 2 of 3, they can commit the progress write, although C must catch up later. Disabling certificates is reasonable because certificate issuance is an authoritative user-visible promise. Recommendation hints need a merge or deduplication rule, such as union by stable hint id or bounded latest-event merge, so divergent local histories can be repaired.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Failure models improve design clarity. They force the system to say what kind of uncertainty it can survive: crash, delay, loss, overload, asymmetric communication, minority partition, or total isolation.</p>
+<p>They cost complexity. A richer failure model needs more careful protocols, clearer incident language, better telemetry, and more explicit user-facing behavior. A simpler model is easier to reason about, but it may make the system overconfident when real networks fail in messier ways.</p>
+<p>This lesson does not teach consensus algorithms in depth. It uses quorum as a visible example of one design response to partitions. Full leader election, log replication, read leases, CRDTs, and formal proofs belong in later tracks.</p>
+<p>You can see the boundary when a team says "C was down" but the evidence only says "A did not hear from C." That small language correction can prevent a large design mistake.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Designing Data-Intensive Applications<ul>
-<li>Link: <a href="https://dataintensive.net/">https://dataintensive.net/</a></li>
-<li>Focus: Revisit network partitions, replication trade-offs, and why coordination under uncertainty forces real choices.</li>
-</ul>
-</li>
-<li>[PAPER] Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services<ul>
-<li>Link: <a href="https://dl.acm.org/doi/10.1145/564585.564601">https://dl.acm.org/doi/10.1145/564585.564601</a></li>
-<li>Focus: Read CAP as a statement about behavior under partition, not as a product taxonomy.</li>
-</ul>
-</li>
-<li>[PAPER] In Search of an Understandable Consensus Algorithm<ul>
-<li>Link: <a href="https://raft.github.io/raft.pdf">https://raft.github.io/raft.pdf</a></li>
-<li>Focus: See how leader terms and quorum rules respond to uncertain communication.</li>
-</ul>
-</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> - Revisit network partitions, replication trade-offs, and why coordination under uncertainty forces real choices.</li>
+<li>[PAPER] <a href="https://dl.acm.org/doi/10.1145/564585.564601">Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services</a> - Read CAP as a statement about behavior under partition, not as a product taxonomy.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> - See how leader terms and quorum rules respond to uncertain communication.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
@@ -160,6 +381,7 @@ partition heals
 <li>A timeout is a local observation; it does not prove crash, loss, overload, or partition by itself.</li>
 <li>Quorum systems preserve authoritative state by refusing some work when reachability is uncertain.</li>
 <li>Staying writable during a partition usually means accepting divergence and designing explicit reconciliation rules.</li>
+<li>Good partition design chooses behavior per operation: fail closed for authority, degrade for optional reads, and reconcile only when the domain can tolerate it.</li>
 </ul>
 </section>
 
@@ -189,7 +411,7 @@ partition heals
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

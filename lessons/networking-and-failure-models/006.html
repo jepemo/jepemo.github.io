@@ -76,83 +76,335 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Service Discovery, Naming, and Routing Control</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain why a service name is not the same thing as a network endpoint.</p>
+</li>
+<li>
+<p>Trace how discovery, routing, health, and identity combine before a request is sent.</p>
+</li>
+<li>
+<p>Identify stale discovery as a normal failure mode, not a rare control-plane bug.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Discovery gives a client candidate destinations, routing chooses one for this request, and identity proves the chosen endpoint is allowed to answer for the stable service name.</p>
+</blockquote>
 <h2>Core Insight</h2>
-<p>Suppose the learning platform splits progress, catalog, certificates, and recommendations into separate services. The frontend no longer talks to one backend, and the services no longer live at one fixed address. Replicas appear, disappear, move zones, roll versions, drain during deploys, and fail readiness checks.</p>
-<p>The tempting story is that service discovery is just a lookup table: ask for <code>progress-service</code>, receive an address, connect. The real problem is subtler. A name is a promise about identity and intent, while an address is only a current place to send traffic. In a dynamic system, those two facts drift unless discovery, routing, and health information stay coordinated.</p>
-<p>Discovery decides what endpoints exist. Routing decides which one gets this request. Identity decides whether the endpoint is allowed to answer as that service. Health decides whether the endpoint should still be considered a responsible destination. If any of those meanings are blurred, failures become confusing: stale DNS records, traffic to old versions, requests sent across the wrong region, or clients trusting an endpoint that should no longer represent the service.</p>
-<p>The useful design shift is to treat naming as a control surface. The trade-off is freshness versus stability: clients need endpoint updates quickly enough to avoid broken paths, but not so eagerly that every small change becomes a fleet-wide storm.</p>
-<h2>Names Are Stable, Endpoints Are Not</h2>
-<p>A service name should express intent: "the progress API that owns lesson completion state." An endpoint expresses a current routing option: "this IP and port currently accepts progress traffic." The name should outlive any particular replica.</p>
-<div class="codehilite"><pre><span></span><code>service name: progress-service
-current endpoints:
-  10.0.1.7:8080
+<p>The previous lesson looked at health checks and traffic steering. A router cannot choose a healthy target until it has a list of possible targets. That list usually comes from service discovery.</p>
+<p>Imagine the learning platform has split into services:</p>
+<div class="codehilite"><pre><span></span><code>frontend
+  -&gt; progress-service
+  -&gt; catalog-service
+  -&gt; certificate-service
+  -&gt; recommendation-service
+</code></pre></div>
+
+<p>The frontend and gateway should not need to know that <code>progress-service</code> currently runs on <code>10.0.1.7:8080</code>, <code>10.0.2.4:8080</code>, and <code>10.0.3.9:8080</code>. Those addresses are temporary. Replicas restart, deployments roll, zones partition, nodes drain, certificates rotate, and endpoint lists change.</p>
+<p>The naive model says:</p>
+<div class="codehilite"><pre><span></span><code>service discovery = lookup table
+progress-service -&gt; 10.0.1.7:8080
+</code></pre></div>
+
+<p>That model is useful for the first minute of learning, then it starts lying.</p>
+<p>In a live distributed system, service discovery is not merely a phone book. It is part of the control plane that connects stable intent to temporary destinations. A client asks for <code>progress-service</code> because it wants "the service allowed to handle progress reads and writes." The discovery system returns candidates that might be able to serve that intent right now. Routing policy then chooses a destination for this particular request. Identity checks make sure the endpoint is actually allowed to answer as that service.</p>
+<p>The important distinction is:</p>
+<div class="codehilite"><pre><span></span><code>service name: stable intent
+endpoint: temporary destination
+discovery: candidate list
+routing: request-specific choice
+identity: proof that the endpoint is allowed to answer
+health: evidence about whether the endpoint should receive traffic
+</code></pre></div>
+
+<p>Once you separate those meanings, several confusing network failures become easier to explain. A request can fail because the name resolved to stale endpoints. It can fail because routing chose a candidate that was healthy for reads but unsafe for writes. It can fail because an endpoint answered from the wrong rollout group. It can fail because the endpoint existed, but could not prove the right workload identity.</p>
+<p>The useful design shift is to treat naming as a control surface, not a string replacement trick. Names, endpoint freshness, routing policy, health state, and identity all shape where traffic goes.</p>
+<h2>Stable Names, Temporary Endpoints</h2>
+<p>A service name should express what the caller means, not where the process happens to run today.</p>
+<p>For the learning platform:</p>
+<div class="codehilite"><pre><span></span><code>progress-service = the API that owns lesson completion state
+catalog-service = the API that exposes lesson and track metadata
+certificate-service = the API that issues durable completion evidence
+</code></pre></div>
+
+<p>Those names should survive normal operational change. The progress service may run three replicas this morning, six replicas during peak traffic, and two replicas during a quiet deploy. The name stays stable while the destination set changes.</p>
+<p>An endpoint is different:</p>
+<div class="codehilite"><pre><span></span><code>progress-service endpoints
+  P1 10.0.1.7:8080  zone=A  version=v2  write_ready=true
+  P2 10.0.2.4:8080  zone=B  version=v2  write_ready=false read_ready=true
+  P3 10.0.3.9:8080  zone=C  version=v1  draining=true
+</code></pre></div>
+
+<p>Each endpoint is a current option, not a promise forever. P3 may be removed because it is draining. P2 may stay in the pool for reads but not writes. P1 may be the only write-ready target for a short period. A minute later the table may look different.</p>
+<p>That difference matters because application code often wants a stable name, while infrastructure has to deal with unstable destinations. If application code hard-codes endpoints, every deployment becomes a coordination problem. If infrastructure hides too much, callers may assume that a successful lookup means "safe to use for anything," which is also false.</p>
+<p>Plain meaning:</p>
+<p>The name says what you want. The endpoint says where you might send this request. They are related, but they are not the same fact.</p>
+<p>Technical name:</p>
+<p>This is indirection. A stable service identity is mapped to a changing set of concrete network destinations.</p>
+<h2>Discovery Is Not Routing</h2>
+<p>Discovery answers:</p>
+<div class="codehilite"><pre><span></span><code>What endpoints could currently receive traffic for this service name?
+</code></pre></div>
+
+<p>Routing answers:</p>
+<div class="codehilite"><pre><span></span><code>Which endpoint should receive this request now?
+</code></pre></div>
+
+<p>Those are different decisions.</p>
+<p>Suppose a gateway receives:</p>
+<div class="codehilite"><pre><span></span><code>POST /complete-lesson
+target service: progress-service
+operation: authoritative write
+deadline remaining: 700 ms
+idempotency key: req-3017-a
+</code></pre></div>
+
+<p>Discovery might return three candidates:</p>
+<div class="codehilite"><pre><span></span><code>P1: zone A, version v2, write_ready=true, identity=progress-service
+P2: zone B, version v2, read_only=true, identity=progress-service
+P3: zone C, version v1, draining=true, identity=progress-service
+</code></pre></div>
+
+<p>Routing should not randomly pick one of the three just because discovery returned them. The request is a write, so P2 is not safe even if it can serve reads. P3 is draining, so it should not receive new work. P1 is the only candidate that matches the request class.</p>
+<p>For a different request, the right decision may change:</p>
+<div class="codehilite"><pre><span></span><code>GET /progress-summary
+</code></pre></div>
+
+<p>That read might be acceptable on P2 if the product allows bounded staleness. The same endpoint can be a good destination for one request class and a bad destination for another.</p>
+<p>This is the bridge to the previous lesson. Health and load balancing act on the candidates that discovery provides. If discovery gives stale or incomplete candidates, routing starts from bad evidence. If routing ignores request meaning, a good candidate list still produces bad traffic decisions.</p>
+<p>The trade-off is where to place the intelligence. A smart gateway or service mesh can centralize routing policy. A simple client can be easier to reason about. But no design escapes the semantic question: "safe for which request?"</p>
+<p><strong>Check:</strong> Discovery returns endpoints P1, P2, and P3 for <code>progress-service</code>. P2 is read-only. Should the gateway send <code>POST /complete-lesson</code> to P2 because it appeared in discovery?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. Discovery only says P2 is a candidate for the service name. Routing still has to check whether P2 is safe for this request class.</p>
+<h2>A Worked Discovery And Routing Trace</h2>
+<p>Follow one request through the mechanism.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  POST /complete-lesson
+  service name = progress-service
+  request class = authoritative write
+  idempotency key = req-3017-b
+
+Transition:
+  gateway resolves progress-service
+  discovery returns endpoint metadata
+  gateway evaluates health, version, zone, request class, and identity
+
+Intermediate state:
+  P1 = write-ready, version v2, identity valid
+  P2 = read-only, version v2, identity valid
+  P3 = draining, version v1, identity valid but stale in one client cache
+
+Output or decision:
+  route the write to P1
+  do not route the write to P2
+  do not start new work on P3
+
+Naive failure contrast:
+  cached address sends the write to P3 because P3 was valid earlier
+  round-robin sends the write to P2 because P2 is alive
+  lookup-table thinking treats all discovered endpoints as equivalent
+</code></pre></div>
+
+<p>Here is the same mechanism as a table:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Question</th>
+<th>Example answer</th>
+<th>Decision impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Name</td>
+<td>What service does the caller intend?</td>
+<td><code>progress-service</code></td>
+<td>Use the stable service identity</td>
+</tr>
+<tr>
+<td>Discovery</td>
+<td>What endpoints are candidates?</td>
+<td>P1, P2, P3</td>
+<td>Build the candidate set</td>
+</tr>
+<tr>
+<td>Health</td>
+<td>Are candidates responsible destinations?</td>
+<td>P3 is draining</td>
+<td>Remove P3 from new work</td>
+</tr>
+<tr>
+<td>Request class</td>
+<td>What kind of operation is this?</td>
+<td>authoritative write</td>
+<td>Reject read-only candidates</td>
+</tr>
+<tr>
+<td>Routing</td>
+<td>Which endpoint should receive it?</td>
+<td>P1</td>
+<td>Send the request or fail closed</td>
+</tr>
+<tr>
+<td>Identity</td>
+<td>Is the endpoint allowed to answer?</td>
+<td>P1 proves progress identity</td>
+<td>Continue only if verification succeeds</td>
+</tr>
+</tbody>
+</table>
+<p>The output is not "we found an IP." The output is a controlled decision:</p>
+<div class="codehilite"><pre><span></span><code>send POST /complete-lesson to P1
+because P1 is write-ready, current, and identity-valid
+</code></pre></div>
+
+<p>If no endpoint satisfies those conditions, the right answer may be a fast <code>503 Service Unavailable</code>, a retry after backoff, or a degraded response depending on the operation. For a progress write, failing closed is usually safer than sending the request to a destination that cannot responsibly commit it.</p>
+<p>This is why service discovery belongs in failure-model thinking. Discovery data is evidence. Routing policy interprets that evidence. Identity constrains trust. None of them is perfect truth.</p>
+<h2>Stale Discovery Is A Normal Failure Mode</h2>
+<p>Discovery systems are distributed systems too. They have caches, watches, registries, DNS TTLs, control-plane delays, resolver behavior, dropped updates, and clients that continue using old data.</p>
+<p>Stale discovery is therefore not strange. It is one of the everyday ways a networked system fails.</p>
+<p>Imagine this deploy:</p>
+<div class="codehilite"><pre><span></span><code>t0: P3 is serving progress-service traffic
+t1: P3 starts draining for a deploy
+t2: orchestrator marks P3 not ready
+t3: registry removes P3 from the ready endpoint list
+t4: one gateway has a cached endpoint list that still includes P3
+t5: gateway sends POST /complete-lesson to P3
+</code></pre></div>
+
+<p>The discovery system may be behaving reasonably and still produce this situation. The cache existed to reduce control-plane load and survive brief registry problems. The stale entry is the cost of that resilience.</p>
+<p>Now P3 needs defensive behavior. It cannot assume "if traffic arrived, I must be a good target." A draining endpoint can reject new writes, finish in-flight work, or redirect only if that is safe. The gateway can refresh discovery after a failed attempt. The application can require idempotency so a retry does not create duplicate completion state.</p>
+<p>The key lesson is that discovery should reduce bad routing, not become the only safety barrier.</p>
+<p>There is a real trade-off:</p>
+<table>
+<thead>
+<tr>
+<th>Choice</th>
+<th>Benefit</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Long cache / high TTL</td>
+<td>fewer lookups, less control-plane dependency</td>
+<td>clients keep stale endpoints longer</td>
+</tr>
+<tr>
+<td>Short cache / low TTL</td>
+<td>faster reaction to endpoint changes</td>
+<td>more lookup traffic and more sensitivity to control-plane issues</td>
+</tr>
+<tr>
+<td>Push updates / watches</td>
+<td>fast convergence when healthy</td>
+<td>watch streams can lag, reconnect, or miss events</td>
+</tr>
+<tr>
+<td>Proxy-managed discovery</td>
+<td>consistent policy in one layer</td>
+<td>proxy/control-plane bugs affect many services</td>
+</tr>
+</tbody>
+</table>
+<p>No setting eliminates failure. The goal is to know what kind of failure each setting makes more likely.</p>
+<p><strong>Check:</strong> A team lowers DNS TTL to one second and claims stale discovery is now solved. What is missing from that claim?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> TTL helps, but it does not remove client caches, resolver behavior, delayed health updates, watch lag, partitions, or endpoints that must still defend themselves when stale traffic arrives.</p>
+<h2>Identity Prevents Blind Trust</h2>
+<p>Finding an endpoint is not the same as trusting it.</p>
+<p>Suppose discovery returns:</p>
+<div class="codehilite"><pre><span></span><code>progress-service -&gt; 10.0.2.4:8080
+</code></pre></div>
+
+<p>The client still needs to know whether the workload at that address is allowed to answer as <code>progress-service</code>. In modern service fleets, that proof may come from mTLS certificates, SPIFFE identities, service accounts, signed tokens, or platform workload identity.</p>
+<p>Without identity, discovery can accidentally become trust:</p>
+<div class="codehilite"><pre><span></span><code>I found an address, therefore I trust whatever answers there.
+</code></pre></div>
+
+<p>That is dangerous. A stale registry entry, misconfigured DNS record, reused IP, compromised side path, or accidental port exposure can send traffic to the wrong workload. Strong identity gives the client or proxy a way to reject the connection even when the address was reachable.</p>
+<p>The better model is:</p>
+<div class="codehilite"><pre><span></span><code>name requested:
+  progress-service
+
+endpoint reached:
   10.0.2.4:8080
-  10.0.3.9:8080
+
+identity verified:
+  workload is allowed to represent progress-service
+
+route allowed:
+  only if health and request policy also match
 </code></pre></div>
 
-<p>When a replica fails readiness, the endpoint list should change. When a deployment adds a new version, the endpoint set may include both old and new replicas while traffic shifts. When a zone partitions, different clients may temporarily see different reachable endpoints. The service name stays the same while the safe destinations behind it change.</p>
-<p>The discovery mechanism can be DNS, a service registry, an orchestrator API, a sidecar proxy, or a platform-specific control plane. The mechanism matters, but the core question is the same: how does the client learn where safe destinations are, and how stale can that knowledge become?</p>
-<p>The trade-off is caching versus freshness. Caching discovery data reduces load and smooths transient control-plane problems. Stale discovery data can keep sending traffic to endpoints that are no longer healthy, no longer local, no longer on the intended version, or no longer authorized for a request class.</p>
-<h2>Discovery And Routing Are Different Decisions</h2>
-<p>Discovery answers "what could receive this service's traffic?" Routing answers "where should this specific request go now?" Mixing them makes systems harder to reason about.</p>
-<div class="codehilite"><pre><span></span><code>discovery: progress-service has endpoints A, B, C
-routing: send this write to B because it is healthy, local, and in the active rollout group
+<p>Identity does not replace discovery. It also does not replace health checks. It answers a different question: "is this endpoint who it needs to be?"</p>
+<p>The trade-off is operational complexity. Certificates expire. Identities need policy. Rotation can break traffic. Debugging a failed handshake is harder than debugging a plain TCP connection. But without identity, a discovery mistake can turn into an authorization mistake.</p>
+<h2>Design Pressure Points</h2>
+<p>A good service discovery design makes several choices explicit.</p>
+<p>First, decide what a service name means. If <code>progress-service</code> means "any process with a progress HTTP port," the name is too loose. If it means "the workload identity and API surface allowed to handle progress state," the name carries useful intent.</p>
+<p>Second, decide how clients learn endpoint changes. DNS, a registry API, Kubernetes Services, sidecar proxies, and service meshes all draw the boundary differently. The right answer depends on operational maturity, traffic volume, latency needs, and how much policy you want outside application code.</p>
+<p>Third, decide what metadata routing needs. A bare IP list may be enough for simple read traffic. A platform that routes writes, canaries, regional traffic, and degraded reads probably needs metadata such as version, zone, readiness class, weight, and identity.</p>
+<p>Fourth, decide what happens when discovery is unavailable. Some clients can continue with cached endpoints for a short time. Some operations should fail closed. A certificate issuance path should not blindly use old discovery data if it cannot verify authority.</p>
+<p>Fifth, decide what the endpoint does when it receives traffic it should not have received. The defensive answer should live in the service too, not only in the router.</p>
+<h2>Observability Needs The Decision Trail</h2>
+<p>The next lesson focuses on observability because discovery and routing bugs are painful when the decision trail disappears.</p>
+<p>For this lesson's worked trace, useful telemetry would include:</p>
+<div class="codehilite"><pre><span></span><code>requested service name = progress-service
+discovery source = gateway cache
+endpoint candidates = P1, P2, P3
+selected endpoint = P1
+route reason = write_ready=true and identity_valid=true
+rejected candidates = P2 read_only, P3 draining
+endpoint version = v2
+identity verification = success
+cache age = 4 seconds
 </code></pre></div>
 
-<p>For the learning platform, a catalog read can often go to any healthy local replica. A progress write may need a region with access to authoritative storage. A certificate issuance request may need stricter routing because duplicate issuance is expensive. All three may discover service endpoints the same way while routing requests differently.</p>
-<p>This separation also helps during deploys. Discovery may show both version <code>v1</code> and <code>v2</code> endpoints. Routing policy decides whether canary traffic gets <code>v2</code>, whether only internal users see it, or whether the system rolls back because error rates crossed a threshold.</p>
-<p>The trade-off is central control versus client simplicity. Putting routing in a gateway or proxy can standardize policy. Putting too much policy there can hide application meaning and make every route depend on a complex control plane.</p>
-<h2>Stale Discovery Is A Failure Mode</h2>
-<p>Discovery systems are themselves distributed systems. They have caches, watchers, registries, DNS TTLs, control-plane outages, delayed health updates, and clients with old endpoint lists. That means stale discovery is not an edge case. It is one of the normal ways networked systems fail.</p>
-<p>Imagine the progress service starts draining a replica before a deploy. The orchestrator removes the endpoint from the service list, but one client cached the old address for thirty seconds. That client may still send writes to a replica that is trying to leave rotation.</p>
-<div class="codehilite"><pre><span></span><code>t0: replica P3 starts draining
-t1: registry removes P3 from ready endpoints
-t2: client with stale cache sends write to P3
-t3: P3 must reject, forward, or safely finish the request
+<p>Without those facts, engineers may only see "one progress request was slow" or "P3 received traffic during deploy." They will not know whether the problem was stale discovery, bad routing policy, an identity mismatch, a health signal delay, or a client ignoring the gateway.</p>
+<p>This connects the track arc:</p>
+<ul>
+<li>lesson 4 explained that partitions can make authority ambiguous</li>
+<li>lesson 5 explained that health and load balancing are traffic decisions under uncertainty</li>
+<li>this lesson explains how names become candidate endpoints and trusted routes</li>
+<li>lesson 7 will explain how to record the path so incidents can be reconstructed</li>
+</ul>
+<h2>Practice</h2>
+<p>Take a service in a system you know and write five lines:</p>
+<div class="codehilite"><pre><span></span><code>stable service name:
+request classes:
+endpoint metadata needed:
+identity proof:
+what stale discovery would break:
 </code></pre></div>
 
-<p>The service still needs defensive behavior. Discovery should reduce bad routing, not become the only protection. A draining replica can reject new work, a proxy can refresh endpoint state, and a write operation can still require idempotency or authoritative routing before changing state.</p>
-<p>The trade-off is efficiency versus safety. Longer caches reduce discovery load and make clients less dependent on the control plane. Shorter caches react faster but can create more lookup traffic and more sensitivity to control-plane instability.</p>
-<h2>Identity Prevents Accidental Trust</h2>
-<p>Finding an endpoint is not the same as trusting it. A client needs confidence that the endpoint answering as <code>progress-service</code> is actually allowed to represent that service. In modern service fleets, that usually means identity is tied to certificates, workload identity, service accounts, or another authenticated channel.</p>
-<p>Without identity, discovery can become a dangerous source of trust. A stale registry entry, misconfigured DNS record, or compromised network path can send traffic to the wrong place. With identity, the client or proxy can reject an endpoint that does not prove it belongs to the intended service.</p>
-<div class="codehilite"><pre><span></span><code>name says: progress-service
-endpoint says: 10.0.2.4:8080
-identity proves: this workload is allowed to serve progress-service traffic
+<p>For example:</p>
+<div class="codehilite"><pre><span></span><code>stable service name: progress-service
+request classes: progress reads, completion writes, admin repair jobs
+endpoint metadata needed: zone, version, read_ready, write_ready, draining
+identity proof: workload certificate for progress-service
+what stale discovery would break: writes may go to a draining or old-version replica
 </code></pre></div>
 
-<p>The trade-off is security and clarity versus operational complexity. Strong identity helps contain misrouting and impersonation, but certificate rotation, policy configuration, and debugging failed handshakes become part of the networked system's everyday work.</p>
-<h2>Common Design Mistakes</h2>
-<p>One mistake is treating DNS or the registry as if it were always fresh truth. It is a cacheable control signal. TTLs, client caching, resolver behavior, and failure modes decide how quickly discovery reacts.</p>
-<p>Another mistake is letting service names encode physical placement too early. A name like <code>progress-service-zone-a-v2</code> may be useful for rollout plumbing, but it can leak temporary routing concerns into application code if used carelessly.</p>
-<p>A third mistake is ignoring identity until after discovery works. The system may route successfully and still be unsafe if clients cannot verify which service actually answered.</p>
-<h2>Connections</h2>
-<p>The previous lesson treated health and load balancing as traffic decisions under uncertainty. Discovery supplies the candidate destinations those policies act on. If discovery is stale or naming is sloppy, even a good load-balancing policy starts from bad inputs.</p>
-<p>The next lesson focuses on observability because discovery and routing bugs are hard to diagnose after the fact. A trace or log should be able to show which name was resolved, which endpoint was selected, which version answered, and whether identity verification succeeded.</p>
+<p>Then ask one review question:</p>
+<div class="codehilite"><pre><span></span><code>If discovery returns this endpoint, what still has to be true before routing a write there?
+</code></pre></div>
+
+<p>If the answer is only "it was in discovery," the design is under-specified.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] Kubernetes Services<ul>
-<li>Link: <a href="https://kubernetes.io/docs/concepts/services-networking/service/">https://kubernetes.io/docs/concepts/services-networking/service/</a></li>
-<li>Focus: Study the difference between stable service names and changing backend endpoints.</li>
-</ul>
-</li>
-<li>[DOC] Consul Service Discovery<ul>
-<li>Link: <a href="https://developer.hashicorp.com/consul/docs/concepts/service-discovery">https://developer.hashicorp.com/consul/docs/concepts/service-discovery</a></li>
-<li>Focus: Compare registry-based discovery, health state, and service identity concepts.</li>
-</ul>
-</li>
-<li>[DOC] SPIFFE Concepts<ul>
-<li>Link: <a href="https://spiffe.io/docs/latest/spiffe-about/overview/">https://spiffe.io/docs/latest/spiffe-about/overview/</a></li>
-<li>Focus: Use workload identity as the missing link between naming, discovery, and trust.</li>
-</ul>
-</li>
+<li>[TUTORIAL] <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Services</a> - Study how a stable Service fronts a changing set of Pods and endpoints.</li>
+<li>[ARTICLE] <a href="https://developer.hashicorp.com/consul/docs/concepts/service-discovery">Consul Service Discovery</a> - Compare registry-based discovery, health state, and service lookup.</li>
+<li>[ARTICLE] <a href="https://spiffe.io/docs/latest/spiffe-about/overview/">SPIFFE Overview</a> - Use workload identity as the trust layer that keeps naming separate from blind address trust.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Service names express stable intent; endpoints are temporary routing options.</li>
-<li>Discovery lists possible destinations, while routing chooses where a particular request should go.</li>
-<li>Stale discovery data is a normal failure mode, so TTLs and caching need deliberate design.</li>
-<li>Service identity keeps discovery from becoming blind trust in whatever endpoint a lookup returned.</li>
+<li>A service name expresses stable intent; an endpoint is a temporary destination.</li>
+<li>Discovery creates a candidate list, while routing chooses a destination for the current request.</li>
+<li>Health, request class, rollout metadata, and identity all affect whether a discovered endpoint is safe.</li>
+<li>Stale discovery is a normal failure mode caused by caches, delayed updates, watches, TTLs, and partitions.</li>
+<li>Strong workload identity prevents a successful lookup from becoming blind trust in the wrong endpoint.</li>
 </ul>
 </section>
 
@@ -182,7 +434,7 @@ identity proves: this workload is allowed to serve progress-service traffic
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

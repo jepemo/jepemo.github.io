@@ -76,89 +76,323 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Serialization, Schemas, and Protocol Choices</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain why serialization is a boundary contract, not just object-to-bytes conversion.</p>
+</li>
+<li>
+<p>Compare JSON, Protocol Buffers, and Avro from boundary constraints instead of format preference.</p>
+</li>
+<li>
+<p>Review a schema change for compatibility risks across clients, services, and event consumers.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A wire format is a promise about meaning across time, language, deployment, and ownership boundaries.</p>
+</blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the same learning platform from the previous lesson sending a progress update to two places. One copy goes to a mobile client so the learner can see that a lesson is complete. Another copy goes into an internal event stream so analytics, recommendations, and certificates can react later. Both paths move bytes, but the real risk is not the movement. The real risk is that different systems disagree about what those bytes mean.</p>
-<p>Serialization is the moment a local object becomes a cross-boundary contract. Inside one process, <code>percent_complete</code> may be an integer in memory. Across a network, it becomes an encoded field whose name, type, optionality, default behavior, and future meaning must survive independent deployments. A mobile app might be weeks behind the backend. An event consumer might replay messages written months ago.</p>
-<p>That is why protocol choice is not just a performance decision. JSON, Protocol Buffers, and Avro each make a different trade-off between human readability, compact machine exchange, schema discipline, and long-term evolution. The useful question is not "which format is best?" It is "which boundary needs which kind of contract?"</p>
-<h2>Serialization As A Boundary Contract</h2>
-<p>Across a process boundary, the receiver cannot see the sender's in-memory object. It sees bytes. Serialization gives those bytes enough structure for the receiver to rebuild meaning.</p>
-<p>For a lesson progress update, the message might need:</p>
+<p>In the previous lesson, the learning platform had to decide which layer knew enough to retry a request safely. Now the same platform has a different boundary problem.</p>
+<p>The progress service records that learner <code>7</code> completed lesson <code>041</code>. That fact must travel to several places:</p>
 <ul>
-<li>learner identifier</li>
-<li>lesson identifier</li>
-<li>completion percentage</li>
-<li>update timestamp</li>
-<li>source device or locale</li>
+<li>the mobile app, so the learner can see the lesson as complete</li>
+<li>the recommendation service, so it can choose the next lesson</li>
+<li>the certificate service, so it can update completion requirements</li>
+<li>the analytics pipeline, so reports can count progress later</li>
 </ul>
-<p>The network can deliver the payload perfectly and the system can still fail if the receiver interprets the payload differently. Is <code>percent_complete</code> allowed to be <code>null</code>? Is <code>updated_at_ms</code> milliseconds since epoch or seconds? If <code>source_device</code> is missing, does that mean "unknown", "web", or "old client"? These are contract questions, not transport questions.</p>
-<div class="codehilite"><pre><span></span><code>local object
-  -&gt; encoded message
-  -&gt; network or log boundary
-  -&gt; decoded structure
-  -&gt; local meaning on the receiver
+<p>The naive idea is:</p>
+<blockquote>
+<p>We just need to serialize the object and send it.</p>
+</blockquote>
+<p>That sounds reasonable. Inside one process, the progress object is ordinary local data. Across a network or log boundary, it becomes a message that other systems must understand without seeing the original code, memory layout, database model, or release history.</p>
+<p>Serialization is the moment local meaning becomes a cross-boundary contract.</p>
+<p>The hard part is not only "can the receiver parse these bytes?" The harder questions are:</p>
+<ul>
+<li>What does each field mean?</li>
+<li>Which fields are required?</li>
+<li>What should an old reader do with a new field?</li>
+<li>What should a new reader do with an old message?</li>
+<li>How long can this message live?</li>
+<li>Who is allowed to change the contract?</li>
+</ul>
+<p>Those are design questions. JSON, Protocol Buffers, Avro, and other formats are tools for answering them under different constraints.</p>
+<h2>The Small Situation</h2>
+<p>Start with one local object in the progress service:</p>
+<div class="codehilite"><pre><span></span><code>ProgressUpdate
+  learner_id: &quot;7&quot;
+  lesson_id: &quot;041&quot;
+  percent_complete: 100
+  completed_at_ms: 1720000000000
+  source: &quot;web&quot;
 </code></pre></div>
 
-<p>The trade-off is clarity versus flexibility. Loose message shapes feel easy early because they require little ceremony. Explicit schemas make change slower at first, but they reduce ambiguity once producers and consumers evolve independently.</p>
-<h2>Choosing The Format For The Boundary</h2>
-<p>JSON is often a good fit at public edges, admin APIs, debugging tools, and integration-heavy boundaries. Humans can inspect it, logs are readable, and nearly every language can produce and consume it. That operational convenience is real. Its cost is that JSON alone does not enforce much about required fields, unknown fields, numeric precision, or compatibility rules.</p>
-<p>Schema-driven binary formats such as Protocol Buffers optimize a different shape of work. They are usually more compact, faster to parse, and friendlier to generated client/server code. They ask the team to manage field numbers, defaults, unknown fields, and compatibility rules with more discipline.</p>
-<p>Avro and similar schema-oriented formats become attractive for event streams and data pipelines because messages may be stored, replayed, and read by consumers that did not exist when the producer wrote the event. In that setting, schema resolution and version history are part of the system's memory.</p>
-<div class="codehilite"><pre><span></span><code>public API: readability and broad interoperability may dominate
-internal RPC: compact messages and generated contracts may dominate
-event stream: schema evolution and replay safety may dominate
+<p>Inside the service, this object is easy to understand because the code gives it context. The field names, types, defaults, and validation rules live nearby.</p>
+<p>Now send the same fact to three boundaries:</p>
+<div class="codehilite"><pre><span></span><code>progress service
+  -&gt; public API response for mobile app
+  -&gt; internal RPC to recommendation service
+  -&gt; event stream for analytics and certificates
 </code></pre></div>
 
-<p>The trade-off is not text versus binary in the abstract. It is human operability versus machine efficiency versus evolution safety. A mature system may use different formats at different boundaries for good reasons.</p>
-<h2>Schema Evolution Is Where The Contract Is Tested</h2>
-<p>The hardest serialization failures often arrive after the first release. The backend adds <code>completion_source</code>. The mobile app has not upgraded. A batch job replays last month's events. A new consumer reads an old message and assumes a missing field means something the producer never intended.</p>
-<p>A schema is useful because it gives safe-change rules:</p>
-<ul>
-<li>which fields may be added</li>
-<li>which fields are required or optional</li>
-<li>which defaults old readers should assume</li>
-<li>how unknown fields are handled</li>
-<li>which identifiers or field numbers must never be reused</li>
-</ul>
-<div class="codehilite"><pre><span></span><code><span class="kd">message</span><span class="w"> </span><span class="nc">LessonProgress</span><span class="w"> </span><span class="p">{</span>
-<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">learner_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
-<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">lesson_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
-<span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">percent_complete</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
-<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">updated_at_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
-
-<span class="w">  </span><span class="k">reserved</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<p>The same business fact crosses three different boundaries. Each boundary has a different audience and a different failure cost.</p>
+<p>The mobile app may be old for weeks. The recommendation service may deploy several times per day. The analytics job may replay messages written months ago. A contract that is fine for one boundary may be risky at another.</p>
+<p>Plain meaning:</p>
+<p>A boundary contract is the agreement a receiver depends on when it cannot see the sender's local code.</p>
+<p>In this scenario:</p>
+<p>The mobile app does not know the progress service's internal model. It only sees the response payload. The analytics job does not know today's service code when it replays last month's event. It only sees stored messages.</p>
+<p>Technical name:</p>
+<p>The encoded message plus its compatibility rules form a serialization contract.</p>
+<h2>Where The Naive Design Breaks</h2>
+<p>Suppose the first version uses a loose JSON payload:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;learner_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;7&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;lesson_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;041&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;percent_complete&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;completed_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1720000000000</span>
 <span class="p">}</span>
 </code></pre></div>
 
-<p>The important part is not that this example uses Protocol Buffers. The important part is that a field number becomes part of history once messages escape into production. Reusing it later for a different meaning can break readers that are not deploying in lockstep.</p>
-<p>Event streams make this sharper because they separate systems by time as well as by network. A message can outlive the process, release, and team that produced it. In that world, schema evolution is not documentation polish. It is how the system keeps old facts understandable.</p>
+<p>This works on day one. It is readable. It is easy to log. The mobile app can parse it with standard libraries.</p>
+<p>Then the team adds certificates. Certificates need to know whether completion came from a normal lesson page, an admin correction, or a data repair job. A developer adds a field:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;learner_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;7&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;lesson_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;041&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;percent_complete&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;completed_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1720000000000</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;completion_source&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;web&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>What happens now?</p>
+<p>Some receivers ignore the new field. Some generated clients may reject unknown fields. Some analytics queries may assume the field always exists. A mobile app may keep using the old shape for weeks. A replay job may read old events where <code>completion_source</code> is missing.</p>
+<p>The network delivered the bytes. The protocol may have returned a clean <code>200</code>. The failure is at the meaning boundary: different systems no longer agree on what the message promises.</p>
+<p>That is why "just use JSON" and "just use Protobuf" are both incomplete answers. The useful design question is:</p>
+<blockquote>
+<p>Which boundary needs which contract discipline?</p>
+</blockquote>
+<h2>A Worked Contract Review</h2>
+<p>Review the three boundaries for the same progress fact.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  one progress update from the progress service
+
+Transition:
+  the update crosses three boundaries with different readers
+
+Intermediate state:
+  mobile app wants inspectable public data
+  recommendation service wants fast typed calls
+  analytics pipeline wants replay-safe events
+
+Output or decision:
+  choose a format and schema policy per boundary
+
+Naive failure contrast:
+  one unversioned message shape for every boundary makes easy changes risky
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>Boundary</th>
+<th>Main reader</th>
+<th>Message lifetime</th>
+<th>Good pressure</th>
+<th>Risk to manage</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Public API response</td>
+<td>mobile and web clients</td>
+<td>days to months</td>
+<td>readable, debuggable, broadly compatible</td>
+<td>old clients and missing fields</td>
+</tr>
+<tr>
+<td>Internal RPC</td>
+<td>service code deployed by the team</td>
+<td>minutes to days</td>
+<td>typed contract, generated clients, efficient calls</td>
+<td>field evolution and rollout order</td>
+</tr>
+<tr>
+<td>Event stream</td>
+<td>jobs, consumers, future services</td>
+<td>months or years</td>
+<td>replay safety, schema history, compatibility checks</td>
+<td>old messages and unknown future readers</td>
+</tr>
+</tbody>
+</table>
+<p>This table does not pick one universal winner. It says the boundary should drive the format.</p>
+<p>For the public API, JSON may be a good choice because humans inspect it easily, logs are readable, and client ecosystems are broad. But JSON alone is not the contract. You still need API documentation, compatibility tests, optional field rules, and a clear rule for unknown fields.</p>
+<p>For internal RPC, Protocol Buffers may fit because generated clients and typed messages reduce drift. But Protobuf does not remove design judgment. Field numbers become history. Defaults matter. Removing or reusing a field can break old readers.</p>
+<p>For event streams, Avro or another schema-oriented event format may fit because messages are stored and replayed. The schema registry or schema history becomes part of the system's memory.</p>
+<p>So far:</p>
+<ul>
+<li>serialization turns local data into a boundary contract</li>
+<li>different boundaries have different readers and lifetimes</li>
+<li>a format choice is really a compatibility and operations choice</li>
+</ul>
+<p><strong>Check:</strong> A public mobile API and an internal high-volume service call both carry <code>ProgressUpdate</code>. Should they automatically use the same wire format?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. They may share the same business meaning, but the boundary pressures differ. The mobile API may value readability and broad compatibility. The internal service call may value generated types, compact messages, and stricter schema discipline.</p>
+<h2>Schema Evolution Is The Real Test</h2>
+<p>The first version of a message is rarely the problem. The test comes later, when the system changes.</p>
+<p>A schema change is safe only if old and new producers and consumers can overlap without misunderstanding each other. Distributed systems almost always have overlap:</p>
+<ul>
+<li>old mobile apps keep running</li>
+<li>old service instances stay alive during a rolling deploy</li>
+<li>old events remain in logs</li>
+<li>new consumers start reading old data</li>
+<li>test fixtures and data exports preserve old shapes</li>
+</ul>
+<p>Consider this Protobuf-style message:</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">message</span><span class="w"> </span><span class="nc">ProgressUpdate</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">learner_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">lesson_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">percent_complete</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">completed_at_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Now the team wants <code>completion_source</code>.</p>
+<p>The safe version adds a new field number:</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">message</span><span class="w"> </span><span class="nc">ProgressUpdate</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">learner_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">lesson_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">percent_complete</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">completed_at_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">completion_source</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Old readers can usually ignore field <code>5</code>. New readers must still handle messages where field <code>5</code> is missing. That means the application needs a default meaning such as <code>"unknown"</code> or a rule that only newer events participate in certificate-source logic.</p>
+<p>The unsafe version reuses a field:</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">message</span><span class="w"> </span><span class="nc">ProgressUpdate</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">learner_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">lesson_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">completion_source</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int64</span><span class="w"> </span><span class="na">completed_at_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Field <code>3</code> used to mean <code>percent_complete</code>. Reusing it for <code>completion_source</code> can make old bytes look like a different fact. That is worse than a parse failure because it can create confident wrong meaning.</p>
+<p>Plain meaning:</p>
+<p>Schema evolution is the discipline of changing a message without breaking readers that are not changing at the same time.</p>
+<p>In this scenario:</p>
+<p>The progress service can deploy today, the mobile app can update next week, and analytics can replay last month's events. The schema must survive that uneven timeline.</p>
+<p>Technical name:</p>
+<p>This is backward and forward compatibility. Backward compatibility means new code can read old data. Forward compatibility means old code can tolerate new data.</p>
+<h2>Choosing A Format From Constraints</h2>
+<p>A useful format decision starts with questions, not with a favorite technology.</p>
+<p>Ask:</p>
+<ol>
+<li>Who reads this message?</li>
+<li>How independently do producers and consumers deploy?</li>
+<li>How long can the message live?</li>
+<li>How expensive is a misunderstanding?</li>
+<li>Do humans need to inspect the payload during incidents?</li>
+<li>Do we need generated clients and strict field IDs?</li>
+<li>Do we need a schema registry or compatibility gate?</li>
+</ol>
+<p>Then compare the options.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Strength</th>
+<th>Cost</th>
+<th>Good fit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JSON with explicit API contract</td>
+<td>readable, easy integration, easy debugging</td>
+<td>weak built-in schema rules</td>
+<td>public APIs and operational edges</td>
+</tr>
+<tr>
+<td>Protocol Buffers</td>
+<td>compact, typed, generated clients, stable field IDs</td>
+<td>more tooling and compatibility discipline</td>
+<td>internal RPC and service-to-service contracts</td>
+</tr>
+<tr>
+<td>Avro or schema-registry events</td>
+<td>schema evolution and replay-oriented design</td>
+<td>registry/process complexity</td>
+<td>event streams and long-lived data pipelines</td>
+</tr>
+</tbody>
+</table>
+<p>This comparison is not absolute. JSON can be used with JSON Schema and strong tests. Protobuf can be misused. Avro can be overkill for a simple endpoint. The format does not save a weak contract.</p>
+<p>The design trade-off is speed now versus safety later. A loose shape may help a small team move quickly. A stricter schema slows casual changes but makes independent deployment and replay safer. The right answer depends on the boundary and the cost of being wrong.</p>
+<p><strong>Check:</strong> An analytics team replays six-month-old progress events into a new report. Which risk should influence the format choice most?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Message lifetime and schema evolution. The report reads old data with newer code, so the contract must preserve meaning across time, not only across today's network call.</p>
 <h2>Common Design Mistakes</h2>
-<p>One mistake is choosing a format only from benchmark numbers. Payload size and parse speed matter, but so do debugging, integration, tooling, compatibility checks, and incident response. A slightly larger readable payload can be the right choice at an operational boundary. A compact schema-driven payload can be the right choice in high-volume internal traffic.</p>
-<p>Another mistake is treating "the JSON shape is obvious" as a contract. It may be obvious when one service writes and one service reads. It stops being obvious once there are mobile clients, old deployments, new consumers, test fixtures, replays, and partial migrations.</p>
-<p>A healthier review question is: who will read this message, how independently will they change, how long can the message live, and what kind of mistake would be expensive? Those answers should drive the protocol choice.</p>
+<h3>Confusion: "Serialization is only performance"</h3>
+<p>Why it is tempting:</p>
+<p>Benchmarks are easy to compare. Payload size and parse speed are visible numbers.</p>
+<p>Better model:</p>
+<p>Performance matters, but the contract also controls debugging, compatibility, rollout safety, replay safety, and how clearly systems preserve meaning.</p>
+<h3>Confusion: "Readable means safe"</h3>
+<p>Why it is tempting:</p>
+<p>A JSON payload looks obvious when one team owns both sides and everyone remembers the current shape.</p>
+<p>Better model:</p>
+<p>Readable is not the same as governed. A readable payload can still have unclear defaults, incompatible type changes, missing-field ambiguity, and undocumented ownership.</p>
+<h3>Confusion: "Schemas make compatibility automatic"</h3>
+<p>Why it is tempting:</p>
+<p>Generated types feel strict. A build step can make the message look controlled.</p>
+<p>Better model:</p>
+<p>Schemas give you tools for compatibility. Teams still need rules: do not reuse field IDs, define defaults, reserve removed fields, test old/new combinations, and document semantic changes.</p>
+<h2>Practice</h2>
+<p>Review this design proposal.</p>
+<p>The progress service wants to publish this event to analytics and certificates:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;learner_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;7&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;lesson_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;041&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;percent_complete&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;completed_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2026-07-09T10:00:00Z&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>The team plans three changes next month:</p>
+<ul>
+<li>add <code>completion_source</code></li>
+<li>rename <code>percent_complete</code> to <code>progress</code></li>
+<li>let certificates replay all events from the last year</li>
+</ul>
+<p>Write a short review with:</p>
+<ol>
+<li>one safe change</li>
+<li>one risky change</li>
+<li>one format or schema-policy recommendation</li>
+<li>one compatibility test you would require</li>
+</ol>
+<p>Model answer:</p>
+<p>Adding <code>completion_source</code> as an optional field can be safe if old readers ignore it and new readers define a default for old messages. Renaming <code>percent_complete</code> is risky because old consumers may still depend on that field name, and historical events still use it. For a year-long replay boundary, use an event format with explicit schema evolution rules, or keep JSON only with strict schema checks, versioned contracts, and compatibility tests. A useful test replays old events into the new certificate consumer and sends new events to an old analytics consumer to confirm both sides preserve meaning.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Explicit contracts improve independent deployment. They make it easier for old and new producers, clients, services, and consumers to overlap safely.</p>
+<p>They cost time and process. Someone must own schema review. Compatibility tests must run. Developers must learn which changes are safe, risky, or forbidden. A schema registry, generated clients, or API contract test suite is useful only if teams respect it.</p>
+<p>This lesson helps with boundary format decisions. It does not teach full protocol internals, binary encoding details, HTTP semantics, or storage design for event logs. Those topics live in deeper tracks.</p>
+<p>You can see the boundary when a change looks harmless locally but becomes risky across time or ownership. A field rename inside one service is a refactor. A field rename in a public API or replayed event stream is a migration.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] Protocol Buffers Language Guide (proto3)<ul>
-<li>Link: <a href="https://protobuf.dev/programming-guides/proto3/">https://protobuf.dev/programming-guides/proto3/</a></li>
-<li>Focus: Study field numbering, unknown fields, defaults, and compatibility discipline.</li>
-</ul>
-</li>
-<li>[RFC] JSON Data Interchange Syntax (RFC 8259)<ul>
-<li>Link: <a href="https://www.rfc-editor.org/rfc/rfc8259">https://www.rfc-editor.org/rfc/rfc8259</a></li>
-<li>Focus: Revisit why JSON is broadly interoperable and human-friendly despite weaker built-in schema rules.</li>
-</ul>
-</li>
-<li>[DOC] Apache Avro Specification<ul>
-<li>Link: <a href="https://avro.apache.org/docs/1.12.0/specification/">https://avro.apache.org/docs/1.12.0/specification/</a></li>
-<li>Focus: Compare a schema-oriented format designed for long-lived data exchange and schema resolution.</li>
-</ul>
-</li>
+<li>[ARTICLE] <a href="https://protobuf.dev/programming-guides/proto3/">Protocol Buffers Language Guide</a> - Study field numbers, unknown fields, defaults, reserved fields, and compatibility discipline.</li>
+<li>[ARTICLE] <a href="https://www.rfc-editor.org/rfc/rfc8259">The JavaScript Object Notation Data Interchange Format</a> - Revisit why JSON is broadly interoperable and human-friendly despite weak built-in schema rules.</li>
+<li>[ARTICLE] <a href="https://avro.apache.org/docs/1.12.0/specification/">Apache Avro Specification</a> - Compare a schema-oriented format designed for long-lived data exchange and schema resolution.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> - Use the encoding and evolution chapters to connect message formats with independent deployment.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
 <li>Serialization preserves shared meaning across boundaries, not just bytes on the wire.</li>
 <li>Format choice should follow the boundary: public API, internal RPC, event stream, or long-lived data pipeline.</li>
-<li>Schema evolution is where the contract proves whether independently deployed systems can keep understanding each other.</li>
-<li>The main trade-off is readability, efficiency, tooling discipline, and compatibility safety at the same time.</li>
+<li>Schema evolution is where the contract proves whether independently deployed systems can still understand each other.</li>
+<li>Readability, efficiency, tooling discipline, and compatibility safety are trade-offs, not separate checkboxes.</li>
+<li>A field change can be a local refactor inside one process and a breaking migration across a network or replay boundary.</li>
 </ul>
 </section>
 
@@ -188,7 +422,7 @@ event stream: schema evolution and replay safety may dominate
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

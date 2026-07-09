@@ -76,22 +76,33 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Network Layers and Application Communication</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain why transport reliability is not the same as application reliability.</p>
+</li>
+<li>
+<p>Classify which layer can observe, decide, or repair a communication problem.</p>
+</li>
+<li>
+<p>Trace one request through application, protocol, transport, and network boundaries.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Network layers move and shape communication, but only the application layer knows what a request means and what failure policy is safe.</p>
+</blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a learner opens a lesson page and the frontend calls an API gateway. The gateway fans out to a metadata service, a progress service, and a recommendations service. All three calls cross the network, but they do not mean the same thing. A stale recommendation might be acceptable; a duplicated progress write might not be; a metadata read might be safe to retry only while the user request still has enough time left.</p>
-<p>This is why a "reliable" transport does not automatically create a reliable application. TCP can retransmit lost segments and present an ordered byte stream. It cannot know whether <code>POST /complete-lesson</code> is safe to repeat, whether an HTTP <code>503</code> should be retried, or whether the page deadline has already made another attempt useless.</p>
-<p>Layering is progressive specialization, not pointless repetition. Lower layers solve narrow movement problems because they know less. Higher layers add meaning: methods, status codes, deadlines, identities, headers, routing policy, retry budgets, and telemetry. The design mistake is expecting one layer to solve a problem that only another layer can see.</p>
-<h2>What Each Layer Can Actually Know</h2>
-<p>Each network layer has a different boundary of knowledge. That boundary decides what kind of guarantee the layer can honestly provide.</p>
-<div class="codehilite"><pre><span></span><code>application: operation meaning, idempotency, user deadlines, business risk
-protocol: request/response shape, headers, status codes, framing
-transport: connection state, byte ordering, retransmission behavior
-network/link: reachability, routing path, packet movement
-</code></pre></div>
-
-<p>Suppose the gateway asks the metadata service for lesson details. The transport layer can say whether bytes were exchanged over a connection. The protocol layer can say that the response was an HTTP <code>200</code>, <code>404</code>, or <code>503</code>. The application layer can say whether missing metadata should fail the page, fall back to cached data, or retry another replica.</p>
-<p>The trade-off is abstraction versus visibility. Lower layers are reusable because they are general. Higher layers can make smarter decisions because they carry richer semantics, but that richness must be designed and maintained.</p>
-<h2>A Request Walkthrough</h2>
-<p>Follow one page-load request through the stack:</p>
+<p>Imagine a learner clicks <strong>Complete lesson</strong> in a learning app. The browser calls an API gateway. The gateway calls a progress service, a metadata service, and a recommendation service. All three calls cross the network, but they do not carry the same risk.</p>
+<p>A stale recommendation is annoying. A missing metadata response may be recoverable from cache. A duplicated progress write may mark the same lesson twice, send two events, or unlock a certificate too early.</p>
+<p>The first naive idea is:</p>
+<blockquote>
+<p>If the network delivers the bytes reliably, the application is reliable.</p>
+</blockquote>
+<p>That idea is useful in a small way. Reliable byte movement matters. TCP can retransmit lost segments, put bytes back in order, and hide many packet-level problems from the application.</p>
+<p>But TCP does not know that <code>POST /complete-lesson</code> changes learner state. It does not know whether retrying that request is safe. It does not know that the page has an 800 ms user deadline. It does not know whether <code>503</code> means "try another replica", "stop and show an error", or "serve a degraded page".</p>
+<p>This is the central lesson: lower layers solve movement problems because they know less. Higher layers solve meaning problems because they know more. A reliable distributed system needs both, and it needs each decision to live at a layer that has enough information to make it honestly.</p>
+<h2>The Small Situation</h2>
+<p>Use one page-load request as the running example:</p>
 <div class="codehilite"><pre><span></span><code>browser
   -&gt; API gateway
       -&gt; progress service
@@ -99,56 +110,262 @@ network/link: reachability, routing path, packet movement
       -&gt; recommendation service
 </code></pre></div>
 
-<p>The gateway receives one user-facing deadline, perhaps 800 ms. It has to spend that budget across several downstream calls. TCP can keep a connection open and retransmit missing data, but the gateway still has to decide which calls are required, which calls can be skipped, and which calls may be retried without harming the user.</p>
-<p>A progress write is a good example. If the frontend sends "mark lesson complete" and the connection drops after the server commits the write, the client may not know whether the operation succeeded. Retrying blindly can be dangerous unless the operation has an idempotency key or another deduplication rule. The transport observed a broken connection; the application has to resolve the ambiguity.</p>
-<p>That same page may also call recommendations. A timeout there is different. The gateway might return the page without recommendations, use a cached list, or retry once if enough deadline remains. The lower network layers are the same, but the application policy changes because the user-visible consequence changes.</p>
-<h2>Where Gateways, RPC, and Meshes Fit</h2>
-<p>HTTP, gRPC, gateways, proxies, and service meshes are useful because fleets need repeated communication policy. Once a system has many services, every call starts to need some mix of identity, TLS, tracing headers, timeout defaults, retry limits, load-balancing rules, and rollout controls. Keeping all of that as hand-written client logic becomes brittle.</p>
-<p>These tools still do not replace the transport. They sit above it and use information the transport cannot infer. A gateway can treat <code>GET /lessons/123</code> differently from <code>POST /complete-lesson</code>. A service mesh can propagate tracing headers or enforce mTLS across services. An RPC framework can attach deadlines and method names to calls.</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">should_retry</span><span class="p">(</span><span class="n">status_code</span><span class="p">,</span> <span class="n">idempotent</span><span class="p">,</span> <span class="n">deadline_remaining_ms</span><span class="p">):</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">idempotent</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">False</span>
-    <span class="k">if</span> <span class="n">deadline_remaining_ms</span> <span class="o">&lt;</span> <span class="mi">75</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">False</span>
-    <span class="k">return</span> <span class="n">status_code</span> <span class="ow">in</span> <span class="p">{</span><span class="mi">502</span><span class="p">,</span> <span class="mi">503</span><span class="p">,</span> <span class="mi">504</span><span class="p">}</span>
+<p>The browser wants a lesson page. The gateway has one user-facing deadline, perhaps 800 ms. It must spend that budget across several downstream calls.</p>
+<p>The gateway asks:</p>
+<ul>
+<li>Can I show the page without recommendations?</li>
+<li>Is the metadata required?</li>
+<li>Is a progress update safe to retry?</li>
+<li>Which error should the user see?</li>
+<li>Which trace, metric, or log will help us debug this later?</li>
+</ul>
+<p>The transport layer cannot answer these questions. It can expose connection state, retransmission behavior, and byte delivery. The protocol layer can expose request and response shape. The application layer must connect those signals to user-visible meaning.</p>
+<h2>What Each Layer Can Know</h2>
+<p>Each layer has a different boundary of knowledge. That boundary controls what guarantee the layer can provide.</p>
+<div class="codehilite"><pre><span></span><code>application: operation meaning, user deadline, idempotency, business risk
+protocol: method, path, status code, headers, framing, content type
+transport: connection state, byte ordering, retransmission, flow control
+network/link: reachability, routing path, packet movement, local loss
 </code></pre></div>
 
-<p>This decision is not a packet-delivery decision. It is a request-semantics decision. Central infrastructure can help enforce it consistently, but only if the application exposes meaningful signals such as method type, idempotency, deadlines, and error categories.</p>
-<p>The trade-off is consistency versus operational surface area. Gateways and meshes can reduce policy drift, but they also add latency, configuration, failure modes, and another layer that engineers must debug.</p>
-<h2>Failure Modes Across Layers</h2>
-<p>Layered systems fail in layered ways. A TCP connection can be healthy while the application request times out. An HTTP response can be syntactically valid while the business operation is rejected. A proxy can retry a call successfully but spend the entire latency budget. A service mesh can enforce mTLS correctly while the request itself is semantically unsafe to replay.</p>
-<p>When a request fails, the useful questions are:</p>
+<p>Plain meaning:</p>
+<p>A layer is a place where the system hides some detail and exposes a smaller contract to the layer above it.</p>
+<p>In this scenario:</p>
+<p>TCP hides packet loss and reordering when it can. HTTP exposes methods and status codes. The gateway uses those protocol facts plus application knowledge to decide whether to retry, fail, or degrade.</p>
+<p>Technical name:</p>
+<p>This is a layered communication model. Each layer provides an abstraction, and every abstraction buys simplicity by hiding some information.</p>
+<p>That hiding is both the power and the danger. Lower layers are reusable because they do not need to know every application. Higher layers can make smarter policy decisions because they know the operation's meaning. If we ask the wrong layer to decide, we get a policy that looks general but is unsafe.</p>
+<h2>The Naive Retry</h2>
+<p>Now make the pressure visible.</p>
+<p>The learner clicks <strong>Complete lesson</strong>. The browser sends:</p>
+<div class="codehilite"><pre><span></span><code>POST /complete-lesson
+learner_id=7
+lesson_id=041
+</code></pre></div>
+
+<p>The progress service receives the request, writes the completion record, and returns a response. But the connection drops before the browser receives the response.</p>
+<p>From the browser's view, the operation is ambiguous:</p>
+<div class="codehilite"><pre><span></span><code>Did the server commit the write?
+Did the request disappear before the server saw it?
+Did the response disappear after success?
+</code></pre></div>
+
+<p>The transport layer can report a broken connection. It cannot report whether the progress service committed the application write. The protocol layer may not have a complete HTTP response to inspect. The application must decide how to handle uncertainty.</p>
+<p>The tempting policy is:</p>
+<div class="codehilite"><pre><span></span><code>timeout or connection error -&gt; retry
+</code></pre></div>
+
+<p>That works for some reads. It is dangerous for some writes. Retrying a non-idempotent operation can duplicate work. Retrying after the user deadline can also turn a local ambiguity into a slower page for everyone.</p>
+<p>Plain meaning:</p>
+<p>Idempotent means "doing it more than once has the same intended effect as doing it once."</p>
+<p>In this scenario:</p>
+<p><code>GET /lesson/041</code> can usually be retried because reading lesson metadata should not create another completion. <code>POST /complete-lesson</code> is only safe to retry if the application provides a deduplication rule, such as an idempotency key.</p>
+<p>Technical name:</p>
+<p>Retry safety is an application-level property. It depends on operation semantics, not only on the transport error.</p>
+<h2>A Worked Request Trace</h2>
+<p>Follow the request with four layers visible. The important part is not the exact technology. The important part is what each layer can honestly know.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  browser sends POST /complete-lesson with idempotency_key=req-9
+
+Transition:
+  TCP opens or reuses a connection and moves bytes toward the gateway
+
+Intermediate state:
+  gateway sees method=POST, path=/complete-lesson, deadline_remaining=500 ms
+  gateway forwards to progress service with the same idempotency key
+
+Output or decision:
+  progress service commits completion for (learner_id=7, lesson_id=041)
+  response is lost before the browser receives it
+
+Naive failure contrast:
+  without application semantics, the client only sees &quot;connection failed&quot;
+  with application semantics, the retry can reuse req-9 and avoid duplicate work
+</code></pre></div>
+
+<p>Here is the same trace as a table:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Component</th>
+<th>What it sees</th>
+<th>What it can decide</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Network/link</td>
+<td>Packets move or fail along a path</td>
+<td>Forward, drop, or report local reachability signals</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Transport</td>
+<td>Connection state and ordered bytes</td>
+<td>Retransmit bytes, close connection, apply flow control</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Protocol</td>
+<td>HTTP method, path, headers, status</td>
+<td>Interpret request/response shape and error category</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Application</td>
+<td>Completion meaning, learner state, deadline, idempotency key</td>
+<td>Retry safely, deduplicate, degrade, or show an error</td>
+</tr>
+</tbody>
+</table>
+<p>Notice the uneven knowledge. The transport layer may be the first layer to observe a problem. That does not mean it is the layer that can choose the correct recovery policy.</p>
+<p>So far:</p>
 <ul>
+<li>lower layers can detect movement problems</li>
+<li>protocol layers can expose request and response shape</li>
+<li>application layers connect those facts to meaning, risk, and deadlines</li>
+</ul>
+<p>That separation is why "the network failed" is often an incomplete diagnosis. The observed failure may be at the network boundary, while the unsafe decision may be in retry policy, deadline propagation, or missing idempotency.</p>
+<p><strong>Check:</strong> The recommendation service times out after 200 ms. The page can still render without recommendations. Which layer can decide to return the page anyway?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The application layer, usually in the gateway or backend page handler. The transport can report that bytes did not arrive in time, and the protocol may expose a timeout or status. Only the application knows that recommendations are optional for this page.</p>
+<h2>Where Gateways, RPC, and Meshes Fit</h2>
+<p>HTTP clients, RPC frameworks, API gateways, proxies, and service meshes exist because real fleets repeat communication policy many times.</p>
+<p>Once a system has many services, every call starts to need some mix of:</p>
+<ul>
+<li>identity</li>
+<li>TLS</li>
+<li>tracing headers</li>
+<li>timeout defaults</li>
+<li>retry limits</li>
+<li>load-balancing rules</li>
+<li>rollout controls</li>
+<li>error classification</li>
+</ul>
+<p>Putting all of that in hand-written client code is brittle. Central infrastructure can make the common policy more consistent.</p>
+<p>But these tools still do not replace application meaning.</p>
+<p>A gateway can treat <code>GET /lessons/041</code> differently from <code>POST /complete-lesson</code>. An RPC framework can attach deadlines and method names to calls. A service mesh can propagate trace context, enforce mTLS, and apply configured retry rules.</p>
+<p>What they cannot do is safely invent missing semantics.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">should_retry</span><span class="p">(</span><span class="n">method</span><span class="p">,</span> <span class="n">idempotency_key</span><span class="p">,</span> <span class="n">status_code</span><span class="p">,</span> <span class="n">deadline_remaining_ms</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">deadline_remaining_ms</span> <span class="o">&lt;</span> <span class="mi">75</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">False</span>
+    <span class="k">if</span> <span class="n">method</span> <span class="o">==</span> <span class="s2">&quot;GET&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">status_code</span> <span class="ow">in</span> <span class="p">{</span><span class="mi">502</span><span class="p">,</span> <span class="mi">503</span><span class="p">,</span> <span class="mi">504</span><span class="p">}</span>
+    <span class="k">if</span> <span class="n">method</span> <span class="o">==</span> <span class="s2">&quot;POST&quot;</span> <span class="ow">and</span> <span class="n">idempotency_key</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">status_code</span> <span class="ow">in</span> <span class="p">{</span><span class="mi">502</span><span class="p">,</span> <span class="mi">503</span><span class="p">,</span> <span class="mi">504</span><span class="p">}</span>
+    <span class="k">return</span> <span class="kc">False</span>
+</code></pre></div>
+
+<p>This is not a packet-delivery decision. It is a request-semantics decision. Infrastructure can enforce it consistently, but the application must expose the method meaning, idempotency rule, and deadline.</p>
+<p>The trade-off is consistency versus operational surface area. Gateways and meshes reduce policy drift, but they also add latency, configuration, failure modes, and another layer to debug. The extra layer is worth it when it makes repeated policy visible and controlled. It is not worth much if teams still cannot explain what each request means.</p>
+<h2>Failure Modes Across Layers</h2>
+<p>Layered systems fail in layered ways.</p>
+<p>A TCP connection can be healthy while the application request times out in a queue. An HTTP response can be syntactically valid while the business operation is rejected. A proxy can retry a call successfully but spend the entire user deadline. A service mesh can enforce mTLS correctly while the request itself is unsafe to replay.</p>
+<p>When a request fails, ask three questions:</p>
+<ol>
 <li>Which layer observed the failure?</li>
 <li>Which layer made the last policy decision?</li>
 <li>Which layer had enough context to avoid or recover from the problem?</li>
-</ul>
-<p>For the lesson platform, "the network is fine" is not enough. A slow recommendation call may be caused by queueing inside the service, an aggressive retry policy in the gateway, a missing deadline, or a transport-level connection problem. The fix depends on where the decision went wrong.</p>
-<p>The core debugging discipline is to avoid blaming an abstract network. Separate byte movement, protocol semantics, infrastructure policy, and application meaning. Most real incidents cross at least two of those boundaries.</p>
+</ol>
+<p>For the lesson platform, "the network is fine" is not enough. A slow recommendation call may come from queueing inside the service, an aggressive retry policy in the gateway, a missing deadline, stale service discovery, or transport-level connection trouble.</p>
+<p>The fix depends on the boundary:</p>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Possible layer</th>
+<th>Better next question</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connection reset</td>
+<td>transport</td>
+<td>Did the application operation commit before the reset?</td>
+</tr>
+<tr>
+<td>HTTP <code>503</code></td>
+<td>protocol or service</td>
+<td>Is this request safe to retry within the deadline?</td>
+</tr>
+<tr>
+<td>Page loads slowly</td>
+<td>application or infrastructure policy</td>
+<td>Which downstream call consumed the deadline?</td>
+</tr>
+<tr>
+<td>Duplicate completion event</td>
+<td>application</td>
+<td>Was the write retried without idempotency?</td>
+</tr>
+<tr>
+<td>Trace has missing spans</td>
+<td>observability policy</td>
+<td>Which boundary failed to propagate context?</td>
+</tr>
+</tbody>
+</table>
+<p>The debugging discipline is to avoid blaming an abstract network. Separate byte movement, protocol semantics, infrastructure policy, and application meaning.</p>
+<p><strong>Check:</strong> A service mesh retries <code>POST /complete-lesson</code> after a <code>503</code>, and two completion events appear. Did TCP fail to provide reliability?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not primarily. The dangerous decision was above TCP. The retry policy treated a state-changing operation as safe to replay without enough application semantics or deduplication.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: "Reliable transport means reliable operation"</h3>
+<p>Why it is tempting:</p>
+<p>Reliable transport is visible in everyday programming. A client sends bytes, a server reads bytes, and many packet problems disappear.</p>
+<p>Better model:</p>
+<p>Reliable transport helps bytes arrive in order. It does not prove that the application operation succeeded, failed, or is safe to repeat.</p>
+<h3>Confusion: "The layer that sees the error should choose the fix"</h3>
+<p>Why it is tempting:</p>
+<p>The first error message often comes from a low layer: timeout, connection reset, TLS error, or DNS failure.</p>
+<p>Better model:</p>
+<p>Observation and decision are different. A low layer may observe a symptom, while a higher layer has the semantics needed to choose retry, fallback, deduplication, or user-visible failure.</p>
+<h3>Confusion: "A gateway or mesh can make all communication safe"</h3>
+<p>Why it is tempting:</p>
+<p>Central infrastructure feels like a place to solve the problem once for the whole fleet.</p>
+<p>Better model:</p>
+<p>Shared infrastructure can enforce common policy. It cannot make a non-idempotent operation safe unless the application exposes a safe rule, such as an idempotency key or a clear no-retry classification.</p>
+<h2>Practice</h2>
+<p>Review this small design.</p>
+<p>A gateway calls three services to render a dashboard:</p>
+<div class="codehilite"><pre><span></span><code>profile service: required read
+progress service: optional write that records &quot;dashboard viewed&quot;
+recommendation service: optional read
+</code></pre></div>
+
+<p>The team configures this rule for every downstream call:</p>
+<div class="codehilite"><pre><span></span><code>retry twice on timeout, with no deadline propagation
+</code></pre></div>
+
+<p>Classify the risk at each layer:</p>
+<ol>
+<li>What can the transport layer know?</li>
+<li>What can the protocol layer know?</li>
+<li>What application facts are missing from the retry rule?</li>
+<li>Which call would you allow to retry first, and under what limit?</li>
+</ol>
+<p>Model answer:</p>
+<p>The transport can know whether bytes moved over a connection and whether the connection timed out or reset. The protocol can know method, path, headers, and status when a response exists. The retry rule is missing operation semantics, idempotency, optionality, and the remaining user deadline. The safest first retry is usually the optional recommendation read, but only while enough deadline remains and only if stale or missing recommendations are acceptable. The optional progress write should not be retried blindly unless it has an idempotency key or deduplication rule.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Layering improves local reasoning. Each layer can focus on a smaller problem. Transport can move bytes without knowing every business operation. HTTP or RPC can shape requests without knowing every storage detail. Applications can express meaning without reimplementing packet delivery.</p>
+<p>The cost is hidden information. A lower layer may hide packet loss that matters for debugging. A higher layer may assume the lower layer provides a stronger guarantee than it really does. A shared proxy may apply a policy that is correct for reads but unsafe for writes.</p>
+<p>This model helps when you need to place responsibility: movement, protocol shape, shared infrastructure policy, or application meaning.</p>
+<p>It does not solve every networking problem. It does not teach TCP internals, congestion control, DNS operations, or formal consensus. It also does not remove the need for good telemetry. You can see the boundary when an incident report says "network timeout" but cannot answer whether the operation committed, whether a retry happened, or which deadline was consumed.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Computer Networking: A Top-Down Approach<ul>
-<li>Link: <a href="https://gaia.cs.umass.edu/kurose_ross/index.php">https://gaia.cs.umass.edu/kurose_ross/index.php</a></li>
-<li>Focus: Use the layering chapters to separate transport guarantees from application-level behavior.</li>
-</ul>
-</li>
-<li>[DOC] gRPC Introduction<ul>
-<li>Link: <a href="https://grpc.io/docs/what-is-grpc/introduction/">https://grpc.io/docs/what-is-grpc/introduction/</a></li>
-<li>Focus: Notice how RPC methods, contracts, and deadlines sit above raw transport.</li>
-</ul>
-</li>
-<li>[DOC] Istio Concepts<ul>
-<li>Link: <a href="https://istio.io/latest/docs/concepts/what-is-istio/">https://istio.io/latest/docs/concepts/what-is-istio/</a></li>
-<li>Focus: Read service-mesh features as fleet-level policy and observability layers.</li>
-</ul>
-</li>
+<li>[BOOK] <a href="https://gaia.cs.umass.edu/kurose_ross/index.php">Computer Networking: A Top-Down Approach</a> - Use the layering chapters to separate transport guarantees from application-level behavior.</li>
+<li>[TUTORIAL] <a href="https://grpc.io/docs/what-is-grpc/introduction/">gRPC Introduction</a> - Notice how RPC methods, contracts, deadlines, and generated clients sit above raw transport.</li>
+<li>[ARTICLE] <a href="https://istio.io/latest/docs/concepts/what-is-istio/">Istio Concepts</a> - Read service-mesh features as fleet-level policy, security, traffic, and observability controls.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
 <li>Transport reliability and application reliability are different guarantees.</li>
-<li>Higher layers exist because only they can see request meaning, deadlines, auth context, and safe retry rules.</li>
-<li>Gateways, RPC frameworks, and meshes standardize policy, but they cannot invent missing application semantics.</li>
-<li>Good debugging separates where bytes moved, where protocol semantics applied, where policy acted, and where business meaning lived.</li>
+<li>Each layer can only decide safely from the information it can see.</li>
+<li>Timeouts and connection errors are observations, not complete explanations of application outcome.</li>
+<li>Gateways, RPC frameworks, and meshes help standardize policy, but they need application semantics to make safe decisions.</li>
+<li>Good debugging separates byte movement, protocol shape, shared infrastructure policy, and application meaning.</li>
 </ul>
 </section>
 
@@ -178,7 +395,7 @@ network/link: reachability, routing path, packet movement
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

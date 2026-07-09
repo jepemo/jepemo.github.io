@@ -76,80 +76,306 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Timeouts, Retries, and Backoff</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain what a timeout proves, and what it does not prove.</p>
+</li>
+<li>
+<p>Choose retry behavior from operation semantics, idempotency, deadlines, and overload signals.</p>
+</li>
+<li>
+<p>Review a timeout/retry policy for failure amplification risk.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Recovery logic is part of the failure model: it can contain uncertainty, or it can multiply the failure.</p>
+</blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the learning platform marking a lesson complete. The client sends a request to the progress service and waits. After 300 ms, the caller gives up because the user path cannot spend more time there. What happened on the server? The caller does not know. The service may never have received the request. It may have committed the update and lost the response. It may still be working.</p>
-<p>Timeouts, retries, and backoff are one policy for acting under that uncertainty. A timeout decides when waiting stops. A retry decides whether to reissue work whose outcome may already exist. Backoff decides how much pressure retrying is allowed to add while the dependency may already be struggling.</p>
-<p>The common misconception is that these are independent reliability knobs. In practice, each one changes the meaning of the others. A short timeout with aggressive retries can create more traffic than a slow dependency can survive. A retry on a non-idempotent operation can turn ambiguity into duplicate side effects. Backoff without a retry budget can still create too much work if many callers follow the same pattern.</p>
-<p>The useful design shift is to treat recovery logic as part of the failure model. It can contain uncertainty, preserve user latency, and smooth transient faults. It can also amplify failure into duplicate writes, synchronized retry waves, and a wider outage.</p>
+<p>The learning platform has a familiar path now. A learner finishes lesson <code>043</code>. The browser calls the gateway. The gateway calls the progress service. The progress service writes completion and publishes a progress event.</p>
+<p>Most days, the request is boring. That is good.</p>
+<p>During a live cohort launch, the progress service gets slow. The gateway waits 300 ms, receives no response, and times out.</p>
+<p>The naive idea is:</p>
+<blockquote>
+<p>If a request times out, retry it.</p>
+</blockquote>
+<p>Sometimes that is exactly right. A retry can hide a temporary packet loss, a restarted instance, or a brief overload response. But a retry is not free. It can repeat a side effect, spend the user's remaining deadline, and add load to the dependency that is already struggling.</p>
+<p>A timeout is not a verdict about the server. It is a local decision by the caller: "I stopped waiting." The server may have done nothing. It may have committed the write. It may still be working. It may be overloaded and about to fail more requests.</p>
+<p>Timeouts, retries, backoff, jitter, and retry budgets are one policy bundle for acting under that uncertainty. They should be reviewed together.</p>
+<h2>The Small Incident</h2>
+<p>Here is the incident in small form:</p>
+<div class="codehilite"><pre><span></span><code>learner clicks Complete lesson
+  -&gt; browser sends request to gateway
+  -&gt; gateway calls progress service
+  -&gt; progress service is slow
+  -&gt; gateway times out after 300 ms
+</code></pre></div>
+
+<p>The gateway has an 800 ms user deadline for the whole page interaction. It has already spent time on authentication, metadata, and rendering. Only 350 ms remain when it calls the progress service.</p>
+<p>The progress service normally responds in 80 ms. During the launch, p95 latency rises to 500 ms. Some requests still succeed. Some queue. Some hit overload protection.</p>
+<p>Now the gateway must decide:</p>
+<ul>
+<li>Should it retry?</li>
+<li>How long should it wait?</li>
+<li>Is the completion write safe to repeat?</li>
+<li>How much extra traffic can recovery add?</li>
+<li>What should the user see if the result remains uncertain?</li>
+</ul>
+<p>Plain meaning:</p>
+<p>A timeout is a caller-side stop rule.</p>
+<p>In this scenario:</p>
+<p>The gateway did not receive a useful answer before 300 ms. That is all it knows for sure.</p>
+<p>Technical name:</p>
+<p>This is a local observation under partial failure. The caller observes missing response before deadline, not global operation outcome.</p>
 <h2>Timeout Means "I Stopped Waiting"</h2>
-<p>A timeout is a caller deadline, not proof that the operation failed. It tells the caller that no useful response arrived within the time budget. It does not tell the caller whether the server saw the request, ignored it, committed it, or crashed halfway through.</p>
-<div class="codehilite"><pre><span></span><code>request sent
-  -&gt; caller waits
-  -&gt; deadline expires
-  -&gt; caller stops waiting
-
-server outcome remains uncertain
+<p>A timeout answers one question:</p>
+<div class="codehilite"><pre><span></span><code>Did this caller receive a useful response before its deadline?
 </code></pre></div>
 
-<p>That distinction matters most when the operation has side effects. If the progress service times out while recording completion, the next action depends on what duplicate completion means. If completion is stored as "lesson 043 is complete for learner 17", applying the same fact twice may be harmless. If the request increments a counter, charges money, or sends a certificate email, a blind retry can change reality twice.</p>
-<p>Timeout values should come from the surrounding latency budget and dependency behavior. A user-facing API might have a tight deadline because a late answer is no longer useful. A background reconciliation job can wait longer because user responsiveness is not on the line. The number is a product and systems decision, not just a socket setting.</p>
-<p>The trade-off is responsiveness versus uncertainty. Shorter timeouts keep callers from waiting too long, but they increase the chance that slow successful work will be treated as ambiguous. Longer timeouts give dependencies more room to finish, but they tie up resources and delay fallback decisions.</p>
+<p>It does not answer these questions:</p>
+<div class="codehilite"><pre><span></span><code>Did the server receive the request?
+Did the server commit the write?
+Did the response get lost?
+Is the server slow, crashed, overloaded, or partitioned away?
+</code></pre></div>
+
+<p>That distinction matters most for side effects.</p>
+<p>For a read, uncertainty is often manageable. If <code>GET /lessons/043</code> times out, the gateway may retry another replica or serve cached content.</p>
+<p>For a write, uncertainty can change reality. If <code>POST /complete-lesson</code> times out after the progress service commits the write, a blind retry may create duplicate events, duplicate certificate checks, or confusing audit records.</p>
+<p>The safer mental model is:</p>
+<div class="codehilite"><pre><span></span><code>timeout = caller stopped waiting
+retry = caller chooses to create another attempt
+idempotency = receiver can recognize repeated intent
+deadline = upper bound on useful work
+</code></pre></div>
+
+<p>Timeout values should come from the surrounding user or workflow budget. A user-facing path may use a short timeout because a late answer is no longer useful. A background reconciliation job may wait longer because it is not holding up a person.</p>
+<p>The trade-off is responsiveness versus ambiguity. Short timeouts keep callers from hanging, but they increase the number of ambiguous outcomes. Long timeouts reduce ambiguity for slow successful work, but they tie up resources and delay fallback.</p>
+<p><strong>Check:</strong> The gateway times out after 300 ms. Which statement is safe?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> "The gateway stopped waiting before it received a useful response." It is not safe to say "the progress service did not commit the completion."</p>
+<h2>A Worked Request Trace</h2>
+<p>Follow one completion request with the important states visible.</p>
+<div class="codehilite"><pre><span></span><code>Input:
+  POST /complete-lesson
+  learner_id=7
+  lesson_id=043
+  idempotency_key=req-43-a
+  gateway_deadline_remaining=350 ms
+
+Transition:
+  gateway sends attempt 1 to progress service
+  progress service receives request after 40 ms
+  progress service queues behind slow writes
+
+Intermediate state:
+  gateway reaches 300 ms timeout
+  progress service commits at 330 ms
+  response reaches gateway after gateway stopped waiting
+
+Output or decision:
+  gateway observes timeout
+  progress service has already committed completion
+
+Naive failure contrast:
+  blind retry without idempotency may create duplicate side effects
+  retry with the same idempotency key can return the existing result
+</code></pre></div>
+
+<p>Here is the same trace as a timeline:</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Gateway state</th>
+<th>Progress service state</th>
+<th>What is known</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 ms</td>
+<td>sends attempt 1</td>
+<td>no request yet</td>
+<td>gateway knows it sent bytes</td>
+</tr>
+<tr>
+<td>40 ms</td>
+<td>waits</td>
+<td>receives request</td>
+<td>service may commit later</td>
+</tr>
+<tr>
+<td>300 ms</td>
+<td>timeout fires</td>
+<td>still processing</td>
+<td>gateway outcome is ambiguous</td>
+</tr>
+<tr>
+<td>330 ms</td>
+<td>considering retry</td>
+<td>commits completion</td>
+<td>service outcome is success</td>
+</tr>
+<tr>
+<td>360 ms</td>
+<td>old response arrives too late</td>
+<td>response sent</td>
+<td>gateway may ignore it</td>
+</tr>
+</tbody>
+</table>
+<p>The weird part is the split between observation and reality. The gateway's observation is timeout. The service's reality is success. A distributed system can have both at the same time because components learn facts at different moments.</p>
+<p>So far:</p>
+<ul>
+<li>a timeout is local</li>
+<li>a retry creates more work</li>
+<li>idempotency turns repeated attempts into one intended operation</li>
+<li>deadlines decide whether more work is still useful</li>
+</ul>
 <h2>Retry Safety Depends On Semantics</h2>
-<p>Retrying can improve success rates when a failure is transient, but it is safe only when repeating the operation is acceptable. Transport status alone is not enough information. The real question is: if the first attempt actually succeeded, what would a second attempt do?</p>
-<p>For the learning platform, retrying a read of lesson metadata is usually low risk. Retrying a completion write is safe only if the operation is idempotent or deduplicated. Retrying "send this notification" may need a stable request identifier so the notification service can recognize that the second attempt is the same intended action, not a new one.</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">should_retry</span><span class="p">(</span><span class="n">status_code</span><span class="p">,</span> <span class="n">idempotent</span><span class="p">,</span> <span class="n">deadline_remaining_ms</span><span class="p">):</span>
-    <span class="n">transient</span> <span class="o">=</span> <span class="n">status_code</span> <span class="ow">in</span> <span class="p">{</span><span class="mi">429</span><span class="p">,</span> <span class="mi">500</span><span class="p">,</span> <span class="mi">502</span><span class="p">,</span> <span class="mi">503</span><span class="p">,</span> <span class="mi">504</span><span class="p">}</span>
-    <span class="k">if</span> <span class="n">deadline_remaining_ms</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">False</span>
-    <span class="k">return</span> <span class="n">transient</span> <span class="ow">and</span> <span class="n">idempotent</span>
+<p>A retry is safe only when repeating the operation is acceptable.</p>
+<p>That sentence sounds simple, but it requires application knowledge. Transport status alone is not enough. HTTP status alone is not enough. The retry policy needs to know what the operation means.</p>
+<p>Compare three operations:</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Retry risk</th>
+<th>Safer policy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /lesson/043</code></td>
+<td>low, if the read has no side effect</td>
+<td>retry while deadline remains</td>
+</tr>
+<tr>
+<td><code>POST /complete-lesson</code></td>
+<td>medium, because it changes learner state</td>
+<td>retry only with idempotency key or deduplication</td>
+</tr>
+<tr>
+<td><code>POST /send-certificate-email</code></td>
+<td>high, because duplicates are visible to users</td>
+<td>avoid blind retry; deduplicate by stable request id</td>
+</tr>
+</tbody>
+</table>
+<p>For the completion write, a useful receiver rule might be:</p>
+<div class="codehilite"><pre><span></span><code>if idempotency_key has already committed:
+  return the existing completion result
+else:
+  commit completion and remember idempotency_key
 </code></pre></div>
 
-<p>The condition in real systems may use HTTP methods, gRPC status codes, idempotency keys, request hashes, state-machine versions, or deduplication tables. The important point is that retry policy needs the operation meaning. A library can provide the mechanism, but the application has to provide the semantics.</p>
-<p>The trade-off is resilience versus correctness risk. Retries can hide brief packet loss, a restarted instance, or a temporary overload response. They become dangerous when the system cannot distinguish "try again" from "do the same side effect again."</p>
+<p>The retry policy then has something real to rely on.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">should_retry</span><span class="p">(</span><span class="n">kind</span><span class="p">,</span> <span class="n">status_code</span><span class="p">,</span> <span class="n">idempotency_key</span><span class="p">,</span> <span class="n">deadline_remaining_ms</span><span class="p">):</span>
+    <span class="n">transient</span> <span class="o">=</span> <span class="n">status_code</span> <span class="ow">in</span> <span class="p">{</span><span class="mi">429</span><span class="p">,</span> <span class="mi">500</span><span class="p">,</span> <span class="mi">502</span><span class="p">,</span> <span class="mi">503</span><span class="p">,</span> <span class="mi">504</span><span class="p">}</span>
+    <span class="k">if</span> <span class="n">deadline_remaining_ms</span> <span class="o">&lt;</span> <span class="mi">100</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">False</span>
+    <span class="k">if</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">&quot;read&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">transient</span>
+    <span class="k">if</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">&quot;write&quot;</span> <span class="ow">and</span> <span class="n">idempotency_key</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">transient</span>
+    <span class="k">return</span> <span class="kc">False</span>
+</code></pre></div>
+
+<p>This small function hides a big design point. The client library can implement retries. The application must provide the operation kind, the idempotency rule, and the deadline.</p>
+<p>The trade-off is resilience versus correctness risk. Retries can improve success for transient faults. They become dangerous when the system cannot distinguish "try again" from "do the side effect again."</p>
+<p><strong>Check:</strong> A client library retries every <code>503</code> twice by default. Why might that be unsafe for <code>POST /complete-lesson</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> <code>503</code> may be transient, but the operation changes state. If the first attempt committed and the response was lost, a blind retry can duplicate side effects unless the request is idempotent or deduplicated.</p>
 <h2>Backoff Controls Failure Amplification</h2>
-<p>Now suppose the progress service becomes overloaded during a live cohort launch. Latency rises, many clients time out, and every caller retries immediately. The retry policy has created extra traffic at the exact moment the dependency has the least capacity to handle it.</p>
-<div class="codehilite"><pre><span></span><code>service slows down
-  -&gt; callers time out
+<p>Now widen the incident.</p>
+<p>The live cohort launch sends many learners through the same completion path. The progress service slows down. Gateways time out. Every gateway retries immediately.</p>
+<p>The system creates a feedback loop:</p>
+<div class="codehilite"><pre><span></span><code>progress service slows down
+  -&gt; gateways time out
   -&gt; immediate retries arrive
   -&gt; queues grow
-  -&gt; more callers time out
-  -&gt; retry traffic grows again
+  -&gt; latency rises
+  -&gt; more gateways time out
+  -&gt; even more retries arrive
 </code></pre></div>
 
-<p>Backoff changes that feedback loop by spacing attempts out. Jitter adds randomness so callers do not synchronize into waves. Retry budgets cap how much extra work failure is allowed to generate. Deadlines stop retries once the larger user or workflow budget has already been spent.</p>
-<div class="codehilite"><pre><span></span><code>service slows down
-  -&gt; callers time out
-  -&gt; retries spread out with delay and jitter
-  -&gt; retry budget limits added load
-  -&gt; dependency has room to recover or shed work
+<p>The recovery policy has become a load amplifier.</p>
+<p>Backoff changes the shape of the loop by spacing attempts out. Jitter adds randomness so clients do not all retry on the same schedule. A retry budget limits how much extra work recovery is allowed to create. The caller deadline stops retries once the larger user path no longer benefits.</p>
+<div class="codehilite"><pre><span></span><code>progress service slows down
+  -&gt; gateways time out
+  -&gt; retries wait with backoff and jitter
+  -&gt; retry budget limits extra attempts
+  -&gt; overloaded service has room to recover or shed work
 </code></pre></div>
 
-<p>Backoff belongs beside circuit breakers, queue limits, load shedding, and admission control because all of them protect the system from excess pressure during abnormal conditions. A retry policy that works in a small test can still be destructive in production if thousands of clients run it at once.</p>
-<p>The trade-off is recovery speed versus stability. Immediate retries may recover quickly from tiny transient failures, but they are risky under overload. Slower bounded retries may add a little delay to individual requests while keeping the whole system from entering a retry storm.</p>
+<p>Backoff does not guarantee success. It buys stability. It says, "If we try again, we will not all try again at once forever."</p>
+<p>A small policy might look like:</p>
+<div class="codehilite"><pre><span></span><code>attempt 1: timeout 300 ms
+attempt 2: wait 50-100 ms jitter, timeout 200 ms
+attempt 3: only for idempotent work, wait 150-250 ms jitter
+stop: no retry if user deadline has less than 100 ms left
+budget: retries may add at most 20% extra request volume per minute
+</code></pre></div>
+
+<p>The exact numbers are not universal. The review questions matter more:</p>
+<ul>
+<li>Is the operation safe to retry?</li>
+<li>Does the retry fit inside the end-to-end deadline?</li>
+<li>Does backoff include jitter?</li>
+<li>Is there a retry budget?</li>
+<li>What overload signal should stop retries?</li>
+</ul>
 <h2>Common Design Mistakes</h2>
-<p>One mistake is treating a timeout as a verdict. "The server did nothing" is a tempting story because the caller saw nothing happen. The safer model is narrower: the caller stopped waiting. For side-effecting operations, design idempotency or deduplication before relying on retries.</p>
-<p>Another mistake is copying retry settings from a client library without mapping them to operation semantics. A default that is reasonable for a read can be unsafe for a write. A policy that is fine for one service call can exceed the end-to-end user latency budget when several downstream calls each retry independently.</p>
-<p>A third mistake is adding backoff but forgetting scale. One caller retrying three times is small. Ten thousand callers retrying three times can be an incident. Review retry policies by asking how much extra work they create when the dependency is already slow or returning overload signals.</p>
-<h2>Connections</h2>
-<p>This lesson follows serialization because a retry often repeats a message whose meaning must remain stable across attempts. Idempotency keys, request IDs, and operation schemas make it possible for a receiver to identify duplicate intent rather than blindly executing duplicate work.</p>
-<p>It also prepares the next lesson on partitions and failure models. A timeout is one local observation. It does not prove crash, packet loss, overload, or partition. Good distributed designs resist turning a local symptom into a global conclusion too quickly.</p>
+<h3>Confusion: "Timeout means failure"</h3>
+<p>Why it is tempting:</p>
+<p>The caller saw no answer. In local programming, no answer often feels like the function failed.</p>
+<p>Better model:</p>
+<p>A timeout means this caller stopped waiting. It does not prove the server did nothing. Treat side-effecting timeouts as ambiguous until idempotency, reconciliation, or evidence resolves them.</p>
+<h3>Confusion: "Retries are always reliability"</h3>
+<p>Why it is tempting:</p>
+<p>Retries often make flaky tests or brief network hiccups disappear.</p>
+<p>Better model:</p>
+<p>Retries are extra work under uncertainty. They improve reliability only when operation semantics, deadlines, and dependency health make another attempt safe.</p>
+<h3>Confusion: "Backoff is just waiting longer"</h3>
+<p>Why it is tempting:</p>
+<p>Backoff looks like a delay setting.</p>
+<p>Better model:</p>
+<p>Backoff is pressure control. It changes a retry storm into spaced, bounded attempts so the dependency has a chance to recover or shed load.</p>
+<h2>Practice</h2>
+<p>Review this policy for the learning platform:</p>
+<div class="codehilite"><pre><span></span><code>Gateway rule:
+  timeout every progress-service call after 250 ms
+  retry every timeout twice immediately
+  use no idempotency key
+  ignore the remaining user deadline
+</code></pre></div>
+
+<p>The progress service has two operations:</p>
+<div class="codehilite"><pre><span></span><code>GET /progress-summary
+POST /complete-lesson
+</code></pre></div>
+
+<p>Write a short review with:</p>
+<ol>
+<li>one thing the policy gets right</li>
+<li>two risks</li>
+<li>one safer retry rule for the read</li>
+<li>one safer retry rule for the write</li>
+</ol>
+<p>Model answer:</p>
+<p>The policy at least prevents the gateway from waiting forever. But it treats timeout as proof of failure, retries state-changing writes without idempotency, ignores the user deadline, and can add immediate load during an overload. For <code>GET /progress-summary</code>, retry only transient failures while enough deadline remains, with backoff and jitter. For <code>POST /complete-lesson</code>, retry only if the request carries a stable idempotency key and the progress service deduplicates repeated attempts; otherwise return an uncertain result or schedule reconciliation.</p>
+<h2>Trade-offs and Limits</h2>
+<p>Timeouts improve responsiveness by bounding how long callers wait. They cost certainty because the caller may stop waiting before the server outcome is known.</p>
+<p>Retries improve resilience to transient faults. They cost extra load and can create duplicate side effects unless the operation is safe to repeat.</p>
+<p>Backoff, jitter, and retry budgets improve system stability. They cost some recovery speed for individual requests, especially when a quick second attempt would have worked.</p>
+<p>This lesson does not prove whether a timeout came from packet loss, overload, crash, or partition. That is the next lesson's job. Here, the main discipline is narrower: do not turn one local symptom into unsafe recovery behavior.</p>
+<p>You can see the boundary when the incident question changes from "Why did this request fail?" to "How much extra work did our recovery policy create while the dependency was already slow?"</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Site Reliability Engineering<ul>
-<li>Link: <a href="https://sre.google/sre-book/table-of-contents/">https://sre.google/sre-book/table-of-contents/</a></li>
-<li>Focus: Revisit latency budgets, overload, and safe service-to-service interaction.</li>
-</ul>
-</li>
-<li>[DOC] gRPC Retry Guide<ul>
-<li>Link: <a href="https://grpc.io/docs/guides/retry/">https://grpc.io/docs/guides/retry/</a></li>
-<li>Focus: See how retry behavior is tied to RPC status, configuration, and policy.</li>
-</ul>
-</li>
-<li>[ARTICLE] Timeouts, Retries, and Backoff with Jitter<ul>
-<li>Link: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/</a></li>
-<li>Focus: Study how poorly tuned retry behavior amplifies failure in production systems.</li>
-</ul>
-</li>
+<li>[BOOK] <a href="https://sre.google/sre-book/table-of-contents/">Site Reliability Engineering</a> - Revisit latency budgets, overload, and safe service-to-service interaction.</li>
+<li>[TUTORIAL] <a href="https://grpc.io/docs/guides/retry/">gRPC Retry Guide</a> - See how retry behavior is tied to RPC status, configuration, and policy.</li>
+<li>[ARTICLE] <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, Retries, and Backoff with Jitter</a> - Study how poorly tuned retry behavior amplifies failure in production systems.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
@@ -157,6 +383,7 @@ server outcome remains uncertain
 <li>Retries are safe only when operation semantics, idempotency, or deduplication make repeated attempts acceptable.</li>
 <li>Backoff, jitter, deadlines, and retry budgets prevent recovery logic from becoming a load amplifier.</li>
 <li>Timeout and retry policies should be reviewed as part of the system's failure behavior, not as isolated client settings.</li>
+<li>The next design question after a timeout is not only "try again?" but "what can this caller honestly know, and how much pressure may recovery add?"</li>
 </ul>
 </section>
 
@@ -186,7 +413,7 @@ server outcome remains uncertain
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-09 10:28 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
