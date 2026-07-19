@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SWIM Improvements - Infection Dampening & Health Multipliers - @jepemo</title>
+    <title>How Lifeguard Hardens SWIM Under Local Degradation - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>SWIM Improvements - Infection Dampening & Health Multipliers</h1>
+<h1>How Lifeguard Hardens SWIM Under Local Degradation</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,158 +79,331 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>SWIM Improvements - Infection Dampening &amp; Health Multipliers</h1>
+  <h1>How Lifeguard Hardens SWIM Under Local Degradation</h1>
 <blockquote>
-<p><strong>The core idea</strong>: production SWIM variants add local health awareness and suspicion dampening, trading some failure-detection speed for fewer false positives when the observer itself is degraded.</p>
+<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<ul>
+<li>
+<p>diagnose an incident in which the observer, rather than the target, produces false membership suspicion;</p>
+</li>
+<li>
+<p>trace how local health awareness changes a degraded node's probing and suspicion behavior;</p>
+</li>
+<li>
+<p>choose signals that distinguish slower detection from harmful false-positive churn.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Lifeguard makes a SWIM node more cautious when its own protocol work is late, so a degraded observer spreads fewer bad suspicions while healthy observers continue to detect real failures.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose node <code>A</code> in a SWIM-style service-discovery cluster hits a 20-second CPU stall. Nodes <code>B</code>, <code>C</code>, and <code>D</code> are healthy, but <code>A</code> sends probes late, processes acknowledgements late, and misses refutations that arrived while it was overloaded. From <code>A</code>'s local view, healthy peers begin to look failed.</p>
-<p>Base SWIM already separates probing from dissemination, but it still depends on observers doing reasonably timely work. A slow observer is not dead, so it keeps participating. That makes it dangerous: it can manufacture bad suspicion and then use gossip to spread that suspicion through the cluster.</p>
-<p>The non-obvious improvement is to make the failure detector reason about the detector, not only the target. If the local node has evidence that it is unhealthy, it should become less confident in its accusations. That is the core idea behind Lifeguard-style local health awareness and the "health multiplier" knobs seen in production memberlist systems.</p>
-<p>The trade-off is deliberate. Backing off a degraded observer can delay some true failure detection, but it reduces a worse production failure mode: one overloaded node poisoning membership with a wave of false suspicions. Healthy observers can still confirm real failures, while degraded observers do less damage.</p>
-<h2>The Degraded Observer Problem</h2>
-<p>In a clean crash-stop story, a target stops responding because the target died. Production systems are messier. The observer may be the component with low-quality timing:</p>
-<div class="codehilite"><pre><span></span><code>A is overloaded
-  -&gt; sends probe to B late
-  -&gt; processes B&#39;s reply late
-  -&gt; times out locally
-  -&gt; gossips suspicion about B
+<p>At 10:14, node A in a 1,200-node service-discovery cluster enters a 16-second runtime pause during a memory-pressure event. B, C, and D are healthy. They reply to probes, but A sends some probes late, processes some acknowledgements after its local deadlines, and misses refutation traffic while its event loop is stalled.</p>
+<p>At 10:15, A starts gossiping <code>suspect(B)</code>, <code>suspect(C)</code>, and <code>suspect(D)</code>. The routing layer reacts to those membership changes before the healthy nodes can refute them. Requests shift away from B, C, and D toward already busy peers. Tail latency rises even though the original problem was mostly A's local pause.</p>
+<p>This is a <strong>gray failure</strong>. A is not cleanly crashed, so it remains an active protocol participant. But it is degraded enough to observe the world badly and to spread its bad observations. Base SWIM gives A direct and indirect probes, suspicion, and dissemination. It assumes that the observer can usually run those steps on time. Lifeguard asks what to do when that assumption is temporarily false.</p>
+<p>Plain meaning:</p>
+<p>If your own clock, event loop, or network path is unreliable, you should be less eager to accuse everyone else.</p>
+<p>In this incident:</p>
+<p>A's missed deadlines say something about A's ability to measure B, C, and D. They are not automatically evidence that B, C, and D failed.</p>
+<p>Technical name:</p>
+<p><strong>Local health awareness</strong> tracks evidence that the observer is degraded. A local health multiplier or similar bounded score then makes that observer's failure-detection timings more conservative.</p>
+<h2>Start with the production symptom</h2>
+<p>The visible symptom is not merely “some probes timed out.” It is membership churn with user impact:</p>
+<div class="codehilite"><pre><span></span><code>A pauses
+  -&gt; A creates several suspicions
+  -&gt; gossip spreads them
+  -&gt; routing avoids healthy members
+  -&gt; work concentrates elsewhere
+  -&gt; latency and refutation traffic rise
 </code></pre></div>
 
-<p>From outside, <code>B</code> may be perfectly healthy. The measurement failed because <code>A</code> was delayed. This is a gray failure: the system is not cleanly down, but it is degraded enough to distort protocol behavior.</p>
-<p>If the protocol treats every observer as equally reliable, one bad observer can create membership churn:</p>
+<p>An incident responder should resist the first story: “B, C, and D were briefly unhealthy.” The useful question is whether the accusations share an observer. If one node suddenly suspects many peers while other observers still reach them, the observer is a primary suspect.</p>
+<table>
+<thead>
+<tr>
+<th>Evidence</th>
+<th>Naive interpretation</th>
+<th>Better interpretation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A times out probing B, C, and D in one short period</td>
+<td>Three targets failed together</td>
+<td>A may be paused, saturated, or locally partitioned</td>
+</tr>
+<tr>
+<td>C reports a successful probe to B</td>
+<td>B is globally healthy</td>
+<td>B is reachable from C; A's path or observation may be the problem</td>
+</tr>
+<tr>
+<td>B, C, and D refute rapidly</td>
+<td>The system is noisy but harmless</td>
+<td>False suspicion is creating churn before correction</td>
+</tr>
+<tr>
+<td>Only A has a growing protocol-work backlog</td>
+<td>The cluster needs shorter timeouts</td>
+<td>A cannot currently make high-quality timing judgments</td>
+</tr>
+</tbody>
+</table>
+<p>The earlier phi lesson helps here. A high phi score reports surprising delay from A's point of view. It does not identify the cause. Lifeguard adds a second question: <em>is A itself currently trustworthy enough to make an aggressive decision from this delay?</em></p>
+<h2>The naive response and where it breaks</h2>
+<p>A straightforward SWIM implementation might run with a fixed probe interval, fixed timeout, and fixed suspicion policy for every observer:</p>
+<div class="codehilite"><pre><span></span><code>every interval:
+  choose target
+  probe target
+  if no acknowledgement before timeout:
+    suspect target
+    gossip the suspicion
+</code></pre></div>
+
+<p>This is easy to reason about when all nodes execute protocol work promptly. During A's pause, however, the rule turns missed local scheduling deadlines into accusations. Once A resumes, it may create a burst of suspicions from stale timers before it has processed the acknowledgements that would have softened its view.</p>
+<p>Increasing every timeout for every node would reduce some false positives, but it would also delay detection by healthy observers. It treats a local problem as a cluster-wide condition. The better response is local: A should slow down and become more conservative while A has evidence of local degradation. B, C, and D should continue using ordinary timings if they are healthy.</p>
+<p>This gives the operational promise:</p>
+<div class="codehilite"><pre><span></span><code>degraded observer -&gt; reduced confidence in its own timing
+healthy observer  -&gt; normal probing and confirmation
+</code></pre></div>
+
+<h2>Local health awareness: a control loop around the detector</h2>
+<p>Lifeguard-style designs maintain local information about how well a node is keeping up with membership-protocol work. Implementations differ in the exact signals and formulas, but the control loop has a stable shape.</p>
+<div class="codehilite"><pre><span></span><code>late or failed local protocol work
+  -&gt; raise local awareness score
+  -&gt; increase a bounded local health multiplier
+  -&gt; lengthen this node&#39;s relevant probe and suspicion timings
+  -&gt; create fewer premature suspicions
+
+timely protocol work resumes
+  -&gt; lower local awareness score gradually
+  -&gt; return toward normal timings
+</code></pre></div>
+
+<p>The score belongs to A. It is not a score for B, and it is not a command to slow the whole cluster. A uses it to discount the quality of its own measurement.</p>
+<table>
+<thead>
+<tr>
+<th>Local condition at A</th>
+<th>Awareness effect</th>
+<th>Safer behavior from A</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Protocol work is timely</td>
+<td>Low multiplier</td>
+<td>Normal probe interval and timeout</td>
+<td>A's timing observations are reasonably useful</td>
+</tr>
+<tr>
+<td>Some deadlines or acknowledgements are late</td>
+<td>Multiplier rises</td>
+<td>Give peers more time; avoid rapid suspicion</td>
+<td>A may be measuring its own delay</td>
+</tr>
+<tr>
+<td>Long pause or sustained overload</td>
+<td>Multiplier is near its configured cap</td>
+<td>Limit the rate and confidence of new suspicions</td>
+<td>A should not poison membership with a burst of stale deadlines</td>
+</tr>
+<tr>
+<td>Timely work returns</td>
+<td>Score decays</td>
+<td>Move back toward normal timings</td>
+<td>The detector should recover rather than remain permanently timid</td>
+</tr>
+</tbody>
+</table>
+<p>The multiplier must be bounded. An unbounded multiplier would make an unhealthy A almost stop checking peers, which could hide a real failure forever from that one observer. The design relies on other healthy nodes to keep probing. Local health awareness reduces the harm A can cause; it does not turn A into an authority on liveness.</p>
+<h2>A worked incident trace</h2>
+<p>Return to the 10:14 incident. Assume the normal probe interval is one second and that the implementation has a bounded local awareness multiplier. The exact values are illustrative; the state transitions matter more than the numbers.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>A's local condition</th>
+<th>What A observes</th>
+<th>Lifeguard-style response</th>
+<th>Cluster consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>10:14:00</code></td>
+<td>Normal</td>
+<td>A probes B and receives timely acknowledgement</td>
+<td>Multiplier remains low</td>
+<td>No issue</td>
+</tr>
+<tr>
+<td><code>10:14:01–10:14:17</code></td>
+<td>Runtime pause</td>
+<td>A cannot send or process protocol work on schedule</td>
+<td>On resuming, A recognizes missed local work and raises awareness</td>
+<td>A does not interpret every missed deadline as a fresh target failure</td>
+</tr>
+<tr>
+<td><code>10:14:18</code></td>
+<td>Backlogged</td>
+<td>A's probe of B appears late; C can still reach B</td>
+<td>A uses longer local timing and asks for corroboration rather than immediately hardening suspicion</td>
+<td>One weak observation has limited blast radius</td>
+</tr>
+<tr>
+<td><code>10:14:19</code></td>
+<td>Still degraded</td>
+<td>A hears or creates <code>suspect(B, 12)</code></td>
+<td>Suspicion remains soft; B receives the update quickly enough to refute if healthy</td>
+<td>Membership can carry uncertainty without immediate removal</td>
+</tr>
+<tr>
+<td><code>10:14:20</code></td>
+<td>B is healthy</td>
+<td>B announces <code>alive(B, 13)</code></td>
+<td>Receivers merge the fresher incarnation</td>
+<td>False suspicion is cleared with less routing churn</td>
+</tr>
+<tr>
+<td>Later</td>
+<td>A catches up</td>
+<td>Timely work returns</td>
+<td>Awareness decays toward normal</td>
+<td>A regains ordinary detection speed</td>
+</tr>
+</tbody>
+</table>
+<p>Now change one condition: B is truly crashed. C and D also fail to reach B, B cannot refute, and independent evidence accumulates. Healthy observers keep ordinary timings, so the cluster still moves from suspect toward failure. A's extra caution may delay its personal accusation, but it does not prevent the system from seeing broad evidence.</p>
+<p>The input is A's missed scheduling and acknowledgement deadlines. The transition is a raised local awareness score and more conservative timings. The intermediate state is a soft suspicion that can be refuted or corroborated. The output is either a fresher alive state for a healthy B or a stronger failure decision for a truly unavailable B. The naive failure contrast is important: fixed timing would let A create many confident suspicions before recognizing that A was late.</p>
+<h2>Suspicion should gain confidence, not only spread</h2>
+<p>Local health awareness controls the quality of A's accusations. Suspicion management controls how a cluster treats accusations before they become a failure decision.</p>
+<p>A useful suspicion path has room for two outcomes:</p>
+<div class="codehilite"><pre><span></span><code>one observation
+  -&gt; suspect
+  -&gt; notify enough peers and the target
+  -&gt; wait for refutation or independent confirmation
+
+fresh alive update
+  -&gt; clear suspicion
+
+several independent failed observations and no refutation
+  -&gt; advance toward failed according to policy
+</code></pre></div>
+
+<p>Lifeguard's broader lesson is not “never spread suspicion.” It is “do not let a low-quality, isolated observation harden at the same speed as broad evidence.” Promptly making the accused node aware of a suspicion helps it refute false accusations. Independent confirmations can make a suspicion more credible and justify a shorter remaining window. This creates a safer balance between fast failure detection and avoidable membership churn.</p>
+<h2>Mitigation, prevention, and signals</h2>
+<p>During an incident like A's, mitigate the blast radius before retuning every timeout:</p>
+<ol>
+<li>Confirm whether high suspicions concentrate at one observer or one network segment.</li>
+<li>Check whether allegedly failed peers remain reachable from independent observers.</li>
+<li>Limit or restart a severely unhealthy observer when it cannot process membership work safely.</li>
+<li>Preserve versioned refutation paths so healthy targets can restore a fresher alive state.</li>
+<li>Only then review local-awareness limits, probe timings, and suspicion policy against fault-injection results.</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+<th>First action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>High suspicion count grouped by source node</td>
+<td>An observer may be degraded</td>
+<td>Inspect that node's runtime pauses, CPU throttling, event-loop lag, and local packet loss</td>
+</tr>
+<tr>
+<td>Suspicion-to-refutation ratio</td>
+<td>False positives are causing churn</td>
+<td>Compare threshold policy and observer-awareness behavior</td>
+</tr>
+<tr>
+<td>Direct/indirect probe disagreement</td>
+<td>Failure may be path-local rather than target-wide</td>
+<td>Inspect failure domain and require corroboration</td>
+</tr>
+<tr>
+<td>Membership update and refutation latency</td>
+<td>Correction may arrive too late to prevent impact</td>
+<td>Inspect gossip queue, overlay paths, and target notification</td>
+</tr>
+<tr>
+<td>Local awareness score at cap for long periods</td>
+<td>The node cannot make timely protocol progress</td>
+<td>Treat the node as operationally unhealthy, not merely a tuning case</td>
+</tr>
+</tbody>
+</table>
+<p>The main <strong>trade-off</strong> is explicit: more local caution lowers false-positive churn but can add detection delay from that observer. A system should decide which cost is worse for its workload, then test both. It should not tune by chasing a single average timeout.</p>
+<h2>Common confusions</h2>
+<h3>Confusion: local health awareness says the target is healthy</h3>
+<p>Why it is tempting:</p>
+<p>The mechanism makes A wait longer before suspecting B.</p>
+<p>Better model:</p>
+<p>It says A's timing evidence may be poor. B can still be failed, and healthy observers should continue collecting independent evidence.</p>
+<h3>Confusion: slowing all nodes is safer</h3>
+<p>Why it is tempting:</p>
+<p>If late timeouts caused false suspicion, longer timeouts everywhere seem protective.</p>
+<p>Better model:</p>
+<p>Cluster-wide slowdown delays detection even for healthy observers. Lifeguard's advantage is local adaptation: only the observer with degraded protocol work becomes less aggressive.</p>
+<h3>Confusion: eventual refutation makes false suspicion harmless</h3>
+<p>Why it is tempting:</p>
+<p>Versioned alive updates eventually replace stale suspicion.</p>
+<p>Better model:</p>
+<p>The time before correction can still trigger traffic shifts, rebalancing, alerts, and expensive retries. Dampening and prompt refutation reduce the damage window.</p>
+<h2>Check your understanding</h2>
+<p><strong>Check:</strong> Node A suspects twelve different peers during a single 30-second period. Most other observers can reach those peers, and A has a rising local awareness score. What is the most plausible first diagnosis, and what should remain unchanged elsewhere in the cluster?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> A is likely a degraded observer or is behind a local network problem. Its own suspicion timings should become more conservative, and operators should inspect its runtime and path. Other healthy observers should keep normal probing and can supply independent evidence; the entire cluster should not inherit A's slowdown.</p>
+<h2>Practice: review a gray-failure response</h2>
+<p>Your membership dashboard shows that node R has frequent runtime pauses. During each pause, R creates many suspicions that are refuted within ten seconds. A proposal says: “halve all probe timeouts so the cluster learns the truth sooner.”</p>
+<p>Write a short review with:</p>
 <ul>
-<li>healthy nodes are marked suspect</li>
-<li>suspected nodes must spend effort refuting stale accusations</li>
-<li>routing, placement, or rebalancing systems may react to noise</li>
-<li>gossip spreads bad local conclusions faster than operators can reason about them</li>
+<li>the likely cause of the pattern;</li>
+<li>one immediate mitigation;</li>
+<li>one Lifeguard-style prevention change;</li>
+<li>three metrics you would use to decide whether the change reduced harm without hiding real failures.</li>
 </ul>
-<p>This does not mean SWIM is broken. It means production SWIM needs guardrails around the quality of local evidence. A suspicion is only as good as the observer and timing path that produced it.</p>
-<h2>Health Multipliers</h2>
-<p>Local health awareness gives a node a way to notice that it may be a poor observer. Implementations vary, but the shape is simple: maintain a local health score or awareness counter, raise it when local protocol behavior looks delayed or unreliable, and use it to scale timing decisions.</p>
-<p>The control path looks like this:</p>
-<div class="codehilite"><pre><span></span><code>local node detects self-degradation
-        |
-        v
-local health score rises
-        |
-        v
-probe interval / timeout multiplier increases
-        |
-        v
-node becomes more conservative before suspecting peers
-</code></pre></div>
+<details>
+<summary>Review rubric</summary>
 
-<p>In plain language:</p>
-<ul>
-<li>a healthy node probes on the normal schedule</li>
-<li>a mildly degraded node gives peers more time</li>
-<li>a heavily degraded node becomes much less willing to create new suspicion</li>
-</ul>
-<p>This is not forgiveness for failed peers. It is humility about local evidence. If <code>A</code> knows it is late, <code>A</code> should not interpret every late reply as proof that everyone else is broken.</p>
-<p>The multiplier is also bounded. If local health awareness could grow without limit, a sick node might stop detecting real failures entirely. Production knobs usually cap the effect so the protocol becomes more cautious without becoming inert.</p>
-<h2>Suspicion Dampening</h2>
-<p>Health multipliers reduce how often a degraded observer creates bad suspicion. Suspicion dampening reduces how quickly weak suspicion hardens into a cluster-wide failure story.</p>
-<p>Imagine <code>A</code> suspects <code>B</code>, but no other healthy node agrees. A cautious protocol should give <code>B</code> time to refute the suspicion, often by disseminating a fresher <code>alive</code> update with a higher incarnation. If many independent nodes confirm the suspicion, the protocol can become more confident and shorten the path toward failure.</p>
-<p>That gives a dynamic suspicion shape:</p>
-<div class="codehilite"><pre><span></span><code>single suspicion
-  -&gt; keep suspicion timer generous
-  -&gt; notify / allow target to refute
+A strong answer identifies R as a degraded observer, not evidence that all accused peers are failing. It suggests containing or restarting R if needed, then using bounded local health awareness and suspicion/refutation handling so R becomes more conservative while unhealthy. It measures suspicions by source, refutation rate and latency, detection latency in controlled failures, and the time that local awareness remains elevated. It does not make all healthy observers slower by default.
 
-independent confirmations arrive
-  -&gt; suspicion becomes more credible
-  -&gt; timer can shrink
+</details>
 
-fresh alive refutation arrives
-  -&gt; suspicion is cleared
-</code></pre></div>
-
-<p>This is the "infection dampening" idea. Gossip spreads membership updates like an infection, but not every rumor deserves the same replication pressure or confidence. A low-quality accusation should not immediately trigger the same cluster response as several independent observations.</p>
-<p>Dampening is especially important because eventual correction is not always enough. A false suspicion that is corrected ten seconds later may still cause unnecessary failover, routing churn, ownership transfer, or operator alerts during those ten seconds.</p>
-<h2>Worked Example</h2>
-<p>Consider a cluster where normal probing looks like this:</p>
-<div class="codehilite"><pre><span></span><code>probe interval: 1s
-probe timeout: 500ms
-suspicion window: 5s to 15s, depending on confirmations
-</code></pre></div>
-
-<p>Node <code>A</code> becomes overloaded. It misses several protocol deadlines and raises its local health score. The effective behavior changes:</p>
-<div class="codehilite"><pre><span></span><code>health score rises
-  -&gt; probe interval scales upward
-  -&gt; timeouts become more forgiving
-  -&gt; A creates fewer new suspicions
-</code></pre></div>
-
-<p>Now <code>A</code> suspects <code>B</code>. Because <code>A</code> is locally unhealthy and no independent confirmations have arrived, the suspicion stays soft. <code>B</code> receives or hears about the suspicion, increments its incarnation, and gossips a fresher alive update:</p>
-<div class="codehilite"><pre><span></span><code>A says: B suspect, incarnation 12
-B says: B alive, incarnation 13
-receivers: incarnation 13 wins
-</code></pre></div>
-
-<p>The cluster converges back toward <code>B</code> being alive. The false suspicion still existed, but it did not harden quickly enough to trigger an unnecessary remove/rejoin cycle.</p>
-<p>If <code>B</code> were actually dead, the story would be different. Other healthy observers would also fail to reach <code>B</code>, confirmations would accumulate, and the suspicion timer could collapse toward a failure decision. The protocol is not trying to ignore failure. It is trying to separate one noisy observer from broad evidence.</p>
-<h2>Implications and Trade-offs</h2>
-<p>These improvements make SWIM more production-friendly because they add two forms of quality control:</p>
-<ul>
-<li>local health awareness asks whether the observer is trustworthy right now</li>
-<li>suspicion dampening asks whether the accusation has enough support to spread and harden quickly</li>
-</ul>
-<p>The cost is complexity. The protocol now has extra state, thresholds, and timing parameters. Operators need to understand why a degraded node may probe more slowly or why suspicion may remain soft until enough confirmations arrive.</p>
-<p>The main trade-off is false-positive reduction versus detection latency. Aggressive timing catches true failures quickly but is noisy under gray failure. Conservative timing avoids bad membership churn but may leave a real failure in suspect state longer. Lifeguard-style improvements make that trade-off adaptive instead of fixed.</p>
-<p>The important design boundary is that health-aware backoff should apply to low-quality local judgment, not to every part of the cluster. Healthy peers should keep probing, confirming, and disseminating. The whole cluster should not slow down just because one observer is unhealthy.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Treating the observer as infallible</strong></p>
-<p>If every missed local deadline becomes peer suspicion, overloaded nodes can accuse healthy peers. Track local health so the detector can discount its own degraded observations.</p>
-<p><strong>Letting isolated suspicion spread too strongly</strong></p>
-<p>A single suspicion may be correct, but it may also be local noise. Keep the suspicion soft until refutation fails or independent confirmations accumulate.</p>
-<p><strong>Making multipliers unbounded</strong></p>
-<p>Too much backoff can hide real failures. Cap health multipliers and ensure other healthy observers can continue normal detection.</p>
-<p><strong>Assuming eventual correction is harmless</strong></p>
-<p>False suspicion can cause damage before it is corrected. Dampening matters because operational systems often react to membership changes immediately.</p>
-<h2>Connections</h2>
-<p>Phi accrual adapts suspicion to heartbeat timing history. Lifeguard-style SWIM improvements adapt suspicion to the observer's current health and to independent confirmation.</p>
-<p>The previous membership lesson explained why <code>suspect</code>, <code>alive</code>, incarnation, and stale-state rules matter. This lesson adds a production hardening layer: not every suspicion should be trusted equally.</p>
-<p>Plumtree, next, uses a different hybrid pattern: efficient eager dissemination plus lazy repair. The shared theme is the same: large systems often need a fast path and a guardrail path rather than one pure mechanism.</p>
+<h2>Connections and boundaries</h2>
+<p>Phi accrual adapts a timing signal to one peer's history. Lifeguard adds self-awareness: an observer's own inability to run protocol work on time should reduce its confidence. The membership review supplies the versioned suspicion and refutation rules that make correction possible.</p>
+<p>Plumtree next applies a related systems pattern to broadcast: use an efficient normal path, but preserve a repair path for the failures the normal path cannot safely handle. Lifeguard improves crash-fault membership behavior; it does not provide Byzantine protection, consensus, or authority over configuration changes.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://arxiv.org/abs/1707.00788">Lifeguard: Local Health Awareness for More Accurate Failure Detection</a><ul>
-<li>Focus: Primary source for local health awareness, suspicion timing, and production SWIM hardening.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://www.hashicorp.com/en/blog/making-gossip-more-robust-with-lifeguard">Making Gossip More Robust with Lifeguard</a><ul>
-<li>Focus: Practical explanation of degraded observers, dogpile reduction, and faster refutation paths.</li>
-</ul>
-</li>
-<li>[REPO] <a href="https://github.com/hashicorp/memberlist">HashiCorp Memberlist</a><ul>
-<li>Focus: Inspect production knobs such as awareness multipliers and suspicion-related configuration.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a><ul>
-<li>Focus: Compare the original direct/indirect probing design with later health-aware extensions.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://arxiv.org/abs/1707.00788">Lifeguard: Local Health Awareness for More Accurate Failure Detection</a> - Focus: the local health multiplier, faster refutation, and suspicion handling for SWIM.</li>
+<li>[ARTICLE] <a href="https://www.hashicorp.com/en/blog/making-gossip-more-robust-with-lifeguard">Making Gossip More Robust with Lifeguard</a> - Focus: a practical explanation of degraded observers and false-positive reduction.</li>
+<li>[ARTICLE] <a href="https://github.com/hashicorp/memberlist">HashiCorp memberlist</a> - Focus: implementation-facing configuration and operational surfaces for SWIM-style membership.</li>
+<li>[PAPER] <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a> - Focus: compare base direct/indirect probing with later health-aware hardening.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A degraded observer can create false suspicion even when the target node is healthy.</li>
-<li>Health multipliers make unhealthy observers more conservative instead of letting them accuse peers at full speed.</li>
-<li>Suspicion dampening prevents isolated, low-quality accusations from hardening before refutation or confirmation.</li>
-<li>The core trade-off is adaptive false-positive reduction in exchange for some extra timing complexity and possible detection delay.</li>
-</ol>
+<ul>
+<li>A node that is slow but still participating can manufacture false failure suspicion and spread it through gossip.</li>
+<li>Local health awareness makes the degraded observer more conservative without slowing healthy observers everywhere.</li>
+<li>Suspicion should allow refutation and gain confidence from independent evidence before causing costly membership actions.</li>
+<li>Measure false-positive churn, observer-local degradation, refutation latency, and controlled-failure detection together when tuning the trade-off.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
   
   <a class="nav-card" href="007.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Membership Protocols - Join, Leave, and Failure Handling</strong>
+    <strong>Review: Membership Lifecycles, Freshness, and Failure Evidence</strong>
   </a>
   
 
   
   <a class="nav-card" href="009.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Plumtree - Epidemic Broadcast Trees</strong>
+    <strong>How Plumtree Combines Fast Broadcast with Epidemic Repair</strong>
   </a>
   
 </section>
@@ -241,7 +418,7 @@ receivers: incarnation 13 wins
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-19 17:21 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>HyParView - Hybrid Partial View Membership - @jepemo</title>
+    <title>How HyParView Keeps a Partial Overlay Connected - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>HyParView - Hybrid Partial View Membership</h1>
+<h1>How HyParView Keeps a Partial Overlay Connected</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,157 +79,253 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>HyParView - Hybrid Partial View Membership</h1>
+  <h1>How HyParView Keeps a Partial Overlay Connected</h1>
 <blockquote>
-<p><strong>The core idea</strong>: HyParView keeps large gossip overlays cheap and connected by maintaining a small active peer view plus a larger passive repair reserve, trading extra view-management logic for resilience under churn.</p>
+<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<ul>
+<li>
+<p>distinguish a live neighbor set from a reserve of possible neighbors;</p>
+</li>
+<li>
+<p>trace how a node replaces lost overlay links without making every node know every other node;</p>
+</li>
+<li>
+<p>choose metrics that reveal a partial overlay becoming too local or fragile under churn.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> HyParView keeps a small set of active links for communication and a larger passive set of replacement candidates, then refreshes both so a partial overlay can survive churn without becoming a full mesh.</p>
 </blockquote>
+<p>In the previous lesson, SWIM gave node A a way to gather evidence that a peer may be unavailable. That evidence answers an important but narrow question: <em>should I stop relying on C right now?</em> It does not answer the next question: <em>if I remove C, whom should I talk to instead?</em></p>
+<p>That second question is about the <strong>overlay</strong>: the application-level graph made from the connections that nodes deliberately keep. Gossip, membership, and epidemic broadcast all need an overlay through which messages can travel. A node can have a perfectly good suspicion mechanism and still be in trouble if the remaining paths all lead into the same failed rack, region, or small island of peers.</p>
+<p>HyParView is a protocol design for maintaining such an overlay while nodes join, leave, and fail. Its central move is modest: do not make every known node an expensive, live neighbor. Keep a small working set of live neighbors and a reserve. The difficult part is keeping that reserve useful rather than stale.</p>
+<h2>The incident: a healthy detector, a brittle topology</h2>
+<p>Imagine an internal event-distribution service with 1,200 nodes across three availability zones: east, central, and west. Each node forwards membership updates and small operational events to its overlay neighbors. The service does not need every node to connect directly to 1,199 others; that would create too many sockets, heartbeats, and failure interactions. Instead, each node should have only a few links, provided the whole graph still has many routes.</p>
+<p>Node A currently has four active neighbors:</p>
+<table>
+<thead>
+<tr>
+<th>Neighbor</th>
+<th>Zone</th>
+<th>Why A uses it now</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B</td>
+<td>east</td>
+<td>A stable local edge</td>
+</tr>
+<tr>
+<td>C</td>
+<td>central</td>
+<td>A cross-zone route</td>
+</tr>
+<tr>
+<td>D</td>
+<td>central</td>
+<td>A second central route</td>
+</tr>
+<tr>
+<td>E</td>
+<td>west</td>
+<td>A cross-zone route</td>
+</tr>
+</tbody>
+</table>
+<p>During a rolling deployment, central drains two machines. SWIM's probes and indirect probes make A suspect C and D, then confirm that they should no longer be trusted as live paths. A removes them. Nothing is wrong with the detector: it gave evidence quickly and A reacted correctly.</p>
+<p>But a naive overlay implementation now has a topological problem. Suppose A had selected its four peers once, at startup, and kept no other addresses. It is left with B in east and E in west. That may be enough at this instant, but A has lost redundancy, and other nodes might have made similar choices. A few more departures could separate a group of central nodes from the rest of the graph. The detector can tell them their neighbors are gone; it cannot invent alternative neighbors.</p>
 <h2>Core Insight</h2>
-<p>Suppose a decentralized event-distribution system has 5,000 nodes. Each node can afford only a handful of open peer connections, but published messages still need paths through the overlay to reach most of the cluster. Keeping a full mesh would be too expensive, so each node keeps a partial view: a small set of peers it knows about.</p>
-<p>That solves the local cost problem, but it creates a global risk. If nodes choose neighbors carelessly, the overlay may look fine while the system is quiet and then fragment when many nodes restart, leave, or become unreachable. Once the peer graph breaks, gossip has fewer roads to travel. A good dissemination rule cannot compensate for an overlay that has split into isolated regions.</p>
-<p>HyParView addresses that quieter layer. It does not primarily decide whether a node is alive or dead. It maintains the peer graph that gossip and broadcast protocols rely on. Its central move is to keep two views at once: a small active view for live communication and a larger passive view that acts as repair material when active neighbors disappear.</p>
-<p>The trade-off is clear. A naive partial view is cheap but brittle. A HyParView-style hybrid view costs more bookkeeping and protocol logic, but it gives the system a better chance of staying connected under churn without forcing every node to know everyone else.</p>
-<h2>Partial Views and Their Risk</h2>
-<p>A partial view is attractive because it bounds per-node cost. If each node in a 5,000-node system keeps six active neighbors, memory, sockets, and periodic traffic stay manageable. The problem is that those six choices now matter enormously.</p>
-<p>Imagine these two local views:</p>
-<div class="codehilite"><pre><span></span><code>good enough locally:
-  node A knows B, C, D, E, F, G
-
-bad globally:
-  most of A&#39;s neighbors are in the same rack
-  two of them leave together
-  one was a bridge to another region
-</code></pre></div>
-
-<p>From <code>A</code>'s point of view, six neighbors may sound like enough. From the overlay's point of view, the arrangement may be fragile. The graph can develop weak bridges, isolated pockets, or heavily clustered neighborhoods. Under churn, those weaknesses become delivery failures.</p>
-<p>So the real question is not only:</p>
-<div class="codehilite"><pre><span></span><code>How many peers does each node keep?
-</code></pre></div>
-
-<p>It is:</p>
-<div class="codehilite"><pre><span></span><code>Does the collection of partial views remain connected, diverse, and repairable over time?
-</code></pre></div>
-
-<p>HyParView treats that as a protocol responsibility rather than a lucky side effect of random selection.</p>
-<h2>Mechanism</h2>
-<p>HyParView separates active communication from repair capacity.</p>
-<p>The <strong>active view</strong> is small. These are the peers a node actively maintains connections to and uses for normal communication. Keeping it small is what makes the overlay affordable.</p>
-<p>The <strong>passive view</strong> is larger. These are known peers that are not all actively connected right now. They are candidates for future repair, replacement, and diversification.</p>
-<div class="codehilite"><pre><span></span><code>node A
-
-active view:
-  B, D, F, H
-
-passive view:
-  K, M, Q, R, T, W, Y, Z
-</code></pre></div>
-
-<p>If active peer <code>D</code> fails or leaves, <code>A</code> does not have to discover the cluster from scratch:</p>
-<div class="codehilite"><pre><span></span><code>D disappears
-    |
-    v
-A selects candidate K from passive view
-    |
-    v
-A attempts to promote K into active view
-    |
-    v
-active view becomes B, F, H, K
-</code></pre></div>
-
-<p>The passive view is not just a spare list. It must stay fresh enough and diverse enough to be useful. HyParView uses join handling, forwarding, neighbor replacement, and shuffle-style exchanges to keep views from becoming stale or too local. The details vary by implementation, but the design pressure is stable: the overlay must repair itself faster than churn can tear it apart.</p>
-<h2>Worked Example</h2>
-<p>Imagine a peer-to-peer broadcast system deployed across three availability zones. Node <code>A</code> has active peers in all three zones:</p>
-<div class="codehilite"><pre><span></span><code>A active view:
-  B in az-1
-  C in az-2
-  D in az-2
-  E in az-3
-</code></pre></div>
-
-<p>Then a deployment drains many nodes in <code>az-2</code>. <code>C</code> and <code>D</code> both disappear. If <code>A</code> only had those four active peers and no reserve, it would need to find replacements through a damaged overlay. It might reconnect to nearby peers only, reducing cross-zone reachability and making future broadcasts more fragile.</p>
-<p>With a useful passive view, <code>A</code> can try candidates it already knows:</p>
-<div class="codehilite"><pre><span></span><code>A passive view:
-  F in az-1
-  G in az-2
-  H in az-3
-  J in az-3
-  K in az-1
-
-replacement attempt:
-  promote H and K
-</code></pre></div>
-
-<p>Now <code>A</code> restores its active degree quickly and keeps paths into multiple parts of the system. The overlay still changed, but it did not collapse into a local island.</p>
-<p>That is the practical value of the hybrid design. The active view keeps normal traffic cheap. The passive view gives the node somewhere to turn when normal traffic paths fail.</p>
-<h2>Implications and Trade-offs</h2>
-<p>HyParView improves the odds that epidemic dissemination can survive churn:</p>
+<p>Think of an overlay node as carrying two small address books.</p>
 <ul>
-<li>nodes keep a small active degree instead of a full mesh</li>
-<li>failed active links can be replaced from a reserve</li>
-<li>passive-view refresh reduces stale or overly local knowledge</li>
-<li>the overlay remains a first-class part of the system design</li>
+<li>The <strong>active view</strong> is the set of peers with which the node currently maintains live overlay links. These peers carry the normal forwarding traffic and are the ones whose loss matters immediately.</li>
+<li>The <strong>passive view</strong> is a bounded set of peers known as possible future neighbors. A passive entry is not a live connection and is not proof that the peer is alive. It is a candidate worth trying when the active view needs repair.</li>
 </ul>
-<p>The costs are real:</p>
+<p>In our incident, A can keep an active view of four and a passive view of, say, twelve. Before the deployment, A's passive view includes F and K in east, G in central, and H, J, and L in west, plus other candidates learned through the overlay. These are not a second full mesh. They are names and enough routing information to attempt a later connection.</p>
+<p>The plain-language version is: keep a few people on an active call, and keep a rotating list of people you could call next. The precise version is: maintain two bounded views with different costs, lifecycles, and selection rules.</p>
+<table>
+<thead>
+<tr>
+<th>Moving part</th>
+<th>Job</th>
+<th>Cost if it grows too much</th>
+<th>Failure if it is neglected</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active view</td>
+<td>Carries current overlay traffic and gives immediate paths</td>
+<td>More sockets, probes, and duplicate forwarding</td>
+<td>The graph loses local redundancy when peers depart</td>
+</tr>
+<tr>
+<td>Passive view</td>
+<td>Supplies candidates for promotion into the active view</td>
+<td>More memory and maintenance exchanges</td>
+<td>Replacements are stale, local, or unavailable</td>
+</tr>
+<tr>
+<td>Promotion</td>
+<td>Turns a passive candidate into a live neighbor after loss or join</td>
+<td>Connection bursts if many nodes promote together</td>
+<td>A cannot repair an active-view hole</td>
+</tr>
+<tr>
+<td>Shuffle or exchange</td>
+<td>Trades passive candidates with another node</td>
+<td>Background messages and implementation complexity</td>
+<td>The reserve converges on old or homogeneous addresses</td>
+</tr>
+<tr>
+<td>Eviction policy</td>
+<td>Keeps each view bounded and varied</td>
+<td>May discard a useful entry</td>
+<td>Popular or nearby peers dominate both views</td>
+</tr>
+</tbody>
+</table>
+<p>The key <strong>trade-off</strong> is deliberate. A full mesh makes many alternative paths obvious, but costs grow roughly with the number of possible pairs. A very tiny fixed neighbor list is cheap, but it can fragment under churn. HyParView tries to keep only a small active degree while retaining enough changing knowledge to repair edges and preserve broad reachability.</p>
+<h2>A recovery trace: replacing two lost paths</h2>
+<p>Return to A after C and D depart. The following trace is simplified, but it exposes the decisions that matter.</p>
+<h3>1. Failure evidence removes active entries</h3>
+<p>SWIM supplies the liveness evidence. A does not use HyParView to decide that C is dead; it uses its membership mechanism. Once policy says C and D should no longer be used, A removes both from its active view. It also removes or demotes their addresses from the passive view if they are present, because keeping known-bad candidates only wastes later attempts.</p>
+<p>At this moment:</p>
+<div class="codehilite"><pre><span></span><code>active(A)  = { B[east], E[west] }
+passive(A) = { F[east], G[central], H[west], J[west], K[east], L[central], ... }
+</code></pre></div>
+
+<p>The notation is not an availability guarantee. <code>H[west]</code> means A knows H as a west-zone candidate, not that H has just answered a probe.</p>
+<h3>2. A selects candidates for repair, not merely any addresses</h3>
+<p>A needs two active links. A simplistic policy would choose the first two passive entries. A better policy considers the shape of its remaining view and failure domains. It already has B in east and E in west, so adding another east and another west neighbor may be fine for redundancy but leaves no route into central if central returns. Conversely, choosing two candidates from central makes A vulnerable to another central event.</p>
+<p>In practice, selection policies vary, and a protocol cannot always know accurate zones. Still, where locality or failure-domain information is available, A can prefer candidates that avoid concentration. It might try L in central and H in west first: L restores a central bridge, while H adds a second west route. If L fails to establish a connection because the deployment is still draining central, A tries K in east or another different candidate rather than retrying L indefinitely.</p>
+<h3>3. Successful connections are promoted</h3>
+<p>H accepts A's connection attempt. A and H add each other to their active views, subject to each node's active-view limit. L does not respond, so A drops L from its passive view or marks it unusable according to local policy. A then tries K, which accepts.</p>
+<div class="codehilite"><pre><span></span><code>active(A)  = { B[east], E[west], H[west], K[east] }
+passive(A) = { F[east], G[central], J[west], ... }
+</code></pre></div>
+
+<p>A has regained four live links, but its active view is now skewed: two east, two west, none central. That is acceptable during the central drain; it would be a bad reason to block repair. The overlay needs live paths first. Later exchanges can rediscover central candidates as that zone returns.</p>
+<p>When a node accepts a new active neighbor and is already at capacity, it must make room. HyParView-style designs use bounded active views and may disconnect an existing neighbor, often giving that neighbor a chance to enter the passive view rather than disappearing completely. This avoids unbounded degree while preserving a possible future relationship. The details vary by implementation, but the invariant is stable: active links stay few, and displaced knowledge can remain available as passive knowledge.</p>
+<h3>4. Passive views are refreshed through shuffling</h3>
+<p>If every node only consumes passive entries, the reserve eventually empties or becomes old. HyParView therefore exchanges subsets of passive entries with other nodes. A can send a small shuffled sample of candidates to H and receive a sample from H in return. Entries are typically bounded, aged or replaced according to policy, and propagated with rules that reduce immediate echoing.</p>
+<p>Suppose H has recently heard of M and N in central through a different part of the graph. A receives M and N and inserts them into its passive view, evicting older or duplicate entries when the view is full:</p>
+<div class="codehilite"><pre><span></span><code>active(A)  = { B[east], E[west], H[west], K[east] }
+passive(A) = { F[east], G[central], J[west], M[central], N[central], ... }
+</code></pre></div>
+
+<p>This exchange is why the passive view is more than a cold backup list. It is a moving sample of the wider overlay. The sample need not be globally uniform to be useful, but it must keep changing enough that a node can escape its immediate neighborhood after churn.</p>
+<h3>5. The overlay regains paths, not perfect certainty</h3>
+<p>After repair, a membership update injected at A can travel through B, E, H, and K into several parts of the network. There may be duplicate paths and some candidates may already be stale. That is normal. The goal is not a mathematically perfect graph after each event; it is to keep enough connected, diverse paths that epidemic dissemination and membership repair can continue despite ordinary churn.</p>
+<p>The next lesson will make properties such as degree and path length more quantitative. For now, notice the operational test: after a localized loss, can nodes restore a small number of live edges using distributed candidate knowledge, without a central directory or a global reconnection storm?</p>
+<h2>What HyParView does not solve</h2>
+<p>Keeping these responsibilities separate prevents overclaiming.</p>
 <ul>
-<li>view maintenance adds messages and state</li>
-<li>passive entries can still become stale</li>
-<li>parameter choices affect resilience and overhead</li>
-<li>the overlay remains probabilistic rather than perfectly controlled</li>
-<li>repair behavior can hide problems unless operators measure it</li>
+<li><strong>It is not a failure detector.</strong> SWIM-like probing, timeouts, or transport errors provide the evidence that an active neighbor should be removed. HyParView reacts by repairing connectivity.</li>
+<li><strong>It does not guarantee a connected graph.</strong> A severe correlated failure, a bad bootstrap set, or insufficient candidate diversity can still partition the overlay.</li>
+<li><strong>It is not the gossip dissemination algorithm itself.</strong> Once an overlay exists, another mechanism decides which messages to forward, how often, and with what duplicate suppression.</li>
+<li><strong>It does not make stale addresses live.</strong> Passive candidates can fail. The protocol needs bounded retries, eviction, and ongoing exchange precisely because reserve knowledge decays.</li>
 </ul>
-<p>The key trade-off is low per-node cost versus overlay robustness. If the active view is too small or too poorly diversified, dissemination slows or fragments. If the protocol maintains too much state or shuffles too aggressively, membership maintenance starts consuming the savings that partial views were supposed to provide.</p>
-<p>HyParView is valuable because it makes that trade-off explicit. It says: keep the active graph small, but do not pretend a small graph maintains itself.</p>
-<h2>Common Failure Modes</h2>
-<p><strong>Picking a few random peers once and stopping</strong></p>
-<p>Initial randomness helps, but churn changes the graph. A partial view that is never refreshed becomes stale, biased, or disconnected. The corrective model is ongoing maintenance, not one-time peer selection.</p>
-<p><strong>Confusing active degree with resilience</strong></p>
-<p>Two nodes can each have four active peers while one sits in a healthy region of the graph and the other depends on fragile bridge links. Degree is only one signal. Diversity, replacement paths, and connectivity matter too.</p>
-<p><strong>Treating HyParView as a failure detector</strong></p>
-<p>HyParView is about overlay membership and peer-view health. It can help protocols continue communicating under churn, but it does not replace liveness probing, suspicion logic, or application-level policy about what to do with failed nodes.</p>
-<h2>Connections</h2>
-<p>SWIM focuses on sampling liveness and disseminating membership changes cheaply. HyParView focuses on the peer graph that lets those messages keep moving.</p>
-<p>The next topology discussion generalizes this idea: degree, diameter, redundancy, and repairability shape gossip behavior even when the message rule stays the same.</p>
-<p>Plumtree builds on the same intuition by combining efficient eager broadcast paths with lazy repair paths; it benefits from an overlay that remains connected and diverse.</p>
+<p>A common mistake is to count active neighbors and stop there: “every node has four links, so the overlay is resilient.” Four links all pointing into the same rack are not equivalent to four links spread across independent parts of the graph. Degree is one signal; diversity and successful replacement are other signals.</p>
+<h2>Observe the mechanism in production</h2>
+<p>Do not wait for a visible partition to discover that the passive view has rotted. Instrument the protocol's behavior.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What a worrying value suggests</th>
+<th>First investigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active-view size distribution</td>
+<td>Many nodes below the target degree</td>
+<td>Are connection attempts failing, or are limits/evictions misconfigured?</td>
+</tr>
+<tr>
+<td>Replacement success rate</td>
+<td>Passive candidates are stale or overloaded</td>
+<td>Check candidate age, churn burst size, and connection admission failures</td>
+</tr>
+<tr>
+<td>Passive-entry age and duplicate rate</td>
+<td>The reserve is not being refreshed</td>
+<td>Inspect shuffle frequency, fanout, and eviction policy</td>
+</tr>
+<tr>
+<td>Zone or failure-domain diversity</td>
+<td>Edges have become too local</td>
+<td>Compare neighbor placement with the node population and bootstrap sources</td>
+</tr>
+<tr>
+<td>Connected-component or reachability probes</td>
+<td>A partition may already exist</td>
+<td>Correlate with correlated loss, bootstrap failures, and blocked traffic</td>
+</tr>
+<tr>
+<td>Shuffle traffic and connection attempts</td>
+<td>Repair is becoming a storm</td>
+<td>Check backoff, limits, and whether a common event triggered mass promotion</td>
+</tr>
+</tbody>
+</table>
+<p>The measurements should guide policy, not merely decorate a dashboard. For example, a low replacement success rate after an isolated host failure may mean the passive view is too old. The same rate during a whole-zone outage may be expected; the urgent question then is whether nodes still find candidates outside that zone and whether retries are throttled.</p>
+<h2>Check your understanding</h2>
+<p>Node Q has an active view <code>{R[east], S[central], T[central], U[west]}</code>. A deployment removes S and T. Its passive view includes <code>{V[east], W[west], X[central], Y[west]}</code>.</p>
+<ol>
+<li>What information tells Q that S and T should leave the active view?</li>
+<li>Why is immediately promoting V and W a reasonable repair choice, even though it leaves no central active neighbor?</li>
+<li>What later mechanism can make Q learn fresh central candidates after the deployment?</li>
+</ol>
+<details>
+<summary>Model answer</summary>
+
+1. A liveness or membership mechanism, such as SWIM's probing and suspicion process, provides the evidence; the passive view alone does not.
+2. They are available candidates from surviving failure domains, so restoring live degree can be more urgent than preserving an ideal geographic mix while central is unavailable. Q should still avoid a policy that always picks only nearby or identical-domain candidates.
+3. Passive-view shuffle or exchange with current active neighbors can introduce candidates learned elsewhere. Failed central candidates should be evicted or deprioritized rather than retried forever.
+
+</details>
+
+<h2>Practice: design a repair policy</h2>
+<p>You operate a 1,000-node telemetry overlay spanning three zones. Each node has an active-view target of five and a passive-view limit of twenty. During a zone maintenance window, node M loses two active neighbors from the same zone. Write a small repair policy that answers:</p>
+<ul>
+<li>how M chooses its first two passive candidates;</li>
+<li>what M does when a chosen candidate cannot connect;</li>
+<li>how M avoids turning repair into an unbounded connection burst;</li>
+<li>which two metrics you would alert on during the maintenance window.</li>
+</ul>
+<p>A solid answer will separate liveness evidence from candidate selection, prefer diversity when it is available, use bounded retries or backoff, and watch both active-degree recovery and replacement success. If your answer says only “connect to random peers,” add how those peers enter and remain useful in the passive view.</p>
+<h2>Connections and boundaries</h2>
+<p>Lesson 002 supplied the failure evidence that triggers removal from an active view. This lesson supplies the overlay repair mechanism that makes the removal survivable. Lesson 004 will examine how to reason about partial-overlay shape—degree, reachability, and path length—rather than treating “a few peers” as automatically sufficient.</p>
+<p>For a real system, also ask what information is safe to exchange in passive views. Addresses, identities, admission control, and transport authentication connect this mechanism to the security and networking tracks. HyParView improves the chance of maintaining paths; it does not remove the need to validate who is allowed to become a neighbor.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf">HyParView: A Membership Protocol for Reliable Gossip-Based Broadcast</a><ul>
-<li>Focus: Read the motivation and evaluation sections to see how churn breaks naive partial overlays and why hybrid views help.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf">Epidemic Broadcast Trees for Large-Scale Systems</a><ul>
-<li>Focus: Use this as the next step from overlay maintenance into efficient and repairable broadcast.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a><ul>
-<li>Focus: Compare SWIM's liveness and dissemination focus with HyParView's overlay-maintenance focus.</li>
-</ul>
-</li>
-<li>[REPO] <a href="https://github.com/hashicorp/memberlist">HashiCorp memberlist</a><ul>
-<li>Focus: Although it is not HyParView, it is a practical reference for how real systems expose membership and peer-management parameters.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf">HyParView: A Membership Protocol for Reliable Gossip-Based Broadcast</a> - Focus: the active/passive-view protocol and its churn rationale.</li>
+<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf">Epidemic Broadcast Trees</a> - Focus: how membership-overlay choices support reliable broadcast.</li>
+<li>[PAPER] <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a> - Focus: the separate role of scalable failure detection and membership dissemination.</li>
+<li>[ARTICLE] <a href="https://github.com/hashicorp/memberlist">HashiCorp memberlist</a> - Focus: an implementation-oriented reference for SWIM-style membership trade-offs.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A partial view reduces per-node cost, but it can become fragile unless the overlay is actively maintained.</li>
-<li>HyParView uses an active view for live communication and a passive view as repair capacity under churn.</li>
-<li>The main trade-off is extra view-management complexity in exchange for a cheaper, more resilient peer graph.</li>
-<li>Gossip quality depends on the overlay that carries it, not only on the message-spreading rule.</li>
-</ol>
+<ul>
+<li>An active view contains current live overlay neighbors; a passive view contains bounded replacement candidates, not guaranteed-live peers.</li>
+<li>Failure detection and topology repair are separate responsibilities: SWIM can justify removing a neighbor, while HyParView helps find another one.</li>
+<li>Passive views need ongoing shuffle, eviction, and diversity-aware selection or they become stale and local.</li>
+<li>A small active degree can scale, but resilience also depends on replacement success and paths across failure domains.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
   
   <a class="nav-card" href="002.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>SWIM Protocol - Scalable Membership at Scale</strong>
+    <strong>How SWIM Separates Probing from Dissemination</strong>
   </a>
   
 
   
   <a class="nav-card" href="004.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Gossip Topologies - Overlay Network Design</strong>
+    <strong>How Overlay Shape Changes Gossip Behavior</strong>
   </a>
   
 </section>
@@ -240,7 +340,7 @@ replacement attempt:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-19 17:21 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

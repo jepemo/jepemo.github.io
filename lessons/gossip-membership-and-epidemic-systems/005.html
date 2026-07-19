@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Phi Accrual Failure Detector - Adaptive Suspicion - @jepemo</title>
+    <title>How Phi Turns Delay into Graded Suspicion - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>Phi Accrual Failure Detector - Adaptive Suspicion</h1>
+<h1>How Phi Turns Delay into Graded Suspicion</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,147 +79,282 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Phi Accrual Failure Detector - Adaptive Suspicion</h1>
+  <h1>How Phi Turns Delay into Graded Suspicion</h1>
 <blockquote>
-<p><strong>The core idea</strong>: a phi accrual failure detector turns missing heartbeats into a graded suspicion score, trading binary timeout simplicity for adaptive evidence that can be thresholded by operational risk.</p>
+<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<ul>
+<li>
+<p>calculate the interpretation of a phi score from a supplied tail probability;</p>
+</li>
+<li>
+<p>distinguish an unusual heartbeat delay from a probability that a node has crashed;</p>
+</li>
+<li>
+<p>choose different actions for low, medium, and high suspicion without treating a threshold as a membership verdict.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Phi accrual turns “this heartbeat is late” into a score for how surprising the silence is relative to recent timing, so policy can react gradually instead of falling off one timeout cliff.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose node <code>A</code> watches heartbeats from node <code>B</code> in a distributed cache cluster. Most intervals are near one second: <code>980 ms</code>, <code>1010 ms</code>, <code>960 ms</code>, <code>1040 ms</code>. Then the next heartbeat takes <code>3200 ms</code>. Did <code>B</code> fail, hit a long pause, get delayed by the network, or simply run during a noisy moment?</p>
-<p>A fixed timeout forces that messy question into a hard cliff. If the timeout is <code>2000 ms</code>, <code>A</code> may call <code>B</code> failed too early. If the timeout is <code>8000 ms</code>, <code>A</code> avoids some false positives but reacts slowly when <code>B</code> is actually gone. The same threshold has to serve both fast detection and tolerance for ordinary delay.</p>
-<p>Phi accrual changes the interface. Instead of outputting only "alive" or "dead", the detector outputs a suspicion score that rises as the current silence becomes less plausible given recent heartbeat history. A short delay in a noisy environment may be unsurprising. The same delay in a very stable environment may be strong evidence that something changed.</p>
-<p>The trade-off is useful but not magical. Phi gives better evidence than a blind timeout, but it still reasons from timing signals. The system must decide which <code>phi</code> threshold is worth acting on, and that choice depends on the cost of false failover, stale routing, rebalancing, and delayed recovery.</p>
-<h2>Why Fixed Timeouts Are Crude</h2>
-<p>Fixed timeouts are attractive because they are easy to explain:</p>
-<div class="codehilite"><pre><span></span><code>if silence &gt; 2 seconds:
-  mark peer as failed
+<p>Node A monitors node B in a service-discovery cluster. B normally sends a heartbeat about once a second. For the last few minutes, A has seen intervals such as <code>0.98 s</code>, <code>1.02 s</code>, <code>1.01 s</code>, and <code>0.99 s</code>. Then 2.8 seconds pass with no new heartbeat.</p>
+<p>Should A remove B from routing? Start an indirect probe? Record a warning? Wait longer?</p>
+<p>A fixed timeout forces all of those decisions through one question:</p>
+<div class="codehilite"><pre><span></span><code>has silence exceeded T?
 </code></pre></div>
 
-<p>That rule works only if delay is stable enough and the cost of mistakes is low enough. Real distributed systems rarely behave that cleanly. Hosts pause for garbage collection, CPUs saturate, packet queues build up, network paths jitter, and observers can be slow to process replies.</p>
-<p>The detector is not observing failure directly. It is observing delayed or missing messages. That means failure detection is an inference problem:</p>
-<div class="codehilite"><pre><span></span><code>missing signal
-  -&gt; possible crash
-  -&gt; possible pause
-  -&gt; possible packet loss
-  -&gt; possible overloaded observer
+<p>If <code>T = 2 s</code>, A reacts quickly but may treat a short pause as a failure. If <code>T = 8 s</code>, A avoids some false alarms but keeps sending work toward a genuinely failed B for longer. The timeout does not explain <em>how unusual</em> the current delay is; it only says whether the clock crossed a line.</p>
+<p>Phi accrual changes the output, not the fundamental uncertainty. It asks: given B's recent heartbeat timing, how surprising is it that no heartbeat has arrived by now? The detector returns a number that rises as the silence becomes less plausible. A later policy decides what to do with that number.</p>
+<p>Plain meaning:</p>
+<p>Instead of a traffic light that flips directly from green to red, phi is a needle that moves upward as a delay becomes more surprising.</p>
+<p>In this scenario:</p>
+<p>A 2.8-second silence is far more surprising after many one-second intervals than after a history containing 2.5-second pauses.</p>
+<p>Technical name:</p>
+<p>A <strong>phi accrual failure detector</strong> emits a graded suspicion score derived from an estimated distribution of heartbeat inter-arrival times.</p>
+<h2>Why a single timeout loses useful evidence</h2>
+<p>The detector never observes a crash directly. It observes a missing or late signal. Several causes can produce the same silence:</p>
+<div class="codehilite"><pre><span></span><code>no heartbeat at A
+  -&gt; B crashed
+  -&gt; B paused for garbage collection
+  -&gt; a packet was lost or delayed
+  -&gt; the network path is congested
+  -&gt; A itself was too busy to process the heartbeat
 </code></pre></div>
 
-<p>A binary timeout discards useful context. It treats a delay after calm heartbeat history the same way as a delay after already-noisy heartbeat history. Phi accrual keeps that context visible by asking a better question: how surprising is this silence relative to what this peer has recently looked like?</p>
-<h2>Mechanism</h2>
-<p>Phi accrual maintains a recent history of heartbeat inter-arrival times. When no heartbeat has arrived yet, it compares the elapsed silence with that history and converts the tail probability into a suspicion score.</p>
-<p>At a high level:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">phi</span><span class="p">(</span><span class="n">now</span><span class="p">,</span> <span class="n">last_heartbeat_at</span><span class="p">,</span> <span class="n">interval_history</span><span class="p">):</span>
-    <span class="n">elapsed</span> <span class="o">=</span> <span class="n">now</span> <span class="o">-</span> <span class="n">last_heartbeat_at</span>
-    <span class="n">p_later</span> <span class="o">=</span> <span class="n">probability_next_interval_is_at_least</span><span class="p">(</span><span class="n">elapsed</span><span class="p">,</span> <span class="n">interval_history</span><span class="p">)</span>
-    <span class="k">return</span> <span class="o">-</span><span class="n">log10</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">p_later</span><span class="p">,</span> <span class="mf">1e-12</span><span class="p">))</span>
+<p>The naive design treats every cause the same after a fixed time. This can be reasonable in a small, predictable system. It becomes brittle when different peers or different periods have different timing behavior. One global timeout may be too short for a noisy link and much too long for a normally quiet one.</p>
+<p>Keeping a short recent history gives the detector context. If B has often been late, another late heartbeat is still concerning but less surprising. If B has been regular and suddenly goes quiet, the same elapsed time carries stronger evidence that something has changed.</p>
+<p>This does not make timing objective truth. The history can be unrepresentative, the statistical model can be wrong, and a partition can make a healthy B appear absent to A. Phi makes the uncertainty visible in a more useful shape; it does not remove it.</p>
+<h2>From timing history to a phi score</h2>
+<p>The mechanism has four steps.</p>
+<ol>
+<li>A records recent intervals between heartbeats from B.</li>
+<li>When the next heartbeat has not arrived, A measures the elapsed silence.</li>
+<li>A's timing model estimates the chance that a normal next heartbeat would take at least that long.</li>
+<li>A transforms that tail probability into phi:</li>
+</ol>
+<div class="codehilite"><pre><span></span><code>phi = -log10(p_later)
 </code></pre></div>
 
-<p>The exact statistical model can vary, but the interpretation is stable:</p>
-<ul>
-<li>low <code>phi</code>: this silence is still plausible</li>
-<li>rising <code>phi</code>: this silence is becoming unusual</li>
-<li>high <code>phi</code>: this silence is unusual enough that the system may act</li>
-</ul>
-<p>The value is not "probability that the node is dead." It is a transformed suspicion score. It says something closer to:</p>
-<div class="codehilite"><pre><span></span><code>Given the heartbeat pattern I have seen,
-this much silence is becoming increasingly unlikely.
+<p>Here, <code>p_later</code> means the model's estimated probability of waiting at least this long for the next heartbeat. Lower <code>p_later</code> means the current silence is less plausible. The negative logarithm turns tiny probabilities into a score that is easier to compare with thresholds.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Estimated <code>p_later</code></th>
+<th style="text-align: right;">Phi</th>
+<th>Interpretation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;"><code>0.1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td>A delay this long is still fairly plausible.</td>
+</tr>
+<tr>
+<td style="text-align: right;"><code>0.01</code></td>
+<td style="text-align: right;"><code>2</code></td>
+<td>Only about one modeled interval in one hundred would be this late or later.</td>
+</tr>
+<tr>
+<td style="text-align: right;"><code>0.0001</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td>The silence is much more unusual under the model.</td>
+</tr>
+<tr>
+<td style="text-align: right;"><code>0.00000001</code></td>
+<td style="text-align: right;"><code>8</code></td>
+<td>The silence is extremely unusual under the model.</td>
+</tr>
+</tbody>
+</table>
+<p>The table is an interpretation exercise, not a promise about a particular implementation. Different systems choose different history windows, distributions, minimum standard deviations, and caps. Those choices change <code>p_later</code>. The relationship <code>phi = -log10(p_later)</code> is the useful mental model: every increase of one phi unit means a tenfold decrease in the modeled plausibility of waiting this long.</p>
+<p>The most important negative statement is also the easiest to forget:</p>
+<div class="codehilite"><pre><span></span><code>phi = 8 does not mean “B is 80% dead.”
 </code></pre></div>
 
-<p>That distinction prevents a common mistake. <code>phi = 8</code> does not mean "80 percent dead." It means the current delay is surprising enough, under the detector's model, to cross whatever operational threshold the system has chosen.</p>
-<h2>Worked Example</h2>
-<p>Imagine two environments.</p>
-<p>In a stable cluster, node <code>B</code> usually heartbeats every second with tiny variation:</p>
-<div class="codehilite"><pre><span></span><code>990 ms, 1005 ms, 995 ms, 1010 ms
+<p>Phi describes surprise under a timing model, not the probability of a particular failure cause. A paused B, a partitioned B, and a failed B can all yield a high score at A. The action must account for that ambiguity.</p>
+<h2>A worked trace: one silence, two histories</h2>
+<p>Return to A and B. At <code>t = 0</code>, A receives B's last heartbeat. We compare a stable recent history with a noisy one. The values in the table are deliberately supplied model outputs; the lesson is about reading the model, not fitting a distribution by hand.</p>
+<div class="codehilite"><pre><span></span><code>stable history: 0.98, 1.02, 1.01, 0.99, 1.00 seconds
+noisy history:  0.90, 1.80, 1.30, 2.60, 1.40 seconds
 </code></pre></div>
 
-<p>If <code>A</code> has heard nothing for <code>3500 ms</code>, that silence is very unusual. Phi rises quickly, and a moderate threshold may be enough to treat <code>B</code> as strongly suspect.</p>
-<p>In a noisier cluster, recent intervals look like this:</p>
-<div class="codehilite"><pre><span></span><code>900 ms, 1800 ms, 1300 ms, 2600 ms
-</code></pre></div>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Elapsed since last heartbeat</th>
+<th style="text-align: right;">Stable-history <code>p_later</code></th>
+<th style="text-align: right;">Stable phi</th>
+<th style="text-align: right;">Noisy-history <code>p_later</code></th>
+<th style="text-align: right;">Noisy phi</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;"><code>1.2 s</code></td>
+<td style="text-align: right;"><code>0.12</code></td>
+<td style="text-align: right;">about <code>0.9</code></td>
+<td style="text-align: right;"><code>0.55</code></td>
+<td style="text-align: right;">about <code>0.3</code></td>
+</tr>
+<tr>
+<td style="text-align: right;"><code>2.0 s</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+<td style="text-align: right;"><code>3</code></td>
+<td style="text-align: right;"><code>0.08</code></td>
+<td style="text-align: right;">about <code>1.1</code></td>
+</tr>
+<tr>
+<td style="text-align: right;"><code>3.2 s</code></td>
+<td style="text-align: right;"><code>0.000001</code></td>
+<td style="text-align: right;"><code>6</code></td>
+<td style="text-align: right;"><code>0.004</code></td>
+<td style="text-align: right;">about <code>2.4</code></td>
+</tr>
+</tbody>
+</table>
+<p>At 1.2 seconds, both histories can plausibly produce another heartbeat. At 2.0 seconds, the stable history has made the silence unusual, while the noisy history has not. At 3.2 seconds, both deserve attention, but the stable model assigns much stronger surprise.</p>
+<p>The input is the same absence of a heartbeat. The transition is the timing model converting elapsed time into <code>p_later</code>, then into phi. The intermediate state is A's graded suspicion, which differs by history. The output is not “B is dead”; it is a policy decision such as probing, avoiding new work, or creating a membership suspicion.</p>
+<p>Compare this with a naive <code>2 s</code> timeout. At exactly 2.0 seconds, it would make the same binary decision for both histories. Phi preserves the difference that the timing evidence contains.</p>
+<h2>Turn a score into proportional actions</h2>
+<p>Phi is useful because different actions have different costs. Logging an observation is cheap. Avoiding new traffic may be reversible. Removing a member can trigger rebalancing, failover, or loss of capacity. One threshold should not silently perform all three jobs.</p>
+<p>An illustrative policy might look like this:</p>
+<table>
+<thead>
+<tr>
+<th>Phi range</th>
+<th>Possible action</th>
+<th>Why this action fits</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>below <code>2</code></td>
+<td>Continue normal operation; retain the score for observation</td>
+<td>The silence is not yet very surprising.</td>
+</tr>
+<tr>
+<td><code>2</code> to below <code>5</code></td>
+<td>Increase monitoring or attempt a direct/indirect probe</td>
+<td>Gather more evidence before changing shared state.</td>
+</tr>
+<tr>
+<td><code>5</code> to below <code>8</code></td>
+<td>Stop assigning new optional work to B; surface degraded health</td>
+<td>The local risk may justify a reversible precaution.</td>
+</tr>
+<tr>
+<td><code>8</code> or higher</td>
+<td>Enter the membership protocol's suspicion path according to its rules</td>
+<td>Strong timing evidence can trigger corroboration and dissemination, not an automatic global removal.</td>
+</tr>
+</tbody>
+</table>
+<p>These numbers are examples, not a configuration recipe. A payment coordinator may tolerate delay rather than falsely failing over. A latency-sensitive router may reduce new assignments earlier. A cluster that is already overloaded may need to avoid turning simultaneous high phi scores into a probe storm.</p>
+<p>The <strong>trade-off</strong> is adaptive sensitivity versus operational complexity. A fixed timeout is easy to explain and test. Phi captures more local context and permits proportional response, but it needs history management, threshold policy, observability, and careful handling of correlated events.</p>
+<h2>The history is part of the detector</h2>
+<p>Phi quality depends on the data used to build its timing model. A detector that has just started may have too little history. A very long history may retain a past network incident and become too tolerant after the system recovers. A short history can overreact to a brief run of unusually fast heartbeats.</p>
+<p>Practical designs therefore choose a bounded window, initialize conservatively, and prevent a tiny estimated variance from making ordinary scheduling noise look impossible. Some models assume a normal distribution; others use different distributions or empirical estimates. The model choice matters less than being explicit about its limits and measuring whether the resulting policy causes harmful false suspicion.</p>
+<p>Also inspect the observer. A is measuring when <em>it</em> received and processed B's heartbeat. If A has a long runtime pause or a saturated event loop, many healthy peers can appear late at once. Phi can describe the unusual silence, but it cannot tell whether the fault is B, the path, or A without additional evidence. Lifeguard later addresses this kind of degraded-observer problem in a SWIM setting.</p>
+<h2>Signals and boundaries</h2>
+<p>Use phi as a measurable input to a failure policy, not as a mysterious scalar.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What to look for</th>
+<th>Boundary it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Phi distribution by observer</td>
+<td>One observer has high phi for many peers at once</td>
+<td>The observer or its local network may be unhealthy</td>
+</tr>
+<tr>
+<td>Suspicions later refuted</td>
+<td>High scores frequently lead to healthy peers responding</td>
+<td>Thresholds, history, or runtime pauses are too aggressive</td>
+</tr>
+<tr>
+<td>Detection latency after controlled failure</td>
+<td>How long scores take to cross the action threshold</td>
+<td>The system is too cautious for its recovery promise</td>
+</tr>
+<tr>
+<td>Heartbeat interval distribution</td>
+<td>Long tails, changing variance, or sudden shifts</td>
+<td>The timing model is stale or workload conditions changed</td>
+</tr>
+<tr>
+<td>Actions per threshold band</td>
+<td>Too many route changes or probes near a boundary</td>
+<td>A threshold is causing churn rather than useful adaptation</td>
+</tr>
+</tbody>
+</table>
+<p>Phi helps when a local timing signal must drive a graded response. It does not solve membership dissemination, guarantee that all observers agree, prove the cause of silence, or select an authoritative cluster view. Those are separate protocol and system-design questions.</p>
+<h2>Common confusions</h2>
+<h3>Confusion: phi is a probability that the node is dead</h3>
+<p>Why it is tempting:</p>
+<p>The score comes from a probability calculation and increases when heartbeats are missing.</p>
+<p>Better model:</p>
+<p>It is a transform of the modeled probability that the <em>delay</em> is this long or longer. It says the observation is surprising, not which cause produced it.</p>
+<h3>Confusion: one phi threshold is the failure policy</h3>
+<p>Why it is tempting:</p>
+<p>A single number looks like a drop-in replacement for a timeout.</p>
+<p>Better model:</p>
+<p>Different actions have different blast radii. Use a graduated policy, corroborate when needed, and keep membership-state transitions under their own rules.</p>
+<h3>Confusion: a personal timing history is global knowledge</h3>
+<p>Why it is tempting:</p>
+<p>If A has a high score for B, it is easy to say that B is unavailable to the cluster.</p>
+<p>Better model:</p>
+<p>The history and the observation belong to A. Another observer may see B normally. A high score should be treated as local evidence until the membership protocol evaluates and disseminates it.</p>
+<h2>Check your understanding</h2>
+<p><strong>Check:</strong> A's model says the chance of waiting at least 4 seconds for B's next heartbeat is <code>0.00001</code>. What phi does that imply, and what does it <em>not</em> imply?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> <code>phi = -log10(0.00001) = 5</code>. A five means the 4-second silence is unusual under A's heartbeat model. It does not mean B has a 50% or 5% chance of being dead, and it does not authorize a permanent membership removal by itself.</p>
+<h2>Practice: write a safer threshold policy</h2>
+<p>Your 600-node service-discovery cluster has expensive failovers but must stop routing new optional work to a truly failed node within roughly five seconds. Recent tests show that ordinary heartbeat delay occasionally reaches 2.5 seconds, while real host failures produce no heartbeat at all. Design a four-band phi policy for <code>observe</code>, <code>probe</code>, <code>avoid new work</code>, and <code>membership suspicion</code>.</p>
+<p>For each band, state the action and one metric you would watch. Your answer should explain why the membership-suspicion threshold is stricter than the routing threshold, and how you would detect a bad timing model.</p>
+<details>
+<summary>Review rubric</summary>
 
-<p>Now <code>3500 ms</code> is still concerning, but it is not as shocking. Phi rises more cautiously because recent history already contains large delays.</p>
-<p>This is the practical advantage. The detector adapts its suspicion to observed timing behavior instead of pretending one universal timeout fits every node, workload, and network condition.</p>
-<p>The output still needs policy:</p>
-<div class="codehilite"><pre><span></span><code>phi &gt;= 3:
-  log or surface mild suspicion
+A strong policy uses low phi for observation, a middle band to gather direct or indirect evidence, and a reversible routing precaution before a high threshold enters the membership-suspicion path. It watches propagation from high phi to refuted suspicion, detection latency in controlled failures, and high-score clusters by observer. It does not claim that a numeric threshold proves a crash or that one threshold should serve every action.
 
-phi &gt;= 8:
-  avoid routing new work to this peer
+</details>
 
-phi &gt;= 12:
-  consider stronger membership action
-</code></pre></div>
-
-<p>Those thresholds are examples, not universal rules. A system with expensive false failovers may wait longer. A system where stale routing is dangerous may act earlier.</p>
-<h2>Implications and Trade-offs</h2>
-<p>Phi accrual improves failure detection in three ways:</p>
-<ul>
-<li>it preserves timing context instead of collapsing everything into one timeout</li>
-<li>it lets suspicion grow gradually</li>
-<li>it allows different subsystems to react at different thresholds</li>
-</ul>
-<p>The costs and limits matter:</p>
-<ul>
-<li>poor heartbeat history produces poor suspicion estimates</li>
-<li>bursty latency can still cause false positives</li>
-<li>thresholds must match operational risk</li>
-<li>the detector does not prove death</li>
-<li>long pauses and network partitions can still confuse interpretation</li>
-</ul>
-<p>The main trade-off is adaptive sensitivity versus policy complexity. A fixed timeout is crude but simple. Phi gives a richer signal, but someone must decide what scores mean and which actions are safe at each level.</p>
-<p>That makes phi accrual a measurement component, not a complete membership protocol. It can inform SWIM-style suspicion, service routing, alerts, or operator dashboards. It does not decide by itself when a node should be permanently removed from the cluster.</p>
-<h2>Common Failure Modes</h2>
-<p><strong>Reading phi as a death probability</strong></p>
-<p>The score is not a direct probability that the node has crashed. It is a measure of how unlikely the current silence is under recent heartbeat behavior.</p>
-<p><strong>Using one threshold without considering action cost</strong></p>
-<p>The same <code>phi</code> value may be appropriate for logging, too low for failover, and much too low for permanent removal. Thresholds should match the action they trigger.</p>
-<p><strong>Training on unrepresentative history</strong></p>
-<p>If the recent heartbeat window is too short, too old, or collected during unusual conditions, the detector may become overconfident or too tolerant.</p>
-<p><strong>Ignoring the observer</strong></p>
-<p>If node <code>A</code> is overloaded, it may process heartbeats late and blame <code>B</code>. Adaptive suspicion helps with timing history, but later SWIM-style health awareness is still needed when the observer itself is degraded.</p>
-<h2>Connections</h2>
-<p>Heartbeats provide the raw timing signal. Phi accrual is the interpretation layer that turns that signal into graded suspicion.</p>
-<p>SWIM uses direct and indirect probes to gather liveness evidence. Phi accrual shows another way to make liveness evidence less binary before membership policy acts on it.</p>
-<p>Later SWIM improvements, such as local health awareness and suspicion dampening, address a related problem: preventing low-quality suspicion from spreading too aggressively.</p>
+<h2>Connections and boundaries</h2>
+<p>The preceding overlay lessons made paths and repair visible. Phi reads timing evidence on one such path. The next lesson makes the architectural boundary explicit: failure evidence is gathered locally, while gossip disseminates accepted membership updates through the cluster.</p>
+<p>Phi can inform SWIM-style suspicion, routing, and alerts. It does not replace direct or indirect probing, versioned membership state, gossip dissemination, consensus, or a security trust model.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://doc.akka.io/libraries/akka-core/current/typed/failure-detector.html">Akka Failure Detector</a><ul>
-<li>Focus: A practical explanation of phi accrual in an actor-based distributed runtime.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://cassandra.apache.org/doc/stable/cassandra/architecture/gossip.html">Apache Cassandra Gossip</a><ul>
-<li>Focus: See how adaptive suspicion fits into a production membership and gossip subsystem.</li>
-</ul>
-</li>
-<li>[REPO] <a href="https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/gms/FailureDetector.java">Apache Cassandra FailureDetector.java</a><ul>
-<li>Focus: Useful for connecting the high-level idea to threshold and implementation decisions.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.researchgate.net/publication/29682135_The_Phi_Accrual_Failure_Detector">The Phi Accrual Failure Detector</a><ul>
-<li>Focus: Read for the original framing of accrual failure detection as a suspicion-level interface.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.researchgate.net/publication/29682135_The_Phi_Accrual_Failure_Detector">The Phi Accrual Failure Detector</a> - Focus: the original accrual-detector framing and the meaning of a suspicion level.</li>
+<li>[ARTICLE] <a href="https://doc.akka.io/libraries/akka-core/current/typed/failure-detector.html">Akka Phi Accrual Failure Detector</a> - Focus: an implementation-oriented explanation of history, thresholds, and timing assumptions.</li>
+<li>[ARTICLE] <a href="https://cassandra.apache.org/doc/stable/cassandra/architecture/gossip.html">Apache Cassandra Gossip</a> - Focus: how liveness-related state participates in a production gossip subsystem.</li>
+<li>[ARTICLE] <a href="https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/gms/FailureDetector.java">Apache Cassandra FailureDetector.java</a> - Focus: connect the model to threshold and implementation choices without treating defaults as universal.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Fixed timeouts force one hard threshold to balance fast detection against false positives.</li>
-<li>Phi accrual turns heartbeat silence into a graded suspicion score based on recent timing history.</li>
-<li>The score is evidence, not proof; policy still decides what actions are safe at each threshold.</li>
-<li>The main trade-off is a richer adaptive signal in exchange for threshold tuning and operational interpretation.</li>
-</ol>
+<ul>
+<li>Phi is a graded measure of how surprising current heartbeat silence is relative to an observer's timing history.</li>
+<li><code>phi = -log10(p_later)</code> turns a small tail probability into an interpretable score; it is not a probability that a node crashed.</li>
+<li>A useful policy separates reversible local actions from stronger membership suspicion and corroboration.</li>
+<li>History quality, observer health, and threshold outcomes determine whether adaptive suspicion is helping or creating false alarms.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
   
   <a class="nav-card" href="004.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Gossip Topologies - Overlay Network Design</strong>
+    <strong>How Overlay Shape Changes Gossip Behavior</strong>
   </a>
   
 
   
   <a class="nav-card" href="006.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Heartbeats vs Gossip - Direct Probes vs Epidemic Dissemination</strong>
+    <strong>Why Failure Evidence and Dissemination Are Different Jobs</strong>
   </a>
   
 </section>
@@ -230,7 +369,7 @@ phi &gt;= 12:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-19 17:21 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

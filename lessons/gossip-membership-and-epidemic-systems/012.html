@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vector Clocks - Causal Ordering in Gossip - @jepemo</title>
+    <title>How Causal Metadata Prevents Stale Updates from Winning - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>Vector Clocks - Causal Ordering in Gossip</h1>
+<h1>How Causal Metadata Prevents Stale Updates from Winning</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,160 +79,137 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Vector Clocks - Causal Ordering in Gossip</h1>
+  <h1>How Causal Metadata Prevents Stale Updates from Winning</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Vector clocks attach causal history to replicated versions, trading extra metadata and pruning complexity for the ability to distinguish true replacement from concurrent work.</p>
+<p><strong>The core idea</strong>: A vector clock records which updates a version has already incorporated. That lets a replica distinguish a genuinely stale version from an independent concurrent version, at the cost of metadata and lifecycle rules.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a replicated shopping cart stored on replicas <code>A</code>, <code>B</code>, and <code>C</code>. A network partition separates <code>A</code> from <code>B</code>. During that partition, a user connected to <code>A</code> adds a keyboard, while a user connected to <code>B</code> adds a mouse. When the partition heals, gossip starts moving both cart versions around the cluster.</p>
-<p>The dangerous question is not which version arrives last. Arrival order is just a fact about the network path. It does not tell the receiving node whether one writer had already seen the other writer's change. If the system treats the later-arriving version as the single newest truth, it can silently erase a real update.</p>
-<p>Vector clocks solve a narrower and more useful problem than "make one global timeline." They record enough per-replica history to answer whether version <code>x</code> causally includes version <code>y</code>, whether <code>y</code> causally includes <code>x</code>, or whether neither version includes the other. That last case is concurrency, and it is exactly the case where a system should preserve both versions, merge them, or ask application logic to reconcile them.</p>
-<p>The design trade-off is causal precision versus metadata and operational complexity. Vector clocks make concurrency visible, but they add state to every version and require production rules for bounding, pruning, and comparing that state.</p>
-<h2>Why Arrival Order Is Not Causality</h2>
-<p>Gossip systems are intentionally opportunistic. A version can reach one node directly, another node through a chain of peers, and a third node after a long delay. The last message a node receives may be old in the causal sense, and an early message may already include more history than a later one.</p>
-<p>Consider this sequence:</p>
-<div class="codehilite"><pre><span></span><code>1. A writes cart_v1 while isolated from B.
-2. B writes cart_v2 while isolated from A.
-3. C receives cart_v2 first.
-4. C receives cart_v1 later.
+<p>Gossip is good at moving information, but it deliberately does not promise a single delivery order. A message can take a direct path to one replica, wait behind a slow peer on another path, and be duplicated when a partition heals. Therefore, the last version a node receives is not necessarily the most informed one.</p>
+<p>Consider one shared shopping cart replicated at <code>A</code>, <code>B</code>, and <code>C</code>. A network partition separates <code>A</code> and <code>B</code>. A user connected to <code>A</code> adds a keyboard; another user connected to <code>B</code> adds a mouse. Once the partition heals, gossip carries both cart versions to <code>C</code>.</p>
+<p><code>C</code> must answer a precise question: did one writer already know about the other writer's change? If yes, the later version can causally replace the earlier one. If no, the writes are concurrent. Selecting a winner solely because it arrived last can silently erase a real cart item.</p>
+<p>Vector clocks preserve exactly the evidence needed for this question. They do not make a global timeline and they do not merge business data. Instead, they expose a partial order: one version happened after another, or neither version happened after the other. Concurrency is useful information, not an error to hide.</p>
+<h2>The Small Situation: One Object, Three Replicas</h2>
+<p>Suppose every replica begins with the same empty cart and the same clock:</p>
+<div class="codehilite"><pre><span></span><code>v0 = {A: 0, B: 0, C: 0}
 </code></pre></div>
 
-<p>If <code>C</code> decides by arrival order, it may keep <code>cart_v1</code> and discard <code>cart_v2</code>. That is not a conflict resolution policy. It is a guess based on transport timing.</p>
-<p>Wall-clock timestamps have a similar problem. Clock skew can make the wrong write look newer, but even perfectly synchronized clocks would not answer the causal question. A physical timestamp can say which event happened at a later time. It cannot prove that the later writer had observed the earlier value.</p>
-<p>The causal question is different:</p>
-<div class="codehilite"><pre><span></span><code>Did this version include the history of that version when it was created?
+<p>During the partition, each writer increments only its own entry:</p>
+<div class="codehilite"><pre><span></span><code>A adds keyboard -&gt; vA = {A: 1, B: 0, C: 0}
+B adds mouse    -&gt; vB = {A: 0, B: 1, C: 0}
 </code></pre></div>
 
-<p>Vector clocks encode a partial order so the system can answer that question directly.</p>
-<h2>The Vector Clock Mechanism</h2>
-<p>A vector clock is a small map from participant id to counter. For replicas <code>A</code>, <code>B</code>, and <code>C</code>, a version might carry:</p>
-<div class="codehilite"><pre><span></span><code>{A: 2, B: 1, C: 0}
+<p><code>vA</code> contains one event from <code>A</code> but no event from <code>B</code>; <code>vB</code> says the reverse. Neither writer could have observed the other write. The cart values might be represented as two siblings, <code>cart@vA</code> and <code>cart@vB</code>, until the application combines them.</p>
+<p>A naive receiver might use this rule: “retain whichever message arrived most recently.” It fails because transport delay is evidence about a route, queue, or retry—not about what a writer knew. The same failure appears with wall-clock timestamps. Even a perfectly synchronized physical clock orders instants; it cannot prove that the later writer read the earlier value before writing.</p>
+<p>The question for a replicated object is instead:</p>
+<div class="codehilite"><pre><span></span><code>When this version was created, did its creator already include the other version&#39;s history?
 </code></pre></div>
 
-<p>Read it as a compact history summary:</p>
+<h2>The Mechanism: Compare Every Component</h2>
+<p>A vector clock is a map from actor identifier to a counter. Missing entries mean zero. The rules are deliberately small:</p>
+<ol>
+<li>On a local write, increment the local actor's component.</li>
+<li>When incorporating known histories, retain the component-wise maximum.</li>
+<li>Compare two vectors across every actor that appears in either vector.</li>
+</ol>
+<p>For vectors <code>x</code> and <code>y</code>, <code>x</code> is before <code>y</code> when every component of <code>x</code> is less than or equal to the corresponding component of <code>y</code>, and at least one is strictly smaller. In that case, <code>y</code> dominates <code>x</code>: it includes everything <code>x</code> knew, plus something more.</p>
+<p>If every component is equal, the vectors have the same causal summary. If each vector is larger in at least one different component, neither dominates: they are concurrent.</p>
+<table>
+<thead>
+<tr>
+<th>Comparison</th>
+<th>Result</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>{A: 0, B: 0, C: 0}</code> vs. <code>{A: 1, B: 0, C: 0}</code></td>
+<td>first is older</td>
+<td>Every component is no greater, and <code>A</code> is smaller.</td>
+</tr>
+<tr>
+<td><code>{A: 1, B: 0, C: 0}</code> vs. <code>{A: 0, B: 1, C: 0}</code></td>
+<td>concurrent</td>
+<td>The first is larger at <code>A</code>; the second is larger at <code>B</code>.</td>
+</tr>
+<tr>
+<td><code>{A: 0, B: 1, C: 0}</code> vs. <code>{A: 2, B: 1, C: 0}</code></td>
+<td>first is older</td>
+<td>The second includes <code>B</code>'s event and has a newer <code>A</code> event.</td>
+</tr>
+</tbody>
+</table>
+<p>Do not reduce this to “find the largest number.” <code>{A: 5, B: 0}</code> does not supersede <code>{A: 4, B: 1}</code>. The first has not seen the event from <code>B</code>, so it cannot legitimately erase the second.</p>
+<h2>Worked Trace: From Concurrent Siblings to a Causal Replacement</h2>
+<p>Start after the partition with the two versions from the cart:</p>
+<div class="codehilite"><pre><span></span><code>cart@vA = keyboard, vA = {A: 1, B: 0, C: 0}
+cart@vB = mouse,    vB = {A: 0, B: 1, C: 0}
+</code></pre></div>
+
+<h3>Step 1: <code>C</code> receives versions in an arbitrary order</h3>
+<p>Assume <code>C</code> receives <code>cart@vB</code> first and <code>cart@vA</code> later. Arrival order suggests nothing about causality. Component comparison shows that <code>vA</code> is larger at <code>A</code>, while <code>vB</code> is larger at <code>B</code>. They are concurrent.</p>
+<p>The correct output is not a single “latest cart.” <code>C</code> preserves both versions or invokes an application merge. For a cart, an application may safely union independent item additions. For a bank transfer or a seat reservation, automatic union could violate an invariant; the system may expose a conflict or use a different coordination protocol.</p>
+<h3>Step 2: <code>A</code> learns <code>B</code>'s history</h3>
+<p><code>A</code> receives <code>cart@vB</code>. To represent all history it now knows, it takes the per-component maximum:</p>
+<div class="codehilite"><pre><span></span><code>max(vA, vB) = {A: 1, B: 1, C: 0}
+</code></pre></div>
+
+<p>This merge alone records knowledge. If <code>A</code> now creates a new resolved cart version, it increments its own entry:</p>
+<div class="codehilite"><pre><span></span><code>cart@vA2 = keyboard + mouse, vA2 = {A: 2, B: 1, C: 0}
+</code></pre></div>
+
+<h3>Step 3: Other replicas compare the new version</h3>
+<p><code>vA2</code> dominates <code>vA</code> because it is greater at <code>A</code> and equal elsewhere. It also dominates <code>vB</code> because it is greater at <code>A</code> and equal at <code>B</code> and <code>C</code>. A replica that receives <code>cart@vA2</code> can drop both earlier siblings: the new version carries evidence that their histories were included.</p>
+<p>This trace has an important boundary. The vector clock justified removing obsolete versions only after a new version incorporated both histories. It never chose how <code>keyboard</code> and <code>mouse</code> should be combined. The domain or a CRDT supplied that meaning.</p>
+<h2>Why This Fits Gossip and Anti-Entropy</h2>
+<p>The previous lessons separate several jobs that are easy to blur together:</p>
 <ul>
-<li><code>A: 2</code> means this version has seen two updates from <code>A</code></li>
-<li><code>B: 1</code> means this version has seen one update from <code>B</code></li>
-<li><code>C: 0</code> means this version has not seen any update from <code>C</code></li>
+<li>Gossip and anti-entropy disseminate missing versions.</li>
+<li>Merkle trees help locate where replicas differ efficiently.</li>
+<li>Vector clocks classify two object versions as ordered, equal, or concurrent.</li>
+<li>A CRDT or application-specific policy gives concurrent values a meaning.</li>
 </ul>
-<p>There are three core operations.</p>
-<p>First, a replica increments its own component when it creates a local update:</p>
-<div class="codehilite"><pre><span></span><code>A writes:
-{A: 0, B: 0, C: 0} -&gt; {A: 1, B: 0, C: 0}
-</code></pre></div>
-
-<p>Second, a replica merges clocks by taking the element-wise maximum when it receives another version:</p>
-<div class="codehilite"><pre><span></span><code>A has: {A: 1, B: 0, C: 0}
-B has: {A: 0, B: 1, C: 0}
-
-after A receives B:
-max   : {A: 1, B: 1, C: 0}
-</code></pre></div>
-
-<p>Third, a replica compares clocks component by component:</p>
-<ul>
-<li>if every component of <code>x</code> is <code>&lt;=</code> the corresponding component of <code>y</code>, and at least one component is <code>&lt;</code>, then <code>x</code> happened-before <code>y</code></li>
-<li>if every component of <code>y</code> is <code>&lt;=</code> the corresponding component of <code>x</code>, and at least one component is <code>&lt;</code>, then <code>y</code> happened-before <code>x</code></li>
-<li>if neither clock dominates the other, the versions are concurrent</li>
-<li>if all components match, the clocks represent the same causal summary</li>
-</ul>
-<p>The "all components" part matters. A larger number in one slot is not enough to prove that one version is newer. <code>{A: 2, B: 0}</code> and <code>{A: 1, B: 1}</code> are incomparable: the first has seen more from <code>A</code>, the second has seen more from <code>B</code>.</p>
-<p>A simple comparison function looks like this:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compare</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">):</span>
-    <span class="n">actors</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">|</span> <span class="nb">set</span><span class="p">(</span><span class="n">y</span><span class="p">)</span>
-    <span class="n">x_le_y</span> <span class="o">=</span> <span class="nb">all</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">y</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">actors</span><span class="p">)</span>
-    <span class="n">y_le_x</span> <span class="o">=</span> <span class="nb">all</span><span class="p">(</span><span class="n">y</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">x</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">actors</span><span class="p">)</span>
-
-    <span class="k">if</span> <span class="n">x_le_y</span> <span class="ow">and</span> <span class="n">y_le_x</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">&quot;equal&quot;</span>
-    <span class="k">if</span> <span class="n">x_le_y</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">&quot;x_before_y&quot;</span>
-    <span class="k">if</span> <span class="n">y_le_x</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">&quot;y_before_x&quot;</span>
-    <span class="k">return</span> <span class="s2">&quot;concurrent&quot;</span>
-</code></pre></div>
-
-<p>That is the practical difference between a scalar timestamp and a vector clock. A timestamp can force an order. A vector clock can say that no causal order exists.</p>
-<h2>Worked Example</h2>
-<p>Start with three replicas holding the same object:</p>
-<div class="codehilite"><pre><span></span><code>A: {A: 0, B: 0, C: 0}
-B: {A: 0, B: 0, C: 0}
-C: {A: 0, B: 0, C: 0}
-</code></pre></div>
-
-<p>During a partition, <code>A</code> and <code>B</code> both write independently:</p>
-<div class="codehilite"><pre><span></span><code>A writes keyboard version:
-{A: 1, B: 0, C: 0}
-
-B writes mouse version:
-{A: 0, B: 1, C: 0}
-</code></pre></div>
-
-<p>When gossip resumes, <code>C</code> receives both versions. Compare them:</p>
-<div class="codehilite"><pre><span></span><code>keyboard: {A: 1, B: 0, C: 0}
-mouse   : {A: 0, B: 1, C: 0}
-</code></pre></div>
-
-<p>The keyboard version is greater in <code>A</code>'s component. The mouse version is greater in <code>B</code>'s component. Neither dominates the other, so they are concurrent. A versioned key-value store should not discard one merely because it arrived later. It should keep both siblings, run an application merge, or ask a client to reconcile them.</p>
-<p>Now suppose <code>A</code> receives <code>B</code>'s version, merges the clocks, and writes again:</p>
-<div class="codehilite"><pre><span></span><code>A after receiving B:
-{A: 1, B: 1, C: 0}
-
-A writes again:
-{A: 2, B: 1, C: 0}
-</code></pre></div>
-
-<p>The new version <code>{A: 2, B: 1, C: 0}</code> dominates both earlier versions:</p>
-<div class="codehilite"><pre><span></span><code>{A: 1, B: 0, C: 0} &lt;= {A: 2, B: 1, C: 0}
-{A: 0, B: 1, C: 0} &lt;= {A: 2, B: 1, C: 0}
-</code></pre></div>
-
-<p>Now the system can safely treat the earlier versions as causally included in the newer one. The overwrite is not a blind timestamp decision. It is justified by the version's recorded history.</p>
-<h2>Design Implications and Trade-offs</h2>
-<p>Vector clocks are useful when the system needs to reason about versions, not just values. They help a replicated store decide whether an old sibling can be dropped, whether two values need conflict handling, or whether an incoming update is redundant because its history is already included.</p>
-<p>They also separate two ideas that are often mixed together:</p>
-<ul>
-<li>dissemination: gossip and anti-entropy move versions between replicas</li>
-<li>causality: vector clocks describe what each version had already seen</li>
-<li>merge policy: CRDTs or application logic decide what to do with concurrent versions</li>
-</ul>
-<p>That separation is valuable. Merkle trees can tell a system that replicas differ. Gossip can move the missing object. A vector clock can say whether the object versions are ordered or concurrent. A CRDT or application rule can then decide how to combine or expose them.</p>
-<p>The cost is real. Plain vector clocks grow with the number of relevant participants. In a large, dynamic cluster, every object version can accumulate metadata from actors that no longer matter. Production systems often use version vectors, dotted version vectors, pruning limits, or client-assisted reconciliation to keep that metadata bounded.</p>
-<p>That creates the main trade-off: the more accurately you preserve causal history, the easier it is to avoid accidental overwrites; the more aggressively you prune or approximate, the more you risk treating concurrent work as ordered or carrying unresolved siblings for longer.</p>
+<p>This division makes failures easier to reason about. If a peer has not learned a version, the dissemination layer has more work to do. If two versions are both present but incomparable, that is not a delivery failure: it is a real concurrent write. If their merge would break an invariant, causal metadata cannot repair the invariant. It only refuses to pretend that one write made the other obsolete.</p>
+<p>Faster gossip can reduce the time window in which users create concurrent versions, but it cannot make that window zero during partitions, retries, offline clients, or merely delayed communication.</p>
+<h2>Trade-offs and Metadata Lifecycle</h2>
+<p>The central trade-off is causal precision against the cost of carrying causal history. A plain vector has one component for every relevant actor. In a large or dynamic system, per-object metadata can grow, increase network payloads, and make comparison more expensive.</p>
+<p>Actor lifecycle is part of correctness, not cleanup. A node that permanently leaves, a client that returns after months offline, or an identifier that is reused all affect whether old components can be safely removed. Blind pruning may make two previously concurrent histories look ordered. Keeping every component forever may be impractical.</p>
+<p>Production designs therefore choose a bounded representation and document its loss mode: version vectors scoped to writers, dotted version vectors, server-side compaction, retained siblings, or reconciliation by a client. The right choice depends on the acceptable failure. Is it preferable to keep extra conflicts for humans to resolve, or to risk collapsing a conflict under a stated approximation? There is no universal answer, but “last arrival wins” is usually an accidental and unexamined one.</p>
+<h2>Active Check</h2>
+<p>Classify these pairs before reading the answer.</p>
+<ol>
+<li><code>x = {A: 4, B: 2, C: 1}</code> and <code>y = {A: 4, B: 3, C: 1}</code>.</li>
+<li><code>x = {A: 4, B: 2, C: 1}</code> and <code>z = {A: 3, B: 3, C: 1}</code>.</li>
+</ol>
+<p>For the first pair, <code>y</code> dominates <code>x</code>: every component is at least as large and <code>B</code> is larger. For the second, <code>x</code> is larger at <code>A</code> while <code>z</code> is larger at <code>B</code>, so they are concurrent. A receiver must not discard either simply because one message happened to arrive second.</p>
+<h2>Practice: Make the Decision Explicit</h2>
+<p>You operate a replicated preferences object. During a partition, <code>A</code> writes <code>pA = {A: 5, B: 2}</code>, while <code>B</code> writes <code>pB = {A: 4, B: 3}</code>. When a third replica sees both values, write down:</p>
+<ol>
+<li>The result of the component-wise comparison.</li>
+<li>The safe storage action before knowing the product's merge rule.</li>
+<li>What extra write would make a later value dominate both histories.</li>
+</ol>
+<p>The first result is concurrency: <code>pA</code> is ahead at <code>A</code>, <code>pB</code> at <code>B</code>. Preserve both versions or pass both to the configured resolver. A resolver that has incorporated both histories starts from <code>{A: 5, B: 3}</code> and, if it writes at <code>A</code>, emits <code>{A: 6, B: 3}</code>. That later version dominates both inputs. Notice that the final step still assumes a product decision about the preferences themselves.</p>
 <h2>Common Failure Modes</h2>
-<p><strong>Using wall-clock time as causal proof</strong></p>
-<p>Wall-clock timestamps are useful for observability, expiration, and rough freshness, but they do not prove that one write observed another. If the correctness question is causal, timestamp order is the wrong evidence.</p>
-<p><strong>Treating one larger component as "newer"</strong></p>
-<p>Vector clocks are compared component by component. <code>{A: 5, B: 0}</code> does not dominate <code>{A: 4, B: 1}</code> because the second version has seen work from <code>B</code> that the first has not.</p>
-<p><strong>Expecting vector clocks to resolve conflicts</strong></p>
-<p>Vector clocks detect causal order and concurrency. They do not decide whether two shopping-cart updates should be unioned, whether a document edit should be merged, or whether a domain invariant has been violated.</p>
-<p><strong>Ignoring metadata lifecycle</strong></p>
-<p>Unbounded causal metadata can become expensive to store, transmit, and compare. Any production design needs rules for actor identity, pruning, compaction, and what to do when precision is intentionally reduced.</p>
+<p><strong>Using a wall-clock timestamp as causal proof.</strong> Timestamps help observation, expiration, and rough freshness. They do not prove that one write read another.</p>
+<p><strong>Treating one larger component as “newer.”</strong> Dominance requires comparing all components. A larger <code>A</code> counter cannot erase unseen work from <code>B</code>.</p>
+<p><strong>Expecting a clock to resolve a business conflict.</strong> Vector clocks reveal conflict shape; they do not decide whether edits should be unioned, rejected, or shown to a user.</p>
+<p><strong>Pruning actor history without a stated policy.</strong> Metadata reduction changes what the system can know. Treat it as a correctness and product decision, not an implementation detail.</p>
 <h2>Connections</h2>
-<p>CRDTs, from the previous lesson, define merge semantics that tolerate unordered and duplicated delivery. Vector clocks answer a different question: whether two versions are causally ordered or concurrent before a merge decision is made.</p>
-<p>Dynamo-style versioning uses vector-like causal metadata so a replicated key-value store can preserve concurrent object histories instead of collapsing them into a single misleading "latest" value.</p>
-<p>Gossip performance optimization, next, changes how quickly and expensively these versions move around the cluster. Faster dissemination can reduce how long conflicts remain visible, but it does not remove the need for causal metadata when concurrent writes actually happen.</p>
+<p>CRDTs from the previous lesson define safe merge behavior for particular data types. Vector clocks answer an earlier question: is this incoming value already included, or is it an independent sibling?</p>
+<p>The next lesson tunes gossip's fanout, interval, and payload choices. Those controls affect how rapidly causal versions travel, but they do not remove the need to represent genuine concurrency.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Time, Clocks, and the Ordering of Events in a Distributed System</a><ul>
-<li>Focus: Foundational framing for happened-before relationships and why distributed ordering is not just physical time.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://twiki.di.uniroma1.it/pub/Users/ArbriShqepa/VirtualTime.pdf">Virtual Time and Global States of Distributed Systems</a><ul>
-<li>Focus: Classic vector-clock treatment of virtual time and global states.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
-<li>Focus: Practical use of vector-like versioning for concurrent object histories and application reconciliation.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Time, Clocks, and the Ordering of Events in a Distributed System</a> - Focus: happened-before relationships and why physical time is not causal proof.</li>
+<li>[PAPER] <a href="https://twiki.di.uniroma1.it/pub/Users/ArbriShqepa/VirtualTime.pdf">Virtual Time and Global States of Distributed Systems</a> - Focus: a classic treatment of vector timestamps and distributed state.</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a> - Focus: practical causal versioning, sibling values, and reconciliation.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ol>
-<li>Vector clocks summarize causal history per actor, letting systems distinguish dominance from true concurrency.</li>
-<li>Arrival order and wall-clock order can force a misleading total order; vector clocks preserve the partial order that distributed writes actually create.</li>
-<li>Vector clocks identify conflict shape, but application merge logic or CRDT semantics still decide what concurrent versions mean.</li>
-<li>The price of better causal precision is metadata size, comparison cost, and lifecycle rules for pruning or approximating histories.</li>
+<li>Vector clocks compare causal history component by component, so they can identify both stale versions and genuine concurrency.</li>
+<li>Arrival order and wall-clock order are not evidence that one writer observed another writer's value.</li>
+<li>A dominating version may replace older versions; concurrent siblings need an explicit merge, preservation, or resolution policy.</li>
+<li>Causal precision costs metadata, comparison work, and careful rules for actor identity, compaction, and pruning.</li>
 </ol>
 </section>
 
@@ -236,14 +217,14 @@ A writes again:
   
   <a class="nav-card" href="011.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>CRDTs for Gossip Convergence</strong>
+    <strong>When Gossip Can Converge Without Coordination</strong>
   </a>
   
 
   
   <a class="nav-card" href="013.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Gossip Performance Optimization</strong>
+    <strong>Tune Gossip Without Moving the Bottleneck</strong>
   </a>
   
 </section>
@@ -258,7 +239,7 @@ A writes again:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-19 17:21 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

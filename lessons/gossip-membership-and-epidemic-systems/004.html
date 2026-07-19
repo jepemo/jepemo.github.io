@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Gossip Topologies - Overlay Network Design - @jepemo</title>
+    <title>How Overlay Shape Changes Gossip Behavior - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>Gossip Topologies - Overlay Network Design</h1>
+<h1>How Overlay Shape Changes Gossip Behavior</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,141 +79,262 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Gossip Topologies - Overlay Network Design</h1>
+  <h1>How Overlay Shape Changes Gossip Behavior</h1>
 <blockquote>
-<p><strong>The core idea</strong>: gossip behavior is shaped by the overlay graph it runs on, so topology design trades per-node cost against propagation speed, redundancy, and failure resilience.</p>
+<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<ul>
+<li>
+<p>compare overlay choices using per-node cost, propagation paths, and failure-domain diversity;</p>
+</li>
+<li>
+<p>explain why two overlays with the same neighbor count can behave differently during an outage;</p>
+</li>
+<li>
+<p>review a gossip topology and name the measurements needed to decide whether it is adequate.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Gossip does not spread through an abstract cluster; it spreads through chosen links, so the overlay shape is a design decision about speed, cost, and resilience.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose a 10,000-node cluster needs to spread a membership update after one rack starts failing. The gossip rule sounds simple: each node forwards new information to a few peers. But the outcome depends on who those peers are. The same rule can converge quickly on one overlay, crawl on another, and fail to reach an isolated region on a third.</p>
-<p>This is the point that is easy to miss. Gossip does not move through "the cluster" as an abstract cloud. It moves over a graph. The graph decides which paths exist, how many hops a fact must travel, where duplicate traffic appears, and which failures can cut off whole neighborhoods.</p>
-<p>That makes topology part of the protocol story. If every node keeps too few neighbors, local cost stays low but propagation may be slow or fragile. If every node keeps many neighbors, spread improves but sockets, maintenance traffic, and duplicate messages increase. The trade-off is not optional; topology is where the system pays for the kind of global behavior it wants.</p>
-<p>A useful design review therefore asks two questions together: what does each node do with messages, and what graph carries those messages? Looking at only one of those questions hides the real reason many gossip systems behave well in a lab and poorly under churn.</p>
-<h2>Topology as the Hidden Variable</h2>
-<p>Take one dissemination rule:</p>
-<div class="codehilite"><pre><span></span><code>when a node receives a new update,
-forward it to each neighbor once
+<p>In the last lesson, node A repaired lost active links by promoting peers from a passive view. That made one node less likely to become isolated. But it leaves a design question: which links should A and every other node try to keep in the first place?</p>
+<p>Consider a 900-node service-discovery cluster divided across east, central, and west availability zones. A membership change starts at node A in east. Every node forwards a newly seen update to each active neighbor once. The forwarding rule is identical in two deployments, and every node keeps four active neighbors in both. Yet one deployment reaches the whole cluster quickly after a few ordinary failures, while the other leaves central with a stale view for too long.</p>
+<p>The difference is not in the update payload or the forwarding code. It is in the <strong>overlay graph</strong>: the set of application-level links the nodes have chosen to maintain. Each active neighbor is an edge in that graph. The graph decides which paths an update can take, how long those paths are, where traffic concentrates, and which lost links can divide the cluster.</p>
+<p>Plain meaning:</p>
+<p>An update can only travel along connections that exist. The shape of the connections changes what the same gossip rule can accomplish.</p>
+<p>In this scenario:</p>
+<p>Four neighbors per node can either form three mostly separate zone-local groups, or create several routes between zones.</p>
+<p>Technical name:</p>
+<p>The chosen graph is the <strong>overlay topology</strong>. Designing it means choosing degree, peer-selection rules, diversity, and repair behavior together.</p>
+<h2>The tempting design: four nearby peers</h2>
+<p>The first design sounds sensible. Local connections are fast and cheap, so each node chooses four peers in its own zone whenever possible. A small number of bootstrap nodes happen to have cross-zone links.</p>
+<div class="codehilite"><pre><span></span><code>east cluster                 central cluster                 west cluster
+
+A -- B -- C                  H -- I -- J                    O -- P -- Q
+|    |    |                  |    |    |                    |    |    |
+D -- E -- F                  K -- L -- M                    R -- S -- T
+       \                         /                                 \
+        \_______________________/___________________________________\
+                 a few cross-zone bridge links
 </code></pre></div>
 
-<p>Now run it on three small overlays:</p>
-<div class="codehilite"><pre><span></span><code>ring:
-A - B - C - D - E - F
-
-tree:
-      A
-    / | \
-   B  C  D
-  / \    \
- E   F    G
-
-random partial graph:
-A -- C -- F
-|  \/ \  /|
-B -- D -- G
- \      /
-    E
+<p>This overlay has low local latency and degree four. In a quiet test, it may look healthy: an update quickly fills east, then crosses one bridge, then fills central. The trap is that the bridges are scarce and easy to concentrate on the same machines. If a deployment drains two bridge holders or a zone boundary becomes unreliable, many nodes still have four live neighbors but have no usable path to another region.</p>
+<p>The naive model says, “every node has enough peers.” The better model asks, “enough peers for which paths, and through which failure domains?” A neighbor count describes only one local fact. It does not say whether the graph has alternate routes when a rack, zone, or heavily used node disappears.</p>
+<h2>The levers a topology design controls</h2>
+<p>Four properties are useful when reviewing an overlay. They are related, but none can substitute for the others.</p>
+<table>
+<thead>
+<tr>
+<th>Lever</th>
+<th>Question it answers</th>
+<th>What improves when it rises</th>
+<th>What it costs or risks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active degree</td>
+<td>How many live neighbors does one node keep?</td>
+<td>More immediate paths and more forwarding choices</td>
+<td>More sockets, probes, maintenance, and duplicate messages</td>
+</tr>
+<tr>
+<td>Path length</td>
+<td>How many forwarding steps separate distant nodes?</td>
+<td>Updates can reach remote regions in fewer rounds</td>
+<td>Shortcuts require extra links or may create popular relays</td>
+</tr>
+<tr>
+<td>Path diversity</td>
+<td>Can an update use materially different routes?</td>
+<td>A single edge or node failure is less likely to isolate a region</td>
+<td>Extra routes create duplicate delivery and harder traffic prediction</td>
+</tr>
+<tr>
+<td>Peer diversity</td>
+<td>Are neighbors spread across useful failure domains rather than one local pocket?</td>
+<td>Less correlation between one failure and all of a node's links</td>
+<td>Cross-zone connections can cost more latency and money</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Degree</strong> is the most visible knob. If each node has one neighbor, connection cost is low, but a lost edge is serious. If each node has fifty, there are many routes, but every membership update has many more opportunities to be forwarded and every node must maintain more state. A full mesh gives short paths, but its connection count grows too quickly for a large changing cluster.</p>
+<p><strong>Path length</strong> is the practical version of asking how many hops an update needs to reach far-away peers. A long chain can be connected and still be slow to inform its far end. A short-path graph can spread quickly, but a small set of very central nodes may become traffic hot spots.</p>
+<p><strong>Path diversity</strong> is not merely duplicate edges. Two routes that both pass through the same gateway do not protect against that gateway failing. The useful question is whether different parts of the graph can carry the update after one expected failure domain is removed.</p>
+<p><strong>Peer diversity</strong> is a local policy that helps produce global path diversity. A node does not need a complete map of the cluster to avoid putting all of its active links in the same rack or zone. HyParView's passive candidates make this policy possible; the topology policy decides what A should prefer when it promotes one.</p>
+<p>The central <strong>trade-off</strong> is simple: extra edges buy more routes and usually fewer hops, but each edge costs connections, health checks, repair work, and duplicate traffic. There is no universally best degree or locality mix. The right shape follows the failure model and the propagation promise.</p>
+<h2>A worked comparison: same degree, different outage behavior</h2>
+<p>Return to the 900-node cluster. We compare two overlays. Each node has four active neighbors. The update starts at A in east, and a rolling deployment removes two central bridge nodes shortly after the update begins.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Local-first overlay</th>
+<th>Mixed overlay</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Initial links</td>
+<td>Most nodes choose four same-zone peers; only B and H bridge east to central</td>
+<td>Each node keeps a mix of local and cross-zone peers where candidates allow it</td>
+</tr>
+<tr>
+<td>A forwards update</td>
+<td>East learns quickly through short local paths</td>
+<td>East learns quickly; some copies enter central and west early</td>
+</tr>
+<tr>
+<td>B and H depart</td>
+<td>East still has many internal links, but its only useful east-central bridge is gone</td>
+<td>Other east-central and east-west paths remain, though some are slower</td>
+</tr>
+<tr>
+<td>Central's view</td>
+<td>It may receive the update only after overlay repair finds and promotes a new bridge</td>
+<td>It receives a duplicate through another path and suppresses it as already seen</td>
+</tr>
+<tr>
+<td>After repair</td>
+<td>Recovery depends heavily on whether passive views contain cross-zone candidates</td>
+<td>Repair restores degree and can improve diversity, but the update was already likely to cross</td>
+</tr>
+</tbody>
+</table>
+<p>Here is the same trace as a small message timeline:</p>
+<div class="codehilite"><pre><span></span><code>round 0: A[east] receives membership update U42
+round 1: A -&gt; B, C, D, E
+round 2: B is a bridge but departs; C, D, E continue inside east
+round 3: local-first overlay has no east-to-central path for U42
+         mixed overlay sends U42 through D -&gt; N[west] -&gt; L[central]
+round 4: central receives U42 in the mixed overlay; local-first waits for repair
+round 5+: HyParView-style repair may create a new bridge in both designs
 </code></pre></div>
 
-<p>If <code>A</code> starts with the update, the ring spreads steadily but may require many hops. The tree spreads efficiently in the happy path, but an internal edge failure can hide an entire branch. The random partial graph is messier, but alternate paths give the update more chances to keep moving.</p>
-<p>The lesson is not that one of these toy graphs is always best. The lesson is that message behavior and graph structure are inseparable. A protocol can look correct in pseudocode and still perform badly because the overlay creates long paths, bottlenecks, or fragile bridges.</p>
-<h2>The Main Levers</h2>
-<p>Three graph properties are especially useful when reasoning about gossip overlays.</p>
-<p><strong>Degree</strong> is how many neighbors a node keeps. Higher degree gives each update more possible paths, but it also increases connection state, periodic maintenance, and duplicate traffic.</p>
-<p><strong>Diameter</strong> is the rough maximum distance across the graph in hops. A lower diameter means fewer rounds may be needed for a fact to reach far-away nodes. But reducing diameter usually means adding links or relying on special high-connectivity nodes.</p>
-<p><strong>Redundancy</strong> means whether there are multiple independent paths between regions. Redundancy helps the overlay survive failures, but it often increases extra forwarding and duplicate delivery.</p>
-<p>These levers pull against one another:</p>
-<div class="codehilite"><pre><span></span><code>more neighbors
-  -&gt; more path choices
-  -&gt; faster spread and better failure tolerance
-  -&gt; higher per-node maintenance cost
-  -&gt; more duplicate traffic
-</code></pre></div>
-
-<p>The design goal is not to maximize every property. A full mesh has very low path length and high redundancy, but it is unrealistic for large clusters. A sparse ring is cheap, but it is slow and easy to damage. A useful overlay spends just enough local cost to buy the propagation and resilience the workload needs.</p>
-<h2>Worked Example</h2>
-<p>Imagine a service-discovery layer with nodes spread across three availability zones. Every node keeps four neighbors. That sounds balanced, but two topologies with the same degree can behave very differently.</p>
-<div class="codehilite"><pre><span></span><code>topology A:
-  most neighbors stay inside the same AZ
-  only a few links bridge AZs
-
-topology B:
-  each node keeps a mix of local and cross-AZ peers
-  several independent paths connect the AZs
-</code></pre></div>
-
-<p>Both topologies have degree four. Under normal conditions, both may spread updates eventually. During an AZ-level network problem, topology A is much more fragile. A few bridge failures can isolate a whole region, and membership updates may appear to "stall" even though nodes are still forwarding to their local neighbors.</p>
-<p>Topology B costs roughly the same active degree, but the neighbor choice is more diverse. Cross-AZ redundancy gives updates alternate routes. The system still has to manage duplicate traffic and connection health, but it is less likely to confuse local connectivity with global reachability.</p>
-<p>That is why topology work is not just drawing nicer graphs. It changes production symptoms:</p>
+<p>The input is <code>U42</code>; the transition is forwarding along active links; the intermediate state is different knowledge in east, central, and west; the output is either broad awareness or a stale central pocket. The naive contrast matters: both overlays had degree four, so checking degree alone would have predicted the wrong outcome.</p>
+<p>The mixed design does not promise instant delivery. A network partition can still prevent communication, passive candidates can be stale, and a correlated outage can remove several cross-zone paths together. Its advantage is probabilistic and structural: it creates more independent opportunities for a message and for later repair to escape one local neighborhood.</p>
+<h2>Choose the topology from the promise</h2>
+<p>Start with what the system promises, not a fashionable graph name.</p>
+<p>If membership updates may take several seconds to converge and the cluster lives in one failure domain, a modest random partial overlay may be sufficient. If an update must cross zones quickly during ordinary host churn, the design needs explicit cross-zone diversity and enough budget for those links. If traffic must be very efficient in the normal case, a hybrid can use a lean forwarding structure while retaining another path for repair; Plumtree is a later example of this fast-path and repair-path separation.</p>
+<p>Use a small decision sequence:</p>
+<ol>
+<li><strong>Name the failure domains.</strong> Hosts, racks, zones, and network boundaries are not interchangeable. A link between two different hosts may still fail together if both live behind one top-of-rack switch.</li>
+<li><strong>Set a local budget.</strong> Choose a maximum active degree that the node can sustain under normal operation and churn. Include sockets, probes, TLS or transport cost, and duplicate forwarding in the budget.</li>
+<li><strong>Choose peer-selection rules.</strong> Prefer randomness to avoid deterministic clusters, then add diversity constraints only where the system can reliably know a failure domain.</li>
+<li><strong>Plan repair before the outage.</strong> A passive view, candidate exchange, bounded connection attempts, and eviction policy determine whether a lost edge can actually be replaced.</li>
+<li><strong>State the convergence envelope.</strong> For example: under one-host failures and ordinary packet loss, most membership updates should reach every connected zone within a chosen time range. This is a target to measure, not a guarantee under partition.</li>
+</ol>
+<p>This avoids two opposite mistakes. “Random peers solve everything” ignores locality cost and correlated failures. “Always choose the nearest peers” turns a latency optimization into a reachability risk. Good topology design makes the preferred failures explicit.</p>
+<h2>What to measure instead of admiring the diagram</h2>
+<p>A graph drawing can hide the conditions that matter in production. Measure whether the overlay is actually behaving as designed.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Why it matters</th>
+<th>Boundary it can reveal</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Active-degree distribution</td>
+<td>Shows whether nodes keep their intended number of live paths</td>
+<td>A repair problem or connection-capacity limit</td>
+</tr>
+<tr>
+<td>Cross-domain neighbor ratio</td>
+<td>Shows whether links are concentrating locally</td>
+<td>A zone-aware policy that is ineffective or starved of candidates</td>
+</tr>
+<tr>
+<td>p50 and p99 update propagation time by zone</td>
+<td>Shows both ordinary speed and slow pockets</td>
+<td>Long paths, weak bridges, or churn during dissemination</td>
+</tr>
+<tr>
+<td>Duplicate-forward count</td>
+<td>Prices the redundancy you added</td>
+<td>Degree or fanout is causing excessive work</td>
+</tr>
+<tr>
+<td>Replacement success and time</td>
+<td>Tests the repair path, not just steady-state shape</td>
+<td>Passive entries are stale or connection attempts are throttled badly</td>
+</tr>
+<tr>
+<td>Reachability during fault tests</td>
+<td>Reveals components or near-partitions</td>
+<td>A correlated failure can cut every apparent route</td>
+</tr>
+</tbody>
+</table>
+<p>These measurements also keep the topology discussion honest. Lowering degree may reduce duplicate traffic while silently increasing p99 propagation or partition risk. Adding cross-zone links may improve recovery while increasing normal traffic and cost. The system needs a stated target before either change can be called an improvement.</p>
+<h2>Common confusions</h2>
+<h3>Confusion: equal degree means equal resilience</h3>
+<p>Why it is tempting:</p>
+<p>Degree is easy to count. If every node has four peers, the overlay looks balanced.</p>
+<p>Better model:</p>
+<p>Count where those peers lead and which failures can remove them together. Four local edges and four diverse edges create different paths through the graph.</p>
+<h3>Confusion: a connected graph is enough</h3>
+<p>Why it is tempting:</p>
+<p>If every node can eventually reach every other node in a quiet snapshot, the topology seems correct.</p>
+<p>Better model:</p>
+<p>Gossip needs a connected graph that can remain useful while nodes churn and information is time-sensitive. Repair time, bridge concentration, and propagation tails matter as much as a steady-state connectivity check.</p>
+<h3>Confusion: more links always improve gossip</h3>
+<p>Why it is tempting:</p>
+<p>More links create more paths, so delivery seems safer.</p>
+<p>Better model:</p>
+<p>More links also mean more maintenance and duplicates. At some point they create load that harms the same nodes expected to relay updates. The design must pay only for resilience it can observe and justify.</p>
+<h2>Check your understanding</h2>
+<p><strong>Check:</strong> Two 500-node overlays give every node six active neighbors. Overlay X chooses the six nearest peers. Overlay Y chooses four nearby peers and two peers from other zones when available. A zone-local switch fails. Which overlay is more likely to keep membership updates moving between surviving zones, and what evidence would you inspect before claiming it did?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Overlay Y is more likely to retain cross-zone paths because its links are less concentrated in one locality. That is not proof: inspect propagation time by zone, active-degree loss, cross-domain neighbor ratios, and reachability under the fault. If Y's remote candidates were stale or all used the same failed gateway, its apparent diversity may not help.</p>
+<h2>Practice: review a proposed overlay</h2>
+<p>A team proposes this topology for a 2,000-node membership service: each node keeps three neighbors in its own zone, one random neighbor anywhere, and a passive view of ten candidates. The service wants low normal traffic, recovery from single-host and single-rack failures, and membership updates visible in every connected zone within ten seconds.</p>
+<p>Write a short design review that answers:</p>
 <ul>
-<li>p99 propagation time</li>
-<li>hot or overloaded peers</li>
-<li>stale membership pockets</li>
-<li>behavior under churn</li>
-<li>how quickly disconnected regions recover</li>
+<li>what this design does well;</li>
+<li>one failure pattern it may still handle poorly;</li>
+<li>one change you would consider only after measuring a signal;</li>
+<li>the three signals you would use to judge the ten-second promise.</li>
 </ul>
-<h2>Common Topology Patterns</h2>
-<p><strong>Full mesh</strong></p>
-<p>Every node can reach every other node directly. This gives excellent path length and redundancy in small systems, but it is too expensive for large clusters because connection count grows aggressively.</p>
-<p><strong>Ring or chain-like structures</strong></p>
-<p>These are cheap and easy to reason about, but they spread slowly and are fragile when links break. They rarely fit high-churn membership dissemination by themselves.</p>
-<p><strong>Tree-like overlays</strong></p>
-<p>Trees can make broadcast efficient because each edge carries the full message once in the happy path. Their weakness is fragility: failure near the root can disconnect whole subtrees from the update.</p>
-<p><strong>Random partial graphs</strong></p>
-<p>These often give a practical balance: bounded degree, tolerable path length, and multiple routes. Their quality depends on peer selection, refresh, and repair behavior.</p>
-<p><strong>Hybrid overlays</strong></p>
-<p>Hybrid designs combine different strengths. HyParView uses a maintained partial overlay for robustness. Plumtree later builds efficient eager broadcast paths while retaining lazy epidemic repair. The common pattern is to separate the cheap common path from the resilient repair path.</p>
-<h2>Design and Failure Modes</h2>
-<p><strong>Choosing only for shortest paths</strong></p>
-<p>Short paths help, but they do not settle the design. A low-diameter topology can be too expensive to maintain or can concentrate too much traffic on a few central nodes.</p>
-<p><strong>Treating equal degree as equal resilience</strong></p>
-<p>Two graphs can give every node the same number of neighbors and still behave very differently. Clustering, bridge links, and path diversity matter as much as neighbor count.</p>
-<p><strong>Forgetting churn</strong></p>
-<p>An overlay that looks connected at rest may degrade quickly during deploys, autoscaling, or failures. Topology should be judged by how it repairs under change, not only by its steady-state shape.</p>
-<p><strong>Debugging the message rule while ignoring the graph</strong></p>
-<p>If updates are slow or uneven, the bug may not be the gossip payload or merge rule. It may be that updates are trapped in a sparse or biased overlay.</p>
-<h2>Connections</h2>
-<p>HyParView is one concrete response to the topology problem: keep the active view small, but maintain passive repair capacity so the graph survives churn.</p>
-<p>Plumtree shows a later hybrid pattern: use a tree-like eager path for efficiency and epidemic-style lazy paths for repair.</p>
-<p>SWIM focuses on scalable membership detection and dissemination. Its behavior still depends on the peer choices and overlay health that carry its messages.</p>
+<details>
+<summary>Review rubric</summary>
+
+A strong review credits the bounded active degree and the random cross-zone edge for limiting cost while creating some escape paths. It notes that one remote edge may be insufficient if it is stale, overloaded, or correlated with a rack or zone failure. It proposes a change such as a second diversity-aware edge, a larger or fresher passive view, or a different repair policy only after observing a problem. Its signals include propagation time by zone, cross-domain active-link distribution, and replacement success or reachability during injected failures.
+
+</details>
+
+<h2>Connections and boundaries</h2>
+<p>HyParView supplies bounded active and passive views; topology design tells those views which candidate diversity is worth preserving. The next lesson changes focus from graph shape to uncertain time: phi accrual turns delayed heartbeats into a graded suspicion signal. Both are needed, but they answer different questions. One creates and repairs paths; the other interprets evidence about a peer on a path.</p>
+<p>An overlay can make epidemic dissemination resilient. It does not provide consensus, decide authoritative membership, merge conflicting replicated data, or protect against malicious peers. Those needs belong to later coordination, replication, and security work.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf">HyParView: A Membership Protocol for Reliable Gossip-Based Broadcast</a><ul>
-<li>Focus: Use it to see how partial-view overlay design directly affects reliability under churn.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf">Epidemic Broadcast Trees for Large-Scale Systems</a><ul>
-<li>Focus: Read this as a topology lesson as much as a broadcast lesson; it shows how hybrid structures buy both efficiency and resilience.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a><ul>
-<li>Focus: Compare SWIM's membership-dissemination design with the overlay assumptions that carry those messages.</li>
-</ul>
-</li>
-<li>[REPO] <a href="https://github.com/hashicorp/memberlist">HashiCorp memberlist</a><ul>
-<li>Focus: A practical reference for bounded peer views, membership state, and operational tuning surfaces.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf">HyParView: A Membership Protocol for Reliable Gossip-Based Broadcast</a> - Focus: how bounded partial views and randomized repair support a resilient overlay.</li>
+<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf">Epidemic Broadcast Trees for Large-Scale Systems</a> - Focus: a hybrid topology that separates efficient dissemination from repair.</li>
+<li>[PAPER] <a href="https://web.stanford.edu/class/cs224w/readings/erdos59random.pdf">Random Graphs as Models of Communication Networks</a> - Focus: why randomized links can change global path and connectivity properties.</li>
+<li>[ARTICLE] <a href="https://github.com/hashicorp/memberlist">HashiCorp memberlist</a> - Focus: an implementation-oriented reference for bounded membership communication and operational tuning.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Gossip runs over an overlay graph, and that graph shapes propagation speed, redundancy, load, and fragility.</li>
-<li>Degree, diameter, and redundancy are the core topology trade-off levers.</li>
-<li>Equal neighbor counts do not imply equal resilience; path diversity and repair behavior matter.</li>
-<li>A dissemination rule and its overlay must be evaluated together, especially under churn.</li>
-</ol>
+<ul>
+<li>The overlay graph is part of the gossip protocol: it determines paths, traffic concentration, and what failures can isolate knowledge.</li>
+<li>Degree alone is not resilience; path diversity and failure-domain diversity determine whether equal-degree overlays have alternate routes.</li>
+<li>Extra links trade more propagation and repair opportunities for more sockets, maintenance, and duplicate work.</li>
+<li>Evaluate a topology with propagation tails, diversity, repair success, and fault-injected reachability—not only a steady-state diagram.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
   
   <a class="nav-card" href="003.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>HyParView - Hybrid Partial View Membership</strong>
+    <strong>How HyParView Keeps a Partial Overlay Connected</strong>
   </a>
   
 
   
   <a class="nav-card" href="005.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Phi Accrual Failure Detector - Adaptive Suspicion</strong>
+    <strong>How Phi Turns Delay into Graded Suspicion</strong>
   </a>
   
 </section>
@@ -224,7 +349,7 @@ topology B:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-19 17:21 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

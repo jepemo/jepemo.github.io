@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SWIM Protocol - Scalable Membership at Scale - @jepemo</title>
+    <title>How SWIM Separates Probing from Dissemination - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>SWIM Protocol - Scalable Membership at Scale</h1>
+<h1>How SWIM Separates Probing from Dissemination</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,144 +79,258 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>SWIM Protocol - Scalable Membership at Scale</h1>
+  <h1>How SWIM Separates Probing from Dissemination</h1>
 <blockquote>
-<p><strong>The core idea</strong>: SWIM makes large-cluster membership practical by separating targeted failure detection from gossip-style dissemination, trading instant certainty for bounded per-node cost and fast-enough convergence.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace a SWIM protocol period through a direct probe, indirect probes, and a membership update.</p>
+</li>
+<li>
+<p>Explain why one timeout is evidence about a path, not proof that a node has failed.</p>
+</li>
+<li>
+<p>Separate failure detection, membership dissemination, and the authority that acts on membership state.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> SWIM keeps membership affordable by asking one small liveness question at a time and spreading the resulting update through the ordinary messages nodes already exchange.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose a 1,000-node cache cluster depends on membership to route requests, rebalance shards, and stop sending work to failed machines. If node <code>B</code> stops responding, the cluster needs two different things: some node must gather evidence that <code>B</code> may be unavailable, and the rest of the cluster must hear that update.</p>
-<p>Naive heartbeat designs often blur those two jobs. They ask every node to check every other node, or they rely on a central membership authority to collect and redistribute the answer. Both approaches can look simple, but they make membership traffic grow into a coordination burden. The system spends too much effort proving that the system still exists.</p>
-<p>SWIM's important move is to split the problem. It uses narrow, periodic probes to ask one liveness question at a time, then uses infection-style dissemination to spread membership changes. That separation gives the protocol its scaling shape: each node does a small amount of work per period, while the cluster still learns about joins, leaves, and suspicions over repeated rounds.</p>
-<p>The trade-off is deliberate. SWIM gives scalable membership awareness, not a magic oracle. Nodes may briefly disagree, some suspicions may be false, and dissemination is probabilistic. In return, the cluster avoids all-to-all checking and keeps useful membership information moving without a permanent central announcer.</p>
-<h2>The Cost Problem</h2>
-<p>Consider node <code>A</code> in an 800-node cluster. It needs to participate in membership, but it cannot afford to maintain fresh direct evidence about 799 peers every few seconds. If every node tried that, normal operation would create a constant background storm of pings, acknowledgements, timeouts, and updates.</p>
-<p>The costly part is not a single heartbeat. The costly part is the relationship count. All-to-all membership asks each node to behave as if it has direct responsibility for every peer all the time. As the cluster grows, the amount of checking grows faster than the useful work each node actually needs to do.</p>
-<p>SWIM changes the question from:</p>
-<div class="codehilite"><pre><span></span><code>How does every node check every other node?
+<p>In the previous lesson, node <code>A</code> could spread an update about <code>N87</code> by talking to a few peers. That explained dissemination. It did not answer a harder question:</p>
+<div class="codehilite"><pre><span></span><code>What gives A the right to say that N87 is unavailable?
 </code></pre></div>
 
-<p>to:</p>
-<div class="codehilite"><pre><span></span><code>How can each node sample cheaply while membership updates still spread widely?
+<p>Imagine that <code>A</code> sends a request to <code>N87</code> and receives no reply before its timeout. The tempting conclusion is simple:</p>
+<div class="codehilite"><pre><span></span><code>N87 did not answer, so N87 is dead.
 </code></pre></div>
 
-<p>That is why SWIM is a practical bridge from general gossip to a concrete membership protocol. It does not just say "spread information epidemically." It defines how a node gathers liveness evidence cheaply enough for large clusters.</p>
-<h2>Mechanism</h2>
-<p>A SWIM protocol period has two conceptual halves:</p>
+<p>That conclusion is too strong. The packet may have been lost. The route from <code>A</code> to <code>N87</code> may be damaged while another route works. <code>A</code> may be paused or overloaded. <code>N87</code> may be alive but unable to process the request during this interval.</p>
+<p>SWIM, short for <em>Scalable Weakly-consistent Infection-style Membership</em>, breaks this large question into two smaller jobs:</p>
 <ol>
-<li>Pick one target and probe it.</li>
-<li>Carry recent membership updates along protocol messages.</li>
+<li>Collect evidence about one target with a direct probe and, when necessary, a few indirect probes.</li>
+<li>Disseminate membership updates through piggybacked messages over many later exchanges.</li>
 </ol>
-<p>The direct probe path is simple:</p>
-<div class="codehilite"><pre><span></span><code>A ---- PING ----&gt; B
-A &lt;---- ACK ----- B
+<p>The trade-off is important. SWIM avoids all-to-all failure checking and a permanent central announcer. In return, its evidence is incomplete, views can disagree temporarily, and a consumer still needs rules for how strongly to act on a suspicion.</p>
+<h2>The Naive Membership Loop</h2>
+<p>Consider a 600-node service-discovery cluster. Every node needs enough membership information to avoid routing new requests to unavailable peers.</p>
+<p>The naive loop is:</p>
+<div class="codehilite"><pre><span></span><code>for every node X:
+  ask every other node, &quot;are you alive?&quot;
 </code></pre></div>
 
-<p>If <code>B</code> answers in time, <code>A</code> treats that round as successful. If <code>B</code> does not answer, SWIM does not immediately conclude that <code>B</code> is dead. A single timeout might mean <code>B</code> failed, but it might also mean the path from <code>A</code> to <code>B</code> is delayed, <code>A</code> is overloaded, or one packet was lost.</p>
-<p>So SWIM asks a few helper nodes to probe <code>B</code> indirectly:</p>
-<div class="codehilite"><pre><span></span><code>A -- PING-REQ --&gt; C ---- PING ----&gt; B
-A -- PING-REQ --&gt; D ---- PING ----&gt; B
-
-if C or D gets an ACK:
-  A learns that B is probably reachable
-
-if helpers also fail:
-  A has stronger evidence that B should be suspected
+<p>This seems thorough. It also asks each node to maintain hundreds of direct relationships all the time. A temporary network event creates a storm of timeouts, retries, and conflicting observations.</p>
+<p>Another naive loop is:</p>
+<div class="codehilite"><pre><span></span><code>one monitor checks every node
+one monitor publishes the answer
 </code></pre></div>
 
-<p>That indirect step is the difference between "I did not hear from <code>B</code>" and "several paths failed to reach <code>B</code> during this window." It is still not perfect truth, but it is better evidence than one failed direct ping.</p>
-<p>The dissemination half is separate. SWIM spreads membership updates by piggybacking them on messages that are already being exchanged. A probe, acknowledgement, or indirect-probe request can carry recent facts such as:</p>
-<div class="codehilite"><pre><span></span><code>node B: suspect, incarnation 12
-node F: alive, incarnation 4
-node K: left, incarnation 7
+<p>That can be useful when the monitor is deliberately authoritative. But the monitor becomes a dependency: clients need to reach it, it needs capacity for the whole fleet, and its own failure needs a plan.</p>
+<p>SWIM changes the question:</p>
+<div class="codehilite"><pre><span></span><code>How can every node sample one membership fact cheaply,
+while the cluster still learns about useful changes?
 </code></pre></div>
 
-<p>In rough pseudocode:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">swim_period</span><span class="p">(</span><span class="n">local_state</span><span class="p">,</span> <span class="n">peers</span><span class="p">):</span>
-    <span class="n">target</span> <span class="o">=</span> <span class="n">choose_peer</span><span class="p">(</span><span class="n">peers</span><span class="p">)</span>
-    <span class="n">updates</span> <span class="o">=</span> <span class="n">local_state</span><span class="o">.</span><span class="n">recent_membership_updates</span><span class="p">()</span>
-
-    <span class="k">if</span> <span class="n">ping</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">piggyback</span><span class="o">=</span><span class="n">updates</span><span class="p">):</span>
-        <span class="n">local_state</span><span class="o">.</span><span class="n">note_alive</span><span class="p">(</span><span class="n">target</span><span class="p">)</span>
-        <span class="k">return</span>
-
-    <span class="n">helpers</span> <span class="o">=</span> <span class="n">choose_helpers</span><span class="p">(</span><span class="n">peers</span><span class="p">,</span> <span class="n">exclude</span><span class="o">=</span><span class="n">target</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">indirect_ping</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">helpers</span><span class="p">,</span> <span class="n">piggyback</span><span class="o">=</span><span class="n">updates</span><span class="p">):</span>
-        <span class="n">local_state</span><span class="o">.</span><span class="n">note_alive</span><span class="p">(</span><span class="n">target</span><span class="p">)</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">local_state</span><span class="o">.</span><span class="n">mark_suspect</span><span class="p">(</span><span class="n">target</span><span class="p">)</span>
+<p>It does not ask every node to prove the whole cluster is healthy. During each protocol period, a node chooses one target. Over repeated randomized periods, different nodes examine different peers. When a probe has an ambiguous result, SWIM asks a few helpers for extra paths before creating a suspicion.</p>
+<h2>The Moving Parts</h2>
+<p>Use one concrete period. Node <code>A</code> selects <code>N87</code> as its target.</p>
+<table>
+<thead>
+<tr>
+<th>Part</th>
+<th>What it does</th>
+<th>What it cannot know alone</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>A</code>, the initiator</td>
+<td>Chooses a target and interprets its local probe results.</td>
+<td>Whether <code>N87</code> is unreachable from every node.</td>
+</tr>
+<tr>
+<td><code>N87</code>, the target</td>
+<td>Replies if it receives a probe and can respond.</td>
+<td>Whether every peer has received its latest membership state.</td>
+</tr>
+<tr>
+<td><code>C</code> and <code>D</code>, helpers</td>
+<td>Try separate paths to <code>N87</code> after A's direct timeout.</td>
+<td>Whether <code>A</code>'s original path was healthy.</td>
+</tr>
+<tr>
+<td>Membership table</td>
+<td>Stores facts such as <code>alive</code> or <code>suspect</code>, plus freshness metadata.</td>
+<td>Whether a fact is globally committed.</td>
+</tr>
+<tr>
+<td>Piggyback queue</td>
+<td>Attaches recent membership changes to protocol traffic.</td>
+<td>Whether each peer has already received every update.</td>
+</tr>
+</tbody>
+</table>
+<p>Plain meaning:</p>
+<p>First, ask a narrow question: “Can a path reach <code>N87</code> right now?” If the answer is unclear, ask a few other nodes to try. Later, let the membership result travel through normal protocol traffic.</p>
+<p>In this scenario:</p>
+<p><code>A</code> sends a direct <code>PING</code> to <code>N87</code>. If it times out, <code>A</code> asks <code>C</code> and <code>D</code> to send their own probes. A successful indirect reply tells <code>A</code> that the original timeout was not enough evidence for suspicion.</p>
+<p>Technical name:</p>
+<p>This division is SWIM's <strong>failure detector</strong> plus <strong>infection-style dissemination</strong>. The detector gathers local liveness evidence. Dissemination makes membership facts visible to more nodes. They cooperate, but they are not the same mechanism.</p>
+<h2>The SWIM Period Step by Step</h2>
+<p>At the start of the period, <code>A</code> stores:</p>
+<div class="codehilite"><pre><span></span><code>membership[N87] = alive, incarnation 7
 </code></pre></div>
 
-<p>The important structure is not the exact API. The important structure is that detection and dissemination are decoupled but cooperative: probes gather local evidence, while piggybacked updates spread the evidence through the cluster.</p>
-<h2>Worked Example</h2>
-<p>Imagine node <code>A</code> selects <code>B</code> for this period. <code>B</code> is healthy, but the network path from <code>A</code> to <code>B</code> drops packets for a moment.</p>
-<p>If the protocol used only direct ping, <code>A</code> might mark <code>B</code> failed too quickly. That false suspicion could trigger rerouting, rebalancing, or noisy alerts.</p>
-<p>With SWIM, <code>A</code> asks helpers:</p>
-<div class="codehilite"><pre><span></span><code>direct path:
-  A -&gt; B fails
-
-helper path:
-  A -&gt; C -&gt; B succeeds
-  C -&gt; A reports success
+<h3>Step 1: direct probe</h3>
+<p><code>A</code> selects <code>N87</code> and sends a <code>PING</code>.</p>
+<div class="codehilite"><pre><span></span><code>A ---- PING ----&gt; N87
+A &lt;---- ACK ----- N87
 </code></pre></div>
 
-<p>Now <code>A</code> has a better interpretation: the direct path failed, but <code>B</code> is not clearly unavailable. The cluster avoids turning one bad edge into a membership event.</p>
-<p>Now change the scenario. <code>B</code> has actually crashed. <code>A</code> times out, helper probes also time out, and <code>A</code> records <code>B</code> as suspect. That suspicion is then piggybacked through later SWIM messages. Other nodes may hear it at different times, and <code>B</code> may still appear alive to some peers briefly. That temporary disagreement is part of the protocol's operating model.</p>
-<p>The value is that no node had to notify the entire cluster directly. The suspicion spreads through the same low-cost periodic traffic that keeps membership alive.</p>
-<h2>Guarantees and Limits</h2>
-<p>SWIM gives several useful properties:</p>
+<p>If the <code>ACK</code> arrives before the timeout, this period ends successfully. <code>A</code> has fresh local evidence that it can reach <code>N87</code> through this path at this moment.</p>
+<p>Notice the boundary: this does not prove that every other node can reach <code>N87</code>, nor that <code>N87</code> will remain healthy in the next period.</p>
+<h3>Step 2: indirect probes after ambiguity</h3>
+<p>If the direct <code>ACK</code> does not arrive, <code>A</code> does not immediately declare <code>N87</code> failed. It sends <code>PING-REQ</code> messages to a small helper set, here <code>C</code> and <code>D</code>.</p>
+<div class="codehilite"><pre><span></span><code>A -- PING-REQ --&gt; C ---- PING ----&gt; N87
+A -- PING-REQ --&gt; D ---- PING ----&gt; N87
+</code></pre></div>
+
+<p>If either helper receives an acknowledgement from <code>N87</code>, the protocol gets stronger evidence that <code>N87</code> is reachable somewhere in the cluster. The original <code>A -&gt; N87</code> path may still be bad, but turning one bad edge into a cluster-wide failure event would be an overreaction.</p>
+<h3>Step 3: create a suspicion only when the paths stay silent</h3>
+<p>If the direct probe and helper probes all fail within the period, <code>A</code> records a suspicion rather than an immediate death verdict:</p>
+<div class="codehilite"><pre><span></span><code>membership[N87] = suspect, incarnation 7
+</code></pre></div>
+
+<p>The word <code>suspect</code> matters. It records an observation that needs more time, refutation, or policy before it becomes a stronger membership transition. The later membership-lifecycle lesson will make those transitions explicit.</p>
+<h3>Step 4: carry the update while doing normal work</h3>
+<p>The suspicion enters a queue of recent membership updates. Subsequent SWIM messages can carry it without creating one separate full-cluster broadcast:</p>
+<div class="codehilite"><pre><span></span><code>A -&gt; E : PING + {N87 suspect, incarnation 7}
+E -&gt; F : ACK  + {N87 suspect, incarnation 7}
+F -&gt; G : PING + {N87 suspect, incarnation 7}
+</code></pre></div>
+
+<p>This is piggybacking. The membership fact moves alongside messages the protocol was already going to send.</p>
+<p>The key separation is now visible:</p>
+<div class="codehilite"><pre><span></span><code>direct and indirect probes:
+  collect evidence about N87
+
+piggybacked updates:
+  spread the resulting membership fact
+
+routing or placement policy:
+  decides what to do with that fact
+</code></pre></div>
+
+<h2>A Worked Trace: Bad Path or Failed Node?</h2>
+<p>Let the cluster start with the same record everywhere:</p>
+<div class="codehilite"><pre><span></span><code>N87: alive, incarnation 7
+</code></pre></div>
+
+<h3>Case A: A's route is bad, but N87 is healthy</h3>
+<div class="codehilite"><pre><span></span><code>t0  A selects N87.
+t1  A -&gt; N87 PING is delayed or lost.
+t2  A&#39;s direct timeout expires.
+t3  A asks helpers C and D with PING-REQ.
+t4  C -&gt; N87 PING succeeds.
+t5  C reports the successful acknowledgement to A.
+t6  A keeps N87 as alive for this period.
+</code></pre></div>
+
+<p>State after the trace:</p>
+<div class="codehilite"><pre><span></span><code>A knows: its direct path was unreliable.
+A does not know: that N87 is unreachable everywhere.
+membership[N87]: remains alive.
+</code></pre></div>
+
+<p>The naive detector would have created <code>N87 failed</code> at <code>t2</code>. SWIM does not erase the problem—<code>A</code> may still need to observe its bad path—but it avoids treating a single observer's timeout as a global fact.</p>
+<h3>Case B: N87 has actually stopped responding</h3>
+<div class="codehilite"><pre><span></span><code>t0  A selects N87.
+t1  A -&gt; N87 PING receives no ACK.
+t2  A asks helpers C and D with PING-REQ.
+t3  C -&gt; N87 and D -&gt; N87 receive no ACK.
+t4  A records: N87 suspect, incarnation 7.
+t5  A piggybacks the suspicion to E.
+t6  E later carries the same update to F.
+</code></pre></div>
+
+<p>State after the trace:</p>
+<div class="codehilite"><pre><span></span><code>A, E, and perhaps F know that N87 is suspect.
+Other nodes may still hold alive, incarnation 7.
+The cluster is temporarily inconsistent by design.
+</code></pre></div>
+
+<p>That temporary disagreement is not a bug by itself. The important question is what downstream systems do while the views converge. A router may reduce new traffic to a suspect node. A system changing durable ownership may require stronger confirmation.</p>
+<p>So far, the mechanism gives <code>A</code> a cheaper and more careful way to turn one local observation into a membership update. It does not produce perfect truth.</p>
+<p><strong>Check:</strong> In Case A, should <code>A</code> gossip <code>N87 suspect</code> because its direct ping timed out?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. A helper successfully reached <code>N87</code>, so the timeout describes the original path more than the target's availability. Gossiping a suspicion here would spread a low-quality inference.</p>
+<h2>Why Piggybacking Changes the Cost Shape</h2>
+<p>SWIM could run a separate broadcast whenever a member becomes suspect, alive, left, or dead. That would make update propagation more visible, but it would create another communication stream with its own fanout, retry policy, and load spikes.</p>
+<p>Piggybacking reuses probes, acknowledgements, and helper requests. A message can carry both a protocol action and a small number of recent membership facts.</p>
+<div class="codehilite"><pre><span></span><code>message purpose:       ask N87 for an ACK
+membership payload:    N87 suspect, incarnation 7
+</code></pre></div>
+
+<p>This improves efficiency when membership updates are small and frequent. It costs payload space, merge work, retransmission bookkeeping, and delay when the queue contains more updates than a message can carry.</p>
+<p>The protocol therefore needs limits. A node may cap how many updates it piggybacks, retransmit an update for a bounded number of rounds, or use a later repair mechanism for missed information. “Attached to a message” does not mean “delivered to every node.”</p>
+<p><strong>Check:</strong> A node's piggyback queue grows while probe traffic stays constant. Which problem is most plausible?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The node is learning or producing membership changes faster than its normal protocol messages can carry them. Lowering a timeout will not necessarily help; the team should inspect churn, payload budget, retransmission policy, and queue age.</p>
+<h2>Trade-offs, Limits, and Signals</h2>
+<p>SWIM improves on all-to-all checking because each node performs a small amount of probe work per period. Indirect probes are paid only when a direct path is ambiguous. Membership updates reuse the protocol's existing traffic.</p>
+<p>It costs extra protocol states, timeout tuning, helper traffic during loss, duplicate update delivery, and delayed convergence. A slow observer can still create poor evidence. A partition can make healthy nodes appear unreachable from one side. A malicious member is outside SWIM's crash-fault assumptions.</p>
+<p>Useful signals include:</p>
 <ul>
-<li>bounded-ish per-node protocol work per period</li>
-<li>randomized sampling instead of all-to-all checking</li>
-<li>indirect probes that reduce single-path false positives</li>
-<li>decentralized dissemination of membership changes</li>
-<li>no permanent central membership broadcaster</li>
+<li>direct-probe success rate and latency distribution</li>
+<li>indirect-probe success rate after direct timeouts</li>
+<li>number and age of pending piggyback updates</li>
+<li>suspicion, refutation, and false-positive rates</li>
+<li>messages and bytes per node per protocol period</li>
+<li>time from first suspicion to the action taken by a router or control plane</li>
 </ul>
-<p>It does not give:</p>
-<ul>
-<li>zero false suspicions</li>
-<li>instant global agreement</li>
-<li>Byzantine tolerance</li>
-<li>perfect behavior under overloaded observers</li>
-<li>a complete policy for when consumers should act on suspicion</li>
-</ul>
-<p>This is where the trade-off matters operationally. SWIM improves the cost curve by accepting weakly consistent membership views. The design is good when the product can tolerate a short stale window and when later layers know how to treat <code>alive</code>, <code>suspect</code>, <code>failed</code>, or <code>left</code> states.</p>
-<p>If a system needs one official decision about leadership, ownership, or committed configuration, gossip-style membership can feed useful observations into that decision. It should not be mistaken for the decision itself.</p>
-<h2>Common Failure Modes</h2>
-<p><strong>Treating a direct timeout as proof</strong></p>
-<p>A failed direct ping proves only that one observer did not get an answer in one interval. Indirect probes exist because networks fail asymmetrically, hosts pause, and observers can be unhealthy too.</p>
-<p><strong>Letting suspicion become action too quickly</strong></p>
-<p>SWIM spreads suspicion efficiently, but a consumer must decide what suspicion means. Routing away from a suspect node may be sensible. permanently removing ownership or triggering disruptive rebalancing may require stronger evidence or a longer grace period.</p>
-<p><strong>Forgetting the observer can be the problem</strong></p>
-<p>Base SWIM assumes the observer can run the protocol well enough. In production, a slow or overloaded observer can generate bad suspicions. Later SWIM-style improvements add local health awareness and suspicion dampening to reduce that blast radius.</p>
+<p>This helps when a product can tolerate a brief, measured stale window around membership. It becomes risky when a consumer treats one suspicion as authority to make irreversible placement, security, or ownership decisions.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: a direct timeout proves that the target died</h3>
+<p>Why it is tempting:</p>
+<p><code>A</code> asked <code>N87</code> a simple question and received no answer.</p>
+<p>Better model:</p>
+<p>The timeout proves only that <code>A</code> did not receive an answer on that path during that interval. Indirect probes ask whether the missing answer is local to the path or broader.</p>
+<h3>Confusion: indirect probes are a tiny broadcast</h3>
+<p>Why it is tempting:</p>
+<p>Several helpers become involved after the timeout.</p>
+<p>Better model:</p>
+<p>Helpers gather additional liveness evidence about one target. They are not the dissemination mechanism. Piggybacking later spreads the membership update to the wider cluster.</p>
+<h3>Confusion: SWIM decides the final action</h3>
+<p>Why it is tempting:</p>
+<p>The membership table eventually says <code>suspect</code>, <code>alive</code>, or another state.</p>
+<p>Better model:</p>
+<p>SWIM maintains a useful, weakly consistent membership view. A router, scheduler, or control plane must still decide what each state means for traffic, work, or authority.</p>
+<h2>Practice: Choose the Right Response to an Ambiguous Timeout</h2>
+<p>A deployment system uses SWIM-style membership for 200 workers. Node <code>P</code> cannot receive an acknowledgement from worker <code>W41</code>. One helper can reach <code>W41</code>; another helper times out. The scheduler retries a task if it chooses an unreachable worker, and no single worker owns irreversible state.</p>
+<p>Choose a response and justify it:</p>
+<ol>
+<li>Mark <code>W41</code> failed and immediately remove it from every placement table.</li>
+<li>Keep <code>W41</code> alive for the current period, record the path evidence, and continue measuring it.</li>
+<li>Broadcast a cluster-wide <code>W41 suspect</code> update immediately.</li>
+</ol>
+<p>A strong answer chooses <strong>2</strong>. One successful indirect probe shows that <code>W41</code> is reachable through at least one path. The direct timeout still matters as network evidence, but it is not enough to spread a suspect state. The scheduler's retry behavior also makes a short local uncertainty survivable.</p>
+<p>If every helper had timed out, recording and disseminating <code>suspect</code> would be reasonable. Immediate permanent removal would still need a policy that considers grace periods, refutation, and the cost of a false positive.</p>
 <h2>Connections</h2>
-<p>The previous lesson explained gossip as a general dissemination pattern. SWIM narrows that pattern into a membership protocol by defining how liveness evidence is sampled and how membership updates travel.</p>
-<p>Phi accrual failure detectors approach the liveness question from a different angle: instead of a simple timeout, they turn missing heartbeats into a graded suspicion score.</p>
-<p>HyParView addresses the graph underneath protocols like SWIM. Even good membership messages need a healthy peer overlay to travel through.</p>
+<p>Lesson <code>001</code> established why repeated local exchange can spread soft state. SWIM adds a disciplined source for one kind of update: liveness evidence and membership change.</p>
+<p>Lesson <code>003</code> turns to the overlay itself. Direct and indirect probes need peers and alternate paths; a partial overlay that fragments cannot carry either evidence or dissemination reliably.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a><ul>
-<li>Focus: Read the protocol design and evaluation sections to see the separation between failure detection and dissemination.</li>
-</ul>
-</li>
-<li>[REPO] <a href="https://github.com/hashicorp/memberlist">HashiCorp memberlist</a><ul>
-<li>Focus: Useful for connecting SWIM-style ideas to a practical implementation and its exposed tuning parameters.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/architecture/gossip">HashiCorp Consul Gossip Protocol</a><ul>
-<li>Focus: See how production service discovery uses gossip-style membership inside a larger system.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://developer.hashicorp.com/serf/docs">HashiCorp Serf Documentation</a><ul>
-<li>Focus: Look at how SWIM-inspired membership and event dissemination are exposed to operators.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</a> - Focus: Direct and indirect probes, infection-style dissemination, and the protocol's cost goals.</li>
+<li>[ARTICLE] <a href="https://developer.hashicorp.com/consul/docs/architecture/gossip">Consul Gossip Protocol</a> - Focus: How a production service-discovery system distinguishes LAN gossip, WAN gossip, and higher-level service health.</li>
+<li>[ARTICLE] <a href="https://github.com/hashicorp/memberlist">HashiCorp memberlist</a> - Focus: Practical SWIM-style parameters, event handling, and the boundary between membership state and application policy.</li>
+<li>[PAPER] <a href="https://arxiv.org/abs/1707.00788">Lifeguard: SWIM-ing with Situational Awareness</a> - Focus: Why a slow observer can create false suspicion and how local health awareness responds.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ol>
-<li>SWIM separates liveness sampling from membership dissemination, which is why it scales better than all-to-all heartbeats.</li>
-<li>Direct probes gather sharp local evidence; indirect probes reduce false suspicion from one bad path.</li>
-<li>Piggybacked gossip spreads membership updates without making every change a full-cluster broadcast.</li>
-<li>SWIM's core trade-off is practical membership awareness with bounded cost, not instant or infallible truth.</li>
+<li>SWIM separates local failure evidence from the dissemination of membership updates.</li>
+<li>A direct timeout is a fact about one observation path; indirect probes help decide whether suspicion is justified.</li>
+<li>Piggybacking makes membership dissemination cheap by attaching recent updates to protocol messages that already travel.</li>
+<li>SWIM deliberately permits temporary disagreement and needs downstream policy to decide how strongly to act on membership state.</li>
+<li>Probe outcomes, piggyback-queue age, suspicion rates, and time to consumer action reveal whether the trade-off remains healthy.</li>
 </ol>
 </section>
 
@@ -220,14 +338,14 @@ helper path:
   
   <a class="nav-card" href="001.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Introduction to Gossip Protocols</strong>
+    <strong>Why Local Exchange Can Inform a Whole Cluster</strong>
   </a>
   
 
   
   <a class="nav-card" href="003.html">
     <span class="page-kicker">NEXT</span>
-    <strong>HyParView - Hybrid Partial View Membership</strong>
+    <strong>How HyParView Keeps a Partial Overlay Connected</strong>
   </a>
   
 </section>
@@ -242,7 +360,7 @@ helper path:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-19 17:21 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

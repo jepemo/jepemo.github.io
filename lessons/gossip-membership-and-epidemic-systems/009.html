@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Plumtree - Epidemic Broadcast Trees - @jepemo</title>
+    <title>How Plumtree Combines Fast Broadcast with Epidemic Repair - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>Plumtree - Epidemic Broadcast Trees</h1>
+<h1>How Plumtree Combines Fast Broadcast with Epidemic Repair</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,167 +79,297 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Plumtree - Epidemic Broadcast Trees</h1>
+  <h1>How Plumtree Combines Fast Broadcast with Epidemic Repair</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Plumtree combines eager tree broadcast with lazy epidemic repair, trading a little control complexity for common-case efficiency without losing recovery paths when the tree breaks.</p>
+<p><strong>By the end of this lesson, you will be able to:</strong></p>
+<ul>
+<li>
+<p>trace eager payload delivery, lazy notification, <code>GRAFT</code>, and <code>PRUNE</code> for one broadcast;</p>
+</li>
+<li>
+<p>explain why a tree alone can miss a whole branch and why full epidemic forwarding can waste bandwidth;</p>
+</li>
+<li>
+<p>identify signals that distinguish missing-delivery repair from duplicate-payload cost.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Plumtree sends full messages along a lean eager tree most of the time, while lazy notifications preserve alternate paths that can repair a missed delivery without flooding every payload everywhere.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose a cluster has to broadcast every published event to thousands of subscribers. A simple tree is attractive: each node forwards the full payload to its children, and the message reaches the cluster with little duplication. But if an internal link is stale or a forwarding node misses the message, an entire branch can be left behind.</p>
-<p>Pure epidemic broadcast has the opposite shape. Nodes forward to multiple peers, so alternate paths naturally repair missed deliveries. The cost is duplication: the same payload may arrive several times, consume bandwidth several times, and force receivers to deduplicate constantly.</p>
-<p>Plumtree's non-obvious move is to stop choosing between those extremes. It sends full messages along an efficient eager tree in the common case, while lazy gossip sends lightweight notifications along backup edges. If a node hears that a message exists but did not receive the payload, it can request repair and rebuild the tree around working paths.</p>
-<p>The trade-off is efficiency versus resilience. A pure tree is cheap but brittle. Pure gossip is resilient but noisy. Plumtree adds protocol machinery so the expensive repair behavior is available when needed without paying full epidemic cost for every successful broadcast.</p>
-<h2>Why Trees and Gossip Each Fall Short</h2>
-<p>A broadcast tree gives a clean mental model:</p>
+<p>An alerting service broadcasts a 64 KB event, <code>m42</code>, to a large cluster. The event should reach every connected subscriber quickly enough to trigger local action. Sending the full 64 KB payload along a tree is attractive: each node normally receives it once and forwards it to a few children. Bandwidth is predictable.</p>
+<p>But a tree has a brittle failure shape. If one internal edge is stale, or one forwarding process pauses, every node below that edge can miss <code>m42</code>. A pure epidemic design has the opposite behavior: forward the full payload to many peers, and alternate paths make a miss less likely to matter. The price is that many nodes receive and deduplicate the same 64 KB payload repeatedly.</p>
+<p>Plumtree separates the common path from the repair path. It maintains <strong>eager links</strong> that carry the full message and form a tree-like forwarding structure. It also keeps <strong>lazy links</strong> that carry a small announcement, often called <code>IHAVE</code>: “I have message <code>m42</code>.” A lazy receiver that hears an announcement but still lacks the payload can request it using <code>GRAFT</code>.</p>
+<p>Plain meaning:</p>
+<p>Use a small set of fast delivery roads for the package, and use cheap postcards on other roads to reveal that a package was missed.</p>
+<p>In this scenario:</p>
+<p>The 64 KB <code>m42</code> travels over eager links. A short <code>IHAVE(m42)</code> travels over lazy links. Only a node that discovers a gap asks for the full 64 KB payload.</p>
+<p>Technical name:</p>
+<p>Plumtree is an <strong>epidemic broadcast tree</strong>: a self-adjusting eager tree for efficient payload delivery plus lazy epidemic repair edges for missed broadcasts.</p>
+<h2>The two incomplete extremes</h2>
+<p>Start with a pure tree.</p>
 <div class="codehilite"><pre><span></span><code>        A
-      / | \
-     B  C  D
-    / \    \
-   E   F    G
+      /   \
+     B     C
+     |
+     E
 </code></pre></div>
 
-<p>If <code>A</code> publishes a message and every edge works, each node receives the payload once. Forwarding is predictable, bandwidth is controlled, and duplicate delivery is low.</p>
-<p>The weakness is that the tree is a single preferred structure. If <code>B</code> fails to receive or forward the message, <code>E</code> and <code>F</code> may never learn that the message existed:</p>
-<div class="codehilite"><pre><span></span><code>        A
-      / | \
-     B  C  D
-    / \    \
-   E   F    G
-
-B misses message
-  -&gt; E and F miss message too
-</code></pre></div>
-
-<p>Epidemic broadcast handles that failure better because messages travel through several paths. A missed path is not fatal if another neighbor eventually forwards the payload. But carrying the full payload through many redundant paths creates extra traffic and repeated deduplication work.</p>
-<p>The useful design question is not "tree or gossip?" It is "which path should carry the full payload most of the time, and which path should exist mainly to notice and repair gaps?"</p>
-<h2>Eager and Lazy Links</h2>
-<p>Plumtree keeps two kinds of peer relationships for broadcast.</p>
-<p>Eager links carry the full message immediately. Together, they form a tree-like fast path:</p>
-<div class="codehilite"><pre><span></span><code>A --full message--&gt; B --full message--&gt; E
- \                 \
-  \                 -&gt; F
-   -&gt; C --full message--&gt; G
-</code></pre></div>
-
-<p>Lazy links carry only a small announcement that a message exists. The announcement is often described as an <code>IHAVE</code> style notification: "I have message <code>m123</code>." It does not include the full payload.</p>
-<div class="codehilite"><pre><span></span><code>A --IHAVE m123--&gt; D
-C --IHAVE m123--&gt; F
-</code></pre></div>
-
-<p>That split matters. Eager forwarding optimizes the normal case. Lazy notification keeps extra paths alive without paying full payload cost on each one.</p>
-<p>A simplified receive path looks like this:</p>
-<div class="codehilite"><pre><span></span><code>on full message m:
+<p>If A sends <code>m42</code> and every link works, A sends the payload to B and C; B forwards to E. E gets one copy. This is excellent common-case behavior. The tree directs the payload instead of allowing every connected edge to carry it.</p>
+<p>Now let B pause before forwarding. E does not merely receive a delayed copy. It may receive no indication that <code>m42</code> exists. The tree has no alternate path for this event, so a single missed parent edge hides the message from a whole branch.</p>
+<p>Pure epidemic broadcast reverses the risk. A, B, C, and D might all forward the full payload to several peers. E is likely to see <code>m42</code> through more than one route, but each redundant path carries the entire 64 KB object. At high message rate, that means more network traffic, larger receive queues, and more message-ID bookkeeping for duplicates.</p>
+<table>
+<thead>
+<tr>
+<th>Design</th>
+<th>Normal path</th>
+<th>What a broken edge does</th>
+<th>Main cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pure tree</td>
+<td>One preferred parent-to-child route</td>
+<td>Can hide a whole subtree</td>
+<td>Fragile delivery</td>
+</tr>
+<tr>
+<td>Pure epidemic forwarding</td>
+<td>Many full-payload routes</td>
+<td>Another payload path may repair it</td>
+<td>Duplicate payload traffic</td>
+</tr>
+<tr>
+<td>Plumtree</td>
+<td>Full payload on eager routes; small notices on lazy routes</td>
+<td>A notice exposes a missing payload and starts repair</td>
+<td>Control state, timers, and adaptive link management</td>
+</tr>
+</tbody>
+</table>
+<p>The central <strong>trade-off</strong> is common-case payload cost versus repair responsiveness. Plumtree pays a little ongoing notification and state cost so it does not need to pay full epidemic payload cost for every successful broadcast.</p>
+<h2>Eager and lazy links do different work</h2>
+<p>Each node keeps two broadcast-neighbor sets over an underlying peer overlay.</p>
+<table>
+<thead>
+<tr>
+<th>Link kind</th>
+<th>Carries</th>
+<th>Normal purpose</th>
+<th>When it becomes important</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Eager push</td>
+<td>Full message payload</td>
+<td>Deliver quickly with few duplicates</td>
+<td>Normal broadcasts and recently useful repair paths</td>
+</tr>
+<tr>
+<td>Lazy push</td>
+<td><code>IHAVE</code> notification with message identity</td>
+<td>Preserve low-cost evidence that another path has the message</td>
+<td>When an eager branch misses delivery</td>
+</tr>
+</tbody>
+</table>
+<p>When node N receives a full message for the first time, it records the message ID in a cache, delivers the payload locally, forwards the full payload to eager peers, and announces the ID to lazy peers. The cache is important: it lets N recognize whether a later payload is new, duplicated, or still missing after an announcement.</p>
+<p>A simplified receive rule is:</p>
+<div class="codehilite"><pre><span></span><code>receive full payload m:
   if m is new:
-    deliver m
+    remember and deliver m
     forward full m to eager peers
-    announce m to lazy peers
+    send IHAVE(m) to lazy peers
   else:
-    tell sender to prune this eager edge
+    send PRUNE to the eager sender that produced an unnecessary duplicate
 
-on lazy notification for m:
-  if m is missing after a short delay:
-    graft toward notifier and request full m
+receive IHAVE(m):
+  wait briefly for the eager path
+  if m is still missing:
+    send GRAFT for m to the notifier
 </code></pre></div>
 
-<p>The delay before requesting repair is important. It gives the eager tree a chance to deliver the message first. If the payload arrives normally, the lazy notification costs little. If the payload never arrives, the lazy edge reveals the gap.</p>
-<h2>Prune and Graft</h2>
-<p>Plumtree adapts its broadcast structure through two corrective messages.</p>
-<p><code>PRUNE</code> says, in effect, "this eager edge is creating duplicates; stop sending me full payloads on it." When a node receives a duplicate full message from a peer, that peer is probably not needed as an eager parent for that broadcast path. Demoting the edge to lazy reduces future duplication.</p>
-<p><code>GRAFT</code> says, "I heard that a message exists but did not receive it; promote this lazy edge and send me the payload." When the eager tree fails to reach a node, the lazy path becomes a repair path and may become eager afterward.</p>
-<p>The adaptive loop looks like this:</p>
-<div class="codehilite"><pre><span></span><code>duplicate full payload arrives
-  -&gt; send PRUNE
-  -&gt; eager edge becomes lazy
-  -&gt; less duplicate traffic next time
+<p>The short wait after <code>IHAVE</code> is not wasted time. Without it, a node might request a second full payload even though its normal eager parent was about to deliver one. The delay is a tuning boundary: longer waits reduce unnecessary repair traffic but leave a real miss unresolved for longer.</p>
+<h2>A worked trace: repair a missing branch, then trim a duplicate</h2>
+<p>Use this small topology for <code>m42</code>:</p>
+<div class="codehilite"><pre><span></span><code>eager links for payloads:  A -&gt; B -&gt; E
+                           A -&gt; C -&gt; D
 
-lazy notice arrives but payload is missing
-  -&gt; send GRAFT
-  -&gt; lazy edge becomes eager
-  -&gt; missing payload is repaired
+lazy link for notices:     D -&gt; E
 </code></pre></div>
 
-<p>This is the mechanism that makes Plumtree more than "tree plus gossip." The tree is not fixed. It is continuously shaped by delivery evidence. Edges that waste bandwidth are demoted. Edges that repair missed delivery are promoted.</p>
-<h2>Worked Example</h2>
-<p>Imagine <code>A</code> broadcasts message <code>m123</code>. The current eager tree should send the full message through <code>B</code> to <code>E</code>, while <code>D</code> has only a lazy link to <code>E</code>.</p>
-<div class="codehilite"><pre><span></span><code>A -&gt; B -&gt; E    eager full-message path
-D -&gt; E         lazy notification path
-</code></pre></div>
-
-<p>Now <code>B</code> is slow or the <code>B -&gt; E</code> edge is broken. <code>E</code> does not receive the full payload from the eager tree. Later, <code>E</code> receives a lazy notification from <code>D</code>:</p>
-<div class="codehilite"><pre><span></span><code>D -&gt; E: IHAVE m123
-</code></pre></div>
-
-<p><code>E</code> checks its message cache and sees that <code>m123</code> is missing. It sends a repair request:</p>
-<div class="codehilite"><pre><span></span><code>E -&gt; D: GRAFT m123
-D -&gt; E: full message m123
-</code></pre></div>
-
-<p>After repair, the <code>D -&gt; E</code> edge may become eager because it proved useful. The protocol has learned from failure and adjusted the fast path.</p>
-<p>The opposite adjustment happens when a node receives duplicates. If <code>E</code> gets <code>m123</code> from both <code>B</code> and <code>D</code>, it can keep one eager path and prune the other:</p>
-<div class="codehilite"><pre><span></span><code>E -&gt; D: PRUNE
-D -&gt; E: future messages are lazy notifications, not full payloads
-</code></pre></div>
-
-<p>That is the core balance: repair missing branches, but trim redundant payload paths.</p>
-<h2>Implications and Trade-offs</h2>
-<p>Plumtree works well when most broadcasts follow a stable tree most of the time, but the system still needs a way to detect broken branches. The eager path keeps steady-state cost low. The lazy path keeps the system from silently losing messages when the eager path is stale.</p>
-<p>The costs are real:</p>
+<p>The lazy direction means D can notify E about a message D has seen without normally sending E the full payload. Now trace one broadcast.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Message and state</th>
+<th>What E knows</th>
+<th>Why the step matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>A sends full <code>m42</code> to B and C</td>
+<td>E knows nothing</td>
+<td>Eager path starts efficient delivery</td>
+</tr>
+<tr>
+<td>2</td>
+<td>C sends full <code>m42</code> to D; D stores it and sends <code>IHAVE(m42)</code> to E</td>
+<td>E knows a message exists but lacks the payload</td>
+<td>Lazy edge supplies gap evidence cheaply</td>
+</tr>
+<tr>
+<td>3</td>
+<td>B pauses before forwarding <code>m42</code> to E</td>
+<td>E still lacks the payload after its brief wait</td>
+<td>The eager branch has failed for this event</td>
+</tr>
+<tr>
+<td>4</td>
+<td>E sends <code>GRAFT(m42)</code> to D</td>
+<td>E asks an alternate path for repair</td>
+<td>Repair is demand-driven, not a full flood</td>
+</tr>
+<tr>
+<td>5</td>
+<td>D sends full <code>m42</code> to E; E stores and delivers it</td>
+<td>E now has <code>m42</code></td>
+<td>The missed branch is repaired</td>
+</tr>
+<tr>
+<td>6</td>
+<td>B recovers and later sends a duplicate full <code>m42</code> to E</td>
+<td>E recognizes <code>m42</code> as already seen</td>
+<td>Duplicate is evidence that two eager routes are unnecessary</td>
+</tr>
+<tr>
+<td>7</td>
+<td>E sends <code>PRUNE</code> to one redundant eager sender</td>
+<td>E keeps one useful full-payload path and makes the other lazy</td>
+<td>Future broadcasts carry fewer duplicate payloads</td>
+</tr>
+</tbody>
+</table>
+<p>The input is one broadcast, <code>m42</code>. The first transition is eager full-payload forwarding. The intermediate state is uneven knowledge: D has the payload while E has only an <code>IHAVE</code> notice. The repair decision is E's <code>GRAFT</code> after the wait expires. The output is delivery at E, followed by <code>PRUNE</code> to remove a wasteful duplicate route. The naive contrast is clear: a pure tree leaves E silent after B pauses; full epidemic forwarding would have sent the 64 KB payload over the D-to-E backup even when B was healthy.</p>
+<p><code>GRAFT</code> and <code>PRUNE</code> make the tree adaptive rather than fixed. A path that successfully repairs a gap can become a useful eager path. A path that repeatedly creates duplicates can be demoted to lazy. Exact set-management details vary by implementation, but the reusable mechanism is stable: promote evidence-backed repair paths and demote wasteful payload paths.</p>
+<h2>What the protocol needs underneath</h2>
+<p>Plumtree is not an alternative to membership. It assumes that nodes already have a peer overlay with enough useful alternative paths. HyParView's active and passive views are a natural companion: they help maintain a partial overlay under churn. Plumtree decides how broadcast traffic should use that overlay.</p>
+<p>It also needs bounded message-ID state. To decide whether <code>m42</code> is new, duplicate, or missing, a node remembers recently seen IDs for a retention period. Forget too quickly and a delayed duplicate can be delivered again or a late <code>IHAVE</code> cannot be interpreted correctly. Remember forever and the cache grows without bound. Message lifetime, expected delay, and broadcast rate determine the retention policy.</p>
+<p>Neither requirement is cosmetic. A perfect eager/lazy algorithm cannot repair a partition with no alternate overlay edge, and it cannot reliably suppress duplicates without enough recent identity history.</p>
+<h2>Observe delivery and repair separately</h2>
+<p>Do not judge Plumtree only by average broadcast latency. Its value is in how payload efficiency and repair behave under different conditions.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+<th>Boundary to inspect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full-payload copies per delivered message</td>
+<td>Whether eager structure is near-tree-like or drifting toward flooding</td>
+<td>Excess eager links or ineffective <code>PRUNE</code></td>
+</tr>
+<tr>
+<td><code>IHAVE</code> to <code>GRAFT</code> rate</td>
+<td>How often lazy notices discover missing payloads</td>
+<td>Broken eager branches, too-short wait, or poor overlay</td>
+</tr>
+<tr>
+<td>Repair latency after injected edge loss</td>
+<td>How quickly a lazy path fills a real gap</td>
+<td>Lazy delay, notifier reachability, and payload retrieval</td>
+</tr>
+<tr>
+<td>Duplicate payload rate by sender</td>
+<td>Which links repeatedly waste bandwidth</td>
+<td>Eager-set selection and prune behavior</td>
+</tr>
+<tr>
+<td>Missing-delivery rate in fault tests</td>
+<td>Whether repair covers expected churn and edge failures</td>
+<td>Underlying membership and alternate-path diversity</td>
+</tr>
+<tr>
+<td>Recently-seen cache size and eviction rate</td>
+<td>Whether deduplication state fits the workload</td>
+<td>Message retention period and broadcast rate</td>
+</tr>
+</tbody>
+</table>
+<p>These signals prevent a misleading tuning move. A team might lengthen the lazy wait to reduce <code>GRAFT</code> traffic and call the system more efficient, while silently increasing the time that real misses remain unresolved. Or it might make repair immediate and reduce observed loss while creating duplicate payload spikes. The metrics must show both sides of the trade-off.</p>
+<h2>Common confusions</h2>
+<h3>Confusion: lazy links carry a second copy of every payload</h3>
+<p>Why it is tempting:</p>
+<p>They are called backup paths, so they sound like redundant full delivery.</p>
+<p>Better model:</p>
+<p>Lazy links normally carry only a compact announcement. They become payload paths when a receiver detects that its eager delivery is missing and requests repair.</p>
+<h3>Confusion: <code>PRUNE</code> means the sender is unhealthy</h3>
+<p>Why it is tempting:</p>
+<p>It is sent after receiving a duplicate full message.</p>
+<p>Better model:</p>
+<p><code>PRUNE</code> is usually a bandwidth-shaping signal: this eager payload edge is redundant for the current tree structure. It is not a membership failure verdict about the peer.</p>
+<h3>Confusion: <code>GRAFT</code> guarantees durable or exactly-once delivery</h3>
+<p>Why it is tempting:</p>
+<p>It repairs a missing payload after a branch breaks.</p>
+<p>Better model:</p>
+<p>It requests another broadcast path under the protocol's assumptions. Durability, exactly-once processing, and state reconciliation need separate storage and application semantics.</p>
+<h2>Check your understanding</h2>
+<p><strong>Check:</strong> E receives <code>IHAVE(m77)</code> from D, but E expects a full <code>m77</code> from its eager parent B. Why should E wait briefly before sending <code>GRAFT(m77)</code>, and what does E do if the full payload never arrives?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The wait gives B's normal eager delivery a chance to arrive, preventing unnecessary duplicate repair. If the payload remains missing, E sends <code>GRAFT(m77)</code> to D and requests the full message over that previously lazy alternate path.</p>
+<h2>Practice: review a broadcast repair policy</h2>
+<p>Your event system delivers 256 KB messages. It has low duplicate-payload traffic in normal operation, but fault tests show that a lost eager edge leaves some nodes without a message for eight seconds. The team proposes sending every full payload over every lazy link as well.</p>
+<p>Write a short review that states:</p>
 <ul>
-<li>nodes must remember recently seen message IDs for deduplication</li>
-<li>lazy notifications and timers add control traffic</li>
-<li><code>PRUNE</code> and <code>GRAFT</code> behavior must be tuned so the tree does not oscillate</li>
-<li>the protocol depends on a useful peer overlay, often supplied by a membership layer such as HyParView</li>
+<li>what the proposal improves and what it makes expensive;</li>
+<li>one smaller change you would test first;</li>
+<li>three signals needed to decide whether the repair is fast enough without becoming a flood.</li>
 </ul>
-<p>The main trade-off is common-case bandwidth versus repair responsiveness. Longer lazy delays reduce unnecessary repair requests but make misses slower to heal. Shorter delays repair faster but may request payloads that were already about to arrive.</p>
-<p>Plumtree is therefore not a guarantee of zero duplicates or zero misses. It is a structured compromise: pay near-tree cost when things work, and keep epidemic-style evidence available when the tree stops working.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Assuming the tree is authoritative</strong></p>
-<p>The eager tree is a preferred fast path, not the only path. If lazy repair is disabled or too weak, broken branches can silently miss messages.</p>
-<p><strong>Keeping too many eager edges</strong></p>
-<p>If duplicate payloads are not pruned, Plumtree drifts toward expensive epidemic broadcast. Deduplication still protects correctness, but bandwidth cost rises.</p>
-<p><strong>Repairing too aggressively</strong></p>
-<p>If lazy notifications trigger immediate repair, nodes may request payloads that the eager path would have delivered moments later. A short delay prevents unnecessary graft churn.</p>
-<p><strong>Ignoring the underlying overlay</strong></p>
-<p>Lazy repair only helps if alternate paths exist. A poor membership or partial-view overlay can leave the protocol without useful backup edges.</p>
-<h2>Connections</h2>
-<p>SWIM and Lifeguard harden membership and failure detection. Plumtree uses the same broad lesson for broadcast: the fast path needs a repair path because real distributed systems spend time in partial failure and churn.</p>
-<p>HyParView is a natural companion because Plumtree needs a resilient peer overlay. The quality of eager and lazy links depends on the membership topology underneath.</p>
-<p>Anti-entropy, next, applies a similar fast-path/repair-path idea to replicated data. Broadcast tries to deliver messages now; anti-entropy repairs state later when delivery or replication was incomplete.</p>
+<details>
+<summary>Review rubric</summary>
+
+A strong review recognizes that full payloads on every lazy edge improve redundancy but discard Plumtree's common-case bandwidth advantage. It first tests the lazy wait, `IHAVE` coverage, graft retrieval latency, and alternate-overlay reachability. Its signals include missing-delivery and repair latency under fault injection, full-payload copies per delivered message, `IHAVE`-to-`GRAFT` rate, duplicate payload rate, and cache pressure. It does not confuse a broadcast repair path with durable state replication.
+
+</details>
+
+<h2>Connections and boundaries</h2>
+<p>Lifeguard showed how membership detection needs a fast path plus guardrails for degraded conditions. Plumtree applies that pattern to broadcast: an efficient eager path carries ordinary traffic, and a lazy repair path handles missed delivery. The earlier overlay lessons remain necessary because lazy repair only works when alternate peers exist.</p>
+<p>The next lesson moves from repairing one broadcast message to locating divergence in replica state. Anti-entropy may use later, broader comparison to find missing state; Plumtree tries to repair an individual broadcast promptly. Neither replaces application merge rules, durable replication, consensus, or a security trust model.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf">Epidemic Broadcast Trees for Large-Scale Reliable Broadcast</a><ul>
-<li>Focus: Primary Plumtree paper; read for eager push, lazy push, prune, and graft.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf">HyParView: A Membership Protocol for Reliable Gossip-Based Broadcast</a><ul>
-<li>Focus: Companion protocol that provides the resilient partial-view overlay Plumtree benefits from.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
-<li>Focus: Broader systems pattern: efficient common paths paired with repair and reconciliation paths.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf">Epidemic Broadcast Trees for Large-Scale Reliable Broadcast</a> - Focus: eager push, lazy push, <code>PRUNE</code>, <code>GRAFT</code>, and the adaptive broadcast tree.</li>
+<li>[PAPER] <a href="https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf">HyParView: A Membership Protocol for Reliable Gossip-Based Broadcast</a> - Focus: the resilient partial-view overlay that supplies useful alternate peers.</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a> - Focus: the broader systems pattern of an efficient common path paired with repair and reconciliation.</li>
+<li>[ARTICLE] <a href="https://github.com/libp2p/specs/tree/master/pubsub/gossipsub">libp2p GossipSub</a> - Focus: compare another practical eager/lazy gossip design and its control-message trade-offs.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Pure trees minimize duplicate traffic but can lose whole branches when an edge fails.</li>
-<li>Pure epidemic broadcast is resilient but pays for that resilience with duplicate payload traffic.</li>
-<li>Plumtree sends full messages on eager tree links and uses lazy notifications to detect and repair missed deliveries.</li>
-<li><code>PRUNE</code> and <code>GRAFT</code> let the broadcast tree adapt by trimming wasteful edges and promoting useful repair paths.</li>
-</ol>
+<ul>
+<li>Eager links carry full payloads efficiently, while lazy links normally carry compact evidence that a message exists.</li>
+<li><code>GRAFT</code> repairs a detected gap through a lazy alternate path; <code>PRUNE</code> removes a redundant eager payload path.</li>
+<li>The protocol adapts broadcast structure from delivery evidence instead of fixing one tree forever.</li>
+<li>Evaluate payload copies, repair latency, missing-delivery rate, and cache pressure together; broadcast repair is not durable state reconciliation.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
   
   <a class="nav-card" href="008.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>SWIM Improvements - Infection Dampening & Health Multipliers</strong>
+    <strong>How Lifeguard Hardens SWIM Under Local Degradation</strong>
   </a>
   
 
   
   <a class="nav-card" href="010.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Anti-entropy with Merkle Trees</strong>
+    <strong>How Anti-Entropy Finds Missing State Efficiently</strong>
   </a>
   
 </section>
@@ -250,7 +384,7 @@ D -&gt; E: future messages are lazy notifications, not full payloads
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-19 17:21 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
