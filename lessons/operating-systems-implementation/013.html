@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Networking Path and Packet Buffers - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/operating-systems-implementation.html" aria-label="Exit lesson and return to Operating Systems Implementation">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Networking Path and Packet Buffers</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/systems-internals.html">Systems Internals</a>
+    /
+    <a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a>
+    /
+    013
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">013</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Networking Path and Packet Buffers</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace an incoming UDP datagram from a NIC receive descriptor to <code>recvfrom</code>.</p>
+</li>
+<li>
+<p>State who owns a packet buffer at each handoff through driver, protocol, socket, and user copy.</p>
+</li>
+<li>
+<p>Predict a correct drop, wakeup, or queueing decision when a socket is empty or full.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A readable socket is not a magical network event; it is a queue of validated kernel packet buffers whose ownership has moved safely from a device to the waiting process.</p>
+</blockquote>
+<p>Process <code>dns_client</code> has bound UDP port <code>5300</code> and calls <code>recvfrom(sock, user_buf, 512, ...)</code>. Its receive queue is empty, so the process blocks. Later, a NIC receives an Ethernet frame carrying a UDP datagram for that port.</p>
+<p>The frame does not land in <code>user_buf</code>. The NIC first DMA-writes into a buffer the driver gave it. The driver takes that completed buffer away from the receive ring, replaces it with a fresh one, and passes the completed packet to the network stack. The stack must reject malformed or irrelevant packets, find the bound socket, add an accepted packet to its queue, and wake the blocked process without losing the notification. Only when <code>dns_client</code> runs again does the kernel copy the payload across the user-kernel boundary.</p>
+<p>That chain turns “a socket is readable” into visible state and ownership transitions.</p>
+<h2>Core Insight</h2>
+<p>The receive path has four useful owners:</p>
+<div class="codehilite"><pre><span></span><code>NIC -&gt; driver -&gt; protocol/socket queue -&gt; receiving process copy -&gt; freed or recycled
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>Owner or boundary</th>
+<th>What it may do</th>
+<th>What must be true before handoff</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NIC receive ring</td>
+<td>DMA-write a new frame into a posted buffer</td>
+<td>buffer is valid, DMA-ready, and not used by the CPU</td>
+</tr>
+<tr>
+<td>driver</td>
+<td>observe completion and transfer the completed buffer onward</td>
+<td>device is done with that descriptor; a fresh buffer is posted before reuse</td>
+</tr>
+<tr>
+<td>protocol and socket layer</td>
+<td>parse headers, decide destination, enqueue or drop</td>
+<td>length and basic header checks are safe to read; queue policy is respected</td>
+</tr>
+<tr>
+<td><code>recvfrom</code> path</td>
+<td>remove one queued packet and copy payload to user memory</td>
+<td>user range is validated; queue state and packet lifetime are synchronized</td>
+</tr>
+</tbody>
+</table>
+<p>Plain meaning:</p>
+<p>The NIC is a courier that can place parcels only into empty delivery bins prepared by the kernel. Once a bin is full, the driver takes it away, puts out a fresh empty bin, and sends the full parcel through sorting. A process collects a parcel only from its own queue.</p>
+<p>In this scenario:</p>
+<p>The completed buffer contains Ethernet, IP, UDP, and payload bytes. The packet's destination UDP port is <code>5300</code>, so the protocol layer routes it to <code>dns_client</code>'s socket queue. The process's <code>user_buf</code> remains untouched until the syscall path owns the queued packet and performs a checked copy.</p>
+<p>Technical name:</p>
+<p>Choosing a protocol handler and endpoint from packet headers is <strong>demultiplexing</strong>. The kernel-owned object that carries packet bytes and metadata is a <strong>packet buffer</strong> (Linux calls a common form <code>sk_buff</code>). A per-socket <strong>receive queue</strong> provides buffering and ordering between asynchronous arrival and process scheduling.</p>
+<h2>The Naive Receive Path Has Two Races</h2>
+<p>One tempting design passes the NIC's current DMA buffer directly to the socket queue without replacing it in the receive descriptor. The NIC can then overwrite the queued packet when the next frame arrives. The application sees changing packet contents or the device stalls because it has no fresh receive buffers.</p>
+<p>Another tempting design is:</p>
+<div class="codehilite"><pre><span></span><code>receiver: sees empty queue
+NIC path: enqueues packet and wakes receivers
+receiver: marks itself asleep
+</code></pre></div>
+
+<p>The wakeup can be lost, exactly like the pipe case in lesson 009. The receiver must test the queue condition and publish its sleep state under the queue's synchronization rule. The producer enqueues and wakes while holding the matching state protection; the receiver wakes and rechecks because another receiver may take the first packet.</p>
+<p>The queue also needs a capacity rule. A hostile or simply faster sender can fill every available packet buffer. An unbounded queue turns incoming traffic into unbounded kernel memory growth. A bounded queue makes the choice visible: when full, drop a new packet, apply a policy, increment a drop counter, and keep the rest of the system alive.</p>
+<h2>The Moving Parts</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Input</th>
+<th>Decision or state change</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NIC RX ring</td>
+<td>DMA-completed descriptor</td>
+<td>which buffer and byte length completed</td>
+<td>packet buffer becomes driver-owned</td>
+</tr>
+<tr>
+<td>driver</td>
+<td>completed buffer</td>
+<td>replenish ring, validate basic completion</td>
+<td>packet buffer becomes stack-owned or is dropped</td>
+</tr>
+<tr>
+<td>Ethernet/IP/UDP parser</td>
+<td>headers and length</td>
+<td>is this a supported, well-formed packet for this host and protocol?</td>
+<td>destination protocol and port, or drop</td>
+</tr>
+<tr>
+<td>socket table</td>
+<td>UDP destination port</td>
+<td>is a socket bound and does its queue have capacity?</td>
+<td>enqueue + wake, or drop</td>
+</tr>
+<tr>
+<td><code>recvfrom</code> syscall</td>
+<td>socket handle and user destination</td>
+<td>dequeue one packet and copy a bounded payload</td>
+<td>byte count and source address, or wait/error</td>
+</tr>
+</tbody>
+</table>
+<p>This is intentionally a narrow receive path. It does not explain TCP retransmission, congestion control, eBPF programs, routing policy, or a high-performance polling dataplane. It explains the kernel state that makes a basic UDP socket become readable.</p>
+<h2>Worked Trace: one UDP datagram reaches a blocked process</h2>
+<p>Assume <code>dns_client</code> has a bound UDP socket for port <code>5300</code>, its receive queue is empty, and it has called <code>recvfrom</code>. The NIC's RX descriptor <code>7</code> points to packet buffer <code>P7</code>, owned by the device. A UDP datagram with payload <code>"hi"</code> arrives for the local address and port <code>5300</code>.</p>
+<p><strong>Input:</strong> Ethernet frame → IPv4 packet → UDP datagram, destination port <code>5300</code>, payload length <code>2</code>.</p>
+<h3>1. The receiver waits on an empty socket queue</h3>
+<p><code>dns_client</code> enters the syscall from lesson 008. The kernel validates the socket handle and the user output ranges for payload and source information. It locks the socket queue, sees <code>queue.count == 0</code>, and publishes the process as waiting on <code>readable(socket 5300)</code> before releasing the queue lock through the scheduler handoff.</p>
+<p><strong>State:</strong> socket queue empty; <code>dns_client: running -&gt; blocked</code>; <code>P7: device-owned</code>.</p>
+<h3>2. The NIC completes DMA and the driver reclaims the buffer</h3>
+<p>The NIC writes the frame into <code>P7</code> and marks descriptor <code>7</code> complete. Its interrupt invokes the driver's receive path. The driver reads completion state and length, takes <code>P7</code> away from descriptor <code>7</code>, and allocates or obtains fresh packet buffer <code>Pnew</code>.</p>
+<p>It places <code>Pnew</code> into descriptor <code>7</code>, clears the descriptor completion state, and updates the receive-ring register according to the device protocol. Now the NIC can receive another frame without touching <code>P7</code>.</p>
+<p><strong>Ownership transition:</strong> <code>P7: NIC -&gt; driver -&gt; protocol stack</code>; <code>Pnew: CPU -&gt; NIC</code>.</p>
+<p>If allocation fails or the descriptor reports an invalid length, the driver drops <code>P7</code> safely and records the reason. It must still keep the receive ring supplied with buffers when possible; otherwise future packets have nowhere to go.</p>
+<h3>3. The protocol layer validates and demultiplexes</h3>
+<p>The stack checks enough information before trusting offsets: Ethernet type, IP version and header length, total lengths, destination address policy, IP protocol <code>UDP</code>, UDP length, and destination port. Exact checksum policy depends on the teaching kernel and hardware features, but malformed lengths or unsupported protocols must not be parsed as though their headers exist.</p>
+<p>The UDP header says <code>dport = 5300</code>. The socket table finds the bound socket for port <code>5300</code>. This is the demultiplexing decision: it is not “send to every process that reads”; it is “this packet belongs to this endpoint's queue.”</p>
+<h3>4. The packet is enqueued or dropped under the socket lock</h3>
+<p>The stack acquires the socket queue lock. If the queue has capacity, it appends <code>P7</code> in arrival order, changes <code>count: 0 -&gt; 1</code>, and wakes processes waiting for the socket. It then releases the lock.</p>
+<div class="codehilite"><pre><span></span><code>socket 5300 queue: [] -&gt; [P7(payload &quot;hi&quot;)]
+dns_client: blocked -&gt; runnable
+</code></pre></div>
+
+<p>If the queue is full or no socket is bound, the stack frees <code>P7</code> and increments the appropriate drop statistic. It does not block the interrupt path waiting for application memory to become available.</p>
+<h3>5. <code>recvfrom</code> rechecks, copies, and releases</h3>
+<p>When scheduled, <code>dns_client</code> reacquires the socket lock and checks the queue again. It removes <code>P7</code>, obtains the payload length and source address, and releases the queue lock. It copies at most the user's requested length to the validated <code>user_buf</code>, returns the actual copied count and source metadata, then frees or returns <code>P7</code> to the packet allocator.</p>
+<p><strong>Output:</strong> user memory receives <code>hi</code>, <code>recvfrom</code> returns <code>2</code>, and the packet buffer's lifetime ends after the copy.</p>
+<p><strong>Naive contrast:</strong> reusing <code>P7</code> in the NIC ring before the socket consumes it lets later DMA overwrite queued data. Copying directly to a user pointer in interrupt context bypasses the syscall's validation and makes user-memory lifetime part of the driver. Skipping the locked queue/wakeup handoff can leave <code>dns_client</code> asleep while a packet waits.</p>
+<p>So far, the same ownership pattern from lesson 012 has crossed a new set of layers. The driver only knows descriptors and buffers. The protocol layer only accepts valid, addressed packets. The socket queue bridges arrival time to process time. The syscall copy makes the result a user-visible byte sequence.</p>
+<h2>Drops, Copies, and Backpressure</h2>
+<p>A receive queue is a deliberate boundary between a bursty device and a scheduled process. A large queue absorbs bursts and may reduce drops, but it consumes memory and increases latency: old packets can wait behind new ones. A small queue keeps memory bounded and failures visible, but drops more readily when the process cannot keep up.</p>
+<p>The trade-off also appears in copying. Copying the payload from a packet buffer into user memory simplifies ownership: after the copy, the kernel can release the packet. It costs CPU time and memory bandwidth. Zero-copy designs can reduce copying, but require stronger lifetime, pinning, security, and backpressure rules because user code may retain access while the networking stack needs to recycle buffers.</p>
+<p>Dropping a packet is not automatically a driver failure. It can be the correct resource-control decision for an unbound port, malformed header, checksum policy failure, or full socket queue. The signal to inspect is the <em>reason</em> and rate of drops: a rising “queue full” count points to an application or queue-capacity mismatch; malformed-header drops point to validation or traffic quality; RX-ring starvation points to a buffer-lifetime or allocation problem.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: “An interrupt delivers a packet directly to a process.”</h3>
+<p>Why it is tempting:</p>
+<p>The user experiences a <code>recvfrom</code> return soon after network activity.</p>
+<p>Better model:</p>
+<p>The interrupt completes device work. The kernel validates, queues, and wakes. The process later runs and copies from the kernel queue under its syscall contract.</p>
+<h3>Confusion: “The packet buffer may return to the RX ring once parsing starts.”</h3>
+<p>Why it is tempting:</p>
+<p>The driver no longer needs to inspect it after handing it upward.</p>
+<p>Better model:</p>
+<p>The socket queue may still own that buffer. The driver posts a <em>fresh</em> buffer to the device and releases the completed one only after the final consumer drops it.</p>
+<h3>Confusion: “A bound port guarantees every packet is delivered.”</h3>
+<p>Why it is tempting:</p>
+<p>Binding creates a named endpoint.</p>
+<p>Better model:</p>
+<p>Packets can be malformed, addressed elsewhere, dropped by policy, lost before arrival, or discarded when a bounded receive queue is full. UDP-style delivery needs an explicit drop model.</p>
+<h3>Confusion: “A wakeup transfers packet ownership to one receiver.”</h3>
+<p>Why it is tempting:</p>
+<p>One packet made a blocked receiver runnable.</p>
+<p>Better model:</p>
+<p>Wakeup means the queue may have changed. The receiver must recheck under the socket lock because another receiver can dequeue first.</p>
+<p><strong>Check:</strong> An RX descriptor has completed into <code>P7</code>. The driver gives <code>P7</code> to the protocol stack but puts <code>P7</code> back into the RX ring before the socket queue consumes it. What can happen?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The NIC can DMA the next frame over the queued packet. The receiving process may see altered data, and two owners now believe they control the same buffer. The driver must post a different fresh buffer to the ring.</p>
+<p><strong>Check:</strong> Socket port <code>5300</code> has a queue capacity of 16 and already holds 16 packets. A valid seventeenth packet arrives. Should the interrupt path sleep until <code>recvfrom</code> makes space?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The receive path should apply its bounded-queue drop policy and record the drop. Sleeping in this context can stall receive processing and allows a sender to consume kernel resources indefinitely.</p>
+<h2>Practice: trace and review a receive path</h2>
+<p>For a UDP socket with a queue capacity of two, trace this event sequence:</p>
+<div class="codehilite"><pre><span></span><code>queue = [P1, P2]
+packet P3 arrives for the bound port
+the application calls recvfrom(..., maxlen = 1)
+packet P4 arrives
+</code></pre></div>
+
+<p>Write the resulting queue contents, ownership of each packet, return value of <code>recvfrom</code>, and two metrics you would increment. Use this rubric:</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>A good answer includes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bounded queue</td>
+<td><code>P3</code> is dropped while the queue is full; it is not retained without capacity</td>
+</tr>
+<tr>
+<td>Syscall semantics</td>
+<td><code>recvfrom</code> removes <code>P1</code>, copies one payload byte, and returns the copied count under the chosen truncation policy</td>
+</tr>
+<tr>
+<td>Later arrival</td>
+<td><code>P4</code> can enter after one slot opens, in arrival order behind <code>P2</code></td>
+</tr>
+<tr>
+<td>Ownership</td>
+<td>queued packets remain stack/socket-owned; dropped or consumed packets are freed/recycled only after their final owner</td>
+</tr>
+<tr>
+<td>Signals</td>
+<td>at least a queue-full drop counter and an accepted/enqueued or RX packet counter</td>
+</tr>
+</tbody>
+</table>
+<h2>Resources</h2>
+<ul>
+<li>[COURSE] <a href="https://pdos.csail.mit.edu/6.1810/2025/labs/net.html">MIT 6.1810 networking lab</a> — Focus: trace E1000 RX descriptors, fresh-buffer replacement, UDP demultiplexing, bounded queues, and blocking receive.</li>
+<li>[DOC] <a href="https://docs.kernel.org/networking/index.html">Linux kernel networking documentation</a> — Focus: connect the teaching receive path to production networking vocabulary and subsystem boundaries.</li>
+<li>[DOC] <a href="https://docs.kernel.org/networking/skbuff.html">Linux kernel socket-buffer documentation</a> — Focus: inspect the ownership and metadata role of a packet buffer in a production kernel.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>A NIC completion gives the kernel a buffer; protocol validation and socket demultiplexing decide whether that buffer becomes readable data.</li>
+<li>Every handoff must give the NIC a fresh RX buffer and preserve exactly one owner for the completed packet.</li>
+<li>Socket receive queues connect asynchronous packet arrival to scheduled <code>recvfrom</code> calls, using the same locked condition and wakeup discipline as other kernel queues.</li>
+<li>Bounded queues and explicit drops preserve kernel memory and expose backpressure instead of hiding it.</li>
+</ol>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="012.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Device Driver Model, MMIO, DMA, and Interrupts</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="014.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Containers as Kernel Namespace and Resource-Control Mechanisms</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/operating-systems-implementation.html">← Back to Operating Systems Implementation</a></p>
+  <p><a href="../../classifications/systems-internals.html">← Back to Systems Internals</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-20 08:42 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

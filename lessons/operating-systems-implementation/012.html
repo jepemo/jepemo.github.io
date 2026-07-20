@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Device Driver Model, MMIO, DMA, and Interrupts - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/operating-systems-implementation.html" aria-label="Exit lesson and return to Operating Systems Implementation">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Device Driver Model, MMIO, DMA, and Interrupts</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/systems-internals.html">Systems Internals</a>
+    /
+    <a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a>
+    /
+    012
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">012</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Device Driver Model, MMIO, DMA, and Interrupts</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace one block request from a kernel buffer to device completion.</p>
+</li>
+<li>
+<p>Explain the ownership transition that makes DMA safe.</p>
+</li>
+<li>
+<p>Diagnose an early buffer reuse, missing completion, or interrupt-context error.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A driver turns a kernel request into device-visible descriptors and registers, then turns an asynchronous completion back into a safe kernel state transition.</p>
+</blockquote>
+<p>Lesson 011 left a dirty cache buffer for device block <code>42</code>. The buffer cache now asks the block driver to write it back. Calling the driver is not like calling <code>memcpy</code>: the device runs independently, reads descriptors from memory, transfers bytes with DMA, and signals completion later with an interrupt.</p>
+<p>The driver must answer three questions precisely. Which registers tell the device where the request queue lives? Who owns the buffer while the device can read or write it? When an interrupt arrives, how does the kernel know which waiting request is complete without sleeping or touching a buffer that has already been reused?</p>
+<p>Those are the driver's real interface. Register names and device manuals vary. The ownership and completion contract does not.</p>
+<h2>Core Insight</h2>
+<p>Use a small generic block-device model. The kernel has a fixed descriptor array in DMA-addressable memory. Each request contains a header, a pointer to the data buffer, and a one-byte status location. The driver also keeps a software table that maps a descriptor slot to the kernel buffer and any process waiting for it.</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>What it can see or change</th>
+<th>What it must not assume</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>buffer cache</td>
+<td>current bytes for block <code>42</code>, dirty state, buffer lock</td>
+<td>that storage has completed the request</td>
+</tr>
+<tr>
+<td>driver request table</td>
+<td>free descriptor slots and the buffer associated with each slot</td>
+<td>that a slot is reusable before completion</td>
+</tr>
+<tr>
+<td>DMA descriptor ring</td>
+<td>addresses, lengths, and device-readable flags</td>
+<td>that it is ordinary private CPU memory once submitted</td>
+</tr>
+<tr>
+<td>MMIO registers</td>
+<td>queue address, available index, interrupt status</td>
+<td>that writing a register is a normal function call</td>
+</tr>
+<tr>
+<td>interrupt handler</td>
+<td>completion status and finished descriptor slots</td>
+<td>that it may block, wait for I/O, or do long work</td>
+</tr>
+</tbody>
+</table>
+<p>Plain meaning:</p>
+<p>The driver hands the device a labeled package and keeps the receipt. While the device has the package, the CPU must not replace its contents or give the same package to somebody else. When the device rings the bell, the driver uses the receipt to return the package to the kernel.</p>
+<p>In this scenario:</p>
+<p>The dirty buffer for block <code>42</code> becomes the data portion of one descriptor chain. The driver records “slot 5 belongs to buffer 42” before it tells the device about slot 5. The buffer stays pinned until the completion path returns ownership.</p>
+<p>Technical name:</p>
+<p><strong>Memory-mapped I/O</strong> (MMIO) exposes device control registers at addresses the CPU accesses with loads and stores. <strong>Direct memory access</strong> (DMA) lets the device read from or write to memory without the CPU copying each byte. A descriptor ring is a shared-memory queue whose entries describe DMA work. An <strong>interrupt</strong> transfers control to a short handler when the device has a completion or needs service.</p>
+<h2>The Naive Driver Corrupts Ownership</h2>
+<p>This unsafe sketch is tempting:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">submit</span><span class="p">(</span><span class="n">device</span><span class="p">,</span><span class="w"> </span><span class="n">buffer</span><span class="p">);</span>
+<span class="n">release_buffer</span><span class="p">(</span><span class="n">buffer</span><span class="p">);</span><span class="w">   </span><span class="c1">// looks efficient, but the device may still use it</span>
+</code></pre></div>
+
+<p>The cache may reuse <code>buffer</code> for block <code>99</code> before the device reads it. The device then writes bytes for block <code>99</code> into the storage location intended for block <code>42</code>, or writes received data into memory now owned by another subsystem. The completion interrupt has no reliable object to wake or mark clean.</p>
+<p>The opposite mistake is to make the interrupt handler wait for something else while holding the driver lock. Interrupt context is not a normal thread that can sleep. It must acknowledge the device, collect finished work, update short shared state, and wake or mark runnable any blocked requester. Heavier work can happen later in task context.</p>
+<p>The driver therefore needs an ownership state machine:</p>
+<div class="codehilite"><pre><span></span><code>CPU owns buffer
+  -&gt; CPU prepares descriptor and records request
+  -&gt; device owns/in-flight DMA buffer
+  -&gt; device marks completion and interrupts
+  -&gt; driver confirms completion
+  -&gt; CPU owns buffer again
+</code></pre></div>
+
+<p>At any point, exactly one owner is allowed to modify the buffer contents. “In flight” is not an empty status label: it is the reason cache eviction, reuse, and dirty-to-clean transitions must wait.</p>
+<h2>The Two Channels: Registers and Shared Memory</h2>
+<p>A driver usually communicates with a device through two different channels.</p>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Direction</th>
+<th>Example job</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MMIO register</td>
+<td>CPU and device control</td>
+<td>configure queue address, acknowledge interrupt, ring a doorbell</td>
+</tr>
+<tr>
+<td>DMA memory</td>
+<td>device and CPU data/control exchange</td>
+<td>descriptors, request status, and block bytes</td>
+</tr>
+</tbody>
+</table>
+<p>MMIO registers are not cached ordinary variables. A write can notify hardware or change a device state machine; reads can acknowledge status or observe a changing device value. The kernel maps and accesses them using the platform's rules. A device descriptor must be fully initialized before the driver updates the MMIO register or queue index that makes it visible to the device. On real architectures, the driver uses the required ordering primitives or DMA API so the CPU and device agree on that publication order.</p>
+<p>DMA does not mean “any pointer is safe.” A user virtual address from a syscall is not automatically valid for a device. For this writeback path, the driver uses a kernel-owned cache buffer whose lifetime and DMA suitability are controlled. Production kernels may map DMA addresses, handle IOMMU translation, cache coherency, and device constraints; the teaching-kernel rule remains useful: never hand hardware a buffer whose ownership or lifetime is unclear.</p>
+<h2>Worked Trace: write back block 42</h2>
+<p>Assume the buffer cache holds dirty buffer <code>B42</code>, the driver has free descriptor slot <code>5</code>, and a process may be waiting for a synchronous completion. The device uses a descriptor ring and an MMIO “notify” register.</p>
+<p><strong>Input:</strong> <code>writeback(B42)</code> for device block <code>42</code>.</p>
+<h3>1. The cache gives the driver a stable request</h3>
+<p>The buffer cache locks or pins <code>B42</code> so eviction cannot recycle it. It records that the buffer is in writeback rather than clean. The driver acquires its short queue lock and reserves slot <code>5</code>.</p>
+<p><strong>State:</strong> <code>B42 = dirty + pinned</code>; descriptor slot <code>5 = reserved</code>; device has not been notified.</p>
+<h3>2. The driver builds the shared descriptor chain</h3>
+<p>The driver fills entries in DMA-visible memory:</p>
+<div class="codehilite"><pre><span></span><code>descriptor 5a: operation = WRITE, block = 42
+descriptor 5b: address = DMA address of B42.data, length = 1024
+descriptor 5c: address = request[5].status, length = 1
+request[5]: buffer = B42, waiter = optional, in_flight = true
+</code></pre></div>
+
+<p>The header tells the device which block to write. The data descriptor identifies the buffer it may read. The status byte gives the device a place to record success or failure. The software request table is the driver's receipt: it links an eventual completion back to <code>B42</code>.</p>
+<p>The driver performs the required memory-ordering publication step, then advances the ring's available index or writes the MMIO notify register. Only now may the device inspect slot <code>5</code>.</p>
+<p><strong>State transition:</strong> <code>B42: CPU-owned -&gt; device-owned/in flight</code>.</p>
+<h3>3. The driver releases the lock and the caller may block safely</h3>
+<p>The driver does not spin while the physical device works. It releases the queue lock. If the caller needs synchronous completion, it waits using the lock-and-wakeup discipline from lesson 009: publish the wait condition, release the appropriate lock, then sleep. The buffer remains pinned even if the requesting thread blocks.</p>
+<p>The device independently reads the descriptors and DMA-reads <code>B42.data</code>. It may finish much later than the submitting CPU.</p>
+<h3>4. Device completion triggers an interrupt</h3>
+<p>After the device completes slot <code>5</code>, it records a completion/status and raises an interrupt. Trap handling enters the driver's interrupt handler. The handler acknowledges the relevant device status, acquires the driver lock suitable for this context, and examines completed slots.</p>
+<p>For slot <code>5</code>, it finds <code>request[5].buffer == B42</code> and reads the status. On success it clears <code>in_flight</code>, returns the descriptor chain to the free pool, and wakes the request's waiter or marks the buffer completion state visible. On failure it records an error; it must not lie by marking the buffer clean.</p>
+<p><strong>Output/decision:</strong> success lets the cache transition <code>B42: writeback in flight -&gt; clean</code> and unpin it. Failure leaves the data needing retry, reporting, or recovery policy. In either case, CPU ownership returns only after the completion state is recorded.</p>
+<h3>5. The waiting path rechecks and continues</h3>
+<p>The awakened thread reacquires the relevant lock and rechecks request status; it does not assume that a wakeup itself proves success. It can now return an I/O result, retry, or let background writeback handle the next step.</p>
+<p><strong>Naive contrast:</strong> ringing the device before descriptor fields are visible lets hardware read partial or stale work. Releasing <code>B42</code> before step 4 allows reuse during DMA. Marking it clean when merely submitted makes a power or device error look like durable storage.</p>
+<p>So far, the kernel has transformed one cache-buffer request into a descriptor chain, hardware activity, an interrupt, and a completion state. The driver holds the same invariant throughout: slot <code>5</code>, its DMA buffer, and its completion record describe one request until the device gives ownership back.</p>
+<h2>Trade-offs and Limits</h2>
+<p>DMA reduces CPU copying and lets the CPU schedule other work while a device transfers bytes. Interrupts avoid busy-waiting for infrequent completions. The trade-off is extra state: descriptor allocation, DMA-safe memory, publication ordering, locks shared with interrupt context, and explicit error recovery.</p>
+<p>For a tiny or very fast operation, polling a status register can be simpler and avoid interrupt overhead. For many requests, rings and batched notifications improve throughput but make ownership and queue indices harder to inspect. A robust driver may switch between interrupt-driven and polling modes under load, but the basic ownership state machine remains the same.</p>
+<p>This mechanism does not make hardware trustworthy or transfers infallible. A device can report errors, reset, or fail to complete. A driver needs timeouts, recovery, and resource limits before it can claim a production-quality interface. The signal to watch is a request that stays <code>in_flight</code> too long, a completion status error, or a growing count of pinned buffers: each means the ownership handoff did not finish normally.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: “MMIO is just a function call through a pointer.”</h3>
+<p>Why it is tempting:</p>
+<p>The source code often looks like a store to an address.</p>
+<p>Better model:</p>
+<p>The address represents hardware state. A read or write can communicate with a device and must follow the platform's ordering and access rules.</p>
+<h3>Confusion: “DMA lets the device use any buffer forever.”</h3>
+<p>Why it is tempting:</p>
+<p>DMA bypasses per-byte CPU copying.</p>
+<p>Better model:</p>
+<p>The driver grants device access to a specific buffer for a defined interval. The buffer must remain valid and unmodified in incompatible ways until completion returns ownership.</p>
+<h3>Confusion: “An interrupt means the request succeeded.”</h3>
+<p>Why it is tempting:</p>
+<p>The interrupt arrives after a device event.</p>
+<p>Better model:</p>
+<p>The handler must inspect completion status and map it to the matching request. An interrupt can indicate an error or several completions, not a universal success signal.</p>
+<h3>Confusion: “The interrupt handler can wait for a free descriptor.”</h3>
+<p>Why it is tempting:</p>
+<p>The handler also needs shared queue state.</p>
+<p>Better model:</p>
+<p>Interrupt context should update short state and wake task-context code. Waiting while holding an interrupt-shared lock can deadlock progress or stall the CPU.</p>
+<p><strong>Check:</strong> The driver submits a DMA write for <code>B42</code>, then immediately unpins and recycles <code>B42</code> for an incoming network packet. What is the specific failure risk?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The device can still DMA-read or DMA-write <code>B42</code> while the network code changes or owns that memory. The transfer may write the wrong bytes, corrupt the new owner, and leave the completion mapping meaningless. The buffer stays pinned until completion returns ownership.</p>
+<p><strong>Check:</strong> An interrupt handler wakes a blocked writer, but the request status is still “in flight.” Should the writer report success?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The writer must recheck the status under the request's synchronization rule. A wakeup announces that relevant state may have changed; it does not substitute for a recorded successful completion.</p>
+<h2>Practice: review a DMA handoff</h2>
+<p>Review a proposed driver change: “To reduce latency, write the MMIO notify register first, then fill the descriptor fields and request table. Free the buffer as soon as notify returns.”</p>
+<p>Write a short review that names:</p>
+<ol>
+<li>two states that must be recorded before notification;</li>
+<li>the ownership violation in freeing the buffer;</li>
+<li>the correct point at which a dirty cache buffer may become clean; and</li>
+<li>one action appropriate for the interrupt handler versus one action that belongs in task context.</li>
+</ol>
+<p>Use this rubric:</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>A good answer shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Publication</td>
+<td>descriptors and software request mapping are complete before hardware can observe the slot</td>
+</tr>
+<tr>
+<td>Ownership</td>
+<td>the DMA buffer remains valid, pinned, and associated with its request until completion</td>
+</tr>
+<tr>
+<td>Completion</td>
+<td>success status, not submission, permits clean/unpinned cache state</td>
+</tr>
+<tr>
+<td>Context</td>
+<td>the interrupt handler acknowledges, records, and wakes; longer waiting or recovery runs in task context</td>
+</tr>
+<tr>
+<td>Failure</td>
+<td>an error or timeout preserves evidence and triggers policy rather than silently declaring success</td>
+</tr>
+</tbody>
+</table>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://pdos.csail.mit.edu/6.1810/2025/xv6/book-riscv-rev5.pdf">MIT 6.1810 xv6 book, interrupts and device drivers</a> — Focus: trace a teaching kernel's interrupt path and driver ownership boundaries.</li>
+<li>[COURSE] <a href="https://pdos.csail.mit.edu/6.1810/2025/labs/net.html">MIT 6.1810 network-driver lab</a> — Focus: inspect an E1000's DMA descriptor rings, MMIO control registers, and receive-buffer replacement.</li>
+<li>[DOC] <a href="https://docs.kernel.org/driver-api/index.html">Linux kernel Driver API</a> — Focus: use the production-driver vocabulary for device discovery, DMA, interrupts, and lifecycle management.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>A driver bridges synchronous kernel requests and asynchronous hardware using MMIO control plus DMA-visible shared memory.</li>
+<li>A DMA buffer has an explicit ownership interval; it cannot be recycled until completion returns it to the CPU.</li>
+<li>Descriptor, buffer, and software request-table state must be published before the device is notified.</li>
+<li>Interrupt handlers record and signal completion; they do not assume success or block on long operations.</li>
+</ol>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="011.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Block I/O, Buffer Cache, and Writeback</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="013.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Networking Path and Packet Buffers</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/operating-systems-implementation.html">← Back to Operating Systems Implementation</a></p>
+  <p><a href="../../classifications/systems-internals.html">← Back to Systems Internals</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-20 08:42 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Files, Inodes, and the Virtual Filesystem Interface - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/operating-systems-implementation.html" aria-label="Exit lesson and return to Operating Systems Implementation">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Files, Inodes, and the Virtual Filesystem Interface</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/systems-internals.html">Systems Internals</a>
+    /
+    <a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a>
+    /
+    010
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">010</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Files, Inodes, and the Virtual Filesystem Interface</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace <code>open</code> and <code>read</code> from a pathname or descriptor to kernel file state.</p>
+</li>
+<li>
+<p>Distinguish a file descriptor, an open-file object, an inode, and a directory entry.</p>
+</li>
+<li>
+<p>Review a minimal VFS boundary and predict whether two reads share an offset.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A filesystem interface works because it gives names, per-open state, persistent object metadata, and storage-specific operations different jobs instead of putting them all in “the file.”</p>
+</blockquote>
+<p><code>logger</code> executes:</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">&quot;/var/log/app.log&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">);</span>
+</code></pre></div>
+
+<p>It looks like <code>fd</code> is the file. Then a second process opens the same path and gets another integer. If the integers were the file, what happens to the cursor? If the pathname were the file, what happens after the pathname has been resolved? If the inode alone were the file, where would the read offset and access mode live for each open?</p>
+<p>Those questions force a useful split. A small kernel needs at least a process-local handle, an object representing one open instance, persistent metadata for the underlying object, and a way to translate names through directories. A <strong>virtual filesystem interface</strong> (VFS) is the boundary that lets <code>open</code>, <code>read</code>, and <code>close</code> use those roles without making every syscall know how a particular backing filesystem stores blocks.</p>
+<h2>Core Insight</h2>
+<p>The tempting design is one record called <code>file</code> that stores a name, data blocks, permissions, offset, and every process's handles. It works for one process and one filesystem. It breaks as soon as two processes open the same object with different offsets, a pipe is exposed through a descriptor but has no pathname, or a second filesystem needs different lookup and read code.</p>
+<p>Use separate objects with separate ownership:</p>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th>What it answers</th>
+<th>Typical lifetime</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>file descriptor (<code>fd</code>)</td>
+<td>“Which open object does this process mean?”</td>
+<td>until the process closes that table entry or exits</td>
+</tr>
+<tr>
+<td>open-file object</td>
+<td>“What are this open's mode, offset, and reference count?”</td>
+<td>until every descriptor referring to this open is closed</td>
+</tr>
+<tr>
+<td>inode or vnode-like object</td>
+<td>“What persistent object is this, and how can its filesystem operate on it?”</td>
+<td>cached while referenced; its durable metadata outlives opens</td>
+</tr>
+<tr>
+<td>directory entry</td>
+<td>“Within this directory, which name refers to which object?”</td>
+<td>while that name-to-object link exists; it may also be cached</td>
+</tr>
+</tbody>
+</table>
+<p>Plain meaning:</p>
+<p>The pathname is an address written on an envelope. An inode is the building's record. An open-file object is one visitor's bookmark and access badge. A descriptor is the number on that visitor's coat check ticket.</p>
+<p>In this scenario:</p>
+<p><code>fd == 3</code> is meaningful only in <code>logger</code>'s descriptor table. It points to an open-file object whose offset may be <code>0</code>. A second <code>open</code> of the same pathname can create a second open-file object, also referring to the same inode, but with its own offset.</p>
+<p>Technical name:</p>
+<p>The process table maps an integer <strong>file descriptor</strong> to an <strong>open file description</strong> (called an open-file object here). The object representing filesystem metadata is often an <strong>inode</strong>. A production VFS commonly also uses a <strong>dentry</strong> to represent a name in a directory. A teaching kernel can use a simpler in-memory directory lookup while keeping the same responsibility split.</p>
+<h2>The Promise of a Small VFS</h2>
+<p>The syscall layer should make one promise: after a pathname resolves, ordinary operations work through a stable file-like interface. A regular disk file, a directory, a device, or a pipe can present operations such as:</p>
+<div class="codehilite"><pre><span></span><code>lookup(parent, name) -&gt; object or error
+open(object, flags) -&gt; open-file object
+read(open-file object, destination, count) -&gt; bytes or error
+write(open-file object, source, count) -&gt; bytes or error
+close(open-file object) -&gt; release one reference
+</code></pre></div>
+
+<p>This is deliberately small. The VFS owns common policy and routing: descriptor allocation, per-open mode, offset updates, reference accounting, and dispatch to the object's operations. The backing filesystem owns its representation: directory records, inode layout, logical-block mapping, and later the cache and writeback policy in lesson 011.</p>
+<p>The boundary is not a claim that every object behaves identically. Reading a directory may return entries, reading a pipe may block, and reading a device may invoke a driver. The promise is narrower: the syscall layer can route a file-like request through one controlled interface, with each object type declaring the operations it supports.</p>
+<h2>A Naive Design Loses Per-Open State</h2>
+<p>Suppose a kernel stores one mutable <code>offset</code> inside the inode:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">inode</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">size</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">offset</span><span class="p">;</span><span class="w">   </span><span class="c1">// naive: shared by every open</span>
+<span class="w">  </span><span class="p">...</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p><code>logger</code> reads four bytes and changes <code>inode.offset</code> from <code>0</code> to <code>4</code>. Later, <code>reporter</code> opens the same path expecting to start at byte <code>0</code>, but it starts at byte <code>4</code>. The two processes have accidentally shared a cursor just because they share the persistent object.</p>
+<p>Moving the offset into the open-file object fixes the normal <code>open</code> case:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">open_file</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">struct</span><span class="w"> </span><span class="nc">inode</span><span class="w"> </span><span class="o">*</span><span class="n">node</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">offset</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">readable</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">writable</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">refcount</span><span class="p">;</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p>Now two calls to <code>open</code> create two open-file objects and two offsets. But duplicating a descriptor with <code>dup</code> should usually create a second descriptor to the <em>same</em> open-file object, so those duplicated descriptors intentionally share an offset. That is not a special exception; it is evidence that “descriptor” and “open” are different objects.</p>
+<p>The object split also makes ownership visible. <code>open_file.node</code> holds a reference to the inode. Each descriptor pointing to the open file raises its <code>refcount</code>. <code>close(fd)</code> removes just that process-table entry; it releases the inode only when the final open-file reference disappears. The lifetime rules from lesson 005 and synchronization rules from lesson 009 apply here too.</p>
+<h2>Worked Trace: <code>open</code> then <code>read</code></h2>
+<p>Assume <code>logger</code> has an empty descriptor slot and <code>/var/log/app.log</code> contains the bytes <code>KERN...</code>. The process asks to read the first four bytes.</p>
+<p><strong>Input:</strong> <code>open("/var/log/app.log", O_RDONLY)</code> followed by <code>read(3, user_buf, 4)</code>.</p>
+<h3>1. <code>open</code> crosses the syscall boundary</h3>
+<p>As in lesson 008, the kernel copies or safely reads the user pathname and validates flags before changing kernel state. It begins at the process root or current working directory and resolves one component at a time:</p>
+<div class="codehilite"><pre><span></span><code>root -- &quot;var&quot; --&gt; inode for /var
+/var -- &quot;log&quot; --&gt; inode for /var/log
+/var/log -- &quot;app.log&quot; --&gt; inode for the regular file
+</code></pre></div>
+
+<p>Each directory lookup turns a name in a parent directory into a child object. A production VFS may cache this name-to-object relation as dentries; the teaching-kernel model only needs the same logical transition.</p>
+<h3>2. The kernel creates per-open state and a process handle</h3>
+<p>The resolved inode says what the persistent object is: regular file, directory, device, or another supported kind. The kernel checks that <code>O_RDONLY</code> is allowed, increments the inode reference, creates:</p>
+<div class="codehilite"><pre><span></span><code>open_file A: node = app.log inode, offset = 0, readable = true, refcount = 1
+</code></pre></div>
+
+<p>Then it selects an unused entry in <code>logger.files[]</code> and stores a pointer to <code>open_file A</code> there. Suppose the selected index is <code>3</code>.</p>
+<p><strong>Intermediate state:</strong> <code>logger.files[3] -&gt; open_file A -&gt; app.log inode</code>; the return value is <code>3</code>. No pathname needs to be parsed on each later <code>read</code>.</p>
+<h3>3. <code>read(3, user_buf, 4)</code> routes through that open</h3>
+<p>The kernel first checks that descriptor <code>3</code> exists in <code>logger</code> and that <code>open_file A.readable</code> is true. It reads from the inode at <code>open_file A.offset == 0</code>. The filesystem-specific read implementation maps the requested byte range to its stored representation; the next lesson will follow that mapping through cached blocks and device I/O.</p>
+<p>If four bytes are available, the filesystem supplies <code>KERN</code>. Only after the read result is known does the kernel advance <code>open_file A.offset: 0 -&gt; 4</code>, subject to the object's locking and short-read/error rules. It copies the four bytes to the validated user buffer and returns <code>4</code>.</p>
+<p><strong>Output:</strong> the process sees <code>KERN</code>, and its next sequential read starts at byte <code>4</code>.</p>
+<h3>4. A second open does not inherit the first cursor</h3>
+<p><code>reporter</code> now executes <code>open("/var/log/app.log", O_RDONLY)</code>. It resolves the same inode but receives <code>open_file B</code> with <code>offset = 0</code>. Its descriptor might also be integer <code>3</code>, because descriptor numbers are process-local.</p>
+<div class="codehilite"><pre><span></span><code>logger.files[3]   -&gt; open_file A (offset 4) -&gt; app.log inode
+reporter.files[3] -&gt; open_file B (offset 0) -&gt; app.log inode
+</code></pre></div>
+
+<p><strong>Naive contrast:</strong> storing the offset in the inode would make both reads begin at the same shared cursor. Storing descriptor <code>3</code> globally would make unrelated processes collide. The three-level graph prevents both errors.</p>
+<p>So far, the pathname gave us a route, the descriptor gave one process a handle, the open-file object gave one open its mutable state, and the inode identified the underlying object. The VFS boundary makes these responsibilities explicit before we add the lower storage path.</p>
+<h2>Trade-offs and Limits of the VFS Boundary</h2>
+<p>A minimal VFS buys a stable syscall path and lets a kernel add another filesystem or file-like object without duplicating descriptor logic. It also makes debugging clearer: an invalid descriptor is a process-table problem; a wrong offset is an open-file problem; a bad name lookup is a directory problem; wrong data mapping is an inode or storage problem.</p>
+<p>The trade-off is explicit: the split buys a stable interface and independent per-open state, but it costs extra objects, references, locking, and error paths. Name lookup may need caches and invalidation. Sharing an open-file object through <code>dup</code> requires its offset updates to be synchronized. Supporting many object types grows the operation table and makes unsupported operations explicit errors.</p>
+<p>The boundary does not solve storage durability. A successful <code>write</code> may have changed an in-memory cache but not reached the device. It also does not make permissions optional: access checks occur during lookup and open according to the kernel's policy, and later operations must respect the open mode. You can see the boundary when a bug crosses layers: a correct <code>fd</code> with stale data is not a descriptor bug; it is evidence to inspect cache or writeback behavior next.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: “A descriptor is the inode number.”</h3>
+<p>Why it is tempting:</p>
+<p>Both are small identifiers associated with a file.</p>
+<p>Better model:</p>
+<p>An <code>fd</code> indexes one process's descriptor table and can refer to a pipe or device as well as a regular file. An inode identifies filesystem object metadata. The mapping between them passes through an open-file object.</p>
+<h3>Confusion: “Two opens of the same pathname must share the cursor.”</h3>
+<p>Why it is tempting:</p>
+<p>They reach the same underlying bytes.</p>
+<p>Better model:</p>
+<p>Two independent <code>open</code> calls normally create two open-file objects, so their offsets are independent. Two descriptors produced by <code>dup</code> reference one open-file object and therefore share its offset.</p>
+<h3>Confusion: “The pathname is checked once, so it is permanent identity.”</h3>
+<p>Why it is tempting:</p>
+<p>The user supplies a pathname and receives a descriptor from it.</p>
+<p>Better model:</p>
+<p>A pathname is a directory lookup request. After resolution, the open object holds a reference to the underlying object; later <code>read(fd, ...)</code> uses the descriptor graph, not a new pathname search each time.</p>
+<h3>Confusion: “VFS means every backend has identical behavior.”</h3>
+<p>Why it is tempting:</p>
+<p>The top-level calls have uniform names.</p>
+<p>Better model:</p>
+<p>VFS standardizes routing and common object roles. It dispatches to type- or filesystem-specific operations, which may reject an operation or implement different waiting and storage behavior.</p>
+<p><strong>Check:</strong> <code>logger</code> calls <code>open</code> twice on the same pathname. It reads 10 bytes through the first descriptor. Where should the second descriptor's initial offset be stored, and what value should it have?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> In a second open-file object, initialized to <code>0</code>. Both open-file objects refer to the same inode, but separate <code>open</code> calls need separate per-open state. This differs from <code>dup</code>, which adds another descriptor to the existing open-file object.</p>
+<p><strong>Check:</strong> A program successfully opens a file, then calls <code>read(fd, ...)</code> one thousand times. Why should the kernel not redo pathname lookup on every call?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The descriptor already identifies a validated open-file object, which holds a reference to the resolved inode and the current offset. Repeating lookup wastes work and could change the meaning if directory names change; descriptor operations should route through the open state.</p>
+<h2>Practice: review a minimal file-object graph</h2>
+<p>Design the structures for a teaching kernel that supports regular files, a read-only device, <code>open</code>, <code>read</code>, <code>close</code>, and <code>dup</code>.</p>
+<p>Draw a graph for this sequence:</p>
+<div class="codehilite"><pre><span></span><code>fd1 = open(&quot;/notes.txt&quot;, O_RDONLY)
+fd2 = dup(fd1)
+fd3 = open(&quot;/notes.txt&quot;, O_RDONLY)
+read(fd1, ..., 5)
+</code></pre></div>
+
+<p>Use this rubric:</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>A good answer shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Descriptor mapping</td>
+<td><code>fd1</code> and <code>fd2</code> are entries in one process table; <code>fd3</code> is another entry</td>
+</tr>
+<tr>
+<td>Per-open state</td>
+<td><code>fd1</code> and <code>fd2</code> share one offset; <code>fd3</code> has a distinct offset beginning at <code>0</code></td>
+</tr>
+<tr>
+<td>Persistent object</td>
+<td>both open-file objects refer to the same inode for <code>/notes.txt</code></td>
+</tr>
+<tr>
+<td>Ownership</td>
+<td>closing one descriptor does not release the inode while another open-file reference remains</td>
+</tr>
+<tr>
+<td>VFS boundary</td>
+<td>regular-file and device reads can use common routing while dispatching to different read operations</td>
+</tr>
+</tbody>
+</table>
+<h2>Resources</h2>
+<ul>
+<li>[DOC] <a href="https://docs.kernel.org/filesystems/vfs.html">Linux kernel: Overview of the Virtual File System</a> — Focus: inspect the distinct VFS roles of file, inode, dentry, and operation objects.</li>
+<li>[BOOK] <a href="https://pdos.csail.mit.edu/6.1810/2025/xv6/book-riscv-rev5.pdf">MIT 6.1810 xv6 book, File system chapter</a> — Focus: trace the smaller teaching-kernel path from descriptors through files and inodes.</li>
+<li>[COURSE] <a href="https://pdos.csail.mit.edu/6.1810/2025/homework/xv6-fs.html">MIT 6.1810 xv6 filesystem reading</a> — Focus: inspect <code>file.c</code>, <code>sysfile.c</code>, <code>fs.c</code>, and <code>bio.c</code> as separate implementation boundaries.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>A file descriptor is a process-local handle, not a pathname or a persistent filesystem object.</li>
+<li>An open-file object owns per-open state such as offset and mode; an inode represents the underlying object and its metadata.</li>
+<li>Pathname lookup maps names through directories once; later descriptor operations route through the resolved open object.</li>
+<li>A small VFS centralizes routing and common policy while leaving data layout and device behavior to the backing implementation.</li>
+</ol>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="009.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Synchronization Inside the Kernel</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="011.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Block I/O, Buffer Cache, and Writeback</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/operating-systems-implementation.html">← Back to Operating Systems Implementation</a></p>
+  <p><a href="../../classifications/systems-internals.html">← Back to Systems Internals</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-20 08:42 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

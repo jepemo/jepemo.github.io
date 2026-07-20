@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Block I/O, Buffer Cache, and Writeback - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/operating-systems-implementation.html" aria-label="Exit lesson and return to Operating Systems Implementation">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Block I/O, Buffer Cache, and Writeback</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/systems-internals.html">Systems Internals</a>
+    /
+    <a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a>
+    /
+    011
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/operating-systems-implementation.html">Operating Systems Implementation</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">011</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Block I/O, Buffer Cache, and Writeback</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace a file write from byte offset to cached block, dirty state, and device submission.</p>
+</li>
+<li>
+<p>Distinguish a write that is visible to readers from one that is durable after a crash.</p>
+</li>
+<li>
+<p>Diagnose unsafe eviction, stale reads, and an incomplete writeback path.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A buffer cache gives the kernel one shared, mutable copy of a disk block; dirty state records that the copy is newer than storage until writeback makes it durable.</p>
+</blockquote>
+<p><code>logger</code> already has an open-file object for <code>/var/log/app.log</code> from lesson 010. It calls:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">write</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;OK</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Suppose its current file offset is <code>1026</code> and the teaching kernel uses 1024-byte blocks. The bytes do not go directly from the user buffer to “the file.” First the VFS routes the request to the inode. The filesystem maps the byte range to a <em>logical block within that file</em>, then to a <em>physical block on the device</em>. The buffer cache finds or creates the in-memory copy for that physical block. Only then can the kernel modify three bytes.</p>
+<p>The difficult question arrives after <code>write</code> returns: if another process reads the same file now, should it see <code>OK\n</code>? Usually yes. If power fails now, must the bytes survive reboot? Not necessarily. A cache can make a write visible before it is durable. That gap is useful for performance, but it is also a contract the kernel must state and protect.</p>
+<h2>Core Insight</h2>
+<p>The small state machine for a cached block is more useful than the word “cache”:</p>
+<div class="codehilite"><pre><span></span><code>not cached
+  -&gt; present and clean
+  -&gt; present and dirty
+  -&gt; writeback in flight
+  -&gt; present and clean
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Memory copy compared with storage</th>
+<th>What the kernel may do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>clean</td>
+<td>equal to the last completed device write</td>
+<td>reuse it for reads or evict it when unpinned</td>
+</tr>
+<tr>
+<td>dirty</td>
+<td>newer than storage</td>
+<td>serve coherent reads, retain it, and schedule writeback</td>
+</tr>
+<tr>
+<td>writeback in flight</td>
+<td>being submitted or completed by the device</td>
+<td>protect its ownership and define what a concurrent writer sees</td>
+</tr>
+<tr>
+<td>pinned/referenced</td>
+<td>actively used by a caller or required by a transaction</td>
+<td>do not recycle it for another block</td>
+</tr>
+</tbody>
+</table>
+<p>Plain meaning:</p>
+<p>The buffer cache is the kernel's shared notebook for one disk block. A dirty page in that notebook contains the latest agreed edit, while the disk may still have yesterday's page.</p>
+<p>In this scenario:</p>
+<p>The three bytes at offsets <code>1026..1028</code> are part of file logical block <code>1</code>, at in-block offsets <code>2..4</code>. The cache buffer for whichever device block backs logical block <code>1</code> becomes the authoritative in-memory version for later readers.</p>
+<p>Technical name:</p>
+<p>This is a <strong>buffer cache</strong> or block cache. A block with modifications not yet installed on persistent media is <strong>dirty</strong>. Moving dirty contents to the device is <strong>writeback</strong>. A completed writeback is a durability event only when the storage stack's ordering and flush guarantees say it is; a mere CPU copy is not persistence.</p>
+<h2>Why a Cache Is Also a Correctness Boundary</h2>
+<p>The naive design lets each reader or writer allocate its own temporary block buffer:</p>
+<div class="codehilite"><pre><span></span><code>writer A reads sector 42 into private buffer A
+writer B reads sector 42 into private buffer B
+A changes bytes 2..4 and writes A
+B changes bytes 500..503 and writes B
+</code></pre></div>
+
+<p>If <code>B</code> writes last, its older private copy can erase A's new bytes. Reads can also disagree: a process that rereads through a new buffer may see an older device copy even though another process just received a successful write result.</p>
+<p>A buffer cache maintains a central invariant:</p>
+<blockquote>
+<p>For each device and block number, there is at most one cached buffer representing its current in-memory contents.</p>
+</blockquote>
+<p>The exact implementation can use a hash table plus an eviction list, or a simpler fixed table in a teaching kernel. The important part is not the data structure. It is that lookup, buffer ownership, dirty marking, and eviction all respect the “one current copy” invariant. The locks and reference rules from lesson 009 protect that state; the ownership rules from lesson 005 explain why an in-use or transaction-pinned buffer cannot simply be reused.</p>
+<h2>The Moving Parts</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Input</th>
+<th>Responsibility</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VFS/open-file object</td>
+<td><code>fd</code>, user bytes, file offset</td>
+<td>validate mode and route the operation</td>
+<td>inode write request</td>
+</tr>
+<tr>
+<td>inode mapping</td>
+<td>byte range</td>
+<td>map file logical block to device block; allocate if needed</td>
+<td><code>(device, block_number, in_block_offset)</code></td>
+</tr>
+<tr>
+<td>buffer cache</td>
+<td>device block</td>
+<td>return the unique locked/pinned in-memory buffer</td>
+<td>readable/writable block contents</td>
+</tr>
+<tr>
+<td>writeback policy</td>
+<td>dirty buffer</td>
+<td>decide when and in what order to submit it</td>
+<td>device request or deferred dirty state</td>
+</tr>
+<tr>
+<td>device driver</td>
+<td>block request</td>
+<td>transfer bytes and report completion</td>
+<td>success, error, or retry signal</td>
+</tr>
+</tbody>
+</table>
+<p>The cache does not replace the filesystem's mapping. It stores device blocks, while the inode says which blocks belong to which byte range in a file. Lesson 010 separated the open-file offset from the inode; this lesson separates logical file layout from one current copy of a device block.</p>
+<h2>Worked Trace: a write becomes dirty, then durable</h2>
+<p>Assume <code>fd</code> is writable, its current offset is <code>1026</code>, block size is 1024, and the inode maps logical file block <code>1</code> to device block <code>42</code>. The process writes <code>OK\n</code>.</p>
+<p><strong>Input:</strong> <code>write(fd, user_buf, 3)</code> with bytes <code>O</code>, <code>K</code>, newline.</p>
+<h3>1. The VFS validates the open and finds the byte range</h3>
+<p>The syscall handler validates the user range before copying it, as in lesson 008. The VFS checks <code>fd</code> and the open-file mode, then asks the inode layer to write at offset <code>1026</code>.</p>
+<div class="codehilite"><pre><span></span><code>file offset = 1026
+logical block = floor(1026 / 1024) = 1
+in-block offset = 1026 mod 1024 = 2
+range in block 1 = bytes 2, 3, 4
+</code></pre></div>
+
+<p>The inode mapping returns device block <code>42</code>. If the file must grow, the mapping may allocate a new data block and update metadata; those metadata changes have their own ordering requirements.</p>
+<h3>2. The cache returns the one buffer for block 42</h3>
+<p>The kernel looks up <code>(device0, 42)</code>. On a cache miss it reserves a reusable <em>clean and unpinned</em> buffer, labels it as block <code>42</code>, and asks the driver to read it before modifying unrelated bytes. On a hit it waits or locks as needed so that no second caller edits a competing copy.</p>
+<p><strong>Intermediate state:</strong> one buffer represents block <code>42</code>; it is locked or referenced by this operation. It is clean if its bytes match storage, or already dirty if an earlier writer changed it.</p>
+<h3>3. The write changes the cache before storage</h3>
+<p>The inode layer copies <code>OK\n</code> into positions <code>2..4</code> of the buffer. It records the data-length or inode metadata change that the write requires, marks the relevant buffers dirty, and advances this open-file object's offset from <code>1026</code> to <code>1029</code> after the accepted byte count is known.</p>
+<div class="codehilite"><pre><span></span><code>buffer 42: clean -&gt; dirty
+cache bytes 2..4: old -&gt; &quot;OK\n&quot;
+device block 42: still old contents
+</code></pre></div>
+
+<p>At this point a later reader that uses the same cache can observe the new bytes. The process may receive return value <code>3</code> if the kernel's write contract accepts buffered writes. That return value says the kernel accepted the bytes into its managed state; it does not automatically say the bytes survive a power loss.</p>
+<h3>4. Writeback submits the dirty buffer</h3>
+<p>A synchronous request, memory pressure, a background policy, or an explicit durability operation may select buffer <code>42</code> for writeback. The cache keeps it referenced or marks it in flight, and the block layer gives the driver a request for device block <code>42</code>.</p>
+<p>The driver programs the device and later receives a completion signal. On successful completion, the kernel can mark buffer <code>42</code> clean <em>only if no later writer dirtied it again while the earlier write was in flight</em>. If a second write occurred, it remains dirty and needs another pass.</p>
+<p><strong>Output/decision:</strong> after the required data and metadata writes complete in the promised order, the kernel may report durability for an explicit sync-style request. If the device reports an error, the buffer cannot be quietly treated as clean; the error must reach the policy and, where applicable, the caller.</p>
+<h3>5. Crash contrast: visible is not durable</h3>
+<p>If power fails after step 3 but before the relevant writes complete, the cache disappears. After reboot, device block <code>42</code> can contain its old bytes. If the write also extended a file, data and metadata may disagree unless the filesystem uses a disciplined ordering or a journal/transaction protocol.</p>
+<p><strong>Naive contrast:</strong> writing each caller's private temporary buffer directly to the device loses the single-current-copy invariant. Marking a buffer clean immediately after issuing I/O can claim durability before completion. Evicting a dirty buffer without flushing it discards accepted data.</p>
+<p>So far, we have seen a complete path: user bytes become a range, the range maps to a logical and then device block, one cache buffer becomes dirty, and writeback plus device completion determines when the storage copy catches up. The cache is fast because it avoids unnecessary I/O, but it is correct only because later readers and writers agree on the same buffer state.</p>
+<h2>Visibility, Durability, and Ordering</h2>
+<p>Three statements that sound similar are different:</p>
+<table>
+<thead>
+<tr>
+<th>Statement</th>
+<th>Meaning</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>accepted</td>
+<td>the kernel copied or recorded the requested bytes</td>
+<td>syscall returned a count</td>
+</tr>
+<tr>
+<td>visible</td>
+<td>a subsequent read through the coherent cache can observe them</td>
+<td>cache lookup returns the dirty buffer</td>
+</tr>
+<tr>
+<td>durable</td>
+<td>they survive the failure model promised by the storage interface</td>
+<td>required writes and ordering completed successfully</td>
+</tr>
+</tbody>
+</table>
+<p>A small kernel can choose simple synchronous writes: do not return until the device confirms the block. That narrows the visibility/durability gap but makes each write slow. A write-back cache batches work and improves throughput, but exposes a window in which a crash loses recent changes. The trade-off is explicit: buffering reduces device waits and enables coalescing, while it costs memory, eviction policy, error handling, and a clear durability contract.</p>
+<p>Ordering adds another limit. Updating a file can touch both a data block and an inode or directory block. If the system writes metadata that exposes a new file length before its data is safe, a crash can leave a length that points at uninitialized or old content. A logging or journaling design records groups of metadata changes so recovery can decide whether to replay a complete transaction. xv6's log pins modified cache buffers until commit and uses a commit point before installing them at their final locations; that is one small example of turning writeback order into a crash-consistency protocol.</p>
+<p>This lesson does not prove a production filesystem recovery algorithm. It gives the boundary: dirty cache state alone provides coherence in memory, not atomic crash recovery.</p>
+<h2>Common Confusions</h2>
+<h3>Confusion: “A cache is only a performance optimization.”</h3>
+<p>Why it is tempting:</p>
+<p>The first visible benefit is fewer device reads.</p>
+<p>Better model:</p>
+<p>One shared buffer per block also makes concurrent reads and writes observe a coherent current copy. Removing it requires another protocol that preserves the same invariant.</p>
+<h3>Confusion: “<code>write</code> returning success means the data is on disk.”</h3>
+<p>Why it is tempting:</p>
+<p>The program gave bytes to an operation called <code>write</code>.</p>
+<p>Better model:</p>
+<p>Success may mean buffered acceptance. Durability depends on the API's sync guarantees, writeback completion, device semantics, and metadata ordering.</p>
+<h3>Confusion: “A dirty buffer may be evicted because it is already in memory.”</h3>
+<p>Why it is tempting:</p>
+<p>Eviction is often described as making room in cache.</p>
+<p>Better model:</p>
+<p>Dirty means memory is the only current copy. The buffer must be retained, written back, or incorporated into a protected transaction before reuse.</p>
+<h3>Confusion: “A device completion makes every earlier filesystem change safe.”</h3>
+<p>Why it is tempting:</p>
+<p>One request completed successfully.</p>
+<p>Better model:</p>
+<p>Durability may require several data and metadata writes in a specific order. One block completion does not establish a whole-file atomic update.</p>
+<p><strong>Check:</strong> Buffer 42 is dirty and has no active callers. Memory pressure needs a reusable cache buffer. What must happen before buffer 42 can represent block 99?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The kernel must preserve or flush the dirty contents and wait for the required completion/error outcome before recycling the buffer. Reusing it immediately loses the only current copy of block 42.</p>
+<p><strong>Check:</strong> A read immediately after a successful buffered write sees the new bytes. A power loss one millisecond later loses them. Is this necessarily a cache-coherence bug?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The cache behaved coherently: readers saw the one dirty in-memory copy. The missing property is durability, which requires a completed and correctly ordered persistence path.</p>
+<h2>Practice: audit a write path</h2>
+<p>Review this design claim: “On <code>write</code>, copy into a cached block, set <code>dirty = true</code>, return success, and let the eviction code discard the block whenever cache space is low.”</p>
+<p>Write a short review containing:</p>
+<ol>
+<li>the state transition that is correct;</li>
+<li>the invariant the design violates;</li>
+<li>the minimum safe eviction/writeback transition;</li>
+<li>what <code>write</code> can honestly promise; and</li>
+<li>one additional requirement if the write changes both file data and inode metadata.</li>
+</ol>
+<p>Use this rubric:</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>A good answer includes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Current-copy invariant</td>
+<td>exactly one cache buffer owns the current contents for a device block</td>
+</tr>
+<tr>
+<td>Dirty handling</td>
+<td>a dirty buffer is not recycled before persistence or protected recovery handling</td>
+</tr>
+<tr>
+<td>Contract</td>
+<td>accepted/visible is distinguished from durable</td>
+</tr>
+<tr>
+<td>Failure path</td>
+<td>device error leaves the state dirty or otherwise recoverable, not falsely clean</td>
+</tr>
+<tr>
+<td>Ordering</td>
+<td>data and metadata need an ordering or transaction rule for crash consistency</td>
+</tr>
+</tbody>
+</table>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://pdos.csail.mit.edu/6.1810/2025/xv6/book-riscv-rev5.pdf">MIT 6.1810 xv6 book, File system and logging</a> — Focus: follow buffer-cache ownership, logging, commit, and recovery as one small implementation path.</li>
+<li>[COURSE] <a href="https://pdos.csail.mit.edu/6.1810/2025/homework/xv6-fs.html">MIT 6.1810 xv6 filesystem reading</a> — Focus: inspect <code>bio.c</code>, <code>fs.c</code>, <code>file.c</code>, and <code>sysfile.c</code> to separate mapping, cache, and VFS responsibilities.</li>
+<li>[COURSE] <a href="https://pdos.csail.mit.edu/6.1810/2025/homework/xv6-log.html">MIT 6.1810 xv6 logging reading</a> — Focus: trace how modified cache blocks enter the log and reach the commit point.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>A buffer cache owns the coherent in-memory copy of each device block, not merely a convenient duplicate.</li>
+<li>Dirty state means the cache is newer than persistent storage; it must not be silently recycled.</li>
+<li>Accepted, visible, and durable writes are distinct milestones with different evidence.</li>
+<li>Writeback needs completion, error, and ordering rules, especially when one operation changes both data and metadata.</li>
+</ol>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="010.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Files, Inodes, and the Virtual Filesystem Interface</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="012.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Device Driver Model, MMIO, DMA, and Interrupts</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/operating-systems-implementation.html">← Back to Operating Systems Implementation</a></p>
+  <p><a href="../../classifications/systems-internals.html">← Back to Systems Internals</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-20 08:42 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
