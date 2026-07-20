@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Durable Writes, Journals, and Recovery Boundaries - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/storage-and-filesystems.html" aria-label="Exit lesson and return to Storage and Filesystems">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Durable Writes, Journals, and Recovery Boundaries</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/systems-internals.html">Systems Internals</a>
+    /
+    <a href="../../tracks/storage-and-filesystems.html">Storage and Filesystems</a>
+    /
+    005
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/storage-and-filesystems.html">Storage and Filesystems</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">005</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Durable Writes, Journals, and Recovery Boundaries</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace a multi-step write through intent recording, durable decision, page writeback, and checkpoint.</p>
+</li>
+<li>
+<p>Predict what recovery may replay, discard, or trust after a crash at a named point.</p>
+</li>
+<li>
+<p>State what an acknowledgement promises locally and which signals reveal pressure on that promise.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A durable write is not just bytes reaching a device; it is a recovery rule that ensures a crash leaves either a known old state or a known new state, not an unexplained mixture.</p>
+</blockquote>
+<h2>The publish button during a power cut</h2>
+<p>An editor changes a course title and presses <strong>Publish</strong>. The platform must update two pieces of durable state:</p>
+<div class="codehilite"><pre><span></span><code>course record:      title = &quot;Storage Paths&quot;
+publication index:  course-42 is visible
+</code></pre></div>
+
+<p>The editor sees success. At that moment the host loses power.</p>
+<p>After restart, what is allowed to happen? It would be confusing if the index says the course is public but the course record still has the old title. It would be worse if the platform cannot tell which parts of the operation reached storage at all.</p>
+<p>The naive model says that <code>write()</code> changes the file or database page in one indivisible moment. Actual storage paths are usually staged. The process changes memory, queues writes, records intent, asks the operating system or service to make some state durable, writes data pages later, and eventually records a checkpoint. A power cut can interrupt any boundary.</p>
+<p>The system needs a story that survives the interruption. A journal or write-ahead log records enough ordered intent and decision information for recovery to make the state coherent again. The goal is not that every page was already in its final place at the instant of acknowledgement. The goal is that restart can determine which outcome it must produce.</p>
+<h2>Core Insight</h2>
+<p>Plain meaning:</p>
+<blockquote>
+<p>Write down a recoverable plan before relying on scattered final updates, so a restart knows whether to finish the plan or leave it out.</p>
+</blockquote>
+<p>In this scenario:</p>
+<blockquote>
+<p>Before the course record and publication index are both written back, the storage system records that change <code>J81</code> intends to update both and later records whether <code>J81</code> became durable enough to count.</p>
+</blockquote>
+<p>Technical name:</p>
+<blockquote>
+<p>A <strong>journal</strong> or <strong>write-ahead log (WAL)</strong> is an ordered durable record used to recover a consistent state. A <strong>recovery boundary</strong> is the rule that separates changes recovery must honor from changes it must discard or undo.</p>
+</blockquote>
+<p>This lesson uses a small generic model. A filesystem journal, a database WAL, and a copy-on-write system use different data structures and ordering rules. They share a foundational pressure: final state is often materialized in several places, while a crash needs one reliable answer about what happened.</p>
+<h2>Four pieces of a recoverable write</h2>
+<p>Keep four pieces separate. They may be close together in one product, but they are not the same job.</p>
+<table>
+<thead>
+<tr>
+<th>Piece</th>
+<th>Role</th>
+<th>What it lets recovery know</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Intent record</td>
+<td>Describes the change that is being attempted.</td>
+<td>What must be replayed, completed, or checked.</td>
+</tr>
+<tr>
+<td>Decision or commit record</td>
+<td>Says the operation crossed the chosen durable boundary.</td>
+<td>Whether the new outcome belongs to the accepted history.</td>
+</tr>
+<tr>
+<td>Materialized pages</td>
+<td>The ordinary data and metadata pages used for fast reads.</td>
+<td>Current state when they are fully and validly written.</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>Records that earlier durable work is reflected in stable materialized state.</td>
+<td>How far recovery can start without replaying the entire history.</td>
+</tr>
+</tbody>
+</table>
+<p>The journal is not a magical duplicate of all data. In some designs it records metadata changes, in others it records logical changes or page-level information, and in others it helps switch from an old root to a new one. The portable model is simpler: the journal provides a trustworthy ordering and decision boundary while final state may be written later.</p>
+<h2>A worked crash-and-restart trace</h2>
+<p>Use a simplified publication operation <code>J81</code>. The system wants the editor to see success only after the decision record is durably stored. Its ordinary pages may be written back later. That is one valid contract; real systems must document their own ordering and flush behavior.</p>
+<div class="codehilite"><pre><span></span><code>J81 = set title &quot;Storage Paths&quot;; mark course-42 visible
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Journal state</th>
+<th>Materialized course record and index</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0. Before write</td>
+<td>checkpoint through J80</td>
+<td>old title; not visible</td>
+<td>Old state is authoritative.</td>
+</tr>
+<tr>
+<td>1. Prepare</td>
+<td>intent for J81 exists in memory or a queue</td>
+<td>still old</td>
+<td>A crash may lose J81; no promise was made.</td>
+</tr>
+<tr>
+<td>2. Persist intent</td>
+<td>durable intent for J81</td>
+<td>still old</td>
+<td>Recovery knows the proposed change, but not yet whether to accept it.</td>
+</tr>
+<tr>
+<td>3. Commit</td>
+<td>durable decision for J81</td>
+<td>still old</td>
+<td>The new outcome is now part of the recovery boundary; success may be acknowledged in this model.</td>
+</tr>
+<tr>
+<td>4. Write back</td>
+<td>J81 still durable</td>
+<td>title page new; index page may still be old</td>
+<td>Pages can be temporarily uneven because recovery has the journal.</td>
+</tr>
+<tr>
+<td>5. Checkpoint</td>
+<td>J81 is covered by a durable checkpoint</td>
+<td>both pages new</td>
+<td>Recovery no longer needs J81 to reconstruct this operation.</td>
+</tr>
+</tbody>
+</table>
+<p>The input is the editor’s publish request. The transition is from the old pages to a durable journal decision and then to page writeback. The intermediate state at phase 4 is important: one page can be new while another is old. The output after a clean run is a visible course with its new title. The naive failure would be to treat phase 4 as a finished operation without a journal; after a crash, the system could expose a half-published course with no reliable way to choose an outcome.</p>
+<p>Now walk through three crashes.</p>
+<h3>Crash A: after durable intent, before the durable decision</h3>
+<p>The restart sees that <code>J81</code> was being prepared but finds no durable record that it crossed the commit boundary. In this simple model, recovery discards or undoes the incomplete work and keeps the old title and visibility state. The editor did not receive a success acknowledgement, so this outcome matches the promise.</p>
+<h3>Crash B: after the durable decision, before any page writeback</h3>
+<p>The pages still look old. Recovery reads the committed journal entry, replays or completes <code>J81</code>, and materializes both required updates. The editor may have seen success before the power cut, and the restart now makes that success true in the ordinary queryable state.</p>
+<h3>Crash C: after one page writes back, before checkpoint</h3>
+<p>The title page may already be new while the visibility index is old. Recovery does not trust the pages as a complete story by themselves. It uses the committed journal entry to finish or validate the operation, then reaches the same coherent new state as Crash B. The checkpoint was not yet durable, so the journal remains the recovery source for <code>J81</code>.</p>
+<p><strong>Check:</strong> In this model, why is a durable intent record alone not enough to show the editor a successful publish?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Intent says what the system planned, not that it chose to make the new state part of its accepted history. A crash after intent but before the durable decision should be allowed to leave the old state in place. The acknowledgement must match the stronger boundary, not the earliest record written.</p>
+<h2>The acknowledgement is a local promise</h2>
+<p>The previous lesson treated a replicated acknowledgement as evidence about several nodes. Here, zoom in on one node. Its acknowledgement should still mean something precise: under the stated local storage contract, recovery will honor this operation after a process or host crash.</p>
+<p>This does not mean every layer has finished work. Page caches can still contain dirty data, a filesystem may still queue writes, and replicas can still be catching up. It means the system has placed enough information across its trusted durability boundary to recover a coherent result.</p>
+<p>That phrase—<em>trusted durability boundary</em>—deserves care. A call returning to application code is not automatically proof that data survived power loss. The promise depends on the API used, whether writes were flushed or synchronized as required, the device or remote service contract, and the software’s journal ordering. Treat “acknowledged” as a sentence that needs a subject and a condition:</p>
+<div class="codehilite"><pre><span></span><code>Acknowledged by whom?
+Durable where?
+Recoverable after which failure?
+</code></pre></div>
+
+<p>For example, “the application handed bytes to the kernel” is weaker than “the storage system durably recorded a committed journal decision.” Both can be useful events, but they justify different user-facing promises.</p>
+<p><strong>Check:</strong> A monitoring system says dirty pages are high and checkpoint age is growing, yet writes are still acknowledged. Does that automatically prove a bug?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not automatically. If committed journal records are durable, delayed page writeback can be an expected part of the design. But growing dirty-page and checkpoint pressure can increase recovery work and consume journal space. Check that the intended journal durability and checkpoint progress remain healthy rather than assuming pages must be clean for every acknowledged write.</p>
+<h2>Checkpoints make recovery bounded</h2>
+<p>Without checkpoints, a correct system could replay a very long history after every crash. A checkpoint records that a prefix of durable work is now safely represented in stable materialized state. Recovery can start after that boundary, using the journal only for later entries.</p>
+<div class="codehilite"><pre><span></span><code>journal:    [J78] [J79] [J80] | checkpoint | [J81] [J82]
+recovery:                         start here ────────→
+</code></pre></div>
+
+<p>Checkpoints improve restart time and manage journal growth. They have a trade-off: making data pages stable can create background I/O, contention, and latency pressure. Rushing a checkpoint cannot violate the ordering rules that make recovery correct; delaying it too long creates more work after a crash. The interesting question is not “should we checkpoint?” but “how much unfinished durable history can this system safely and economically carry?”</p>
+<h2>Trade-offs and limits</h2>
+<p>Journaling and write-ahead logging improve crash consistency by turning a scattered update into a recoverable sequence. They cost additional writes, ordering barriers, storage space, and recovery or checkpoint work. They do not fix every problem:</p>
+<ul>
+<li>A journal cannot make an incorrect application decision correct.</li>
+<li>A locally durable journal record does not by itself prove that another replica has it.</li>
+<li>Recovery cannot recover information the system never recorded durably.</li>
+<li>A storage device or remote service contract still defines what “flush” and “durable” mean underneath the journal.</li>
+</ul>
+<p>Useful signals reveal the boundary under pressure:</p>
+<ul>
+<li><strong>Journal flush latency and errors</strong> show whether the durable decision path is slowing or failing.</li>
+<li><strong>Dirty-page count and writeback queue depth</strong> show work waiting to become materialized state.</li>
+<li><strong>Checkpoint age, duration, and distance</strong> show how much history a restart may need to process.</li>
+<li><strong>Journal space utilization</strong> shows whether long-running writeback or checkpoints could block future writes.</li>
+<li><strong>Recovery duration and replay count after restart</strong> test whether the designed boundary behaves as expected.</li>
+</ul>
+<p>The goal is not zero recovery work. The goal is known recovery work that leads to a coherent state.</p>
+<h2>Common confusions</h2>
+<h3>Confusion: A journal is only a performance optimization</h3>
+<p>Why it is tempting:</p>
+<p>Journal writes are often discussed alongside batching and sequential I/O, which can improve performance.</p>
+<p>Better model:</p>
+<p>Its central role is correctness after interruption. It gives recovery an ordered record and a decision boundary when final pages are incomplete or uneven.</p>
+<h3>Confusion: A returned write means every final page is already durable</h3>
+<p>Why it is tempting:</p>
+<p>The application sees one success result and naturally imagines one completed physical action.</p>
+<p>Better model:</p>
+<p>The success can be backed by a durable journal decision while ordinary pages remain dirty. The valid promise is recoverability, not necessarily that all representation layers are already clean.</p>
+<h3>Confusion: Crash recovery and replica agreement are the same problem</h3>
+<p>Why it is tempting:</p>
+<p>Both use ordered history and durable records.</p>
+<p>Better model:</p>
+<p>Local recovery asks what one node can reconstruct after a crash. Replication asks which history several nodes may jointly promise. A system often needs both, but each has its own boundary and signals.</p>
+<h2>Practice: choose the recovery boundary</h2>
+<p>A course editor uploads a new package and changes the course manifest to point to it. The package object is stored separately from the manifest. The product must never show a manifest that points to a missing package; it is acceptable for a completed upload to remain hidden after a crash until the editor retries publishing.</p>
+<p>Describe a small recoverable publication plan. State:</p>
+<ol>
+<li>what intent and decision you would record;</li>
+<li>when the editor may receive success;</li>
+<li>what recovery does if the host crashes before or after that decision; and</li>
+<li>one trade-off and one signal to monitor.</li>
+</ol>
+<p><strong>Model answer:</strong> First make the package object durably available under a versioned key. Record an intent to move the manifest from its old package key to the new key, then durably record the publication decision only after the new object’s availability has been verified. Acknowledge the editor after that decision crosses the local durability boundary. If the host crashes before it, recovery leaves the old manifest active and the uploaded object may remain unreferenced for later cleanup. If it crashes after it but before the manifest page is written back, recovery replays or completes the manifest change. This trades extra journal and verification work for no dangling manifest. Monitor journal flush failures, manifest/object verification errors, checkpoint age, and orphaned uploaded-object count.</p>
+<h2>Resources</h2>
+<ul>
+<li>[BOOK] <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">Operating Systems: Three Easy Pieces</a> — Focus: Read the crash-consistency and journaling chapters for concrete filesystem failure traces.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/wal-intro.html">PostgreSQL write-ahead logging</a> — Focus: Compare the generic intent-before-materialization model with a production database WAL.</li>
+<li>[REFERENCE] <a href="https://www.sqlite.org/atomiccommit.html">SQLite atomic commit</a> — Focus: Follow a detailed, inspectable sequence of journal writes, page changes, and crash outcomes.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ol>
+<li>Intent, durable decision, materialized pages, and checkpoints are separate stages of a recoverable write.</li>
+<li>An acknowledgement should name a recovery boundary: after a crash, the system can honor the accepted outcome even if page writeback was incomplete.</li>
+<li>Journals make recovery coherent, not effortless; checkpoint and writeback pressure reveal the cost of carrying unfinished history.</li>
+</ol>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="004.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Replication, Logs, and Storage Consistency</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="006.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>The Storage I/O Path from Syscall to Device or Service</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/storage-and-filesystems.html">← Back to Storage and Filesystems</a></p>
+  <p><a href="../../classifications/systems-internals.html">← Back to Systems Internals</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-20 06:37 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
