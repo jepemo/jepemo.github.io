@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cache Stampede Control and Request Coalescing - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/caching-workers-and-performance.html" aria-label="Exit lesson and return to Caching, Workers, and Performance">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Cache Stampede Control and Request Coalescing</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/reliability-and-observability.html">Reliability And Observability</a>
+    /
+    <a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a>
+    /
+    029
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">029</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Cache Stampede Control and Request Coalescing</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace how one expired popular key can become many equivalent origin requests.</p>
+</li>
+<li>
+<p>Choose a safe coalescing key, leader policy, and follower outcome for a refill.</p>
+</li>
+<li>
+<p>Recognize when stale serving, jitter, or a distributed lease helps—and which freshness or failure boundary remains.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A cache miss is not dangerous by itself; it becomes dangerous when equivalent misses all decide to refill independently.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>For Atlas Shop, <code>product:42:en</code> expires just as a campaign sends 200 requests in one second. The cache says “miss” to every request. Each handler fetches the same product, renders the same public response, and writes it back. Origin CPU spikes even though the resulting cache value is identical.</p>
+<p>The tempting model is that a miss means “this caller must fetch.” That is reasonable for a rare key or a request that cannot share a response. It fails when many callers have the same safe key and arrive before the first refill completes.</p>
+<p>The stronger model is one refill decision per shareable key. One caller becomes the leader; compatible followers either wait for its result, receive a permitted stale value, or receive a bounded overload response. The mechanism reduces duplicate work. It does not decide freshness policy or make unrelated requests equivalent.</p>
+<h2>The Situation: One Expiry, Many Refill Decisions</h2>
+<p>Atlas has already made the public product key safe: it includes product id and language, but not analytics parameters. The origin render takes 120 ms. The following is illustrative traffic:</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Without coordination</th>
+<th>With coordination</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>200 requests find the key expired.</td>
+<td>200 origin renders can begin.</td>
+<td>One refill is elected for <code>product:42:en</code>.</td>
+</tr>
+<tr>
+<td>Origin is slow for 120 ms.</td>
+<td>Connections, CPU, and downstream reads multiply.</td>
+<td>Followers share the leader result, use stale data if allowed, or wait under a timeout.</td>
+</tr>
+<tr>
+<td>The first render finishes.</td>
+<td>Many writes race to store the same value.</td>
+<td>The leader publishes one fresh value and clears in-flight state.</td>
+</tr>
+</tbody>
+</table>
+<p>The unit of coordination is not “the cache” or “the route.” It is the exact response identity that may safely be shared. If the key omits language, authorization, or another representation-changing input, coalescing efficiently returns the wrong response.</p>
+<h2>The Initial Model: Raise TTL Until the Spike Disappears</h2>
+<p>Longer freshness reduces how often a key expires. It is a useful lever when the product can honestly serve an older value for that longer period. But it cannot stop a burst after a purge, an eviction, a deploy, or a genuine expiry. It also does not prevent duplicate in-flight fetches when a miss happens.</p>
+<p>The parallel mistake is to lock every miss globally. That protects origin, but one slow key now delays unrelated keys. The missing boundary is a per-key refill state: calls for <code>product:42:en</code> may coordinate; calls for <code>product:99:en</code> should proceed independently.</p>
+<p>HTTP caching makes the freshness distinction explicit: a response's reuse policy and its validators determine when it can be reused or checked again. Coalescing sits beside that policy; it does not turn stale data into fresh data. <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching">MDN HTTP caching</a>.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>In plain English, request coalescing records that a refill for one cache key is already in flight. The first eligible caller owns the work. Later callers with the same key do not start another equivalent refill.</p>
+<div class="codehilite"><pre><span></span><code>state for product:42:en
+  cache: expired value V7
+  in_flight: none
+
+request A: miss -&gt; claim leader -&gt; in_flight=A
+request B: miss -&gt; sees A -&gt; follower
+request C: miss -&gt; sees A -&gt; follower
+</code></pre></div>
+
+<p>The implementation can be a local in-process table, a shared coordination service, or a CDN feature. The mechanism matters more than the product name. Go's <code>singleflight</code> is one concrete local form: it suppresses duplicate calls for one key, and duplicate callers wait for the original and receive its result. <a href="https://pkg.go.dev/golang.org/x/sync/singleflight">Go <code>singleflight</code></a>.</p>
+<p>Now trace Atlas's policy. Its numbers are illustrative.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Leader A</th>
+<th>Followers B–Z</th>
+<th>Cache / origin state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Misses <code>product:42:en</code>; creates an in-flight entry with a 500 ms leader deadline.</td>
+<td>Arrive after A; see the same in-flight key.</td>
+<td>Expired V7 remains available for a 30 s stale window.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Starts one origin render.</td>
+<td>Public-page followers receive V7 with a stale marker; callers that require fresh data wait up to 150 ms.</td>
+<td>Origin sees one render, not 200.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Origin returns V8 in 120 ms.</td>
+<td>Waiting followers receive V8; stale readers use V7 only for this response.</td>
+<td>Cache stores V8 and clears in-flight state.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>A later request arrives.</td>
+<td>It reads V8 normally.</td>
+<td>No coalescing decision remains.</td>
+</tr>
+</tbody>
+</table>
+<p>The follower policy is a product contract. “Serve stale” fits only when V7 is safe within a named stale window. “Wait” protects freshness but can increase tail latency. “Fail fast” protects the origin but may lower availability. The right choice depends on the response's correctness promise, not on cache-hit aesthetics.</p>
+<h3>A follower must not inherit an unlimited leader deadline</h3>
+<p>It is easy to implement “wait for the promise” and accidentally turn coalescing into a queue with no escape. The leader has a refill budget; each follower has its own request deadline. Those are different clocks. A leader may still have 300 ms left to complete useful work while a browser request has only 40 ms before its page budget is exhausted. That browser must take its named alternative—permitted stale V7, a partial response, or a controlled error—rather than wait simply because the leader exists.</p>
+<p>The reverse race matters too. Suppose A's 500 ms lease expires at 500 ms, B is allowed to become a replacement leader at 510 ms, and A finally gets V8 from origin at 530 ms. If A can blindly write after losing ownership, it can overwrite B's newer value or clear B's in-flight marker. A robust design checks an ownership token or generation when publishing and clearing state. The leader that still owns the current entry may publish; a late leader records its result as abandoned or discards it according to policy.</p>
+<p>This is why “one request at a time” is not a complete specification. State who may take over, how many re-elections are allowed, what result followers see during the handoff, and whether origin work can be cancelled after all followers have left. For a public catalogue entry, one replacement attempt and a short stale window may be sensible. For a balance or permission check, a stale fallback may be forbidden, so a short bounded error is more honest. Coalescing coordinates work; the endpoint's correctness contract still decides the user-visible outcome.</p>
+<h2>Where It Breaks: Leaders Can Fail Too</h2>
+<p>What if A times out, crashes, or receives an origin error? Followers must not wait forever, and a lease must not let an old leader overwrite a newer result.</p>
+<p>The in-flight entry therefore needs a deadline, an observable outcome, and careful cleanup:</p>
+<div class="codehilite"><pre><span></span><code>leader succeeds -&gt; publish V8 if still current -&gt; clear entry
+leader fails before deadline -&gt; return named failure or allowed stale V7 -&gt; clear entry
+leader exceeds deadline -&gt; followers may re-elect once policy permits
+</code></pre></div>
+
+<p>For cross-process coordination, a lease or lock needs an ownership token and a bounded validity window. A naïve key deletion can release a lock acquired by another client after expiration. Redis's lock guidance illustrates the reason for a unique token and conditional release; it also makes clear that safety guarantees depend on the chosen design and failure assumptions. <a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Redis distributed locks</a>.</p>
+<p>This does not mean every cache refill needs a distributed lock. A local coalescer can be enough when duplicate refills across instances are acceptable. A shared lease may be justified when origin protection needs to span instances. State the scope honestly: local suppression reduces duplicate work per process; it does not guarantee one global refill.</p>
+<h2>Cost, Limits, and Signals</h2>
+<p>Coalescing improves origin protection and can make post-purge behavior predictable. It costs in-flight state, deadlines, follower policy, and observability. The trade-off is between some controlled follower waiting or stale delivery and uncontrolled duplicate work at origin.</p>
+<p>Watch these signals by key class:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Refill leaders and shared followers</td>
+<td>Whether requests are actually coalescing.</td>
+</tr>
+<tr>
+<td>Origin renders per expired key</td>
+<td>Whether duplicate work fell.</td>
+</tr>
+<tr>
+<td>Follower wait p95 and timeout rate</td>
+<td>Whether origin protection is becoming user-visible delay.</td>
+</tr>
+<tr>
+<td>Stale-served count and age</td>
+<td>Whether the stale policy remains within its promise.</td>
+</tr>
+<tr>
+<td>In-flight entry age and failed leader count</td>
+<td>Whether leases or cleanup are stuck.</td>
+</tr>
+</tbody>
+</table>
+<p>Jittered expiry can spread future refills across time, reducing synchronized expiry. It does not replace coalescing during a sudden burst. Stale-while-revalidate can keep readers fast, but it does not suit every response. A lease can coordinate instances, but it introduces clock, timeout, and recovery assumptions. None of these mechanisms fixes an origin that is slow for every unique key.</p>
+<p><strong>Check:</strong> Two requests differ only by <code>utm_campaign</code> and hit an expired public product response. A third request is for the same product in another language. Which requests may share one refill?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The first two may share only after verifying the campaign parameter does not affect the response and normalizing it out of the key. The other language must use a different key and refill decision because its representation differs.</p>
+<h2>Trace It Yourself</h2>
+<p>An account-summary key is allowed to serve at most 10 seconds stale. Fifty equivalent requests arrive after a purge. The origin normally answers in 80 ms but now takes 700 ms. Design the follower policy. State the coalescing key, leader deadline, stale rule, follower timeout, and the signal that would make you disable stale serving for this endpoint.</p>
+<p><strong>A good answer should mention:</strong></p>
+<ul>
+<li>a key that includes account identity and any representation-changing authorization or locale dimension;</li>
+<li>exactly one leader attempt per key while its lease is valid, with a deadline below the caller's total timeout;</li>
+<li>stale data only when its measured age is within 10 seconds and the account contract permits it;</li>
+<li>a bounded wait or explicit overload response for followers rather than indefinite waiting; and</li>
+<li>a correctness signal such as an account-balance update, authorization change, or stale-age breach that requires fresh data or a different response.</li>
+</ul>
+<h2>Connections</h2>
+<p>The review lesson ended with an optimization loop: bound unnecessary work, then measure the new limit. Coalescing applies that loop to a cache miss before it multiplies origin work. The next lesson generalizes admission control: token buckets and shared counters decide which traffic may enter a constrained path at all.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOCS] <a href="https://pkg.go.dev/golang.org/x/sync/singleflight">Go <code>singleflight</code></a> — Focus: Inspect duplicate-call suppression, keyed in-flight work, and follower result sharing.</li>
+<li>[DOCS] <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching">HTTP caching</a> — Focus: Separate freshness, validation, and permitted stale reuse from refill coordination.</li>
+<li>[DOCS] <a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Redis distributed locks</a> — Focus: Study ownership tokens, conditional release, lease windows, and failure assumptions for shared coordination.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>Coordinate an exact safe response key, not every cache miss or every request on a route.</li>
+<li>One leader plus compatible followers can reduce an origin stampede, but follower behavior must be an explicit freshness and availability contract.</li>
+<li>Local coalescing and cross-instance leases have different scopes and failure assumptions.</li>
+<li>Deadlines, cleanup, stale-age limits, and per-key metrics make a refill mechanism operable.</li>
+<li>Coalescing reduces duplicate work; it does not make a non-shareable response safe or a unique origin request cheap.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="028.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Optimization Case Studies - Real Production Systems</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="030.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Rate Limits, Token Buckets, and Shared Counters</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/caching-workers-and-performance.html">← Back to Caching, Workers, and Performance</a></p>
+  <p><a href="../../classifications/reliability-and-observability.html">← Back to Reliability And Observability</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-23 09:06 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

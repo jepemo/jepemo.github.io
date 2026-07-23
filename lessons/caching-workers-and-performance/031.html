@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Worker Retry Semantics, Dead Letters, and Poison Jobs - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/caching-workers-and-performance.html" aria-label="Exit lesson and return to Caching, Workers, and Performance">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Worker Retry Semantics, Dead Letters, and Poison Jobs</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/reliability-and-observability.html">Reliability And Observability</a>
+    /
+    <a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a>
+    /
+    031
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">031</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Worker Retry Semantics, Dead Letters, and Poison Jobs</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace an asynchronous job from delivery through a failed attempt, retry, durable effect, and acknowledgement.</p>
+</li>
+<li>
+<p>Separate a safe retry from an ambiguous side effect and define the idempotency evidence each needs.</p>
+</li>
+<li>
+<p>Choose a retry budget, dead-letter route, and operator signals for work that cannot make progress.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A worker retry is safe only when the system can tell whether the intended effect already happened and can stop a permanently failing job from circulating forever.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Atlas Shop places <code>charge-order:O-194</code> on a queue after checkout. A worker receives it, asks the payment provider to charge €49, and the provider completes the charge. Then the worker loses its network response and crashes before it acknowledges the queue message.</p>
+<p>Later, the queue delivers the same job again. The simple rule “a failure means retry” is tempting because it preserves work after a crash. It is correct for a request that definitely did not reach its dependency. Here it can create a second €49 charge: the worker cannot tell whether the first request failed before the provider acted or succeeded just before the response was lost.</p>
+<p>The stronger model is not “exactly once because there is a queue.” It is a lifecycle with explicit delivery semantics, an idempotent business effect, bounded retries, and a quarantine path for work that keeps failing. The queue can make a message visible again. The application must make repeating its effect safe or discoverable.</p>
+<h2>The Production Symptom</h2>
+<p>At 10:02, support sees a customer report two charges for order <code>O-194</code>. The worker dashboard looks healthy: the queue drained, worker CPU is low, and the job has a successful log line. Those facts do not prove that the charge happened only once.</p>
+<p>The useful investigation questions are smaller:</p>
+<ul>
+<li>Which durable job identity represents this order's payment intent?</li>
+<li>Did the provider receive the first attempt, and under which idempotency key?</li>
+<li>Did the worker record a durable outcome before acknowledging the message?</li>
+<li>How many deliveries occurred, and did two workers overlap after a visibility timeout?</li>
+</ul>
+<p>Delivery and completion are different events. A queue can say “a worker may process this message.” It cannot, by itself, prove what an external payment system did. That distinction is the reason retries, visibility timeouts, and dead letters need an operational design rather than just a configured number.</p>
+<h2>What the User Sees</h2>
+<p>The customer needs one clear result: either one charge with a receipt, or a visible pending state while the system resolves uncertainty. A silent duplicate is worse than a delayed confirmation.</p>
+<p>For Atlas, the promise is therefore not “every job succeeds quickly.” It is: <em>one order has at most one accepted charge intent, and any uncertain attempt becomes visible to support rather than being blindly repeated.</em> This wording changes the worker's job. It must preserve the business identity <code>payment:O-194</code>, not merely remember a queue receipt that changes each delivery.</p>
+<h2>The Naive Retry Rule</h2>
+<p>The first worker loop is short:</p>
+<div class="codehilite"><pre><span></span><code>receive message
+call payment provider
+delete message if the call returned success
+otherwise let the message reappear
+</code></pre></div>
+
+<p>This fits a harmless task such as rebuilding a disposable search index. Repeating the work produces the same useful state, and a later attempt can replace an earlier one.</p>
+<p>It breaks for a non-idempotent external effect. A timeout after <code>call payment provider</code> is ambiguous. The worker sees no success response, but the provider may have charged the card. Increasing the number of retries turns uncertainty into a larger duplicate-charge risk.</p>
+<p>Another tempting fix is a long visibility timeout. A visibility timeout hides a received message from other workers for a period; if the worker does not delete it before expiry, it can become visible again. A timeout that is too short can create overlapping attempts; one that is too long delays recovery after a crash. It changes delivery timing, not whether the side effect is safe to repeat. Amazon SQS documents this at-least-once boundary explicitly: a message can be delivered more than once even during its visibility period. <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">SQS visibility timeout</a>.</p>
+<h2>The Failure Mechanism</h2>
+<p>Atlas gives every charge intent a durable idempotency key, <code>charge:O-194</code>. “Idempotent” here means that repeating the same intent produces the same accepted business outcome rather than a second charge. It is not the same as retrying a new order with a new key.</p>
+<p>The payment provider must participate, or Atlas must have another authoritative way to query and reconcile the charge. A provider API can store the first result for an idempotency key and return that result on a later retry; Stripe documents this as a way to retry a request after a connection error without performing the operation twice. <a href="https://docs.stripe.com/api/errors#idempotent_requests">Stripe idempotent requests</a>.</p>
+<p>Atlas's illustrative lifecycle makes the intermediate states visible:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Queue / worker state</th>
+<th>Durable payment state</th>
+<th>What the next attempt may conclude</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>charge-order:O-194</code> is received; visibility starts.</td>
+<td><code>charge:O-194</code> is <code>pending</code>.</td>
+<td>One worker may attempt the provider call.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Worker sends provider request with <code>charge:O-194</code>; network response is lost.</td>
+<td>Provider may have recorded the charge, but the worker does not know yet.</td>
+<td>This is an <strong>unknown</strong> outcome, not proof of failure.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Worker crashes; it cannot acknowledge the message.</td>
+<td>The durable intent and key remain.</td>
+<td>After visibility expires, another delivery is expected.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Retry receives the same job.</td>
+<td>It uses the same idempotency key or reconciles provider state.</td>
+<td>It obtains the existing charge outcome or creates it once.</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Worker records <code>succeeded</code> durably, emits the receipt event, then acknowledges the queue message.</td>
+<td>The intent has a stable outcome.</td>
+<td>A later duplicate delivery can see <code>succeeded</code> and do no new charge.</td>
+</tr>
+</tbody>
+</table>
+<p>The exact order of local writes and acknowledgement depends on the queue and database. The important invariant is visible: the acknowledgement is not the proof of payment; a durable, queryable business outcome is. If receipt delivery has its own external side effect, it needs its own idempotent identity or an outbox-like handoff. One idempotency key does not automatically protect every downstream action.</p>
+<h2>Investigation Path: Classify Before Retrying</h2>
+<p>Retries consume queue capacity and dependency capacity. Before choosing a delay, classify the failure from evidence:</p>
+<table>
+<thead>
+<tr>
+<th>Evidence from an attempt</th>
+<th>Working classification</th>
+<th>Next action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provider returns temporary overload or a connection failed before a request was sent.</td>
+<td>Transient.</td>
+<td>Retry with bounded backoff and jitter.</td>
+</tr>
+<tr>
+<td>Provider returns “card declined” or the job payload lacks a required field.</td>
+<td>Permanent for this intent.</td>
+<td>Do not repeat automatically; mark failed or send to review.</td>
+</tr>
+<tr>
+<td>Response is lost after the request may have reached the provider.</td>
+<td>Unknown / ambiguous.</td>
+<td>Reuse the idempotency key or reconcile the provider outcome before another effect.</td>
+</tr>
+<tr>
+<td>The same malformed payload fails on each delivery.</td>
+<td>Poison job.</td>
+<td>Stop cycling it and quarantine it with evidence.</td>
+</tr>
+</tbody>
+</table>
+<p>The labels are a teaching model; a real integration needs provider-specific error semantics. What matters is that “timeout” does not always mean “safe to try again.” When the effect is expensive or irreversible, ambiguous outcomes deserve a reconciliation path, not a faster retry loop.</p>
+<h2>Mitigation and Prevention</h2>
+<p>Atlas configures an example retry schedule: immediate attempt, then waits of 30 seconds, 2 minutes, and 10 minutes, each with small randomized jitter. The delays are illustrative. Backoff gives an overloaded dependency time to recover, while jitter prevents a large group of failed jobs from retrying in lockstep.</p>
+<p>It also sets a receive-attempt budget. After four unsuccessful deliveries, a message moves to a dead-letter queue (DLQ) with the job id, attempt count, error class, provider request id when known, and the code or configuration version that handled it. A DLQ is a quarantine and investigation queue, not a waste bin. In SQS, a redrive policy uses <code>maxReceiveCount</code> to move a repeatedly received source message to a DLQ; the documentation recommends allowing enough receives for legitimate recovery and then examining or redriving the moved work. <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html">SQS dead-letter queues</a>.</p>
+<p>For a poison job, an operator should answer three questions before redriving it: what caused the repeated failure, whether the earlier side effect happened, and what changed that makes a new attempt safe. Fixing a parser bug may make a redrive appropriate. Redriving an unknown payment charge without reconciliation simply moves the duplicate risk from the main queue to the DLQ.</p>
+<h2>Signals to Watch</h2>
+<p>Watch the whole lifecycle, not only queue depth:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Delivery count and retry rate by error class</td>
+<td>Whether transient failures are recovering or repeating.</td>
+</tr>
+<tr>
+<td>Visibility-timeout expiries and concurrent attempts</td>
+<td>Whether workers lose leases or processing exceeds its budget.</td>
+</tr>
+<tr>
+<td>Age of the oldest ready job and delayed-retry backlog</td>
+<td>Whether retry pressure is delaying new useful work.</td>
+</tr>
+<tr>
+<td>DLQ arrival rate, age, and reason</td>
+<td>Whether poison jobs or a systemic dependency failure need investigation.</td>
+</tr>
+<tr>
+<td>Idempotency-key conflicts and reconciliation outcomes</td>
+<td>Whether ambiguous effects are being resolved safely.</td>
+</tr>
+<tr>
+<td>Provider latency and error rate alongside worker retries</td>
+<td>Whether the worker is amplifying a downstream outage.</td>
+</tr>
+</tbody>
+</table>
+<p>The trade-off is <strong>persistence of effort versus duplicate side effects, queue pressure, and delayed recovery</strong>. More retries improve the chance that a transient failure completes. They can also keep bad work alive, amplify an outage, and hide a semantic failure until the queue becomes the incident. The useful boundary is not “five retries are always enough”; it is the point at which new evidence is unlikely to change the outcome without a human or a repaired dependency.</p>
+<h2>Readiness Check</h2>
+<p><strong>Check:</strong> A worker calls an email provider, times out after the provider may have accepted the request, and the message becomes visible again. Is it safe to send the email immediately on the next delivery?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not from the timeout alone. The second worker needs a stable email intent id and an idempotent provider operation, a query/reconciliation step, or a business decision that duplicate email is acceptable. The queue's repeated delivery only proves that the first worker did not acknowledge; it does not prove the provider did nothing.</p>
+<p><strong>Runbook prompt:</strong> A new deployment causes 2,000 jobs to enter the DLQ with the same validation error. First pause redrive for that job class so repaired workers do not create a retry storm. Inspect one representative payload, the deployed validation version, delivery counts, and any already-recorded side effect. Fix or roll back the validation issue, test one controlled replay with the same idempotency evidence, then redrive in a measured batch while watching DLQ arrivals and downstream latency.</p>
+<h2>Practice: Review a Refund Worker</h2>
+<p>A refund worker receives <code>refund:R-88</code>. The payment provider sometimes takes 90 seconds, the queue visibility timeout is 60 seconds, and the worker blindly retries every exception eight times. Design a safer lifecycle. State the stable identity, how you handle the 60-second boundary, which failures retry automatically, when work enters a DLQ, and what must be checked before a replay.</p>
+<p><strong>A good answer should mention:</strong></p>
+<ul>
+<li>a durable refund intent such as <code>refund:R-88</code>, reused as the provider idempotency key rather than a new key per delivery;</li>
+<li>a visibility lease that is extended safely while known work is still running, or a timeout that fits the observed processing budget, while accepting that duplicates can still occur;</li>
+<li>bounded backoff with jitter for clearly transient provider failures, not immediate retries for every exception;</li>
+<li>reconciliation for an unknown result after a timeout, because a refund may already have occurred;</li>
+<li>a receive budget and DLQ record with error, attempt, provider reference, and code version; and</li>
+<li>a pre-redrive review of the cause, existing refund state, and downstream health.</li>
+</ul>
+<h2>Connections</h2>
+<p>The previous lesson limited how quickly traffic could enter a constrained path. This lesson limits how long failed asynchronous work may keep returning to that path. The capstone asks you to combine both boundaries with cache freshness, queue behavior, and evidence for tail latency.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOCS] <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html">Amazon SQS visibility timeout</a> — Focus: Trace receipt, temporary invisibility, expiry, duplicate delivery, and the timing trade-off.</li>
+<li>[DOCS] <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html">Amazon SQS dead-letter queues</a> — Focus: Inspect receive budgets, quarantine, retention, investigation, and controlled redrive.</li>
+<li>[DOCS] <a href="https://docs.stripe.com/api/errors#idempotent_requests">Stripe idempotent requests</a> — Focus: Separate retrying a stable business intent from creating a new external side effect.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>A redelivered job proves that acknowledgement did not happen; it does not prove that an external side effect did not happen.</li>
+<li>Use durable business identities and idempotent or reconcilable effects before retrying ambiguous outcomes.</li>
+<li>Visibility timeouts coordinate delivery timing, but they neither guarantee one delivery nor make an effect safe to repeat.</li>
+<li>Retry budgets, backoff, jitter, and DLQs preserve transient recovery while stopping poison jobs from consuming the main queue forever.</li>
+<li>A DLQ requires evidence and a redrive decision; replaying blindly can repeat the original incident.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="030.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Rate Limits, Token Buckets, and Shared Counters</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="032.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Caching and Worker Performance Capstone</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/caching-workers-and-performance.html">← Back to Caching, Workers, and Performance</a></p>
+  <p><a href="../../classifications/reliability-and-observability.html">← Back to Reliability And Observability</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-23 09:06 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>

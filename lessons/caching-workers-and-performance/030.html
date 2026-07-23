@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rate Limits, Token Buckets, and Shared Counters - @jepemo</title>
+    <link rel="shortcut icon" href="../../favicon.ico" />
+    <link rel="stylesheet" href="../../css/style.css" />
+    <script src="../../js/site.js" defer></script>
+    
+
+
+  </head>
+  <body class="lesson-reading">
+    <header class="site-header">
+      <div class="site-topline">
+        <a class="site-title" href="../../index.html">@jepemo</a>
+        <div class="site-actions">
+          
+<a class="lesson-exit" href="../../tracks/caching-workers-and-performance.html" aria-label="Exit lesson and return to Caching, Workers, and Performance">EXIT</a>
+
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" title="Switch theme">
+            <span class="theme-toggle-icon theme-toggle-moon" aria-hidden="true">☾</span>
+            <span class="theme-toggle-icon theme-toggle-sun" aria-hidden="true">☀</span>
+          </button>
+        </div>
+      </div>
+      <nav class="site-path" aria-label="Site navigation">
+        <a class="brand" href="../../index.html">Home</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../links.html">Links</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://github.com/jepemo" target="_blank">GitHub</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="https://www.linkedin.com/in/jeremias-perez/" target="_blank">LinkedIn</a>
+        
+        
+        
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="mailto:jeremiespm@gmail.com">Contact</a>
+        
+        
+        
+      </nav>
+    </header>
+
+    <main class="lesson-page">
+      
+<h1>Rate Limits, Token Buckets, and Shared Counters</h1>
+
+<section class="stack-block lesson-context">
+  <p class="breadcrumb">
+    <a href="../../learning.html">Learning</a>
+    /
+    <a href="../../classifications/reliability-and-observability.html">Reliability And Observability</a>
+    /
+    <a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a>
+    /
+    030
+  </p>
+  <p class="page-kicker">LESSON</p>
+  <p><a href="../../tracks/caching-workers-and-performance.html">Caching, Workers, and Performance</a></p>
+  <div class="meta-strip">
+    <span class="meta-chip">030</span>
+    <span class="meta-chip">30 min</span>
+    <span class="meta-chip">intermediate</span>
+    
+  </div>
+</section>
+
+<section class="stack-block lesson-content-shell">
+  <h1>Rate Limits, Token Buckets, and Shared Counters</h1>
+<blockquote>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Design a rate limit around a named caller, route class, burst allowance, and average rate.</p>
+</li>
+<li>
+<p>Trace a token bucket through concurrent requests and explain why its update needs shared authority.</p>
+</li>
+<li>
+<p>Choose a failure policy and signals that make a rejected request an honest system boundary rather than a mystery.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A rate limit is a promise about who may use a constrained resource and how quickly; the counter that enforces it must make the same decision for every relevant request.</p>
+</blockquote>
+<h2>Core Insight</h2>
+<p>Atlas Shop opens its inventory-write API to a partner called Northwind. The normal workload is two updates per second, but a faulty integration retries a batch and sends 80 updates in a few seconds. The database is still available, but its write queue grows and the storefront begins to show old stock.</p>
+<p>The tempting response is “reject requests after some number.” That is too vague to be a useful contract. Which requests share the number? Is a short burst allowed? Does a request to read inventory spend the same budget as a write? What happens when the component that holds the number is unavailable?</p>
+<p>The stronger model is a rate-limit policy with four visible parts: an identity key, an algorithm, an authority for its state, and an outcome when the limit or its authority cannot answer. A token bucket is a common choice when a tenant may burst briefly but must settle to an average rate. It protects the path only when all instances consult compatible, atomically updated state.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>Atlas does not want to punish Northwind for a short, legitimate catch-up burst. It does need to protect inventory writes from a broken client. Its initial contract is deliberately narrow:</p>
+<table>
+<thead>
+<tr>
+<th>Policy field</th>
+<th>Atlas's illustrative decision</th>
+<th>Why it is named</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Identity</td>
+<td><code>tenant:northwind:inventory-write</code></td>
+<td>A tenant's write load is isolated from other tenants and from reads.</td>
+</tr>
+<tr>
+<td>Capacity</td>
+<td>20 tokens</td>
+<td>Up to 20 writes may arrive at once after quiet time.</td>
+</tr>
+<tr>
+<td>Refill</td>
+<td>2 tokens per second</td>
+<td>Sustained traffic settles to two writes per second.</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>One token per normal write</td>
+<td>The unit is a protected write request, not an IP address.</td>
+</tr>
+<tr>
+<td>Outcome</td>
+<td><code>429 Too Many Requests</code> plus retry guidance</td>
+<td>The caller learns that the request was not admitted.</td>
+</tr>
+</tbody>
+</table>
+<p>The numbers are a teaching model, not a universal production setting. A capacity comes from the burst the downstream path can absorb; a refill rate comes from its sustainable work. A costly bulk endpoint may spend five tokens per call, while a cheap read may use a separate policy or no tenant limit at all.</p>
+<p>The boundary matters more than the word <em>bucket</em>. An IP key is helpful for anonymous abuse. It is a poor substitute for a paid tenant quota behind a shared NAT. A global key protects one dependency but lets one noisy tenant spend everyone else's budget. Choose the key from the promise being kept.</p>
+<h2>The Naive Design: A Counter on Every Server</h2>
+<p>The first implementation is simple. Each API instance keeps <code>northwind_writes_this_second</code> in memory, rejects after 10, and resets it every second. It works on one server with steady traffic.</p>
+<p>Now place three API instances behind a load balancer. Northwind sends 30 writes. If the load balancer spreads them evenly, each instance sees 10 and admits all 30. The intended tenant-wide limit was 10; the effective limit silently became roughly 30. A retry that lands on a different instance can bypass the local counter again.</p>
+<p>This trace is evidence of the missing design boundary:</p>
+<div class="codehilite"><pre><span></span><code>intended policy: 10 writes / second for tenant northwind
+
+instance A sees 10 -&gt; allows 10
+instance B sees 10 -&gt; allows 10
+instance C sees 10 -&gt; allows 10
+
+tenant total: 30 allowed
+</code></pre></div>
+
+<p>Local limits still have a use. They can stop one process from spending all of its CPU, and they can act as a safety valve during an outage. They cannot by themselves enforce a tenant-wide promise across instances. For that promise, the decision state must be shared, or the architecture must explicitly accept approximation.</p>
+<h2>Why a Fixed Window Is Not the Same Promise</h2>
+<p>A shared fixed-window counter is the next reasonable design: increment <code>tenant:northwind:12:00</code>, then reject above a limit and let the key expire. It is cheap and often sufficient for a coarse protection boundary. Redis documents <code>INCR</code> plus expiration as a fixed-window rate-limiter pattern, and also notes that the increment-and-expiry sequence needs atomic handling to avoid a leaked counter when a client fails between operations. <a href="https://redis.io/docs/latest/commands/incr/">Redis <code>INCR</code></a>.</p>
+<p>But a window has an edge. With a limit of 10 per minute, Northwind can send 10 writes at <code>12:00:59</code> and 10 more at <code>12:01:00</code>. Each window says “10,” while the database receives 20 writes in two seconds. That may be fine for a monthly reporting API. It is a poor fit when the immediate burst is the thing that hurts the database.</p>
+<p>Two alternatives clarify the choice:</p>
+<table>
+<thead>
+<tr>
+<th>Design</th>
+<th>It promises</th>
+<th>It costs or can surprise</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fixed window</td>
+<td>At most N admissions per named time bucket.</td>
+<td>A boundary burst can be almost twice the nominal window limit.</td>
+</tr>
+<tr>
+<td>Sliding window</td>
+<td>A closer count over the most recent interval.</td>
+<td>More timestamps or approximation state, and more work per decision.</td>
+</tr>
+<tr>
+<td>Token bucket</td>
+<td>A named burst capacity plus a long-run average refill.</td>
+<td>State must track time and tokens, and callers need an explicit denial policy.</td>
+</tr>
+</tbody>
+</table>
+<p>No algorithm is “the accurate one” outside its contract. Atlas needs a bounded immediate burst and a steady write rate, so it chooses a token bucket. A fixed window would be a sensible situated preference if a brief boundary burst cannot harm the constrained resource and very cheap state matters more.</p>
+<h2>A Better Boundary: One Shared Token Decision</h2>
+<p>In plain English, a token bucket is a small store of permission slips. Quiet time adds slips up to a maximum. Each admitted write spends one. When no slip remains, the next write is rejected until time has added another.</p>
+<p>In Atlas's policy, the state is <code>{tokens, last_refill}</code> for the key <code>tenant:northwind:inventory-write</code>. It is not a counter of completed database writes; it is an admission decision made before the write enters the protected path.</p>
+<p>The technical requirement is an atomic read-refill-spend-update operation. If two API processes both read one remaining token, both must not independently decide to spend it. A shared store can supply that authority, but only if the whole transition runs as one operation. Redis's token-bucket example uses a script to fetch state, calculate refill, consume if available, and store the resulting state atomically; without that, concurrent callers can double-spend a token or overwrite each other's update. <a href="https://redis.io/docs/latest/develop/use-cases/rate-limiter/nodejs/">Redis token bucket</a>.</p>
+<p>Here is Atlas's illustrative trace. It uses whole-token refill for clarity; a production implementation may use finer time units or fractional tokens.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Incoming work</th>
+<th>State before decision</th>
+<th>Decision and state after</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>t=0</code></td>
+<td>First request after idle time</td>
+<td>Bucket initializes at 20 tokens.</td>
+<td>Allow one write; 19 remain.</td>
+</tr>
+<tr>
+<td><code>t=0</code></td>
+<td>11 more concurrent writes</td>
+<td>The atomic operation serializes their decisions.</td>
+<td>All 11 are allowed; 8 remain.</td>
+</tr>
+<tr>
+<td><code>t=1.5s</code></td>
+<td>No traffic during the interval</td>
+<td>3 whole tokens refill, capped at capacity.</td>
+<td>Bucket holds 11 tokens.</td>
+</tr>
+<tr>
+<td><code>t=1.5s</code></td>
+<td>13 new writes</td>
+<td>11 tokens are available.</td>
+<td>11 are admitted; 2 receive <code>429</code>.</td>
+</tr>
+<tr>
+<td><code>t=2.0s</code></td>
+<td>One retry follows the guidance</td>
+<td>One token refills.</td>
+<td>Allow the retry if it is otherwise valid.</td>
+</tr>
+</tbody>
+</table>
+<p>The bucket allows a burst because it had saved unused capacity. It does not create database capacity. If the write queue can safely absorb only five concurrent writes, Atlas may need a lower capacity, a concurrency limit, or a queue as well. Rate limiting controls admission over time; it is not a substitute for every downstream control.</p>
+<h2>The Trade-off: Fairness Needs Scope, and Scope Needs State</h2>
+<p>The design trade-off is <strong>fairness and downstream protection versus precision, storage cost, and an extra dependency on the request path</strong>.</p>
+<p>A tenant-wide shared bucket gives each tenant a consistent budget across API instances. It adds a synchronous shared-state lookup. A per-route bucket avoids one expensive endpoint consuming the budget for cheap calls, but creates more keys and policy surface. A global bucket can preserve a fragile third-party quota, but it is deliberately less fair: unrelated tenants now compete.</p>
+<p>Layering limits is often clearer than pretending one key is enough:</p>
+<div class="codehilite"><pre><span></span><code>global inventory writes      -&gt; protect the database as a whole
+tenant inventory writes     -&gt; stop one tenant dominating that capacity
+route or cost-class limit   -&gt; account for unusually expensive work
+local concurrency limit     -&gt; stop one API process from becoming unhealthy
+</code></pre></div>
+
+<p>Each layer must say what it owns. Do not add four opaque <code>429</code>s and call that defense in depth. Record which policy rejected the request, which key was charged, the configured capacity and refill, and a safe retry time when it can be estimated.</p>
+<h2>When the Shared Counter Is Unavailable</h2>
+<p>The counter store is now on the admission path. A network timeout means Atlas cannot know whether the tenant has budget. There is no failure-neutral default.</p>
+<p>For inventory writes that could overload a fragile database, Atlas chooses to fail closed: return a controlled temporary error rather than admit unlimited work. That preference protects the scarce downstream resource, but lowers availability while the limiter is impaired. For a public product read, Atlas might fail open with a tight local emergency limit and an alert, because falsely rejecting every reader can be worse than admitting a bounded excess. Neither choice preserves a strict global quota during the outage.</p>
+<p>Another boundary is identity. If an API key is shared by several real customers, a per-key limit is fair only to the key, not to each customer. If an attacker can cheaply rotate keys, a key-only limit does not control abuse. Identity, authentication, and billing rules determine whether the counter key matches the fairness claim.</p>
+<h2>Operational Consequences</h2>
+<p>The status code is not the whole interface. A good rejection tells a well-behaved client what happened and whether retrying later is useful. Standard HTTP rate-limit fields are defined for communicating quota information; use headers and a response body consistently with the actual policy rather than inventing a reset time the counter cannot justify. <a href="https://www.rfc-editor.org/rfc/rfc9333.html">RFC 9333</a>.</p>
+<p>Watch the decision, the pressure, and the correctness boundary:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Question it answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allowed and rejected requests by policy and tenant class</td>
+<td>Is one policy shaping traffic, or blocking legitimate work?</td>
+</tr>
+<tr>
+<td>Remaining-token distribution</td>
+<td>Are bursts routinely exhausting capacity?</td>
+</tr>
+<tr>
+<td>Shared-store latency, errors, and timeouts</td>
+<td>Is the limiter becoming a new tail-latency dependency?</td>
+</tr>
+<tr>
+<td>Downstream queue depth and write latency</td>
+<td>Did admission actually protect the resource it was meant to protect?</td>
+</tr>
+<tr>
+<td>Fail-open or fail-closed decisions</td>
+<td>Did an outage change the promised protection level?</td>
+</tr>
+</tbody>
+</table>
+<p>An increase in <code>429</code>s is not automatically success or failure. If downstream write latency and queue depth fall while one faulty tenant is rejected, the limit may be working. If normal tenants see rejections while the database remains idle, the key, capacity, or refill rate is likely wrong. Look at both sides of the boundary.</p>
+<h2>Design Review</h2>
+<p><strong>Check:</strong> Northwind has a capacity of 20 and refills two whole tokens per second. It has been idle long enough to fill the bucket. It sends 18 writes at once, then four more after one second. How many of the second group can the bucket admit?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The first group leaves two tokens. One second adds two, so four tokens are available. All four of the second group can be admitted. The answer changes if the policy also has a lower concurrency limit or if a request costs more than one token; a bucket is only one named admission rule.</p>
+<p>Now review this proposal: “Use an in-memory fixed-window counter per server, keyed only by source IP, fail open if it overflows, and return a generic <code>500</code> on rejection.” It is small, but it does not keep Atlas's tenant-wide inventory-write promise. Different instances create separate budgets, a shared NAT can combine tenants, fail-open behavior is unspecified for the counter-store case, and <code>500</code> tells a client that the server failed rather than that a policy denied admission.</p>
+<h2>Practice: Design One Honest Limit</h2>
+<p>A document-export endpoint triggers expensive rendering. A customer may submit a short batch, but sustained requests saturate the renderer. The service runs on six instances. Design a policy with a key, algorithm, capacity, refill rate, authority, denial response, and counter-outage behavior. Say which signal would cause you to revise the policy.</p>
+<p><strong>A good answer should mention:</strong></p>
+<ul>
+<li>a key based on the customer or authenticated tenant and the expensive export route, rather than only the instance or IP;</li>
+<li>a burst capacity and refill rate derived from renderer tolerance, clearly labeled as chosen assumptions;</li>
+<li>a shared, atomic decision if the promise is customer-wide across six instances;</li>
+<li>a <code>429</code> or another explicit admission response with retry guidance when the bucket is empty;</li>
+<li>an intentional fail-open or fail-closed choice for the counter outage, including what protection or availability it sacrifices; and</li>
+<li>a paired signal such as rejected exports plus renderer queue depth or render latency, not only the count of <code>429</code>s.</li>
+</ul>
+<h2>Connections</h2>
+<p>Request coalescing prevented equivalent cache misses from multiplying one refill. A rate limit decides earlier whether a request may consume the constrained path at all. The next lesson moves to asynchronous work, where retries must preserve useful effort without multiplying a side effect.</p>
+<h2>Resources</h2>
+<ul>
+<li>[DOCS] <a href="https://redis.io/docs/latest/develop/use-cases/rate-limiter/">Redis rate limiter</a> — Focus: Compare shared keys, fixed windows, sliding windows, token buckets, and atomic read-decide-update state.</li>
+<li>[DOCS] <a href="https://redis.io/docs/latest/develop/use-cases/rate-limiter/nodejs/">Token bucket rate limiter with Redis</a> — Focus: Trace capacity, refill, consumption, and why concurrent requests need one atomic state transition.</li>
+<li>[STANDARD] <a href="https://www.rfc-editor.org/rfc/rfc9333.html">RFC 9333: RateLimit Fields for HTTP</a> — Focus: Separate the admission decision from how an HTTP API communicates quota and retry information.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>A rate limit begins with a promise: name the caller, protected work, burst, sustained rate, and denial outcome.</li>
+<li>A local counter can protect one process, but it cannot enforce a tenant-wide budget across load-balanced instances.</li>
+<li>Token buckets make burst capacity and average rate explicit; their shared state must update atomically to avoid double-spending permission.</li>
+<li>Fixed windows, sliding windows, and buckets encode different promises. Choose the one whose boundary matches the resource you need to protect.</li>
+<li>The limiter's own outage policy, identity key, downstream signals, and rejection interface are part of the design—not details to postpone.</li>
+</ul>
+</section>
+
+<section class="lesson-navigation-grid lesson-page-nav">
+  
+  <a class="nav-card" href="029.html">
+    <span class="page-kicker">PREVIOUS</span>
+    <strong>Cache Stampede Control and Request Coalescing</strong>
+  </a>
+  
+
+  
+  <a class="nav-card" href="031.html">
+    <span class="page-kicker">NEXT</span>
+    <strong>Worker Retry Semantics, Dead Letters, and Poison Jobs</strong>
+  </a>
+  
+</section>
+
+<section class="stack-block lesson-link-strip">
+  <p><a href="../../tracks/caching-workers-and-performance.html">← Back to Caching, Workers, and Performance</a></p>
+  <p><a href="../../classifications/reliability-and-observability.html">← Back to Reliability And Observability</a></p>
+  <p><a href="../../learning.html">← Back to Learning Hub</a></p>
+</section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Generated on 2026-07-23 09:06 UTC | @jepemo | Built with
+        <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
+      </p>
+    </footer>
+
+    
+  </body>
+</html>
