@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,140 +81,248 @@
 <section class="stack-block lesson-content-shell">
   <h1>IPC, RPC, and Communication Boundaries</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong> distinguish local calls, IPC, RPC, and asynchronous messaging by the boundary they cross; trace what happens when a remote call times out; and choose a communication style from timing, coupling, and failure behavior rather than library convenience.</p>
-<p><strong>Idea in one sentence.</strong> Communication mechanisms are boundary choices: each one trades simple control flow for different costs in latency, copying, isolation, ambiguity, backpressure, and failure propagation.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace one request from a process to a local helper and identify the states where it can wait, fail, or leave work unfinished.</p>
+</li>
+<li>
+<p>Choose between a local call, IPC, and a remote call from the isolation and completion promise required.</p>
+</li>
+<li>
+<p>Explain why a timeout reports a caller's outcome, not necessarily the callee's outcome.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Crossing a process boundary buys isolation, but it turns a simple call into a protocol with bytes, buffers, lifecycle, and an outcome that each side may observe differently.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine an API rendering a lesson page. Some data is already in the same process: the route handler calls a local formatter. A thumbnail is produced by a helper process on the same host. Lesson metadata comes from a service on another machine. Analytics is published to a queue so it can be processed later. To the user, it is one page load. To the system, it is several communication boundaries.</p>
-<p>Those boundaries change the rules. A local function call shares memory and fate with the caller. Inter-process communication, or IPC, crosses process isolation and usually involves kernel mediation, copying, file descriptors, sockets, pipes, or shared memory. Remote procedure call, or RPC, keeps a request-response shape but crosses a network boundary with serialization, remote scheduling, queueing, timeout, and partial failure. A queue or message broker decouples producer and consumer timing, but it introduces backlog, delivery, ordering, and retry questions.</p>
-<p>The trap is that modern interfaces can make these boundaries look similar. A local method, a Unix socket request, and a gRPC call may all appear as <code>client.fetch(...)</code> in code. The call site looks neat, but the failure semantics are not the same. A local function cannot lose a response in the network. A remote service can process a request after the caller has already timed out. A queued message can be accepted now and handled much later.</p>
-<p>The practical mental model is to ask what boundary the work crosses before choosing the transport. Does the caller need an answer now? Can the callee be slow without hurting the user? Who owns retries? Where does backpressure show up? What evidence proves the other side received or completed the work? These questions are more important than whether the client library feels ergonomic.</p>
-<h2>Boundaries Change What a Call Means</h2>
-<p>Start with four ways the lesson-page API can ask for work:</p>
-<div class="codehilite"><pre><span></span><code>local call:
-  format_title(metadata)
-
-IPC:
-  send image bytes to local thumbnail helper process
-
-RPC:
-  fetch lesson metadata from remote service
-
-async message:
-  publish lesson_viewed event for analytics
+<p>Imagine a document-preview service on one host. The web process receives an uploaded file and asks a separate renderer process to produce a thumbnail. Keeping the renderer separate is intentional: it parses untrusted input, uses a lot of CPU, and may crash. The web process should survive if the renderer does not.</p>
+<p>The first implementation looks almost like a local function call:</p>
+<div class="codehilite"><pre><span></span><code>thumbnail = renderer.make_preview(upload)
 </code></pre></div>
 
-<p>They are all communication, but they encode different coupling. Coupling means how tightly two pieces of work depend on each other in time, fate, and state.</p>
-<div class="codehilite"><pre><span></span><code>same stack frame -&gt; same process -&gt; same host, different process -&gt; remote host -&gt; async queue
-least boundary ----------------------------------------------------------&gt; looser timing, wider failure modes
+<p>That model is comfortable while renderer and caller share one process. The caller can pass an object, the function either returns or raises, and a crash ends both together. It breaks as soon as the renderer is a different process. The web process cannot hand it an in-memory object directly. It must send bytes through an operating-system boundary, decide how long to wait, interpret a closed connection, and determine whether a missing reply means “no work happened” or merely “the reply did not arrive.”</p>
+<p>That is the central design shift. <strong>IPC is not a smaller spelling of a function call.</strong> It is a communication contract between independently scheduled, independently failing processes. The trade-off is clear: stronger isolation contains a renderer failure, but it costs message design, buffering, lifecycle management, and explicit uncertainty.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>The preview service needs three promises:</p>
+<div class="codehilite"><pre><span></span><code>1. A malformed file must not take down the web process.
+2. A slow renderer must not make every request wait forever.
+3. The web process must know which outcomes it can safely retry.
 </code></pre></div>
 
-<p>A local call is tightly coupled. The caller waits, the callee runs in the same process, and both share the same memory model. If the process crashes, both disappear. This is simple and fast, but it gives little isolation.</p>
-<p>IPC adds process isolation. The helper may crash without directly corrupting the API process. The price is explicit communication: bytes must cross a process boundary, usually through the kernel. You may need to serialize data, copy buffers, handle broken pipes, and manage process lifecycle.</p>
-<p>RPC adds a remote machine and network. The call may look like a method, but now it depends on two processes, two schedulers, serialization on both sides, network delivery, load at the remote service, and a response path back to the caller.</p>
-<p>Asynchronous messaging loosens timing. The producer can hand off a message without the consumer doing the work immediately. That can contain failures and absorb bursts, but it means success at publish time is not the same as success at processing time.</p>
-<p>The trade-off is direct. Tighter boundaries give simpler reasoning and immediate answers. Looser boundaries give isolation, buffering, and independent scaling, but they make completion, ordering, and failure harder to reason about.</p>
-<h2>The Remote Call Has More States Than It Shows</h2>
-<p>Now trace one RPC from the API to the lesson metadata service. The code might look simple:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">render_lesson_page</span><span class="p">(</span><span class="n">lesson_id</span><span class="p">):</span>
-    <span class="n">metadata</span> <span class="o">=</span> <span class="n">metadata_client</span><span class="o">.</span><span class="n">get_lesson</span><span class="p">(</span><span class="n">lesson_id</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">150</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">render</span><span class="p">(</span><span class="n">metadata</span><span class="p">)</span>
+<p>These promises make a local helper process a reasonable boundary. A Unix-domain socket is one concrete IPC mechanism: Linux documents the <code>AF_UNIX</code> socket family for communication between processes on the same machine. A stream socket is a byte stream, while a datagram or sequenced-packet socket has different message-boundary properties. The choice is part of the protocol; “we use a socket” does not by itself define a request format or completion rule.</p>
+<p>In plain English:</p>
+<blockquote>
+<p>A boundary is a place where one part of the system can no longer assume that another part shares its memory, timing, or fate.</p>
+</blockquote>
+<p>In this service:</p>
+<blockquote>
+<p>The web process owns the client connection and upload request. The renderer owns parsing and thumbnail creation. They can communicate, but either process can be delayed, restarted, or stopped independently.</p>
+</blockquote>
+<p>Technical name:</p>
+<blockquote>
+<p><strong>Inter-process communication (IPC)</strong> is the operating-system-mediated exchange of data or capabilities between separate processes. Pipes, Unix-domain sockets, shared memory, and passed file descriptors are different IPC designs, not interchangeable details.</p>
+</blockquote>
+<h2>The Naive Design: “Write the File and Read One Reply”</h2>
+<p>Suppose the team chooses a Unix-domain stream socket and invents this request shape:</p>
+<div class="codehilite"><pre><span></span><code>web -&gt; renderer: bytes of uploaded document
+renderer -&gt; web: bytes of thumbnail path
 </code></pre></div>
 
-<p>The actual path is longer:</p>
-<div class="codehilite"><pre><span></span><code>caller builds request
--&gt; serialize request
--&gt; send bytes through socket
--&gt; network path delivers or delays packets
--&gt; remote service receives request
--&gt; remote scheduler admits handler work
--&gt; handler reads state and builds response
--&gt; response serializes
--&gt; network path returns bytes
--&gt; caller deserializes or times out
+<p>It works for one small document in a quiet test. The renderer reads what arrives, produces an image, and replies. The design hides two questions that the local-call model did not need to ask.</p>
+<p>First, where does one request end? A stream socket delivers an ordered stream of bytes, not automatically “one application request per read.” One <code>read</code> may return only part of a header, all of one request plus part of another, or wait because no bytes are available. The protocol needs framing: for example, a fixed-size length header followed by that many payload bytes.</p>
+<p>Second, what limits unfinished work? If the web process writes uploads faster than the renderer reads them, a buffer fills. A blocking write can delay the web worker; an unbounded application queue can consume memory; a nonblocking write can report that the caller must wait or reject work. These are not defects in IPC. They are the backpressure decision the boundary forces the design to make.</p>
+<p>The naive design works only while messages are tiny, the peer is healthy, and demand stays below capacity. The missing model is that each message has a lifecycle, and each side sees only part of it.</p>
+<h2>A Better Boundary: Make One Request Inspectable</h2>
+<p>Use a small explicit protocol. The fields below are a teaching model, not a required wire format.</p>
+<div class="codehilite"><pre><span></span><code>request
+  request_id: 91f2
+  content_length: 4_000_000 bytes
+  deadline: 800 ms from now
+
+response
+  request_id: 91f2
+  outcome: completed | rejected | failed
+  thumbnail_path: present only when completed
 </code></pre></div>
 
-<p>Every arrow can wait or fail. The socket buffer may be full. The remote process may be alive but not ready. The remote queue may be backed up. The response may be produced but lost. The caller may give up while the server continues to work. That last case is the key semantic difference from local calls: timeout does not tell you whether the operation happened.</p>
-<p>Consider this timeline:</p>
-<div class="codehilite"><pre><span></span><code>t=000ms caller sends request: &quot;increment view count for lesson 42&quot;
-t=120ms server receives request and starts work
-t=150ms caller timeout fires
-t=180ms server commits increment
-t=210ms server sends response
-t=220ms caller has already returned an error
+<p>The <code>request_id</code> lets the two processes refer to the same unit of work in logs and retries. A length gives a stream receiver a way to find the payload boundary. A deadline names how long the caller is willing to wait; it does not force the renderer to stop exactly at that instant. The response separates successful completion, explicit refusal, and a handled failure.</p>
+<p>This buys us a visible contract, but it costs implementation work. Both processes must agree on framing, maximum sizes, timeouts, cleanup, and versioning. That cost is worthwhile when process isolation protects a real risk. It is unnecessary ceremony for a tiny pure transformation that needs no isolation and shares the caller's fate.</p>
+<h2>Worked Trace: The Reply Never Arrives</h2>
+<p>Trace request <code>91f2</code>. Times are illustrative.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Web process can observe</th>
+<th>Renderer can observe</th>
+<th>Request state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 ms</td>
+<td>upload accepted</td>
+<td>nothing yet</td>
+<td>created in web process</td>
+</tr>
+<tr>
+<td>5 ms</td>
+<td>header and payload written</td>
+<td>bytes become readable</td>
+<td>delivered to kernel buffers</td>
+</tr>
+<tr>
+<td>20 ms</td>
+<td>waiting for reply</td>
+<td>request decoded; render starts</td>
+<td>renderer owns processing</td>
+</tr>
+<tr>
+<td>300 ms</td>
+<td>still waiting</td>
+<td>renderer has produced thumbnail</td>
+<td>work may be complete</td>
+</tr>
+<tr>
+<td>305 ms</td>
+<td>connection closes before reply</td>
+<td>process crashes during reply</td>
+<td>caller lacks a completion record</td>
+</tr>
+<tr>
+<td>800 ms</td>
+<td>deadline expires; return fallback</td>
+<td>renderer is gone</td>
+<td>caller outcome is timeout/failure</td>
+</tr>
+</tbody>
+</table>
+<p>At 305 ms, the web process has a hard question. Did the thumbnail get written before the crash? The answer is not available merely because its <code>read</code> failed. The renderer may have finished its output and died before replying, or it may have died first. A closed local socket is a real failure boundary even though no network was crossed.</p>
+<p>The safe next action depends on the operation. If thumbnail generation writes to a deterministic temporary path and publishing is atomic, retrying with the same request ID may be safe after checking whether the result already exists. If the helper charges a credit, sends email, or performs a non-idempotent update, retrying blindly could repeat the effect. <strong>Idempotency</strong> means that repeating a request has the same intended result as doing it once; it is a contract property, not a magical retry setting.</p>
+<p>So far, we have seen why “the request timed out” is a statement about the caller. It says the caller did not obtain a usable answer by its deadline. It does not prove that the peer did no work.</p>
+<h2>What the Operating System Boundary Adds</h2>
+<p>Separate processes get separate address spaces and lifecycles. That is the isolation benefit. The cost is that data and control must cross a kernel-managed mechanism.</p>
+<p>For the renderer, useful IPC choices have different shapes:</p>
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>Useful when</th>
+<th>Important boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipe</td>
+<td>One-directional stream between related processes is enough</td>
+<td>Byte framing, finite buffer, reader/writer closure</td>
+</tr>
+<tr>
+<td>Unix-domain socket</td>
+<td>A local client/server protocol, bidirectional replies, or peer information is useful</td>
+<td>Connection lifecycle, stream framing, permissions or credentials</td>
+</tr>
+<tr>
+<td>Shared memory</td>
+<td>Large data should avoid repeated copying</td>
+<td>Ownership, synchronization, and cleanup become explicit</td>
+</tr>
+<tr>
+<td>File-descriptor passing</td>
+<td>The peer should use an already opened resource</td>
+<td>It transfers a reference, not a copied file; receiving process still needs a policy for lifetime and access</td>
+</tr>
+</tbody>
+</table>
+<p>Linux <code>AF_UNIX</code> sockets can pass file descriptors and process credentials using ancillary data. This is powerful, but it is not a reason to begin with it. A simple pathname or socket-pair protocol with bounded messages is easier to inspect. Use descriptor passing when the boundary genuinely benefits from sharing an already opened resource or capability.</p>
+<p>Do not make the opposite mistake either: “same host” does not mean “no security or lifecycle design.” A pathname Unix socket has filesystem ownership and permission behavior; abstract socket names are Linux-specific and do not use filesystem permissions. The correct choice depends on the trust boundary and portability requirements.</p>
+<h2>Local Call, IPC, and RPC Are Different Promises</h2>
+<p>Choose the smallest boundary that provides the protection needed.</p>
+<table>
+<thead>
+<tr>
+<th>Choice</th>
+<th>What the caller gets</th>
+<th>What it gives up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Local function call</td>
+<td>Shared memory, simple return/exception path</td>
+<td>No process isolation; a crash affects both</td>
+</tr>
+<tr>
+<td>IPC on one host</td>
+<td>Process isolation and independent restart</td>
+<td>Bytes, buffers, peer lifecycle, timeout and cleanup rules</td>
+</tr>
+<tr>
+<td>RPC to another host</td>
+<td>Independent placement and scaling</td>
+<td>Network delay, remote scheduling, serialization, and wider partial failure</td>
+</tr>
+<tr>
+<td>Asynchronous queue</td>
+<td>Hand-off without waiting for processing now</td>
+<td>Backlog, delivery, ordering, duplicate, and completion tracking</td>
+</tr>
+</tbody>
+</table>
+<p>This is not a ladder where each wider boundary is automatically better. A local call is often the best design when the work belongs in one fault domain. IPC is a good fit when a parser, plugin, or privileged helper needs containment on the same host. RPC is appropriate only when the work truly needs a remote boundary. Moving a renderer to another machine does not make it more reliable by itself; it adds new failure states that the contract must handle.</p>
+<p>The transfer from IPC to RPC is precise: the local trace already taught the important correction. A client timeout cannot prove a callee did nothing. RPC adds network and remote-host uncertainty to that same gap in knowledge. Protocol choice, service discovery, and distributed retry design are outside this track; the host-level move is to identify the process boundary and observe whether work is blocked, queued, accepted, or completed.</p>
+<h2>Operational Consequences: Backpressure Is Part of the API</h2>
+<p>The renderer cannot process infinite concurrent uploads. A sound boundary states what happens when it is full:</p>
+<div class="codehilite"><pre><span></span><code>bounded local queue
+  -&gt; accept up to N pending render requests
+  -&gt; reject or degrade new work when N is full
+  -&gt; expose queue age and in-flight count
 </code></pre></div>
 
-<p>What happened? From the caller's perspective, the call failed. From the server's perspective, the operation succeeded. If the caller retries blindly, the view count may increment twice unless the operation is idempotent. Idempotent means repeating the request has the same intended effect as doing it once, often through request IDs, deduplication keys, or naturally safe operations such as "set this value" instead of "add one."</p>
-<p>This is why timeouts, retries, and idempotency are part of the communication contract. They are not exception-handling decoration. A remote boundary makes uncertainty normal.</p>
-<h2>IPC Is Not Just "Smaller RPC"</h2>
-<p>IPC on the same machine avoids network failure, but it still crosses a meaningful boundary. A pipe, Unix domain socket, shared memory region, or local service process changes ownership and failure behavior.</p>
-<p>Suppose the API sends image bytes to a local thumbnail helper:</p>
-<div class="codehilite"><pre><span></span><code>API process
-  -&gt; write request to Unix socket
-  -&gt; helper process reads bytes
-  -&gt; helper decodes image
-  -&gt; helper writes thumbnail path or error
-</code></pre></div>
-
-<p>The helper can be restarted independently. It may run with fewer permissions. It can crash on malformed input without taking the API process down. That isolation is valuable, especially when the helper handles risky parsing or CPU-heavy work.</p>
-<p>The cost is coordination. The API must decide how long to wait, what to do if the helper exits, whether requests are queued, how large messages may be, and whether backpressure should block the caller or reject work. Shared memory can reduce copying, but it adds ownership and synchronization questions: who writes, who reads, when is a buffer safe to reuse, and what happens if one process dies while holding a lock?</p>
-<p>IPC therefore sits between local calls and networked RPC. It can be much faster and more predictable than crossing the network, but it is still not a normal function call. It introduces an OS-mediated boundary with lifecycle, permissions, buffers, blocking, and cleanup.</p>
-<p>Active check: if a helper process crashes during thumbnail generation, is that the same as a local function raising an exception? No. The API may see a broken pipe, timeout, child exit, or partial output. It also has the option to restart the helper or degrade only thumbnails while keeping the main API process alive.</p>
-<h2>Choosing Sync, Async, or Shared State</h2>
-<p>Communication style should follow the dependency's role in the user-visible path.</p>
-<p>For the lesson page:</p>
-<div class="codehilite"><pre><span></span><code>required now:
-  lesson metadata needed to render the page
-
-useful but degradable:
-  thumbnail generation can fall back to placeholder
-
-not required now:
-  analytics event can be processed later
-</code></pre></div>
-
-<p>Synchronous RPC is reasonable when the caller genuinely needs an answer now and can define a bounded wait. The page cannot render without the lesson title, so a metadata call may belong on the critical path. But it still needs a timeout, fallback behavior, and clear retry rules.</p>
-<p>Asynchronous messaging is better when the caller needs to hand off work but does not need the result immediately. Analytics is a good fit: the user should not wait for the analytics consumer. The trade-off is that publish success only means the message was accepted by the broker or queue, not that analytics has already been updated.</p>
-<p>Shared state can be useful when multiple components need to observe a durable projection. A precomputed lesson metadata cache lets the renderer avoid calling a metadata service on every request. But shared state raises authority and freshness questions: who writes the projection, how stale can it be, and what happens if the updater lags?</p>
-<p>One compact design rule:</p>
-<div class="codehilite"><pre><span></span><code>need answer now -&gt; synchronous call, bounded by timeout and fallback
-need work eventually -&gt; queue/message, bounded by backlog and retry policy
-need reusable view -&gt; shared projection, bounded by freshness and authority rules
-</code></pre></div>
-
-<p>There is no universally best option. The trade-off is immediacy versus containment. Synchronous calls keep control flow simple when everything is healthy, but propagate slow dependencies into the caller. Asynchronous boundaries contain timing failures better, but move complexity into delivery, ordering, duplication, and observability.</p>
-<h2>Failure Modes and Design Checks</h2>
-<p><strong>Failure: treating RPC like a local method.</strong> This hides timeout, retry, idempotency, serialization, remote load, and partial failure. The fix is to write those behaviors into the API contract and tests.</p>
-<p><strong>Failure: building long synchronous chains.</strong> Each call may be reasonable alone, but five required remote calls make the user path depend on five services and five timeout budgets. Ask which dependencies can be cached, precomputed, made optional, or moved behind a queue.</p>
-<p><strong>Failure: adding a queue without owning backlog.</strong> A queue decouples timing, but it does not remove work. Watch queue depth, oldest message age, retry count, dead-letter volume, and consumer throughput.</p>
-<p><strong>Failure: unclear retry ownership.</strong> If the caller, gateway, client library, and worker all retry, one user action can multiply into many operations. Decide where retries live and how idempotency prevents duplicate effects.</p>
-<p>Design review:</p>
-<div class="codehilite"><pre><span></span><code>The lesson page calls:
-  metadata service, required
-  recommendation service, optional
-  analytics RPC, not user-visible
-
-All calls use a 2 second timeout.
-The page waits for all three before responding.
-During an analytics outage, page latency rises to 2 seconds.
-</code></pre></div>
-
-<p>What is wrong? The communication style does not match the dependency role. Analytics should not be on the critical synchronous path. Recommendations may need a short timeout and fallback. Metadata may justify synchronous RPC, but with a bounded timeout that fits the page latency target. A better design publishes analytics asynchronously, degrades recommendations, and keeps only truly required data in the page's critical path.</p>
-<p>Learner action: take one service endpoint you know and list every boundary crossed before the response returns: function call, process, syscall, IPC, RPC, queue, database, or cache. For each boundary, write one failure mode and one limit. A strong answer names timeouts, backpressure, idempotency, freshness, or backlog rather than just naming protocols.</p>
+<p>This protects the web process from holding unlimited uploads in memory and makes overload visible early. The trade-off is that some requests receive a fast rejection or a placeholder rather than waiting hopefully. That is often better for a user-facing path than a growing queue whose eventual latency is unknown.</p>
+<p>Useful evidence follows the request across the boundary:</p>
+<ul>
+<li>request ID in both processes' logs;</li>
+<li>socket connection, error, and close events;</li>
+<li>accepted, in-flight, completed, and rejected counts;</li>
+<li>queue depth and age, not only average render time;</li>
+<li>renderer restart history and the reason a request ended.</li>
+</ul>
+<p>These signals distinguish similar symptoms. A web worker blocked writing points toward a full local path or slow peer. A rising local queue with idle CPUs may mean the renderer waits on storage or a lock. Repeated <code>EPIPE</code> or connection resets point toward peer lifecycle, not an ordinary application exception. The next diagnostic step should follow that evidence rather than assuming “IPC is slow.”</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> The web process gets <code>EPIPE</code> while sending a preview request. Does that prove the renderer processed no bytes?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It proves the stream peer was closed for that write. Some earlier bytes may have been received and work may already have begun. Use the request ID and a completion record to decide whether retrying is safe.</p>
+<p><strong>Check:</strong> A local renderer queue grows while web CPU is low. Should the team first increase web-worker CPU shares?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not from that evidence. Inspect renderer in-flight work, queue age, blocked states, storage access, and process lifecycle. Low web CPU does not say which resource prevents the helper from progressing.</p>
+<h2>Practice: Review a Boundary Before Adding a Queue</h2>
+<p>A service sends 30 MiB images to a local conversion helper through a Unix-domain stream socket. During a burst, web workers block in writes, memory rises, and the helper restarts after malformed files. The team proposes “put every image into an unbounded in-memory queue.”</p>
+<p>Write a better boundary contract.</p>
+<p>A good answer should mention:</p>
+<ul>
+<li>framing and maximum request size for the byte stream;</li>
+<li>a bounded queue or concurrency limit plus a clear rejection, fallback, or admission rule;</li>
+<li>a request ID and a way to distinguish accepted, completed, failed, and unknown outcomes;</li>
+<li>restart handling and whether reprocessing the same image is idempotent;</li>
+<li>evidence such as queue age, blocked writers, helper restart reason, and completion counts.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Operating Systems: Three Easy Pieces - Link: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">https://pages.cs.wisc.edu/~remzi/OSTEP/</a> - Focus: Review IPC mechanisms and how process isolation changes communication and failure behavior.</li>
-<li>[ARTICLE] Linux unix(7) - Link: <a href="https://man7.org/linux/man-pages/man7/unix.7.html">https://man7.org/linux/man-pages/man7/unix.7.html</a> - Focus: See Unix domain sockets as a concrete IPC boundary on one host.</li>
-<li>[ARTICLE] gRPC Introduction - Link: <a href="https://grpc.io/docs/what-is-grpc/introduction/">https://grpc.io/docs/what-is-grpc/introduction/</a> - Focus: Notice how RPC presents procedure-like APIs while still crossing serialization and network boundaries.</li>
-<li>[ARTICLE] RabbitMQ Tutorials - Link: <a href="https://www.rabbitmq.com/tutorials">https://www.rabbitmq.com/tutorials</a> - Focus: Contrast request-response RPC with queue-based asynchronous work and backlog management.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man7/unix.7.html">unix(7): sockets for local interprocess communication</a> — Focus: Compare stream, datagram, and sequenced-packet behavior; inspect local credentials, pathname permissions, and descriptor passing.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man7/pipe.7.html">pipe(7): overview of pipes and FIFOs</a> — Focus: See the finite-buffer and reader/writer-closure behavior behind basic pipe IPC.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man2/socketpair.2.html">socketpair(2)</a> — Focus: Inspect how a connected local socket pair creates an unnamed IPC channel.</li>
+<li>[BOOK] <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">Operating Systems: Three Easy Pieces</a> — Focus: Review process isolation and the practical purpose of inter-process communication.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Communication mechanisms should be chosen by boundary semantics, not by how clean the call site looks.</li>
-<li>IPC gives local isolation but still introduces OS-mediated buffers, lifecycle, blocking, and cleanup.</li>
-<li>RPC adds serialization, remote scheduling, network delay, timeout ambiguity, retries, and idempotency concerns.</li>
-<li>Asynchronous messaging contains timing failures better, but shifts responsibility to backlog, delivery, ordering, and observability.</li>
-</ol>
+<ul>
+<li>IPC is a process boundary: it exchanges bytes or capabilities between independently scheduled and failing processes.</li>
+<li>A stream needs application framing, and every local boundary needs bounds on unfinished work.</li>
+<li>A timeout or closed connection describes the caller's observed outcome; it does not automatically reveal the callee's completed work.</li>
+<li>Choose IPC for a concrete isolation benefit, then make retries, lifecycle, backpressure, and evidence part of the contract.</li>
+<li>RPC extends the same uncertainty across a network, but its distributed mechanisms should not be confused with host-local IPC.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -239,7 +351,7 @@ During an analytics outage, page latency rises to 2 seconds.
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-27 15:03 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

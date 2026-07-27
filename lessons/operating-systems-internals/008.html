@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -79,7 +83,18 @@
 <section class="stack-block lesson-content-shell">
   <h1>OS Internals Synthesis: Diagnosing Host-Level Behavior</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong> classify a slow or unreliable service symptom as CPU scheduling, blocking I/O, synchronization, memory pressure, lifecycle, or communication-boundary pressure; choose the next evidence to collect; and propose a fix that matches the mechanism instead of the most visible symptom.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace one slow unit of work through a host-level path and state the most plausible pressure without treating it as proven.</p>
+</li>
+<li>
+<p>Choose evidence that distinguishes CPU, I/O, synchronization, memory, lifecycle, and communication-boundary hypotheses.</p>
+</li>
+<li>
+<p>Defend one bounded intervention and its trade-off instead of proposing a generic scaling response.</p>
+</li>
+</ul>
 <p><strong>Idea in one sentence.</strong> Good OS diagnosis starts by tracing one unit of work and asking which host-level state, queue, syscall, memory layer, lifecycle transition, or communication boundary changed its progress.</p>
 </blockquote>
 <h2>Core Insight</h2>
@@ -189,6 +204,41 @@ observed:
 
 <p>The mechanism prevents a bad fix. Adding CPU will not help much if the workers are mostly blocked. Restarting workers may briefly clear in-flight jobs but does not change timeout policy. Increasing queue size may hide pressure and increase latency. The better response is to bound waiting, reduce retry amplification, cap in-flight jobs, use backpressure, and make readiness reflect useful capacity.</p>
 <p>There is still a trade-off. Shorter timeouts protect worker capacity but may fail some operations that would have succeeded after a longer wait. More retries improve recovery from transient failures but can amplify load during persistent slowness. Larger queues absorb bursts but delay the overload signal. The design response must pick the trade-off consciously instead of letting defaults choose it.</p>
+<h2>Incident Dossier: Separate What We Know from What We Guess</h2>
+<p>The worker incident contains observations, not a finished root-cause report. Write them in separate columns before choosing a change:</p>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>In this incident</th>
+<th>What it does and does not establish</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Observed evidence</td>
+<td>Throughput falls from 200 to 40 jobs per minute; queue age and memory rise; CPU is around 45%; many threads are blocked.</td>
+<td>The worker is making less progress and holding work longer. It does not identify the blocked resource yet.</td>
+</tr>
+<tr>
+<td>Working hypothesis</td>
+<td>Object-storage waits hold worker threads and retries amplify the dependency load.</td>
+<td>This fits the current trace, but needs blocked-time and dependency evidence.</td>
+</tr>
+<tr>
+<td>Alternative hypothesis</td>
+<td>Threads are mostly contending on an in-process lock after the release.</td>
+<td>This also fits “many blocked threads”; a thread dump or lock evidence could support it.</td>
+</tr>
+<tr>
+<td>Situated mitigation</td>
+<td>Cap in-flight work and reduce retry amplification while collecting the next evidence.</td>
+<td>This bounds harm even if the exact wait is not yet known; it may reject or delay some work.</td>
+</tr>
+</tbody>
+</table>
+<p>This separation is useful under pressure. “Many blocked threads” is a fact only after the measurement method is understood; “object storage is the root cause” is an inference. The capstone does not ask for perfect certainty. It asks for a next action that is both evidence-seeking and safe enough to reverse.</p>
+<p>For this case, collect one traceable sample: choose a job ID, record when it dequeues, begins its storage read, retries, completes or fails, and is acknowledged. Join that record with the relevant worker-thread state and object-storage latency during the same interval. If the wait accumulates before or during the storage call, the I/O hypothesis strengthens. If the job spends most of its time before that call while waiting on a mutex, the synchronization hypothesis replaces it. The same unit of work turns a dashboard correlation into an inspectable path.</p>
 <h2>Distinguishing Similar Symptoms</h2>
 <p>The same top-line symptom can come from different mechanisms. Use contrast pairs when the incident is ambiguous.</p>
 <p><strong>High latency with high CPU.</strong> This may be compute pressure, poor scheduling fairness, or too much accepted work. Evidence should include CPU profiles, runnable queue length, per-core saturation, and request class mix. The fix may involve capacity, admission control, scheduling policy, or reducing CPU cost.</p>
@@ -196,7 +246,9 @@ observed:
 <p><strong>High memory with rising latency.</strong> This can mean useful caching, harmful buffering, memory leaks, large payloads, retry accumulation, or queues absorbing work faster than consumers can drain. Evidence should distinguish hot cache growth from unbounded backlog. Memory hierarchy thinking asks whether memory is keeping hot state close or hiding overload.</p>
 <p><strong>Alive instances with user-visible errors.</strong> This is a lifecycle and readiness question. A process can exist while starting, blocked, overloaded, draining, or repeatedly restarted. Readiness should reflect the ability to accept useful work, not merely the existence of a PID or an HTTP server thread.</p>
 <p><strong>Clean API with surprising failure.</strong> This is a boundary question. A local function, IPC call, RPC, queue publish, and cache read may all look like tidy APIs, but their semantics differ. Ask whether the boundary can delay, duplicate, reorder, lose, or partially complete work.</p>
-<p>Active check: you see high request latency, low CPU, and many threads in <code>futex</code> wait. Which lesson should you reach for first? The synchronization lesson. <code>futex</code> commonly appears when threads wait on lock or condition state. The next step is lock contention evidence or a thread dump, not tuning network retry policy.</p>
+<p><strong>Check:</strong> You see high request latency, low CPU, and many threads in <code>futex</code> wait. Which lesson model should you reach for first?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Start with the synchronization model. <code>futex</code> commonly appears when threads wait on lock or condition state. The next step is lock-contention evidence or a thread dump, not tuning network retry policy. It remains a hypothesis until that evidence shows which lock or wait condition is responsible.</p>
 <h2>Capstone Practice: Diagnose Before Fixing</h2>
 <p>Use this scenario:</p>
 <div class="codehilite"><pre><span></span><code>An image-processing service runs in containers.
@@ -258,7 +310,7 @@ Would weaken it:
 
 <p>This discipline prevents dashboard shopping. Without a hypothesis, it is easy to collect many metrics and then pick the graph that matches the story you already wanted. With a hypothesis, you know what evidence would redirect you from communication pressure to CPU scheduling, synchronization, lifecycle, or memory pressure.</p>
 <p>There is a trade-off here too. Deep instrumentation takes time, and incidents often require action before perfect proof. The practical goal is not infinite certainty. It is to gather enough mechanism-specific evidence that your first mitigation is bounded, reversible, and aimed at the likely pressure. That habit keeps urgency from turning into random change.</p>
-<h2>Architecture Review Rubric</h2>
+<h2>Evidence and Readiness Rubric</h2>
 <p>When reviewing a service after this track, ask five questions.</p>
 <p><strong>1. What owns progress?</strong> Identify the unit of work and where it waits: CPU, lock, syscall, queue, lifecycle, or remote boundary.</p>
 <p><strong>2. What is authoritative?</strong> For memory and cache layers, decide which state is truth and how stale faster copies may be.</p>
@@ -266,6 +318,44 @@ Would weaken it:
 <p><strong>4. What admits work?</strong> Scheduling and load balancing are admission decisions. Readiness must represent useful capacity, not simple liveness.</p>
 <p><strong>5. What happens when the boundary lies?</strong> A timeout may not mean the remote operation did not happen. A queue accept may not mean processing completed. A cache hit may not mean the answer is fresh enough.</p>
 <p>Learner action: close the lesson and reconstruct the diagnosis loop from memory. Then apply it to one endpoint or worker you know. A good answer should name one unit of work, one expected path, one likely waiting state, one piece of confirming evidence, and one bounded response. Avoid fixes that do not name the mechanism they are supposed to change.</p>
+<p>Score the answer before calling it a diagnosis:</p>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Ready answer</th>
+<th>Not ready yet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unit of work</td>
+<td>Names one request, job, or thread and its expected path</td>
+<td>Says only “the service is slow”</td>
+</tr>
+<tr>
+<td>Mechanism</td>
+<td>Separates observed state from a named hypothesis</td>
+<td>Treats a dashboard symptom as a cause</td>
+</tr>
+<tr>
+<td>Evidence</td>
+<td>Names one observation that could weaken the hypothesis</td>
+<td>Lists many generic metrics without a decision rule</td>
+</tr>
+<tr>
+<td>Intervention</td>
+<td>Bounds waiting, admission, retries, or resource use and names the cost</td>
+<td>Proposes “scale,” “restart,” or “add retries” without a mechanism</td>
+</tr>
+<tr>
+<td>Reassessment</td>
+<td>States what should improve and what would cause a different diagnosis</td>
+<td>Declares success because the first change was deployed</td>
+</tr>
+</tbody>
+</table>
+<p>This rubric is the capstone artifact. A complete answer need not identify the final root cause from the short scenario. It must make the next investigation and the first reversible response more disciplined than a guess.</p>
 <h2>Readiness Checklist</h2>
 <p>Before leaving this foundation track, you should be able to answer these without rereading:</p>
 <ul>
@@ -320,7 +410,7 @@ Would weaken it:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-27 15:03 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

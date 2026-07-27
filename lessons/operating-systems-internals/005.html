@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,145 +81,226 @@
 <section class="stack-block lesson-content-shell">
   <h1>Memory Hierarchies and Distributed State</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong> explain why memory and cache hierarchies exist, trace a request through hit, miss, refill, and eviction paths, and diagnose when a small drop in locality can overload a deeper authority.</p>
-<p><strong>Idea in one sentence.</strong> Memory hierarchies keep hot state close to computation, but every fast layer buys lower latency by accepting limits in capacity, freshness, coordination, or failure behavior.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace a file-backed memory access through virtual mapping, resident memory, a possible storage read, and later reuse.</p>
+</li>
+<li>
+<p>Explain why locality, working set, and memory pressure determine whether a process waits or keeps making progress.</p>
+</li>
+<li>
+<p>Separate an operating-system cache from a distributed cache while reusing the same diagnostic questions: where is the copy, what is authoritative, and what happens on a miss?</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Fast memory helps only when the data a program needs is already nearby or likely to be reused; otherwise each miss moves work to a slower, scarce layer.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine an API that serves user profiles. The handler needs a display name, a feature-flag set, an account status, and sometimes an avatar URL. Some of that state may already be in the process heap because the user was just seen. A broader set may live in Redis. The durable profile row lives in a database. The avatar may sit in object storage and be cached by a CDN. A request that looks like "read profile" is really a path through a hierarchy of state.</p>
-<p>That hierarchy exists because no single place wins at everything. The closest layer is fast, but small and usually less durable. The authoritative layer is more complete and durable, but slower and more contended. Caches, page caches, CPU caches, Redis, databases, and CDNs all express the same pressure: the data you need most wants to be near the computation, while the total data you own is too large, expensive, or shared to keep entirely in the fastest place.</p>
-<p>The non-obvious part is that a cache is not just an optimization after the real design. It changes the request path, the failure path, and the load path. A cache hit can make the system look effortless. A cache miss can push work into a slower layer. A cluster of misses can turn a harmless-looking traffic burst into a database incident.</p>
-<p>The practical mental model is a ladder of state with movement between layers. Reads check nearby layers first. Misses fall through to deeper layers. Refills copy selected data back upward. Eviction decides what gets pushed out when fast space is scarce. The system's real behavior is often determined less by the presence of a cache than by what happens when locality breaks.</p>
-<h2>The Layers Exist Because Each One Gives Up Something</h2>
-<p>A memory hierarchy is a ranked set of places where state can live. In a local machine, the layers may look like registers, CPU caches, RAM, page cache, and storage. In a service architecture, the layers may look like process memory, local cache, shared cache, database, object storage, and CDN. These are not identical mechanisms, but they rhyme because the trade-off is structural.</p>
-<p>For the profile API, one possible ladder is:</p>
-<div class="codehilite"><pre><span></span><code>closest / fastest / smallest
--&gt; handler local variables
--&gt; process heap or in-process cache
--&gt; shared cache
--&gt; database row
--&gt; object storage and CDN-managed media
-farthest / slower / larger / more durable
+<p>An indexing process scans a large local file after a restart. Its source code has mapped the file into its virtual address space and now reads the next record. The code looks ordinary:</p>
+<div class="codehilite"><pre><span></span><code>record = mapped_index[offset]
 </code></pre></div>
 
-<p>Each step upward usually buys speed and lower contention. Each step downward usually buys capacity, durability, sharing, or authority. The database is not "worse" than a cache. It answers a different question: what is the durable, authoritative state? The cache answers: what copy is worth keeping close because it is likely to be used again soon?</p>
-<p>This is where the word hierarchy matters. The layers are ordered by access cost and responsibility. A fast layer is useful because many requests can finish before they touch a slower layer. A deep layer is necessary because the fast layer cannot safely own everything. The design works only when both facts remain visible.</p>
-<p>One common mistake is to ask only, "Do we have a cache?" A better question is, "What path does a request take on a hit, what path does it take on a miss, and which layer is authoritative when copies disagree?"</p>
-<h2>Locality Is the Source of the Win</h2>
-<p>Small fast layers are powerful only when access is uneven. If every request touched a random user exactly once, a profile cache would do little. It would fill with objects that are not reused. But real workloads often have locality: recent items are likely to be used again, popular users or tenants receive more traffic, and related data is touched together.</p>
-<p>Locality has two common forms:</p>
-<div class="codehilite"><pre><span></span><code>temporal locality: recently used data is likely to be used again
-spatial or related locality: nearby or associated data is likely to be used together
+<p>It is tempting to call this “a memory read” and stop there. That model works while the needed data is already resident and recently used. It breaks after a restart, after memory pressure has reclaimed old file pages, or when the scan jumps randomly through a file too large to keep close.</p>
+<p>The stronger model is a hierarchy of places and costs. The CPU can use data very quickly when it is in its nearby hardware caches. The process can address a much larger virtual range, but the relevant page must be backed by usable physical memory. For a file-backed mapping, Linux can keep file data in the page cache in RAM; if the needed data is absent there, the kernel may need storage I/O before the access can complete. Exact cache levels, page sizes, replacement policy, and implementation details vary by machine and operating system. The diagnostic shape is stable: identify which layer has the needed data, which layer must supply it on a miss, and what scarce resource is under pressure.</p>
+<h2>The Small Situation: A Warm Scan Becomes a Slow Scan</h2>
+<p>Assume the index file is 8 GiB and the process reads 64 KiB ranges in increasing offset order. These numbers are illustrative.</p>
+<div class="codehilite"><pre><span></span><code>process P -&gt; virtual mapping -&gt; kernel-managed file pages in RAM -&gt; local SSD
 </code></pre></div>
 
-<p>CPU caches rely on both. If code reads one memory address, nearby addresses may be loaded because the program may soon read adjacent data. Application caches often rely more visibly on temporal locality: if a user opens several pages in a short session, their profile data is likely to be needed repeatedly.</p>
-<p>In the profile API, a small cache might hold only a fraction of all users, yet absorb most profile reads if active users repeat. That is why cache size alone is not the design center. A small cache with a good match to the working set can be excellent. A large cache with a random workload can still be disappointing.</p>
-<p>The working set is the subset of data the current workload is actively touching. When the working set fits in the fast layers, hit rates are high and deeper layers are protected. When the working set grows beyond the fast layers, eviction churn rises, misses increase, and the deeper authority starts seeing more traffic.</p>
-<p>Active check: if Redis memory doubles, does the system automatically become twice as fast? No. More space helps only if the extra space captures data that the workload will reuse. If the workload has poor locality or the miss path is dominated by something else, the improvement may be small.</p>
-<h2>Worked Path: Read, Miss, Refill, Evict</h2>
-<p>Trace one request for user <code>42</code>.</p>
-<div class="codehilite"><pre><span></span><code>request: GET /profiles/42
-goal: return display name, account status, feature flags
-fast layer: process cache
-shared layer: Redis
-authority: relational database
+<p>The first run after a restart is slower. A teammate suggests more CPU because P is using little CPU while the scan stalls. That is a reasonable guess when computation is the limiting resource. Here it is incomplete: low CPU use can mean the process is waiting for data movement, not that it has spare useful work.</p>
+<p>The visible evidence might look like this:</p>
+<div class="codehilite"><pre><span></span><code>09:00  process starts; mapped index exists
+09:01  scan throughput: 90 MiB/s; storage reads are high
+09:03  scan throughput: 900 MiB/s; storage reads fall
+09:05  a second sequential pass stays near 900 MiB/s
 </code></pre></div>
 
-<p>A simple read path might be:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">read_profile</span><span class="p">(</span><span class="n">user_id</span><span class="p">):</span>
-    <span class="n">profile</span> <span class="o">=</span> <span class="n">process_cache</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">user_id</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">profile</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">profile</span>
+<p>These values are a teaching trace, not a measurement from a particular host. They suggest a correction: the mapping itself did not place all 8 GiB in the CPU's fastest storage. The early pass had to establish useful resident pages; later accesses reused data that was already closer. A CPU upgrade may change some cost, but it does not by itself explain the transition from storage activity to reuse.</p>
+<h2>Virtual Address Is Permission to Address, Not a Promise of Immediate Data</h2>
+<p>In plain English:</p>
+<blockquote>
+<p>A process can be allowed to refer to a range of addresses before every referenced byte is ready in physical memory.</p>
+</blockquote>
+<p>In this scenario:</p>
+<blockquote>
+<p><code>mapped_index[offset]</code> refers to a location in P's file mapping. The mapping tells the kernel what file range the address represents. It does not guarantee that the required page is already resident in RAM.</p>
+</blockquote>
+<p>Technical name:</p>
+<blockquote>
+<p><code>mmap()</code> creates a mapping in the calling process's virtual address space. On Linux, a file mapping is initialized from a file range; accessing it may later require the memory-management system to make the relevant page available.</p>
+</blockquote>
+<p>This is a deliberately simplified teaching model. The CPU's translation hardware, page tables, kernel memory-management code, filesystem, and device driver cooperate in the real path. We do not need their implementation details to make a good diagnosis. We need to distinguish three facts that source code often merges into one word, “memory”:</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>In the indexing process</th>
+<th>Why it matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Can P name the data?</td>
+<td>Yes: its virtual mapping covers the file offset.</td>
+<td>A valid address is not proof of a fast access.</td>
+</tr>
+<tr>
+<td>Is a usable copy already in RAM?</td>
+<td>Maybe: it can be in the file page cache or absent after reclaim.</td>
+<td>Absence can create a wait for deeper storage.</td>
+</tr>
+<tr>
+<td>Is it near the CPU right now?</td>
+<td>Maybe: repeated access can benefit from hardware caches.</td>
+<td>Locality changes the cost of repeated reads.</td>
+</tr>
+</tbody>
+</table>
+<h2>The Mechanism Step by Step</h2>
+<p>Return to the first access to a file region that is no longer resident. This trace is illustrative and deliberately avoids claiming one universal kernel implementation.</p>
+<div class="codehilite"><pre><span></span><code>starting state
+  P has a valid file mapping for the index
+  P reaches offset 2 GiB
+  the relevant file page is not currently resident in RAM
 
-    <span class="n">profile</span> <span class="o">=</span> <span class="n">redis</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">user_id</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">profile</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">process_cache</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">user_id</span><span class="p">,</span> <span class="n">profile</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">profile</span>
+1. address access
+  P executes an instruction that reads mapped_index[offset]
 
-    <span class="n">profile</span> <span class="o">=</span> <span class="n">database</span><span class="o">.</span><span class="n">fetch_profile</span><span class="p">(</span><span class="n">user_id</span><span class="p">)</span>
-    <span class="n">redis</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">user_id</span><span class="p">,</span> <span class="n">profile</span><span class="p">,</span> <span class="n">ttl</span><span class="o">=</span><span class="mi">300</span><span class="p">)</span>
-    <span class="n">process_cache</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">user_id</span><span class="p">,</span> <span class="n">profile</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">profile</span>
+2. missing resident page
+  hardware and the kernel&#39;s memory-management path discover that P cannot complete this access from its current resident mapping
+
+3. find backing data
+  the kernel identifies the file-backed range; if no usable cached page exists, it asks the storage path to read it
+
+4. wait and useful work elsewhere
+  P waits for the required data while the scheduler can run another runnable task
+
+5. make the page usable
+  the data becomes resident in RAM and P can resume the access
+
+6. reuse
+  a later nearby read may find the page in RAM and may also benefit from CPU-cache locality, avoiding the earlier storage wait
 </code></pre></div>
 
-<p>This code hides several important states. Expand the path:</p>
-<div class="codehilite"><pre><span></span><code>1. process cache lookup
-   hit: return quickly, no network request
-   miss: ask shared cache
+<p>This is a page-fault-shaped event: the process touched a virtual address whose required page was not presently usable in its resident mapping. Not every page fault implies slow storage I/O. A needed page can already be in RAM through another mapping or cache state, and the exact accounting differs by operating system. The useful distinction is evidence-based: if storage activity and process waiting rise together, investigate the data path and memory pressure; if the data is resident but CPU time dominates, investigate computation or scheduling instead.</p>
+<p>The mapping does not erase isolation. P has an address range it may use according to its mapping permissions, while the kernel mediates physical memory, file pages, and storage access. This continues the previous lessons' protected-progress model: the process asks to progress; the host decides what resource condition must be satisfied first.</p>
+<h2>Locality Turns a Small Fast Layer into Useful Capacity</h2>
+<p>The CPU and RAM cannot keep every byte equally close. A hierarchy works because programs often show <strong>locality</strong>:</p>
+<ul>
+<li><strong>Temporal locality:</strong> data used recently is likely to be used again soon.</li>
+<li><strong>Spatial locality:</strong> data near a recently used location is more likely to be used soon.</li>
+</ul>
+<p>The sequential index scan has both. After P reads one record, it is likely to read a nearby record. The first access may establish useful state for the following accesses. A random lookup workload has a weaker version of this story: it may repeatedly touch a small hot subset, or it may jump across a working set too large for the available fast layers.</p>
+<p>The <strong>working set</strong> is a teaching term for the data a workload needs actively enough that keeping it resident pays off. It is not a fixed property of the binary or of the file. It changes with the request mix, the scan pattern, and other processes competing for memory.</p>
+<div class="codehilite"><pre><span></span><code>working set fits available RAM
+  -&gt; many useful pages stay resident
+  -&gt; fewer storage waits
 
-2. shared cache lookup
-   hit: pay network/cache cost, refill process cache
-   miss: ask database
-
-3. database fetch
-   authority supplies current durable state
-   refill shared cache and process cache
-
-4. later insertion into a full cache
-   eviction policy chooses what leaves
+working set exceeds available RAM
+  -&gt; old pages are reclaimed or displaced
+  -&gt; repeated accesses miss again
+  -&gt; more waiting and I/O pressure
 </code></pre></div>
 
-<p>The hit path is cheap because the request stays high in the hierarchy. The miss path is expensive because it falls through to a deeper layer and may trigger refill work. Refill is the upward movement of a useful object after a miss. Eviction is the decision about what object loses its place when fast space is full.</p>
-<p>Now imagine user <code>42</code> becomes popular for a few minutes. After the first miss, the profile is refilled upward. Later requests hit the process cache or Redis. The hierarchy converts repeated access into lower latency and lower database load. If user <code>42</code> is touched once and never again, the refill was mostly wasted and may evict something more valuable.</p>
-<p>That is the central mechanism: the hierarchy bets that recently or frequently used state will be used again. The bet is powerful, but it can be wrong.</p>
-<h2>Miss Cascades and Refill Pressure</h2>
-<p>Most cache incidents are not caused by one miss. They are caused by many related misses. Suppose a deploy clears every process cache at once. Redis still has many profiles, so the database may survive. But Redis now receives a sudden burst from every instance. If Redis has evicted hot entries or is near capacity, many requests fall through to the database at the same time.</p>
-<p>The path can look like this:</p>
-<div class="codehilite"><pre><span></span><code>deploy restarts many API instances
--&gt; process caches are empty
--&gt; Redis receives burst of lookups
--&gt; Redis misses on some hot keys
--&gt; database receives burst of reads
--&gt; database latency rises
--&gt; refills slow down
--&gt; more callers wait and retry
--&gt; database receives even more work
+<p>This buys lower common-case latency, but it costs finite memory and makes performance sensitive to access pattern. A larger cache or more RAM helps when it holds data the workload will reuse. It does not turn a one-time random scan into a locality-rich workload, and it cannot make a slow backing device disappear.</p>
+<h2>A Worked Diagnosis: CPU Is Quiet, But the Host Is Busy</h2>
+<p>Suppose P's scan slows from 900 MiB/s to 35 MiB/s at the same time another batch job begins. An illustrative host view is:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th style="text-align: right;">Before batch job</th>
+<th style="text-align: right;">During slowdown</th>
+<th>What it suggests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P CPU use</td>
+<td style="text-align: right;">80%</td>
+<td style="text-align: right;">6%</td>
+<td>P is not executing much computation.</td>
+</tr>
+<tr>
+<td>storage read activity</td>
+<td style="text-align: right;">low</td>
+<td style="text-align: right;">high</td>
+<td>A deeper data source is active.</td>
+</tr>
+<tr>
+<td>available memory</td>
+<td style="text-align: right;">comfortable</td>
+<td style="text-align: right;">low</td>
+<td>Resident data is under pressure.</td>
+</tr>
+<tr>
+<td>scan throughput</td>
+<td style="text-align: right;">900 MiB/s</td>
+<td style="text-align: right;">35 MiB/s</td>
+<td>The access path became much more expensive.</td>
+</tr>
+</tbody>
+</table>
+<p>Do not treat the table as proof from four metrics alone. It earns a next investigation: confirm that P is blocked or faulting on the mapped-file path, identify which workloads expanded the working set, and check whether the file pages are repeatedly being displaced. A CPU profile by itself would be a poor first tool because P is hardly running.</p>
+<p>The immediate intervention depends on the constraint. If the batch job is an optional scan, staggering it may protect P's working set. If the index truly needs a larger active data set, more memory or a different data layout may help. If the access is random and the file is the wrong representation, changing the workload path can matter more than tuning eviction. These are situated choices, not a universal instruction to “add RAM.”</p>
+<p>So far, we can explain a quiet CPU and a slow process without calling the process idle or broken. Its progress is waiting on a memory-and-storage condition. The next lesson will turn another scarce resource, CPU time, into an explicit scheduling policy.</p>
+<h2>Eviction, Readahead, and Their Boundaries</h2>
+<p>When RAM is scarce, the operating system must reclaim or evict some data to make room. It cannot know future accesses perfectly. Replacement mechanisms use observations and heuristics; they can make a good prediction for a repeated scan and a bad prediction for a random workload.</p>
+<p>For sequential file access, operating systems may use readahead: request nearby file data before the program explicitly reaches it. On Linux, <code>MAP_POPULATE</code> for a file mapping can cause readahead and can reduce later blocking on page faults, but it is not a guarantee that every page is immediately available. This is a useful example of the trade-off:</p>
+<div class="codehilite"><pre><span></span><code>readahead improves: fewer waits when the next access follows the prediction
+readahead costs: memory and I/O for data that may never be used
+readahead fails to help when: access jumps unpredictably or memory pressure displaces the prefetched pages
+signal to watch: read pattern, storage activity, available memory, and useful throughput
 </code></pre></div>
 
-<p>This is a miss cascade. The hierarchy did not just fail to optimize. It actively changed how load propagated. A cold fast layer pushed pressure downward. A slow refill path kept the fast layer cold for longer. Retries and concurrent callers could multiply the work.</p>
-<p>There is a familiar operating-system analogy. When the working set no longer fits in memory, page faults can dominate execution. The CPU may be available, but the process spends its time waiting for pages to move from slower storage. In a distributed service, the same shape appears when hot data no longer fits in cache or when refill paths become saturated.</p>
-<p>The trade-off is that hierarchies improve common-case performance by adding uncommon-case complexity. Hits are fast and cheap. Misses need authority, refill policy, coordination, and protection from stampedes. You buy speed by accepting that the miss path must be engineered, not ignored.</p>
-<h2>Freshness, Authority, and Eviction</h2>
-<p>Distributed state adds a second difficulty: copies can disagree. The profile in process memory might be a few seconds old. Redis might have a five-minute time-to-live. The database might have the latest durable update. If an account is suspended, which layer is allowed to answer?</p>
-<p>Every hierarchy needs an authority rule. The authority is the place treated as the source of truth for a decision. A cache may answer many reads, but it should not silently override the authority for decisions that need current state. Some data tolerates staleness, such as display names or avatar URLs. Other data may not, such as account lock status, payment eligibility, or authorization decisions.</p>
-<p>Eviction policy also expresses values. Least-recently-used tries to keep recently touched objects. Least-frequently-used tries to keep frequently touched objects. TTL-based caching keeps objects for a time window, whether or not the next request will need them. No policy is universally correct; each one guesses what future access will look like.</p>
-<p>The design questions are practical:</p>
-<div class="codehilite"><pre><span></span><code>what layer is authoritative?
-how stale may this copy be?
-what happens on miss?
-what gets evicted under pressure?
-how do we prevent many callers from refilling the same key at once?
+<p>Do not promote a hint into a correctness mechanism. The process must still tolerate a later access that waits or fails. And do not equate a page-cache eviction with data loss: file-backed data still has its backing file, while the resident copy has been discarded or must be reloaded.</p>
+<h2>A Bounded Transfer: Distributed Caches Add Ownership and Freshness</h2>
+<p>An in-process cache, a shared Redis cache, and a CDN resemble the local hierarchy only in one useful way: a nearby copy can avoid a slower path, and misses can concentrate pressure on a deeper layer. They are not the same mechanism. A Linux page cache is host-managed RAM for file data; a distributed cache crosses process and network boundaries and can serve a copy that is stale relative to an authority.</p>
+<p>When moving the model outward, add two questions:</p>
+<div class="codehilite"><pre><span></span><code>Which layer is authoritative for this decision?
+How stale may the nearby copy be?
 </code></pre></div>
 
-<p>Active check: should every profile field share the same caching rule? Probably not. A biography or avatar URL may tolerate a stale read. An account-disabled flag may need a shorter TTL, invalidation, or a direct authority check. The hierarchy should follow the consequence of being wrong, not just the shape of the object.</p>
-<h2>Failure Modes and Design Checks</h2>
-<p><strong>Failure: treating cache hit rate as the whole story.</strong> Hit rate matters, but it hides which keys miss and how expensive those misses are. A 2 percent miss rate on a cheap path may be fine; a 2 percent miss rate on a hot authorization path may overload the authority.</p>
-<p><strong>Failure: no stampede protection.</strong> If one popular key expires and thousands of callers all refill it at once, the hierarchy multiplies work. Use single-flight behavior, request coalescing, jittered TTLs, or background refresh when the path is important.</p>
-<p><strong>Failure: caching data without an authority rule.</strong> If no one knows which layer wins when copies disagree, freshness bugs become policy bugs. Decide whether stale reads are acceptable, how long they may last, and which decisions bypass cache.</p>
-<p><strong>Failure: eviction without workload evidence.</strong> Default eviction may be good enough, but it is still a guess. Watch evictions, miss latency, refill latency, hot-key distribution, and downstream saturation together.</p>
-<p>Design review:</p>
-<div class="codehilite"><pre><span></span><code>An API caches profile objects in Redis for 10 minutes.
-The same object contains avatar URL, display name, account status, and fraud hold.
-Traffic spikes after a marketing campaign.
-Hit rate drops from 96 percent to 92 percent.
-Database CPU jumps and login latency rises.
-</code></pre></div>
-
-<p>What should you inspect first? Do not stop at "hit rate dropped." Ask which keys missed, whether misses clustered on login paths, whether refill latency rose, whether account status should share a TTL with cosmetic profile fields, and whether many callers refilled the same keys concurrently. A good answer traces the miss path and identifies the authority under pressure.</p>
-<p>Learner action: close the lesson and reconstruct the read path from memory: local hit, shared-cache hit, authority miss, refill, eviction. For each step, name the latency effect and the operational signal you would watch. A strong answer mentions both fast-path metrics and downstream load, not just cache size.</p>
+<p>For a profile image URL, a short-lived stale copy may be acceptable. For an account lock or authorization decision, the safer path may require fresher state or an authority check. The transfer is valuable only when it keeps this new ownership and freshness boundary visible; otherwise “cache hierarchy” becomes a misleading slogan.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion: A mapped file is entirely in RAM.</strong></p>
+<p>Why it is tempting: the program reads it through an address.</p>
+<p>Better model: the mapping creates a virtual-address relationship. Individual accesses can still require resident pages and potentially storage I/O.</p>
+<p><strong>Confusion: Low CPU means the host is underused.</strong></p>
+<p>Why it is tempting: CPU percentage is easy to see.</p>
+<p>Better model: a process can be waiting on page or I/O conditions while other resources are saturated. Pair CPU data with memory, storage, and process-state evidence.</p>
+<p><strong>Confusion: More cache is always faster.</strong></p>
+<p>Why it is tempting: a larger fast layer can hold more data.</p>
+<p>Better model: extra capacity helps only when it retains reusable working-set data; it can still cost memory, I/O, and coordination.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A process has a valid file mapping, low CPU use, high storage reads, and a sharp drop in scan throughput after another memory-heavy job starts. Is CPU capacity the first conclusion?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The combined evidence suggests that resident data and the storage path deserve investigation first. Confirm the process's waiting or fault behavior and memory pressure before changing CPU capacity; CPU may matter elsewhere, but these signals do not establish it as the present bottleneck.</p>
+<h2>Practice: Choose the Next Evidence</h2>
+<p>An analytics service scans a local 12 GiB lookup file. After a deployment, request latency rises and CPU falls from 70% to 9%. Storage reads rise, available RAM falls, and the service's second pass over the same key range becomes much faster than the first.</p>
+<p>What model explains the change, and what two observations would you collect before choosing a fix?</p>
+<p><strong>A good answer should mention:</strong></p>
+<ul>
+<li>The deployment or competing load may have left useful file pages nonresident; early accesses took a slower miss path and later accesses reused resident data.</li>
+<li>Verify process waiting or fault behavior and correlate it with memory pressure and storage activity; inspect the competing workload's active data set as well.</li>
+<li>Do not assume that the mapping loaded the whole file or that low CPU proves spare host capacity.</li>
+<li>A remedy depends on the evidence: protect or enlarge the useful working set, stagger competing scans, change the access layout, or investigate the backing storage path.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Operating Systems: Three Easy Pieces - Link: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">https://pages.cs.wisc.edu/~remzi/OSTEP/</a> - Focus: Review virtual memory, caching, paging, and working-set behavior from the local operating-system side.</li>
-<li>[ARTICLE] Redis Key Eviction - Link: <a href="https://redis.io/docs/latest/develop/reference/eviction/">https://redis.io/docs/latest/develop/reference/eviction/</a> - Focus: Compare eviction policies and connect each policy to the workload assumption it makes.</li>
-<li>[ARTICLE] Amazon CloudFront Developer Guide - Link: <a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Introduction.html">https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Introduction.html</a> - Focus: Extend the same hierarchy idea to edge caching and content delivery.</li>
-<li>[ARTICLE] The Cache Stampede Problem - Link: <a href="https://en.wikipedia.org/wiki/Cache_stampede">https://en.wikipedia.org/wiki/Cache_stampede</a> - Focus: Use the overview to recognize why many simultaneous misses can amplify load on the backing authority.</li>
+<li>[BOOK] <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">Operating Systems: Three Easy Pieces</a> — Focus: Read the virtual-memory and paging chapters for working sets, locality, and the cost of a miss.</li>
+<li>[ARTICLE] <a href="https://docs.kernel.org/admin-guide/mm/">Linux Memory Management Documentation</a> — Focus: Locate the Linux concepts for virtual memory, demand paging, and memory-management observability.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man2/mmap.2.html">Linux <code>mmap(2)</code> Manual Page</a> — Focus: Inspect file-backed mappings, page alignment, and the limits of mapping as a promise of residence.</li>
+<li>[ARTICLE/PAPER] <a href="https://www.kernel.org/doc/ols/2007/ols2007v2-pages-273-284.pdf">Linux Readahead: Less Tricks for More</a> — Focus: See how sequential access can motivate prefetching and why a prediction can be wrong.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Memory and cache hierarchies exist because no single layer gives the best latency, capacity, durability, sharing, and cost at once.</li>
-<li>Locality makes small fast layers useful; when the working set stops fitting, misses and evictions expose the deeper system.</li>
-<li>Hit, miss, refill, and eviction paths are part of the architecture, not incidental implementation details.</li>
-<li>Distributed caches need authority and freshness rules so faster copies do not silently answer questions they are not safe to answer.</li>
-</ol>
+<ul>
+<li>A virtual mapping lets a process address file data; it does not guarantee that every referenced page is already resident or fast.</li>
+<li>Locality makes fast layers useful because recently used or nearby data is often reused.</li>
+<li>Memory pressure can displace a working set and turn a previously fast path into waiting and storage I/O.</li>
+<li>Readahead and eviction are performance predictions with costs and limits, not correctness guarantees.</li>
+<li>Distributed caches reuse the miss-path idea but add authority and freshness questions that host page caching does not solve.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -244,7 +329,7 @@ Database CPU jumps and login latency rises.
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-27 15:03 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

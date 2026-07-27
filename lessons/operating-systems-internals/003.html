@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,193 +81,275 @@
 <section class="stack-block lesson-content-shell">
   <h1>OS Concurrency and Synchronization Primitives</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong> explain why interleavings create race conditions, choose between mutexes, semaphores, and condition variables by purpose, and reason about a bounded producer-consumer queue without hiding overload.</p>
-<p><strong>Idea in one sentence.</strong> Synchronization is the set of rules that makes shared progress safe when the scheduler is free to interleave threads in orders your source code did not spell out.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace how a mutex and condition variables keep a bounded queue's shared state coherent.</p>
+</li>
+<li>
+<p>Explain why waking a thread is not permission to act, and why the predicate must be rechecked.</p>
+</li>
+<li>
+<p>Choose a mutex, condition variable, or semaphore from the coordination fact the program must protect or count.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Synchronization makes a shared-state rule survive the instruction interleavings that the scheduler is free to choose.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a worker process with two threads sharing a bounded queue. One thread receives incoming jobs and pushes them into the queue. Another thread removes jobs and processes them. When you read the code one function at a time, everything looks reasonable: producers append, consumers pop, and the queue has a maximum size so memory cannot grow forever.</p>
-<p>The trouble starts because the scheduler does not execute the source file as a neat story. It interleaves instructions from both threads. The producer may be halfway through updating the queue when the consumer observes it. Two producers may both think there is space. A consumer may check that the queue is empty and then go to sleep exactly as a producer adds work. The bug is not that one thread is nonsensical. The bug is that correctness depends on timing unless you define coordination rules.</p>
-<p>That is what synchronization primitives are for. A mutex defines exclusive access to a critical section. A condition variable lets a thread sleep until some state may have changed. A semaphore can represent a count of available capacity or resources. These are not interchangeable decorations. Each primitive answers a different coordination question.</p>
-<p>The practical mental shift is to ask what must be true, not which lock to add. What state must not be observed halfway changed? What condition should wake sleeping work? What capacity limit should make producers wait instead of growing an invisible backlog? Once you ask those questions, synchronization stops feeling like folklore and starts looking like explicit state design.</p>
-<h2>The Failure Is in the Interleaving</h2>
-<p>Start with the familiar counter example:</p>
-<div class="codehilite"><pre><span></span><code><span class="n">counter</span> <span class="o">=</span> <span class="mi">0</span>
-
-<span class="k">def</span><span class="w"> </span><span class="nf">increment</span><span class="p">():</span>
-    <span class="k">global</span> <span class="n">counter</span>
-    <span class="n">counter</span> <span class="o">=</span> <span class="n">counter</span> <span class="o">+</span> <span class="mi">1</span>
+<h3>A Queue That Looks Safe Until Two Threads Arrive</h3>
+<p>A small image-processing service receives jobs from two network threads and hands them to one worker. To keep memory bounded, its in-process queue holds at most two jobs.</p>
+<div class="codehilite"><pre><span></span><code>receivers R1 and R2  -&gt;  [ queue: capacity 2 ]  -&gt;  worker W
 </code></pre></div>
 
-<p>The line looks atomic in source code, but conceptually it contains separate steps:</p>
-<div class="codehilite"><pre><span></span><code>read counter
-compute counter + 1
-write new counter
+<p>The obvious rule seems sufficient: a receiver checks for space, appends a job, and the worker removes it. That model works while only one thread touches the queue at a time.</p>
+<p>It fails as soon as the scheduler interleaves the steps. Suppose the queue has one free slot:</p>
+<div class="codehilite"><pre><span></span><code>R1 observes: one slot is free
+R2 observes: one slot is free
+R1 appends job A
+R2 appends job B
 </code></pre></div>
 
-<p>If two threads both run <code>increment</code>, the bad schedule is easy to miss:</p>
-<div class="codehilite"><pre><span></span><code>counter = 0
-
-Thread A reads 0
-Thread B reads 0
-Thread A writes 1
-Thread B writes 1
-
-final value = 1, even though two increments happened
+<p>Both receivers made a locally sensible decision. Together they exceeded the capacity rule. The problem is not that the scheduler behaved badly; either order is legal. The program assumed that an observation and the later update were one indivisible action when they were not.</p>
+<p>The stronger model is an <strong>invariant</strong>: a fact that must hold whenever another thread is allowed to inspect the shared state. For this queue, a useful teaching model is:</p>
+<div class="codehilite"><pre><span></span><code>0 &lt;= item_count &lt;= 2
+item_count, head, tail, and stored jobs describe the same queue
 </code></pre></div>
 
-<p>Both threads executed valid local code. The global result is wrong because their operations overlapped through shared mutable state. That is a race condition: correctness depends on the relative timing of concurrent actions.</p>
-<p>The protected region is called a critical section. The important point is that the critical section is not "the lines where a mutex appears." It is the region where an invariant can be temporarily broken. For the counter, the invariant is simple: each completed increment should increase the count exactly once. For a queue, the invariant is richer: the length, head, tail, storage slots, and wake-up conditions must agree.</p>
-<p>The trade-off is direct. Protecting critical sections gives correctness and predictability, but it can introduce waiting, contention, and deadlock if the protected regions are too broad or acquired in inconsistent order.</p>
-<h2>Three Primitives, Three Questions</h2>
-<p>Return to the bounded queue. It has two shared facts:</p>
-<div class="codehilite"><pre><span></span><code>queue contents
-queue capacity
+<p>The exact data representation is not important. What matters is that these facts change together. Synchronization is how the program says which thread may make that temporary, internally inconsistent transition and which condition makes waiting work useful.</p>
+<h2>The First Model Breaks at the Instruction Boundary</h2>
+<p>Source code can hide the boundary. Consider a counter written as:</p>
+<div class="codehilite"><pre><span></span><code>counter = counter + 1
 </code></pre></div>
 
-<p>It also has two conditions that matter:</p>
-<div class="codehilite"><pre><span></span><code>not_empty: a consumer can pop
-not_full: a producer can push
+<p>As a teaching expansion, read it as three actions: read the old value, compute the new value, and store it. Two threads can then follow this illustrative interleaving:</p>
+<div class="codehilite"><pre><span></span><code>counter begins at 0
+
+R1 reads 0
+R2 reads 0
+R1 writes 1
+R2 writes 1
+
+result: 1, although two increments were attempted
 </code></pre></div>
 
-<p>Different synchronization primitives map to different questions:</p>
+<p>In a real language, whether this is a data race and what outcomes are permitted also depends on that language's memory model. This track does not teach those formal rules. The host-level lesson is narrower: when several threads access mutable shared state, source-line order is not a coordination contract.</p>
+<p>A <strong>critical section</strong> is the region in which a thread observes and changes the state needed to preserve an invariant. It is not merely “the line containing a lock.” For our queue, checking whether it is full and appending a job belong to the same critical section. Separating them recreates the race.</p>
+<h2>Three Questions, Three Primitives</h2>
+<p>It helps to choose a primitive by the question it answers instead of by habit.</p>
 <table>
 <thead>
 <tr>
 <th>Primitive</th>
-<th>Question it answers</th>
-<th>Bounded queue role</th>
+<th>Coordination question</th>
+<th>Queue use</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Mutex</td>
-<td>Who may inspect or mutate this shared state right now?</td>
-<td>Protect queue internals</td>
+<td>Who may inspect or mutate this shared state now?</td>
+<td>Protect <code>item_count</code>, head, tail, and slots.</td>
 </tr>
 <tr>
 <td>Condition variable</td>
-<td>When should a waiting thread recheck a state condition?</td>
-<td>Wake consumers or producers</td>
+<td>When should a sleeper recheck a shared-state predicate?</td>
+<td>Wait for <code>not_empty</code> or <code>not_full</code>.</td>
 </tr>
 <tr>
 <td>Semaphore</td>
-<td>How many units of a resource are available?</td>
-<td>Represent slots or items</td>
+<td>How many permits or units are available?</td>
+<td>Count free slots or queued items.</td>
 </tr>
 </tbody>
 </table>
-<p>A mutex alone is not enough for the bounded queue. It can stop two threads from corrupting the queue structure, but it does not explain when a consumer should sleep or how a producer should wait for space. Without a waiting primitive, the consumer may spin in a loop burning CPU, or the producer may keep allocating memory until pressure becomes a failure.</p>
-<p>The condition-variable pattern makes the state relationship visible:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">mutex</span><span class="p">:</span>
-    <span class="k">while</span> <span class="n">queue_is_empty</span><span class="p">():</span>
-        <span class="n">not_empty</span><span class="o">.</span><span class="n">wait</span><span class="p">()</span>
-    <span class="n">item</span> <span class="o">=</span> <span class="n">pop_item</span><span class="p">()</span>
-</code></pre></div>
-
-<p>The <code>while</code> is part of the mechanism. A waiting thread wakes because the condition may now be true, not because it is guaranteed to remain true. Another consumer may run first. A spurious wakeup may occur. The thread must recheck the queue state while holding the mutex before it acts.</p>
-<p>So far: the mutex protects the invariant while a thread observes or changes shared state. The condition variable avoids wasting CPU while waiting for that invariant to enter a useful state.</p>
-<h2>Worked Mechanism: Push and Pop Without Losing the State</h2>
-<p>Here is a compact design for the queue:</p>
+<p>A mutex gives exclusive ownership of a critical section. If another thread already owns it, a normal lock operation may block until it becomes available. It does not, by itself, say what a consumer should do when the queue is empty. Repeatedly locking, checking, unlocking, and checking again would be a busy loop: correct in a narrow sense, but wasteful because it consumes CPU while no useful state change has occurred.</p>
+<p>A condition variable pairs waiting with a predicate over state protected by a mutex. In plain English, the worker says: “I cannot pop while <code>item_count == 0</code>; wake me only so I can check that fact again.” The condition variable is not the queue and does not store the job. The queue state is the durable fact.</p>
+<p>A semaphore is a counter with waiting behavior. A <code>wait</code> decrements it when its value is positive; when it is zero, the caller blocks until a permit becomes available. It is especially natural when the important fact is a number of identical units: two free slots, eight database connections, or one item available to consume.</p>
+<h2>The Queue Mechanism, Step by Step</h2>
+<p>We will use one mutex and two condition variables:</p>
 <div class="codehilite"><pre><span></span><code>state:
-  queue
-  capacity
+  queue, item_count, capacity = 2
   mutex
-  not_empty
-  not_full
+  not_empty   # predicate: item_count &gt; 0
+  not_full    # predicate: item_count &lt; capacity
 </code></pre></div>
 
-<p>Producer path:</p>
-<div class="codehilite"><pre><span></span><code>lock mutex
-while queue is full:
-  wait on not_full, releasing mutex while asleep
-push item
-signal not_empty
-unlock mutex
-</code></pre></div>
-
-<p>Consumer path:</p>
-<div class="codehilite"><pre><span></span><code>lock mutex
-while queue is empty:
-  wait on not_empty, releasing mutex while asleep
-pop item
-signal not_full
-unlock mutex
-</code></pre></div>
-
-<p>The subtle part is the wait operation. It must release the mutex while the thread sleeps, otherwise the producer and consumer can block each other forever. If the consumer held the mutex while sleeping on an empty queue, no producer could acquire the mutex to push the item that would wake it. Real condition-variable APIs make "release lock and sleep" one atomic operation with respect to the condition wait.</p>
-<p>Walk through one empty-queue case:</p>
-<div class="codehilite"><pre><span></span><code>consumer locks mutex
-consumer sees empty queue
-consumer waits on not_empty and releases mutex
-producer locks mutex
-producer pushes item
-producer signals not_empty
-producer unlocks mutex
-consumer wakes and re-acquires mutex
-consumer rechecks not_empty condition
-consumer pops item
-consumer signals not_full
-consumer unlocks mutex
-</code></pre></div>
-
-<p>This is synchronization as state choreography. Each part sees, changes, waits for, or signals a specific fact. The design does not rely on "the scheduler probably runs the producer next." It remains correct across many legal interleavings.</p>
-<p>The signal placement is also intentional. The producer signals <code>not_empty</code> after it has changed the queue state, not before. The consumer wakes to recheck a fact that can now be true. Likewise, the consumer signals <code>not_full</code> after it removes an item, because that removal creates capacity for a producer. Signals are not messages with the item inside them. They are nudges that say "some protected state changed; recheck your predicate."</p>
-<p>That distinction prevents a common misunderstanding. If a producer signals when no consumer is waiting, the signal may be lost. That is fine when the queue state itself is the source of truth. A later consumer should not depend on remembering the old signal; it should lock the mutex, inspect the queue, and see the item. Correct designs make the durable state carry the fact, while condition variables only help sleepers stop sleeping.</p>
-<p>Semaphores can express the same bounded-buffer shape in a different style. One semaphore can count available slots, another can count available items, and a mutex can still protect the queue structure itself:</p>
-<div class="codehilite"><pre><span></span><code>producer:
-  wait for one free slot
+<p>The API names differ by language. This pseudocode shows the contract rather than a particular library:</p>
+<div class="codehilite"><pre><span></span><code>producer(job):
   lock mutex
-  push item
+  while item_count == capacity:
+    wait(not_full, mutex)
+  append job; item_count increases
+  signal not_empty
   unlock mutex
-  signal one available item
+
+consumer():
+  lock mutex
+  while item_count == 0:
+    wait(not_empty, mutex)
+  remove job; item_count decreases
+  signal not_full
+  unlock mutex
+  process job outside the mutex
+</code></pre></div>
+
+<p>The <code>wait(condition, mutex)</code> operation has a crucial shape: it releases the mutex while the caller sleeps, then reacquires the mutex before it returns. If the consumer slept while holding the mutex, no producer could lock the queue to append the job that makes <code>not_empty</code> true. POSIX condition waits define that release-and-wait relationship atomically with respect to the mutex and condition variable.</p>
+<p>Why is the guard a <code>while</code>, not an <code>if</code>? A wakeup says only that the predicate <em>may</em> have changed. Another consumer might acquire the mutex first and take the only job. A condition wait can also return without the predicate becoming true. The thread must own the mutex, inspect the actual queue state, and decide again.</p>
+<h3>A Worked Trace: Empty Queue, Full Queue, Then Progress</h3>
+<p>Start with an empty queue. The events below are illustrative, but every state transition is the point of the design.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Thread and action</th>
+<th>Queue state</th>
+<th>What becomes possible</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>W locks, sees <code>item_count = 0</code>, waits on <code>not_empty</code></td>
+<td>empty; mutex released</td>
+<td>A receiver can append.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>R1 locks and appends A</td>
+<td><code>[A]</code>, count 1</td>
+<td>A worker may pop.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>R1 signals <code>not_empty</code>, then unlocks</td>
+<td><code>[A]</code>, count 1</td>
+<td>W can compete to reacquire the mutex.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>R2 locks and appends B</td>
+<td><code>[A, B]</code>, count 2</td>
+<td>The queue is now full.</td>
+</tr>
+<tr>
+<td>5</td>
+<td>R2 unlocks; W reacquires, rechecks, pops A</td>
+<td><code>[B]</code>, count 1</td>
+<td>One receiver may append again.</td>
+</tr>
+<tr>
+<td>6</td>
+<td>W signals <code>not_full</code>, unlocks, and processes A</td>
+<td><code>[B]</code>, count 1</td>
+<td>Processing does not block queue access.</td>
+</tr>
+</tbody>
+</table>
+<p>The signal comes after the state mutation. R1 does not signal “here is job A” as if the condition variable carried a message. It signals that the protected state changed and a waiter may now profitably recheck its predicate. If no worker is waiting at that instant, the queue still contains A or B; a later worker sees that fact by locking and inspecting the queue.</p>
+<p>So far, the mechanism has made two kinds of waiting visible. W waits because there is no item. A receiver waits only if capacity is exhausted. In both cases the thread gives up the mutex while it cannot make progress, allowing another actor to create the required state change.</p>
+<h2>The Semaphore Version Changes the Representation, Not the Need for Rules</h2>
+<p>The same queue can use two semaphores:</p>
+<div class="codehilite"><pre><span></span><code>free_slots = 2
+available_items = 0
+queue_mutex
+
+producer:
+  wait(free_slots)
+  lock queue_mutex
+  append job
+  unlock queue_mutex
+  post(available_items)
 
 consumer:
-  wait for one available item
-  lock mutex
-  pop item
-  unlock mutex
-  signal one free slot
+  wait(available_items)
+  lock queue_mutex
+  remove job
+  unlock queue_mutex
+  post(free_slots)
 </code></pre></div>
 
-<p>This version makes capacity counts explicit. It is useful when the problem is naturally counted: N slots, N permits, N identical resources. It is less expressive when each waiter needs to recheck a richer predicate over shared state. The lesson is not that one primitive is always more advanced. The design question chooses the primitive.</p>
-<h2>Backpressure Is Part of Correctness</h2>
-<p>Producer-consumer examples are often taught as lock exercises, but the deeper lesson is capacity. If producers are faster than consumers, the queue absorbs mismatch for a while. If the queue is unbounded, the system can pretend everything is fine while memory usage and latency grow. The failure is only delayed.</p>
-<p>A bounded queue makes overload visible:</p>
-<div class="codehilite"><pre><span></span><code>producers -&gt; [ bounded queue ] -&gt; consumers
-              full: producers wait or shed
-              empty: consumers wait
-</code></pre></div>
-
-<p>That visibility is a feature. It gives the system a place to apply backpressure, which means slowing, blocking, rejecting, or shedding incoming work before hidden backlog becomes collapse. The same pattern appears in socket buffers, runtime work queues, message brokers, and request pools.</p>
-<p>The trade-off is that bounded capacity can reduce apparent throughput in the short term. A producer may be forced to wait even though it could keep generating work. But the alternative, unbounded acceptance, often converts a manageable overload signal into memory pressure, missed deadlines, and eventual failure.</p>
-<p>Active check: if a bounded queue is full and producers are waiting, is that automatically a bug? No. It may be the system correctly exposing that consumers cannot drain work fast enough. The bug would be ignoring that signal or sizing the queue so large that the signal arrives too late.</p>
-<h2>Failure Modes and Design Checks</h2>
-<p><strong>Failure: protecting the wrong region.</strong> A lock around one line may not protect the invariant. If the invariant spans length, head, tail, and storage slots, all related changes must be observed consistently.</p>
-<p><strong>Failure: waiting without a condition.</strong> A sleeping thread must know what state it is waiting to recheck. "Wake me later" is not enough. Good waits are tied to predicates such as <code>queue_is_not_empty</code> or <code>space_is_available</code>.</p>
-<p><strong>Failure: using <code>if</code> instead of <code>while</code>.</strong> A condition-variable wakeup is not a permanent promise. Recheck the condition under the mutex before consuming or producing.</p>
-<p><strong>Failure: hiding overload in an unbounded queue.</strong> Buffering can be useful, but infinite-looking buffering is often just latency and memory pressure in disguise.</p>
-<p><strong>Failure: assuming tests cover the bad schedule.</strong> A race can disappear under logging, debugging, or a slower machine because the interleaving changed. Review the invariant and the synchronization contract directly; do not treat one clean run as proof that the design is synchronized.</p>
-<p>Review this small design:</p>
-<div class="codehilite"><pre><span></span><code>if queue is empty:
-  wait on not_empty
-pop item
-</code></pre></div>
-
-<p>The missing piece is the loop and the protected predicate. A stronger answer is: hold the mutex, use <code>while queue_is_empty()</code>, wait through the condition variable, and recheck before popping. If the queue is part of a capacity boundary, also signal producers when a pop creates space.</p>
+<p>Here the capacity rule is represented directly: a producer must obtain a free-slot permit before appending, and a consumer must obtain an item permit before removing. The mutex remains necessary because a permit count alone does not safely update the queue's head, tail, and storage.</p>
+<p>This version is a good fit when the coordination fact really is a count. Condition variables are usually clearer when a thread must wait for a richer predicate, such as “the queue contains a job for tenant X and the worker is not draining.” Neither primitive is a universal upgrade; the state you need to represent decides.</p>
+<h2>Costs, Limits, and Signals</h2>
+<p>Synchronization buys safety and explicit waiting. It also adds costs.
+The central trade-off is simple: stronger coordination protects the invariant, but it can make unrelated work wait when the protected region is too broad.</p>
+<table>
+<thead>
+<tr>
+<th>Choice</th>
+<th>Improves</th>
+<th>Costs or can still fail</th>
+<th>Signal to inspect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Very broad mutex</td>
+<td>Simple invariant protection</td>
+<td>Contention; unrelated work waits behind the lock</td>
+<td>Time waiting for the mutex, long critical sections</td>
+</tr>
+<tr>
+<td>Inconsistent lock order</td>
+<td>Local locking seems correct</td>
+<td>Deadlock when threads wait in a cycle</td>
+<td>Threads blocked on each other's locks</td>
+</tr>
+<tr>
+<td>Bounded queue</td>
+<td>Memory and latency remain bounded; overload is visible</td>
+<td>Producers wait, reject work, or need a shedding policy</td>
+<td>Queue stays full; producer wait time rises</td>
+</tr>
+<tr>
+<td>Unbounded queue</td>
+<td>Short bursts are absorbed</td>
+<td>Delay and memory can grow until failure appears elsewhere</td>
+<td>Backlog age and resident memory rise</td>
+</tr>
+</tbody>
+</table>
+<p>Holding the queue mutex while processing A would be another subtle error. The invariant does not require it; only removal does. If the worker performs slow I/O under that mutex, receivers cannot append even when there is space. The diagnosis is not “locks are bad.” It is that the protected region includes work that does not need the shared-state guarantee.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion: A mutex makes the whole program sequential.</strong></p>
+<p>Why it is tempting: one thread waits while another owns the lock.</p>
+<p>Better model: only the critical section is exclusive. Work outside it can run concurrently. Keep the section as small as the invariant allows, not smaller than the invariant requires.</p>
+<p><strong>Confusion: A signal means the condition is now guaranteed.</strong></p>
+<p>Why it is tempting: the name sounds like a delivery notification.</p>
+<p>Better model: the signal invites a waiter to recheck protected state. The predicate, not the signal, authorizes the next action.</p>
+<p><strong>Confusion: A full bounded queue proves the lock is broken.</strong></p>
+<p>Why it is tempting: waiting looks like failure.</p>
+<p>Better model: a full queue can be correct backpressure. It becomes a problem when it misses a deadline, has no shedding policy, or remains full because consumers cannot make progress.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> The worker wakes from <code>not_empty</code>, but R1 has already removed the only job before the worker reacquires the mutex. May the worker pop anyway?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The wakeup only meant that <code>not_empty</code> might have become true. After it reacquires the mutex, the worker finds <code>item_count == 0</code> and waits again. This is exactly why the predicate is guarded by <code>while</code> under the mutex.</p>
+<h2>Practice: Diagnose the Queue Before Changing It</h2>
+<p>An image service has a capacity-200 queue. For ten minutes, it stays at 200, producers spend most of their time waiting for <code>not_full</code>, and workers show little CPU use. An engineer proposes replacing the mutex with a semaphore.</p>
+<p>What should you investigate first, and would that replacement alone address the observation?</p>
+<p><strong>A good answer should mention:</strong></p>
+<ul>
+<li>The queue is exposing sustained consumer-side pressure; inspect worker blocking, downstream I/O, job duration, and completed-job rate before changing primitives.</li>
+<li>A semaphore may be a valid representation for capacity, but it does not make a blocked worker or slow dependency faster.</li>
+<li>The bounded queue is useful evidence, not automatically a defect. The operational decision may be to add capacity, reduce input, shed work, or fix the dependency, depending on the trace.</li>
+<li>Any redesign must still protect the queue's structural invariant and define what happens when no capacity is available.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] The Little Book of Semaphores - Link: <a href="https://greenteapress.com/wp/semaphores/">https://greenteapress.com/wp/semaphores/</a> - Focus: Work through classical synchronization problems and notice which primitive fits each coordination need.</li>
-<li>[BOOK] Operating Systems: Three Easy Pieces - Link: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">https://pages.cs.wisc.edu/~remzi/OSTEP/</a> - Focus: Read the concurrency chapters on locks, condition variables, and producer-consumer queues.</li>
-<li>[ARTICLE] POSIX pthread_mutex_lock - Link: <a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html">https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html</a> - Focus: See the precise contract of mutex acquisition and the edge cases real code must respect.</li>
-<li>[ARTICLE] POSIX pthread_cond_wait - Link: <a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_cond_wait.html">https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_cond_wait.html</a> - Focus: Study why waiting and rechecking under the mutex are part of the primitive's intended use.</li>
+<li>[BOOK] <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">Operating Systems: Three Easy Pieces</a> — Focus: Read the concurrency chapters on locks, condition variables, and bounded-buffer reasoning.</li>
+<li>[BOOK] <a href="https://greenteapress.com/wp/semaphores/">The Little Book of Semaphores</a> — Focus: Work through classical synchronization problems and identify the state predicate each solution protects.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html">POSIX <code>pthread_mutex_lock</code></a> — Focus: Inspect ownership, blocking, and mutex-type behavior.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man3/pthread_cond_wait.3p.html">POSIX <code>pthread_cond_wait</code></a> — Focus: See the atomic release, wait, and reacquisition relationship with the mutex.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man3/sem_wait.3.html">Linux <code>sem_wait(3)</code> Manual Page</a> — Focus: See how a semaphore blocks at zero and proceeds by decrementing an available permit.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Concurrency bugs often come from legal interleavings that break shared-state invariants.</li>
-<li>Mutexes protect exclusive access, condition variables coordinate waiting, and semaphores represent counted capacity.</li>
-<li>Correct waiting means sleeping until a condition may have changed, then rechecking that condition under protection.</li>
-<li>Bounded queues teach both synchronization and backpressure: correctness includes making overload visible.</li>
-</ol>
+<ul>
+<li>A race appears when independent-looking actions jointly violate a shared invariant under a legal interleaving.</li>
+<li>A mutex protects the queue state; a condition variable lets a thread wait to recheck a state predicate; a semaphore models available permits.</li>
+<li>A condition-variable wakeup is not permission to act. Recheck the predicate while holding its mutex.</li>
+<li>A bounded queue is both a synchronization mechanism and an overload boundary: it makes capacity pressure observable.</li>
+<li>When the queue is full, inspect the state that prevents consumers from progressing before replacing the synchronization primitive.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -292,7 +378,7 @@ pop item
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-27 15:03 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

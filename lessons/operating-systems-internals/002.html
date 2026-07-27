@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,126 +81,207 @@
 <section class="stack-block lesson-content-shell">
   <h1>System Calls, Kernel Boundaries, and Blocking I/O</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong> trace a simple file or socket operation from application code into the kernel, explain why a process blocks, and decide whether a latency symptom is probably CPU work, syscall overhead, or waiting on I/O.</p>
-<p><strong>Idea in one sentence.</strong> A system call is the controlled doorway from ordinary program code into kernel-managed resources, and blocking I/O is what happens when that doorway cannot return useful work yet.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace a read from application code through a kernel-managed file descriptor and back.</p>
+</li>
+<li>
+<p>Explain the difference between a process blocked on I/O and one runnable but waiting for CPU.</p>
+</li>
+<li>
+<p>Choose between blocking and readiness-driven I/O from the number of concurrent waits and the state the program can manage.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A system call is a controlled request to the kernel, and blocking I/O lets the kernel pause work that cannot make progress so another task can use the CPU.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a small web service reading a configuration file at startup, accepting a socket connection, writing a log line, and waiting for a database response. In the application code, these actions may look like ordinary function calls: <code>open</code>, <code>read</code>, <code>write</code>, <code>accept</code>, <code>recv</code>. But they are not ordinary local functions in the most important sense. They ask the operating system to do something the process is not allowed to do by itself.</p>
-<p>That permission boundary is the heart of the lesson. User programs run in a restricted mode so they cannot freely touch devices, overwrite another process, change page tables, or invent network packets outside kernel rules. The kernel runs with greater privilege and owns the shared machinery: files, sockets, virtual memory mappings, process tables, timers, device queues, and scheduling decisions. A system call is the carefully defined handoff between those two worlds.</p>
-<p>The non-obvious part is that the handoff is not just a security ritual. It changes performance and failure behavior. A CPU-bound function can usually run until it returns. A syscall may trap into the kernel, validate arguments, copy data, enqueue work to a driver, put the process to sleep, wake another process, or return an error because the requested resource is not ready. The application sees a return value. The OS sees a coordinated interaction with shared state.</p>
-<p>The beginner mistake is to treat I/O as "slow computation." It is better to treat I/O as waiting for a different actor. The disk, network card, filesystem cache, peer process, or remote endpoint may not have produced the data yet. When the kernel blocks a process, it is not punishing it; it is preserving CPU time for work that can actually make progress.</p>
-<h2>The Boundary Your Code Cannot Cross Directly</h2>
-<p>Start with a normal-looking line of code:</p>
-<div class="codehilite"><pre><span></span><code><span class="n">data</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">4096</span><span class="p">)</span>
+<p>An API process has accepted a request and needs a small answer from a local helper over a Unix socket. Its source code contains one ordinary-looking call:</p>
+<div class="codehilite"><pre><span></span><code>read(helper_fd, buffer, 4096)
 </code></pre></div>
 
-<p>At the language level, this is a method call. Underneath, it may become a <code>read</code> system call. The process asks the kernel: "For this file descriptor, copy up to 4096 bytes into my address space." That request has several pieces the kernel must check before it can safely answer:</p>
+<p>It is tempting to read this as a local function call: execute some instructions, produce 4096 bytes, return. That model works when bytes are already available. It fails when the helper has not replied yet. The application cannot manufacture the data, and it is not allowed to inspect or manipulate the socket's shared kernel state directly.</p>
+<p>The operating system supplies the stronger model. A system call crosses from ordinary user code into a controlled kernel interface. The kernel can identify the file descriptor, check the caller's accessible buffer, inspect whether the requested operation can proceed, and then return bytes, an end-of-file result, an error, or a reason to wait. Blocking is not “slow computation.” It is a deliberate state transition while another actor, device, or buffer condition becomes ready.</p>
+<h2>The Small Boundary Behind <code>read</code></h2>
+<p>User code runs with restricted privileges. It cannot directly alter device queues, process tables, page mappings, or another process's address space. The kernel owns those shared mechanisms. A system call is the published doorway through which the process asks the kernel to mediate them.</p>
+<p>In plain English:</p>
+<blockquote>
+<p>The process asks the kernel, “Please give me up to this many bytes from this handle, placing them in a buffer I am allowed to use.”</p>
+</blockquote>
+<p>In our scenario:</p>
+<blockquote>
+<p><code>helper_fd</code> names the local helper connection. The kernel knows whether its receive buffer has data, whether the peer has closed it, and whether the caller may wait.</p>
+</blockquote>
+<p>Technical name:</p>
+<blockquote>
+<p><code>read()</code> is a system-call interface for reading from a file descriptor. On success it returns the number of bytes actually read; that number may be smaller than the amount requested. A return of zero has a distinct meaning for objects such as regular files and closed stream ends, and errors report another outcome.</p>
+</blockquote>
+<p>The exact CPU entry instruction and internal data structures differ by architecture and operating system. This lesson uses the stable teaching model: user code requests, the kernel validates and mediates, then the process either receives a result or changes state.</p>
+<h2>The Naive Model Breaks When No Byte Exists Yet</h2>
+<p>At first, we might think a slow request means the handler is doing expensive work. That is a reasonable starting point when a CPU profile shows the handler executing instructions. It becomes insufficient when the trace says the handler entered <code>read()</code> and then made no CPU progress because the helper has not placed a byte in the socket buffer.</p>
+<p>The return from <code>read()</code> can represent several different outcomes:</p>
+<table>
+<thead>
+<tr>
+<th>Kernel-visible condition</th>
+<th>A possible result for the caller</th>
+<th>What the process should infer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bytes are available</td>
+<td>A positive byte count, possibly less than requested</td>
+<td>Consume only the bytes returned; more may arrive later.</td>
+</tr>
+<tr>
+<td>The stream has ended after buffered bytes are consumed</td>
+<td><code>0</code></td>
+<td>There is no next byte from that stream end.</td>
+</tr>
+<tr>
+<td>The descriptor is nonblocking and the operation would wait</td>
+<td><code>-1</code> with <code>EAGAIN</code> or <code>EWOULDBLOCK</code></td>
+<td>Do other work and wait for a readiness signal before trying again.</td>
+</tr>
+<tr>
+<td>The call is invalid or interrupted</td>
+<td>An error result</td>
+<td>Handle the specific failure rather than treating it as ordinary data.</td>
+</tr>
+</tbody>
+</table>
+<p>The table describes an interface contract, not a complete protocol. A positive return does not mean that an entire application message has arrived. A program that expects a framed message may need several reads, buffering, and parsing. The system call moves bytes; it does not know the application's message boundary.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>Assume the helper has not replied when the API process calls <code>read(helper_fd, buffer, 4096)</code>. The following trace is illustrative; names and exact internal queues vary by operating system.</p>
+<div class="codehilite"><pre><span></span><code>starting state
+  API process is running on a CPU
+  helper_fd refers to a connected local socket
+  socket receive buffer is empty
+
+1. request
+  user code enters the read interface with a descriptor, buffer address, and byte limit
+
+2. mediation
+  kernel resolves the descriptor and checks whether the caller and buffer are valid
+
+3. no immediate result
+  kernel finds no readable byte in the socket receive buffer
+
+4. blocking policy
+  because this descriptor is blocking, the API task sleeps waiting for the socket state to change
+
+5. useful work continues
+  scheduler can run another runnable task; the blocked API task is not consuming a CPU core
+
+6. wakeup
+  helper writes 700 bytes; the kernel records that the socket can now satisfy a read and wakes the waiting task
+
+7. completion
+  after the scheduler runs the API task again, read copies available bytes into the caller buffer and returns 700
+</code></pre></div>
+
+<p>Why 700 rather than 4096? The byte limit is an upper bound, not a promise. The helper had supplied 700 bytes at the moment the operation could complete. Treating every successful <code>read()</code> as a full message is a common application bug.</p>
+<p>So far, the kernel boundary has done two jobs. It protected shared socket state from arbitrary access, and it converted an unavailable input into a waiting state instead of a busy loop. That is why a blocked process and a CPU-bound process need different evidence and different fixes.</p>
+<h2>Blocking and Readiness Put State in Different Places</h2>
+<p>With a blocking descriptor, the calling thread keeps a simple story:</p>
+<div class="codehilite"><pre><span></span><code>call read
+  -&gt; wait if no result is possible
+  -&gt; receive bytes, end of stream, or error
+</code></pre></div>
+
+<p>This is often a good choice for a command-line program, one background worker, or a small number of independent waits. The cost is that each blocked operation ties up surrounding resources such as a thread stack, a connection slot, and a deadline budget, even though it is not using CPU.</p>
+<p>With nonblocking I/O, the kernel returns instead of sleeping the caller when a read would wait. On Linux, <code>read()</code> commonly reports this as <code>EAGAIN</code> or <code>EWOULDBLOCK</code> for a nonblocking socket. The application or runtime now needs to remember partial progress and decide when to retry.</p>
+<div class="codehilite"><pre><span></span><code>nonblocking read
+  -&gt; bytes available: consume the returned bytes
+  -&gt; no bytes available: record that the connection needs another chance
+  -&gt; error or end: close or transition the connection state
+</code></pre></div>
+
+<p>Readiness interfaces such as <code>poll()</code> help with that second step. The program asks which file descriptors are ready for the operation it wants to perform. For a requested read event, readiness means the operation should not block at that moment. It still does not mean “an entire request is complete,” and it does not remove the need to handle short reads, errors, or a peer closing the connection.</p>
+<table>
+<thead>
+<tr>
+<th>Choice</th>
+<th>What improves</th>
+<th>What it costs</th>
+<th>Boundary to watch</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Blocking I/O</td>
+<td>Straight-line control flow and fewer explicit states</td>
+<td>One waiting operation can occupy one thread or equivalent runtime resource</td>
+<td>Rising blocked-thread count, connection slots, or deadline expiry</td>
+</tr>
+<tr>
+<td>Nonblocking plus readiness</td>
+<td>One event loop can supervise many not-ready descriptors</td>
+<td>The program must track partial reads, write readiness, timeouts, and lifecycle transitions</td>
+<td>Lost state, retry loops, or backpressure mistakes in the application</td>
+</tr>
+</tbody>
+</table>
+<p>Neither option makes a slow peer faster. A timeout bounds how long the caller waits; it does not prove the peer is healthy or make a retry safe. The useful choice depends on the number of concurrent waits, the runtime's model, and whether the program can correctly own the extra state.</p>
+<h2>A Worked Diagnosis: Slow Because It Is Waiting</h2>
+<p>Return to the API process. A request takes 230 ms instead of its usual 12 ms. A CPU chart shows the process used only 4 ms of CPU during that interval. A syscall trace, in this simplified example, shows:</p>
+<div class="codehilite"><pre><span></span><code>12:00:00.000  read(helper_fd, buffer, 4096)  ... blocks
+12:00:00.220  read(helper_fd, buffer, 4096)  = 700
+12:00:00.230  write(client_fd, response, 900) = 900
+</code></pre></div>
+
+<p>These timings are illustrative. They support one narrow conclusion: most of the request interval was not local CPU execution. The next useful investigation is the helper's response path, the local socket queue, timeout budget, and whether many API threads are accumulating the same wait. Rewriting arithmetic in the handler would not address the observed delay.</p>
+<p>Compare that with a different trace:</p>
+<div class="codehilite"><pre><span></span><code>12:00:00.000  request starts
+12:00:00.004  handler is runnable but frequently descheduled
+12:00:00.230  handler reaches read(helper_fd, buffer, 4096) = 700
+</code></pre></div>
+
+<p>Here the important wait may be CPU scheduling pressure before the system call. The two incidents both look like “the API is slow.” The first points toward I/O or helper behavior; the second points toward contested CPU time. The state trace earns the distinction.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion: A system call is just an expensive function call.</strong></p>
+<p>Why it is tempting: both appear as a call in source code.</p>
+<p>Better model: a system call is also a privilege and coordination boundary. It can validate, mediate shared state, wait, wake another task, return a short result, or report an error.</p>
+<p><strong>Confusion: Blocked means broken.</strong></p>
+<p>Why it is tempting: the process is not making visible CPU progress.</p>
+<p>Better model: blocking is often correct. It becomes harmful when the wait violates a deadline or consumes too many surrounding resources.</p>
+<p><strong>Confusion: Nonblocking means immediate completion.</strong></p>
+<p>Why it is tempting: the call returns quickly.</p>
+<p>Better model: nonblocking returns control quickly when work cannot proceed. The program still has to retain state and handle the operation later.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A thread is asleep in a blocking <code>read()</code> on a socket. Is adding CPU capacity the first justified fix?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not from this fact alone. The thread is waiting for the socket condition to change, not currently competing for a CPU core. First inspect the peer, queued data, timeout, and how many similar waits occupy threads. CPU may still matter elsewhere, but this observed state does not establish CPU saturation.</p>
+<h2>Practice: Choose the I/O Model</h2>
+<p>You are designing two programs:</p>
 <ul>
-<li>Is the file descriptor valid for this process?</li>
-<li>Does the process have permission to read from it?</li>
-<li>Is there data already available in a kernel buffer or page cache?</li>
-<li>If not, should the caller wait, return immediately, or fail?</li>
-<li>Where can the kernel safely copy the bytes in the caller's memory?</li>
+<li>A command-line importer reads one file and sends one result to a server.</li>
+<li>A proxy must keep 20,000 client sockets open while most clients are idle.</li>
 </ul>
-<p>That is why the user/kernel boundary exists. The application owns its intent: "I want bytes." The kernel owns the shared facts: "Which object does this descriptor name? What state is available? Who else is using it? Is it safe to copy into this address?"</p>
-<p>A compact trace looks like this:</p>
-<div class="codehilite"><pre><span></span><code>application code
-  -&gt; library wrapper
-  -&gt; syscall trap
-  -&gt; kernel validates descriptor and buffer
-  -&gt; kernel finds data, waits, or returns an error
-  -&gt; process resumes with bytes, short read, or errno
-</code></pre></div>
-
-<p>The trap step matters. The CPU switches from user mode into kernel mode through a controlled entry path. The exact mechanism differs by architecture and operating system, but the idea is stable: ordinary code cannot simply jump into privileged memory and do whatever it wants. It has to enter through a published interface.</p>
-<p>So far: a syscall is not magic and not merely a function call. It is a controlled transition where a process asks the kernel to mediate a shared resource.</p>
-<h2>What Blocking Really Means</h2>
-<p>Now suppose the same service calls <code>recv</code> on a socket:</p>
-<div class="codehilite"><pre><span></span><code><span class="n">payload</span> <span class="o">=</span> <span class="n">sock</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="mi">4096</span><span class="p">)</span>
-</code></pre></div>
-
-<p>If data is already waiting in the socket receive buffer, the kernel can copy it into the process and return. If no data is available, the key question is policy: should the process wait?</p>
-<p>For a blocking socket, the usual answer is yes. The kernel marks the process as waiting on that socket and lets another runnable process use the CPU. Later, when packets arrive and data becomes available, the kernel wakes the blocked process. The process re-enters the runnable set, and the scheduler eventually gives it CPU time again.</p>
-<div class="codehilite"><pre><span></span><code>process calls recv
-  -&gt; no data in socket buffer
-  -&gt; process state becomes waiting
-  -&gt; CPU runs other work
-  -&gt; packet arrives
-  -&gt; kernel queues data and wakes process
-  -&gt; scheduler runs process
-  -&gt; recv returns bytes
-</code></pre></div>
-
-<p>This is a coordination mechanism. The process is not "slow" in the same way a loop doing a billion additions is slow. It is waiting for a condition outside its own instruction stream. That distinction changes debugging. If a request spends 200 ms blocked on socket I/O, optimizing application arithmetic will not fix the main delay. You need to look at the dependency, the network path, the peer, the kernel buffers, or the timeout policy.</p>
-<p>Blocking is also not always bad. It is often the simplest correct behavior. If a command-line program reads from standard input, waiting is exactly what the user expects. If a worker has no job yet, sleeping is better than spinning. The problem appears when many blocked operations consume scarce resources indirectly: threads, file descriptors, memory, connection slots, or request deadlines.</p>
-<h2>Blocking, Nonblocking, and Readiness</h2>
-<p>Operating systems also provide nonblocking I/O. A nonblocking read says, in effect: "If the operation can complete now, do it; otherwise return immediately and tell me it would block." The application can then decide what to do next.</p>
-<div class="codehilite"><pre><span></span><code>blocking read:
-  no data -&gt; sleep until data or error
-
-nonblocking read:
-  no data -&gt; return EAGAIN/EWOULDBLOCK
-</code></pre></div>
-
-<p>Nonblocking mode becomes useful when one process or thread must manage many I/O sources. Instead of dedicating one sleeping thread to each socket, the program can ask the kernel which descriptors are ready. Interfaces such as <code>select</code>, <code>poll</code>, <code>epoll</code>, and <code>kqueue</code> are all variations on this readiness idea.</p>
-<div class="codehilite"><pre><span></span><code>many sockets
-  -&gt; readiness API asks &quot;which can make progress?&quot;
-  -&gt; application handles ready sockets
-  -&gt; not-ready sockets do not consume a thread each
-</code></pre></div>
-
-<p>This is not free simplicity. Blocking I/O gives a straightforward control flow: call, wait, return. Nonblocking I/O gives better scaling options for many connections, but the application now owns more state: partial reads, retry loops, readiness notifications, timeouts, and backpressure. The OS still coordinates the resource, but the application participates more explicitly in deciding when to try again.</p>
-<p>The central trade-off is therefore not "blocking is bad, nonblocking is good." It is simpler control flow versus explicit progress management. A small command-line tool may be clearer and safer with blocking reads because there is only one main wait to understand. A proxy or API server with thousands of sockets may need readiness-based I/O because dedicating one sleeping thread to every connection becomes expensive. The same kernel boundary is involved in both cases; what changes is where the coordination state lives. Blocking hides most of that state inside the call stack and scheduler. Nonblocking exposes more of it to the runtime or application.</p>
-<p>Active check: if a server thread is asleep inside <code>recv</code>, is it using CPU? Usually no. It is consuming a thread stack and other process resources, but the scheduler can run other work while the thread waits. That is why "blocked" and "burning CPU" are different symptoms.</p>
-<h2>A Worked Debugging Path</h2>
-<p>Picture a request handler with this simplified path:</p>
-<div class="codehilite"><pre><span></span><code>receive request
-  -&gt; read config from local file
-  -&gt; query local cache over Unix socket
-  -&gt; call remote metadata service
-  -&gt; write response
-</code></pre></div>
-
-<p>The endpoint is slow. A naive diagnosis says, "The handler is expensive." A better OS-aware pass separates CPU time from waiting time:</p>
-<div class="codehilite"><pre><span></span><code>Step 1: Was the process runnable but not scheduled?
-  Possible scheduler contention or CPU saturation.
-
-Step 2: Was it blocked in read, recv, accept, poll, or futex?
-  The process was waiting on I/O or synchronization.
-
-Step 3: Was the syscall returning many small reads or writes?
-  Boundary crossing, buffering, or batching may matter.
-
-Step 4: Was the wait local or remote?
-  A disk/page-cache wait is different from a remote service timeout.
-</code></pre></div>
-
-<p>This is why tools that show syscall and scheduling behavior are so valuable. <code>strace</code> can show which syscalls happen and where time is spent. <code>top</code>, <code>pidstat</code>, <code>perf</code>, kernel tracing tools, and runtime profilers can help separate CPU execution from blocked time. The exact tool is less important than the question: is the program executing instructions, waiting for the kernel, or waiting for the world beyond the kernel?</p>
-<p>The answer determines the fix. CPU saturation might call for algorithmic work or more capacity. Excessive tiny syscalls might call for batching or buffering. Blocking on a socket might call for timeouts, concurrency limits, connection pool tuning, or dependency debugging. The same user-visible symptom, latency, can come from very different internal states.</p>
-<h2>Trade-offs and Failure Modes</h2>
-<p>The syscall boundary gives safety and shared-resource control, but it costs something. Crossing into the kernel has overhead. Copying data between kernel and user memory has overhead. Blocking can simplify code, but it can also tie up a thread while waiting. Nonblocking I/O can scale many connections, but it pushes state management into the application or runtime.</p>
-<p>Common confusions:</p>
+<p>Choose an initial I/O model for each and defend the choice.</p>
+<p><strong>A good answer should mention:</strong></p>
 <ul>
-<li>"Syscalls are just slow function calls." They are controlled privilege transitions that may also coordinate device, memory, scheduler, and filesystem state.</li>
-<li>"Blocked means broken." Often blocked means the process is correctly waiting for a condition. It becomes a problem when wait time violates deadlines or consumes too many surrounding resources.</li>
-<li>"Nonblocking is always faster." Nonblocking I/O can reduce thread-per-connection pressure, but it can make control flow more complex and still depends on the same underlying devices and buffers.</li>
-<li>"A timeout fixes waiting." A timeout bounds how long the caller waits. It does not make the dependency faster or decide whether retrying is safe.</li>
+<li>Blocking I/O is a reasonable initial fit for the importer because its small number of waits keeps control flow simple.</li>
+<li>The proxy is a candidate for nonblocking, readiness-driven I/O because dedicating one sleeping thread to every idle client can consume too many runtime resources.</li>
+<li>The proxy must explicitly manage partial reads and writes, connection lifecycle, timeouts, and backpressure.</li>
+<li>The choice is conditional, not universal: a runtime with lightweight tasks may change the resource trade-off, but it does not remove the need to understand waiting state.</li>
 </ul>
-<p>Readiness check: close the lesson and reconstruct the path for <code>read(fd, buf, n)</code> from memory. A good answer should include user code, syscall entry, descriptor validation, data availability, possible blocking, copying to user memory, and return or error.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Operating Systems: Three Easy Pieces - Link: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">https://pages.cs.wisc.edu/~remzi/OSTEP/</a> - Focus: Read the process, scheduling, and I/O chapters for the conceptual model behind blocking and kernel mediation.</li>
-<li>[ARTICLE] Linux man-pages: syscall(2) - Link: <a href="https://man7.org/linux/man-pages/man2/syscall.2.html">https://man7.org/linux/man-pages/man2/syscall.2.html</a> - Focus: See how Linux documents the direct syscall interface and architecture-specific calling details.</li>
-<li>[ARTICLE] Linux man-pages: read(2) - Link: <a href="https://man7.org/linux/man-pages/man2/read.2.html">https://man7.org/linux/man-pages/man2/read.2.html</a> - Focus: Pay attention to short reads, errors, blocking behavior, and the fact that the caller must handle return values carefully.</li>
-<li>[ARTICLE] Linux man-pages: poll(2) - Link: <a href="https://man7.org/linux/man-pages/man2/poll.2.html">https://man7.org/linux/man-pages/man2/poll.2.html</a> - Focus: Use this as a concrete entry point into readiness-based I/O.</li>
+<li>[BOOK] <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/">Operating Systems: Three Easy Pieces</a> — Focus: Read the I/O and concurrency chapters for the conceptual model behind kernel mediation and waiting.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man2/syscall.2.html">Linux <code>syscall(2)</code> Manual Page</a> — Focus: See how direct system-call interfaces are documented and why the exact call boundary is architecture-specific.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man2/read.2.html">Linux <code>read(2)</code> Manual Page</a> — Focus: Inspect short reads, zero-byte results, errors, and nonblocking <code>EAGAIN</code> or <code>EWOULDBLOCK</code> behavior.</li>
+<li>[ARTICLE] <a href="https://man7.org/linux/man-pages/man2/poll.2.html">Linux <code>poll(2)</code> Manual Page</a> — Focus: See the readiness contract and the events a program must still handle after a descriptor becomes ready.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A system call is a controlled transition from user code into kernel-managed shared resources.</li>
-<li>Blocking I/O means the process cannot make progress until some external condition changes.</li>
-<li>Nonblocking and readiness-based I/O trade simpler call stacks for more explicit state management.</li>
-<li>Latency diagnosis improves when you separate CPU execution, syscall overhead, and waiting time.</li>
-</ol>
+<ul>
+<li>A system call lets user code request a kernel-mediated operation on a shared resource.</li>
+<li>A blocking read can put a task to sleep when no byte is available, freeing the CPU for runnable work.</li>
+<li>A successful read can be short; an interface return is not automatically an application message.</li>
+<li>Nonblocking I/O and readiness move more progress state into the application or runtime.</li>
+<li>Latency diagnosis improves when you distinguish executing, runnable, and blocked work before changing code or capacity.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -225,7 +310,7 @@ Step 4: Was the wait local or remote?
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-07-27 15:03 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
