@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,16 +81,31 @@
 <section class="stack-block lesson-content-shell">
   <h1>Snapshotting, Checkpointing, and Log Compaction</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Snapshotting, checkpointing, and log compaction all reduce the cost of replaying history, but each preserves a different recovery boundary, and the trade-off is between faster recovery, retained history, and stricter consistency rules.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Identify whether a recovery problem needs a snapshot, checkpoint, or compacted log.</p>
+</li>
+<li>
+<p>Trace what a recovering replica or stream job restores and replays.</p>
+</li>
+<li>
+<p>State which history each technique deliberately does not preserve.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Snapshots preserve state at a log boundary, checkpoints preserve safe computational progress, and compaction preserves latest useful values by key—not every past value.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>A replicated service can start with a simple promise: every state change goes into an append-only log, and any replica can recover by replaying that log. At small scale, this feels clean. After months of membership changes, metadata updates, account events, or stream-processing records, "just replay the log" becomes a dangerous operational answer.</p>
-<p>The log may still be the source of truth, but not every recovery path should begin at entry <code>1</code>. New replicas need to catch up quickly. Crashed workers need to resume without duplicating work. Storage systems need to keep latest useful state without paying forever for superseded values in the hot path.</p>
+<p>A replicated service starts with a simple promise: every state change goes into an append-only log, and any replica can recover by replaying that log. At small scale, this feels clean. After months of membership changes, metadata updates, account events, or stream-processing records, “just replay the log” becomes a dangerous operational answer.</p>
+<p>The log may still be the source of truth, but not every recovery path should begin at entry <code>1</code>. New replicas need to catch up quickly. Crashed workers need to resume without losing or repeating visible work. Storage systems need to keep latest useful state without paying forever for superseded values in the hot path.</p>
 <p>Snapshotting, checkpointing, and log compaction are three ways to make history cheaper to use. They are easy to confuse because they all write something durable and all reduce replay. The difference is what each one preserves: a snapshot preserves state at a log point, a checkpoint preserves safe computational progress, and compaction preserves a log that can still rebuild latest state after older per-key versions are removed.</p>
 <h2>The Recovery Pressure</h2>
 <p>Consider a Raft-backed control-plane service that manages service discovery records, leases, and configuration. Every command is appended to a replicated log, then applied to an in-memory state machine. This gives a strong audit trail for the ordered decisions the cluster made.</p>
 <p>Now a new follower joins after the cluster has processed 9 million commands. If it must receive and apply the entire log before it can serve, bootstrap may take minutes or hours. If an operator restarts several nodes during an incident, recovery time becomes part of the outage. A design that is theoretically correct but operationally unable to recover in time is not complete.</p>
 <p>The system needs a way to say, "this is enough history for this recovery task." That boundary must be explicit. It must say what state is covered, which log entries are still needed, and what can be safely removed or replayed.</p>
+<h2>The Initial Model: One Replay Rule for Every Failure</h2>
+<p>We might first choose one rule: retain every record and replay from the beginning. This fits a small state machine with a short history. It becomes insufficient when a new replica needs hours to reconstruct state, a stream job must align state with consumed input, or a changelog only needs the latest value for each key.</p>
+<p>The missing part is that “recovery” has different jobs. Restoring state, resuming a computation, and rebuilding a latest-value view need different durable evidence.</p>
 <h2>Snapshotting: State as of a Log Point</h2>
 <p>A snapshot is a durable summary of state at a specific point in the log. In a replicated state machine, that point is usually named by a log index and term, not by vague wall-clock time.</p>
 <div class="codehilite"><pre><span></span><code>log:       1 2 3 4 ... 950000 950001 950002
@@ -169,6 +188,17 @@ apply log entries 950001..current
 <p>A snapshot and a checkpoint are not always the same thing. Both may write state to storage, but a snapshot usually summarizes state at a point in history, while a checkpoint records a safe resume boundary for a computation.</p>
 <p>Log compaction is not arbitrary deletion. It follows a retention rule, usually by key, so the compacted log can still rebuild latest state. It no longer promises to answer every historical question.</p>
 <p>A snapshot does not eliminate the log. The system usually still needs the tail after the snapshot, and the log often remains the authoritative stream of changes.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A follower restores a snapshot covering log index <code>950000</code>. Which entries must it still apply to reach the current state at index <code>950002</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It restores the snapshot state, then applies entries <code>950001</code> and <code>950002</code>. The snapshot replaces a covered prefix, not the tail after its boundary.</p>
+<p><strong>Check:</strong> A compacted log retains the latest record for <code>user:42</code>. Can it answer what email address <code>user:42</code> had six months earlier?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not necessarily. Compaction supports latest-state reconstruction; it is not a complete audit history of every superseded value.</p>
+<h2>Practice: Review a Recovery Proposal</h2>
+<p>A team says: “Our stream processor has state and writes notifications. We will save a database snapshot every hour, compact the input topic, and therefore never replay or duplicate a notification.”</p>
+<p>What is missing? Name the recovery boundary needed for the computation and one history that compaction may no longer preserve.</p>
+<p><strong>Model answer:</strong> A database snapshot alone does not align input offsets, operator state, and the notification/output boundary. The processor needs a checkpoint or equivalent coordinated recovery claim so it can determine what to replay after failure; external notifications may still need idempotency. Compaction can retain the latest record for a key while dropping prior versions, so it cannot replace an audit log of every input change.</p>
 <h2>Connections</h2>
 <p>The previous lesson showed why timestamps and logical clocks need explicit meaning in distributed histories. Snapshots and checkpoints need the same discipline: "as of index X" or "after offset Y" is useful only if the system can define what belongs before and after that boundary.</p>
 <p>The next lesson on exactly-once semantics builds directly on checkpointing. Once a system can resume from a durable boundary, it still has to make repeated work safe at the boundaries where messages, state, and external side effects meet.</p>
@@ -225,7 +255,7 @@ apply log entries 950001..current
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

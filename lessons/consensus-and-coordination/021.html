@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,121 +81,243 @@
 <section class="stack-block lesson-content-shell">
   <h1>Operating Consensus Clusters: Latency, Disk, Network, and Sizing</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Operating a consensus cluster means keeping the protocol inside a usable latency, durability, and failure-domain envelope, with a trade-off between stronger coordination guarantees and the cost of placing, sizing, and maintaining a small authoritative system.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace a slow control-plane update through the consensus write path and identify the next discriminating signal.</p>
+</li>
+<li>
+<p>Distinguish a healthy quorum from a cluster that is still outside its usable latency and recovery envelope.</p>
+</li>
+<li>
+<p>Review placement and member count against a named failure domain and a concrete coordination workload.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A consensus cluster is operationally healthy only when its durable quorum path and recovery paths stay fast enough for the authority decisions that depend on them.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine an etcd cluster that is theoretically healthy: three members are running, elections work, and writes eventually commit. Yet every deployment controller is slow, watch streams fall behind, and leadership changes whenever one disk stalls.</p>
-<p>Consensus correctness is not enough for a production control plane. The cluster must also have latency, disk, network, and sizing characteristics that let the protocol's timing assumptions remain usable.</p>
-<p>The misconception is that consensus systems fail only through dramatic partitions. Many incidents are quieter: slow disks, overloaded leaders, large values, watch backlogs, compaction pressure, or operators placing quorum members in failure domains that do not match the availability goal.</p>
-<p>The design consequence is that a consensus cluster is not just another replicated service. It is the place where authority is decided. Small operational problems in that cluster can become broad control-plane delays because every lock, lease, watch, election, and configuration change depends on its health.</p>
-<h2>Latency Is Part of the Write Path</h2>
-<p>A consensus write usually waits for a leader path and quorum replication. If the leader is far away from clients or followers, write latency rises. If one follower is slow but not needed for quorum, the cluster may still commit. If enough quorum members are slow, every control-plane operation slows down.</p>
-<p>The relevant latency is not just average network round trip. It includes:</p>
-<ul>
-<li>leader request handling,</li>
-<li>log append and fsync behavior,</li>
-<li>replication to followers,</li>
-<li>quorum acknowledgment,</li>
-<li>client retry and timeout policy.</li>
-</ul>
-<p>This is why consensus clusters are often kept small and close to the control-plane workload. Spreading members too widely can improve disaster tolerance, but it can also make every authoritative decision pay cross-region latency.</p>
-<p>A useful mental model is:</p>
-<div class="codehilite"><pre><span></span><code>client -&gt; leader -&gt; durable log append -&gt; followers -&gt; quorum ack -&gt; client response
+<p>Atlas runs three consensus members across three zones. The cluster still has a leader and still commits writes. Yet deployment rollouts now wait many seconds for a lease change, watches reconnect repeatedly, and a controller starts retrying its updates.</p>
+<p>The tempting conclusion is “the cluster is healthy because quorum exists.” Quorum means the cluster can make some protocol progress. It does not mean that locks, leases, watches, and conditional updates meet the latency and recovery promises that their clients rely on.</p>
+<p>An operational model needs to follow the actual path of an authority decision:</p>
+<div class="codehilite"><pre><span></span><code>client request
+-&gt; leader work and durable append
+-&gt; replication to enough followers
+-&gt; quorum evidence
+-&gt; state-machine apply
+-&gt; client reply and watch delivery
 </code></pre></div>
 
-<p>Every segment can be correct and still too slow. A leader that receives requests quickly but waits on fsync will delay commits. Followers that are reachable but slow can increase tail latency. Client timeouts that are too aggressive can turn slow commits into retry storms.</p>
-<h2>Disk Is a Protocol Dependency</h2>
-<p>Consensus logs are durable evidence. If the disk path is slow, unstable, or saturated, the protocol feels it.</p>
-<p>Symptoms include:</p>
-<ul>
-<li>commit latency spikes,</li>
-<li>followers falling behind,</li>
-<li>leader heartbeats delayed by I/O pressure,</li>
-<li>snapshots taking too long,</li>
-<li>compaction interfering with normal traffic,</li>
-<li>restore or restart times growing beyond the recovery objective.</li>
-</ul>
-<p>A consensus node is not just a stateless API server. It is a storage system whose log durability is part of correctness. That means operators need to monitor fsync latency, database size, compaction progress, snapshot duration, and backend fragmentation, not only CPU and memory.</p>
-<p>The trade-off is uncomfortable but real: stronger durability usually means waiting for storage, and faster storage paths often cost more or require tighter operational discipline. Treating the disk as "just local infrastructure" hides a core part of the consensus protocol.</p>
-<h2>Network Placement Defines the Latency Budget</h2>
-<p>Placement decides which failures the cluster can survive and how expensive each quorum decision becomes.</p>
-<p>A three-member cluster across three zones can survive one zone failure if the network between the remaining zones is healthy. The same three members in one rack may look redundant but fail together. Three members across distant regions may survive more infrastructure events, but each write may now pay wide-area latency.</p>
-<p>The placement question is not "how many places can I spread this across?" It is:</p>
-<div class="codehilite"><pre><span></span><code>Which failure do we intend to survive, and what latency are we willing to pay for every authoritative decision?
+<p>Disk, network, object size, client load, compaction, and placement can slow different parts of that path. The right response is not always “add servers.” First identify which stage has become the limiting evidence path, then choose a mitigation that preserves the cluster's safety and recovery envelope.</p>
+<h2>The Production Symptom</h2>
+<p>At 10:15, Atlas deployment controllers begin reporting lease-renewal timeouts. No zone is down. The consensus dashboard says a leader exists and all three members are reachable. The operator's first task is to separate a slow but safe cluster from one that is close to losing useful authority.</p>
+<p>This illustrative snapshot is not a measurement from a real Atlas system:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Earlier baseline</th>
+<th>Incident window</th>
+<th>What it suggests, not proves</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write commit latency, p99</td>
+<td>80 ms</td>
+<td>6.4 s</td>
+<td>The quorum write path is delayed</td>
+</tr>
+<tr>
+<td>Leader changes</td>
+<td>0 per hour</td>
+<td>4 in 10 minutes</td>
+<td>Heartbeats or scheduling may be disrupted</td>
+</tr>
+<tr>
+<td>Leader durable-append latency, p99</td>
+<td>12 ms</td>
+<td>3.8 s</td>
+<td>Storage pressure is a strong candidate</td>
+</tr>
+<tr>
+<td>Follower replication lag</td>
+<td>under 20 entries</td>
+<td>over 3,000 entries on one member</td>
+<td>A follower or its path is not keeping up</td>
+</tr>
+<tr>
+<td>Cancelled watches</td>
+<td>rare</td>
+<td>180 in 10 minutes</td>
+<td>Clients are reconnecting or falling behind</td>
+</tr>
+<tr>
+<td>Client retries</td>
+<td>low</td>
+<td>12x normal</td>
+<td>Timeouts may now be adding load</td>
+</tr>
+</tbody>
+</table>
+<p>No single line names the cause. High commit latency plus slow durable append points differently from high commit latency with normal storage but a slow cross-zone path. The investigation must choose a signal that can distinguish those hypotheses.</p>
+<h2>What the User Sees</h2>
+<p>The immediate user symptom is not “fsync is slow.” A deployment waits to acquire its lease, a configuration update times out, or a controller acts from a cache that it must now resync. Those failures can cascade:</p>
+<div class="codehilite"><pre><span></span><code>slow commit
+-&gt; client timeout
+-&gt; retry
+-&gt; more proposals and watch work
+-&gt; larger queues and further delay
 </code></pre></div>
 
-<p>For a control plane that drives deployments, locks, and watches, that latency budget affects the whole platform. If each update is slow, controllers reconcile slowly, lock acquisition slows, and operators may misdiagnose downstream symptoms that actually begin in the coordination layer.</p>
-<h2>Sizing Is About Failure Domains, Not Odd Numbers Alone</h2>
-<p>Most crash-fault clusters use odd sizes because majorities are efficient:</p>
-<div class="codehilite"><pre><span></span><code>3 members -&gt; tolerate 1 failure
-5 members -&gt; tolerate 2 failures
-7 members -&gt; tolerate 3 failures, but slower and heavier
-</code></pre></div>
-
-<p>Adding members is not free. It increases replication work, operational surface area, and the number of nodes that can lag or require maintenance. The correct size depends on the failure domains the system must survive.</p>
-<p>A three-member cluster across three zones may be enough for one-zone failure. A five-member cluster may be justified for stronger maintenance and failure tolerance. A seven-member cluster is rarely the first answer unless the operational need is clear.</p>
-<p>Placement matters as much as count. Three members on the same host class, rack, or cloud account can fail together. Five members split poorly across regions can create expensive latency and confusing quorum behavior.</p>
-<p>The sizing review should include client load too. Many control planes have a small number of consensus members but a large number of clients, watchers, and controllers. The cluster can be correctly sized for quorum and still overloaded by watch fan-out, large object values, or high-frequency writes.</p>
-<h2>Worked Example: A Slow Control Plane</h2>
-<p>Suppose deployment rollouts begin taking minutes instead of seconds. Application teams see delayed state changes, but the consensus cluster has not lost quorum.</p>
-<p>The investigation might find this path:</p>
+<p>The initial model—“just raise the client timeout”—can reduce visible errors for a short time. It does not restore the missing capacity. If retries are already multiplying work, a larger timeout without a retry budget can simply allow the queue to grow for longer.</p>
+<p>The stronger goal is an operational envelope. The team defines, for its own API semantics, how quickly lease renewal, conditional writes, and recovery must complete before controllers should degrade or stop protected work. A database with occasional slow writes may tolerate a wider envelope than a scheduler whose lease must renew within a narrow deadline.</p>
+<h2>What the System Knows</h2>
+<p>Use each signal to answer one question rather than collecting a metric wall.</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Useful evidence</th>
+<th>Likely next check</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Is the quorum write path slow?</td>
+<td>Commit latency and proposal queue depth</td>
+<td>Compare leader and follower timing for the same interval</td>
+</tr>
+<tr>
+<td>Is durable storage delaying the leader?</td>
+<td>Durable append or fsync latency, disk queue, storage errors</td>
+<td>Correlate latency spikes with commit delays and host I/O pressure</td>
+</tr>
+<tr>
+<td>Is one network path expensive or unstable?</td>
+<td>Per-peer round-trip, retransmits, replication send failures</td>
+<td>Compare affected follower and zone paths with healthy ones</td>
+</tr>
+<tr>
+<td>Is the cluster overloaded by clients?</td>
+<td>Request rate by operation/prefix, retry rate, value size</td>
+<td>Identify high-frequency writers and repeated failed attempts</td>
+</tr>
+<tr>
+<td>Are watches creating recovery pressure?</td>
+<td>Watch backlog, cancellations, compaction, resync duration</td>
+<td>Check whether clients follow snapshot-plus-watch recovery</td>
+</tr>
+<tr>
+<td>Is membership instability causing extra work?</td>
+<td>Leader changes, election duration, missed heartbeats</td>
+<td>Find the preceding disk, network, CPU, or pause event</td>
+</tr>
+</tbody>
+</table>
+<p>The causal order matters. A leader change can cause transient client retries. Slow storage can contribute to missed protocol deadlines and then leader changes. A retry storm can increase queueing after the first fault. Treating every graph as an independent incident obscures the chain.</p>
+<h2>Investigation Path</h2>
+<p>Start with the safe, high-information checks:</p>
 <ol>
-<li>A controller writes many large metadata objects.</li>
-<li>The leader appends them to its log and waits on a busy disk.</li>
-<li>Followers receive the entries but one follower lags behind.</li>
-<li>Watchers fall behind because compaction and replay pressure increase.</li>
-<li>Controllers retry after timeouts, adding more write load.</li>
+<li><strong>Confirm the failure boundary.</strong> Is a majority reachable? Which client operations are timing out: writes, lease renewals, reads, watches, or all of them? Do not change membership while this answer is unclear.</li>
+<li><strong>Locate the delayed stage.</strong> Compare request arrival, leader append, durable persistence, follower replication, commit, and apply timing. The slowest stage is the current hypothesis, not yet the final cause.</li>
+<li><strong>Compare members and paths.</strong> If one member's durable append is slow, inspect its storage and host pressure. If only one zone path is slow, inspect the network boundary. If every member is busy with proposals, inspect client workload and object size.</li>
+<li><strong>Contain amplification.</strong> Rate-limit noisy clients, deduplicate retries with stable operation identities, and stop unsafe controllers on lease uncertainty. Do not hide the symptom by making stale authority acceptable.</li>
+<li><strong>Recover deliberately.</strong> Let lagging members catch up, complete required compaction or snapshot work, and verify stable leader and commit latency before returning retry policies to normal.</li>
 </ol>
-<p>The cluster is "up," but it is outside its useful operating envelope. Fixing the incident may require reducing object size, separating noisy clients, improving disk latency, increasing watch capacity, adjusting timeouts, or moving members closer to the workload.</p>
-<p>The important lesson is that correctness and usability are different claims. A write that commits eventually may still be too slow for a scheduler lease, rollout gate, or failover path.</p>
-<h2>Operating Review</h2>
-<p>Before trusting a consensus cluster, review:</p>
+<p>This path avoids a common mistake: replacing a member while the real problem is a shared storage class, a cross-zone network event, or client traffic that the replacement will inherit.</p>
+<h2>The Failure Mechanism</h2>
+<p>The incident snapshot has an important clue: durable append latency rises before leader changes. The working hypothesis is a saturated or unstable leader disk path.</p>
+<p>When the leader cannot durably append entries promptly, it delays the records that followers need to acknowledge. Commit latency rises because the quorum path includes that durable evidence. If the same host is also delayed in scheduling protocol work, heartbeat or election timing can become unstable. Client timeouts then retry requests, increasing proposal and apply queues. Watch clients may fall behind and later need snapshots, adding read and transfer work.</p>
+<p>That chain is a hypothesis to test, not a universal diagnosis. A network partition, CPU pause, or overloaded follower can create a similar outward symptom. The evidence earns the correction only when the operator observes the correlation and removes pressure: for example, a durable-append spike disappears after the storage issue is isolated, and commit latency and leader stability recover with it.</p>
+<h2>Mitigation and Prevention</h2>
+<p>Mitigation should match the proven bottleneck and preserve the authority boundary.</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Immediate response</th>
+<th>Prevention or design change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leader storage saturation</td>
+<td>Reduce unnecessary write load; move or repair the unhealthy storage path if the runbook supports it</td>
+<td>Reserve predictable low-latency durable storage; test snapshots and compaction under load</td>
+</tr>
+<tr>
+<td>One slow network path</td>
+<td>Keep a healthy quorum; investigate the path before moving voters</td>
+<td>Place voters across intended failure domains with a quorum latency budget</td>
+</tr>
+<tr>
+<td>Retry amplification</td>
+<td>Enforce backoff, retry budgets, and idempotent request identities</td>
+<td>Make client timeout and retry policy part of capacity testing</td>
+</tr>
+<tr>
+<td>Watch backlog and compaction pressure</td>
+<td>Shed or restart clients that can resync safely; protect the store from unbounded watches</td>
+<td>Use snapshot-plus-watch recovery, bounded retention, and small control-plane objects</td>
+</tr>
+<tr>
+<td>Unclear degraded state</td>
+<td>Freeze risky membership changes and communicate the current guarantee</td>
+<td>Rehearse runbooks that distinguish normal replacement from quorum-loss recovery</td>
+</tr>
+</tbody>
+</table>
+<p>The trade-off is real. Faster durable storage, low-latency placement, and a small control-plane data model cost money and operational discipline. Spreading voters across distant regions may improve a disaster objective while making every quorum decision slower. The correct choice depends on the failure domain to survive and the latency promise made to controller clients.</p>
+<h2>Sizing and Placement Are One Decision</h2>
+<p>An odd number is not a sizing strategy. Under the common crash-fault majority model:</p>
+<div class="codehilite"><pre><span></span><code>3 voters -&gt; tolerate 1 unavailable voter
+5 voters -&gt; tolerate 2 unavailable voters
+</code></pre></div>
+
+<p>Adding two voters improves fault tolerance only if their placement creates independent failure domains and the new quorum path still fits the latency budget. Five members on one shared storage platform can fail together. Three members in very distant regions can be safe from one regional failure but slow every lease grant enough to harm the control plane.</p>
+<p>Capacity also includes clients. A cluster with correctly placed voters may still fail its envelope if it carries large values, high-frequency status writes, or many slow watchers. Keep authoritative metadata small; move bulky artifacts, logs, and telemetry to systems built for them. The previous API lesson explains why clients should recover watches by snapshot rather than retaining an unbounded event history in the coordination store.</p>
+<h2>Signals to Watch</h2>
+<p>Operational readiness needs thresholds chosen for the service, not generic green lights:</p>
 <ul>
-<li>what quorum failure the placement can actually survive,</li>
-<li>what write latency budget the control plane needs,</li>
-<li>how large values and watch traffic are controlled,</li>
-<li>whether snapshots and compaction are tested under load,</li>
-<li>which metrics warn before leadership churn starts,</li>
-<li>how long restore, restart, and member replacement take,</li>
-<li>which clients are allowed to perform high-frequency writes.</li>
+<li>tail commit and apply latency against the lease or control-loop budget;</li>
+<li>durable-append latency, disk errors, and storage queue pressure on each voter;</li>
+<li>leader changes, election duration, and missed heartbeat patterns;</li>
+<li>follower lag and the time a recovering member needs to become useful again;</li>
+<li>watch cancellation, compaction, snapshot-transfer, and resync duration;</li>
+<li>request, retry, and value-size distributions by client and operation;</li>
+<li>restore and replacement drill duration against the recovery objective.</li>
 </ul>
-<p>The goal is not to make consensus cheap. The goal is to keep its cost visible and bounded.</p>
-<h2>Signals to Monitor</h2>
-<p>Useful monitoring should connect symptoms to protocol mechanics:</p>
+<p>These are signals, not proofs in isolation. Their value comes from the path they illuminate: a degraded disk may be harmless for a cache but directly threatens the durable evidence path of a consensus member.</p>
+<h2>Readiness Check</h2>
+<p><strong>Check:</strong> The cluster keeps quorum, but p99 commit latency is now longer than the controller lease-renewal deadline and client retries are climbing. Is the correct status “healthy because there is a leader”?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The cluster may still be safe in the narrow sense that it has a quorum, but it is outside the usable envelope for that lease contract. Contain retries, identify the delayed write stage, and make controllers fail safe on authority uncertainty while the cluster recovers.</p>
+<h2>Practice: Review a Placement Proposal</h2>
+<p>A team proposes moving a three-voter coordination cluster from three zones in one region to three distant regions. They say it will be “more reliable” because outages are less correlated.</p>
+<p><strong>A good answer should mention:</strong></p>
 <ul>
-<li>commit latency and proposal apply latency,</li>
-<li>leader changes and election timeouts,</li>
-<li>follower lag and failed replication streams,</li>
-<li>fsync latency and backend database growth,</li>
-<li>snapshot, restore, and compaction duration,</li>
-<li>watch backlog, cancelled watches, and clients forced to resync,</li>
-<li>request rate by client, key prefix, and operation type.</li>
+<li>which regional or zone failure the change is meant to survive;</li>
+<li>the quorum round-trip and durable-write latency budget that every lease, CAS, and configuration update will now pay;</li>
+<li>whether client placement and network paths preserve a reachable majority during the intended failure;</li>
+<li>disk, watch, and retry load that may amplify wide-area latency;</li>
+<li>a workload test and recovery drill before treating the placement as an improvement.</li>
 </ul>
-<p>These metrics are not just service-health trivia. They answer whether the cluster can still provide authority quickly enough for the systems depending on it.</p>
 <h2>Connections</h2>
-<p>The previous lesson explained the client-facing API contract: CAS, leases, locks, watches, revisions, and fencing tokens. This lesson asks whether the underlying cluster can serve those operations with the latency and reliability their users assume.</p>
-<p>The next lesson moves into reconfiguration and disaster recovery. The operational signals here become the warning signs that decide whether a member replacement is routine maintenance or the beginning of a recovery incident.</p>
+<p>The previous lesson made coordination safety visible in client contracts. This lesson asks whether the underlying cluster can serve those contracts under ordinary infrastructure pressure.</p>
+<p>The next lesson changes the decision set itself through reconfiguration and recovery, where operational diagnosis determines whether a procedure remains routine or crosses into data-loss risk.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://etcd.io/docs/">etcd Operations Guide</a><ul>
-<li>Focus: Read for cluster sizing, hardware, maintenance, and operational metrics.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/deploy">Consul Production Deployment Guide</a><ul>
-<li>Focus: Compare production guidance for another coordination system.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Reconnect operational symptoms to leader, log, and quorum mechanics.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://etcd.io/docs/">etcd Operations Guide</a> — Focus: Hardware, maintenance, monitoring, and the operational effects of data size and compaction.</li>
+<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/deploy">Consul Production Deployment Guide</a> — Focus: Placement, sizing, and production failure-domain trade-offs for another coordination system.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: Relate leader, log, quorum, and recovery mechanics to the symptoms in the investigation.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Consensus clusters depend on ordinary infrastructure details such as disk latency, network placement, object size, and client load.</li>
-<li>More members increase fault tolerance only when placement matches real failure domains and the added replication cost is acceptable.</li>
-<li>A cluster can be correct but still outside the latency and recovery envelope its control plane needs.</li>
-<li>Operational health should be measured through commit latency, leader stability, follower lag, disk behavior, compaction, watches, and recovery drills.</li>
+<li>Quorum existence is not enough: authority operations must also meet their latency and recovery budgets.</li>
+<li>Diagnose a slow consensus cluster by locating the delayed stage in its durable quorum path, then using a signal that distinguishes disk, network, and workload pressure.</li>
+<li>Client retries and watch resync can amplify an initial storage or network fault into a control-plane incident.</li>
+<li>Member count and placement must jointly match an intended failure domain and the latency paid by every quorum decision.</li>
+<li>Operational readiness comes from measured workload and recovery drills, not a permanently green leader indicator.</li>
 </ul>
 </section>
 
@@ -221,7 +347,7 @@
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

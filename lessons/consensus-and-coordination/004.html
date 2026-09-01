@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,127 +81,226 @@
 <section class="stack-block lesson-content-shell">
   <h1>Multi-Paxos and Leader-Based Optimization</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Multi-Paxos keeps Paxos's quorum safety but amortizes the expensive leadership setup across many log slots when one leader remains stable.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain why a replicated log needs many Paxos decisions rather than one.</p>
+</li>
+<li>
+<p>Trace how a new Multi-Paxos leader recovers accepted evidence before using the fast path.</p>
+</li>
+<li>
+<p>Identify why stable leadership improves latency without turning leadership into a safety proof.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Multi-Paxos pays the expensive prepare phase when leadership changes, then uses the resulting promises to choose new log slots with only the accept phase while that leadership remains stable.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a replicated metadata service that needs to commit a stream of small decisions: create this namespace, update that shard owner, revoke this lease, append the next configuration entry. Single-decree Paxos can choose one value safely, but the service does not need one isolated value. It needs a log.</p>
-<p>Running full Paxos from scratch for every slot would be correct, but it would repeatedly pay the same setup cost. The proposer would establish a ballot, collect promises, learn accepted history, and then attempt one accept. Then it would do the same thing again for the next slot, even if the same node is still effectively leading the cluster.</p>
-<p>Multi-Paxos is the optimization that says: keep the safety rule, reuse the leadership context. Once a proposer has established a ballot that an overlapping quorum has promised to respect, the common case can append later slots through Phase 2 without re-running Phase 1 for every single entry.</p>
-<p>The trade-off is that the system becomes much more interested in leader stability. A stable leader gives low-latency log appends. A flapping or contested leader drags the system back toward repeated leadership setup.</p>
-<h2>From One Value to a Replicated Log</h2>
-<p>Single-decree Paxos answers one question:</p>
-<div class="codehilite"><pre><span></span><code>Which value is chosen for this one decision?
+<p>A metadata service must record an ordered stream of commands: create a namespace, move a shard, revoke a lease. A single-decree Paxos instance can choose one command safely. The service needs the same protection for slot <code>41</code>, then <code>42</code>, then <code>43</code>—and it needs replicas to apply those slots in the same order.</p>
+<p>The obvious construction is safe: run full Paxos independently for every slot. For each command, a proposer sends <code>prepare</code>, collects promises and accepted history, then sends <code>accept</code>. The problem is that a healthy leader would repeat the same leadership contest before every append, even though the same majority has already promised to reject lower ballots.</p>
+<p>Multi-Paxos does not remove the hard part. It moves it off the healthy hot path. A leader first runs Phase 1 with a ballot for a collection of log instances, discovers any values that old attempts already accepted, and repairs those slots. For slots with no inherited value, it can then issue new commands directly in Phase 2 under that ballot.</p>
+<p>The key correction is subtle: “the leader can append freely” is true only for slots whose Phase 1 evidence leaves their value unconstrained. Leadership is an efficiently reused safety context, not permission to rewrite a log.</p>
+<h2>The Situation: One Choice Becomes an Ordered History</h2>
+<p>Use five acceptors, <code>A1</code> through <code>A5</code>. Any three form a quorum. The service treats each log position as a separate single-decree Paxos instance:</p>
+<div class="codehilite"><pre><span></span><code>slot 41 -&gt; one chosen command
+slot 42 -&gt; one chosen command
+slot 43 -&gt; one chosen command
 </code></pre></div>
 
-<p>A replicated log asks that question over and over:</p>
-<div class="codehilite"><pre><span></span><code>slot 41 -&gt; choose command A
-slot 42 -&gt; choose command B
-slot 43 -&gt; choose command C
+<p>The log order matters. Suppose <code>41</code> creates <code>/teams/search</code>, <code>42</code> assigns its owner, and <code>43</code> grants a worker a lease. Applying <code>43</code> before a missing <code>42</code> can give replicas different state transitions, even if every individual slot is chosen safely. The primary goal here is still one value per slot; deterministic ordered application comes later in the track.</p>
+<table>
+<thead>
+<tr>
+<th>Actor</th>
+<th>What it remembers or does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leader/proposer <code>L</code></td>
+<td>Chooses a ballot, learns accepted values, assigns new commands to unconstrained slots.</td>
+</tr>
+<tr>
+<td>Acceptor <code>A1</code>–<code>A5</code></td>
+<td>Persists promises and accepted <code>(ballot, slot, value)</code> evidence.</td>
+</tr>
+<tr>
+<td>Learner/replica</td>
+<td>Learns chosen slots and applies the contiguous chosen prefix in order.</td>
+</tr>
+</tbody>
+</table>
+<p>The teaching example holds membership fixed. Reconfiguration changes which sets intersect and deserves its own later lesson.</p>
+<h2>The Initial Model: Prepare Every Slot Forever</h2>
+<p>We might first use the single-decree recipe for each append:</p>
+<div class="codehilite"><pre><span></span><code>slot 41: prepare -&gt; majority promises -&gt; accept -&gt; majority accepts
+slot 42: prepare -&gt; majority promises -&gt; accept -&gt; majority accepts
+slot 43: prepare -&gt; majority promises -&gt; accept -&gt; majority accepts
 </code></pre></div>
 
-<p>Each slot still needs a safe chosen value. The log cannot let two replicas commit different commands for slot <code>42</code> and then pretend the histories are compatible. But the repeated structure changes the engineering pressure. The system wants the safety of Paxos without turning every append into a fresh leadership contest.</p>
-<p>That is the boundary Multi-Paxos works inside:</p>
-<div class="codehilite"><pre><span></span><code>same safety goal:
-  one chosen value per slot
-
-different performance goal:
-  avoid full leadership setup for every slot
+<p>This works. It is also wasteful in a stable period. If <code>L</code> already prepared ballot <code>17</code> with a quorum, those acceptors have promised not to accept lower ballots. Starting a fresh prepare for every empty next slot repeats coordination work instead of using the established ballot.</p>
+<p>The tempting optimization is too aggressive: “Once <code>L</code> is leader, it can put any command in every slot.” That breaks whenever a prior leader accepted a value in a slot before failing. A value need not have been learned by every replica—or even chosen—to constrain the new leader's Phase 2 proposal.</p>
+<p>The stronger model is: establish a higher ballot, recover the accepted evidence for each relevant slot, and only then use that ballot's Phase 2 path for new unconstrained slots.</p>
+<h2>The Mechanism: A Ballot Spans Many Slots</h2>
+<p><strong>Plain meaning:</strong> Establish one safe leadership attempt, inspect the old work it may need to finish, then avoid repeating that establishment for each new command.</p>
+<p><strong>In this scenario:</strong> <code>L</code> prepares ballot <code>17</code> with a majority. The acceptors promise ballot <code>17</code> and report any accepted proposal they hold for the log slots under consideration. For a slot with an accepted value in the replies, <code>L</code> must carry that value forward. For an empty slot, <code>L</code> may select the next client command.</p>
+<p><strong>Technical name:</strong> This is <strong>Multi-Paxos</strong>: many Paxos instances share a stable leader and ballot context. Its ordinary fast path is Phase 2 for new slots; Phase 1 returns when leadership changes or the ballot loses authority.</p>
+<h3>1. A new leader prepares and recovers history</h3>
+<p>After a leader failure or a competing higher ballot, <code>L</code> chooses a ballot above those it knows and contacts a quorum:</p>
+<div class="codehilite"><pre><span></span><code>L -&gt; A2, A3, A4: prepare(17, slots 42 and onward)
 </code></pre></div>
 
-<p>The protocol family still depends on ballots, promises, accepted history, and quorum intersection. What changes is how often the expensive preparation path is needed in the healthy steady state.</p>
-<h2>Reusing Phase 1 Without Throwing It Away</h2>
-<p>In single-decree Paxos, Phase 1 does two jobs. It establishes that a proposer has a high enough ballot, and it lets the proposer learn any accepted value it must preserve.</p>
-<p>Multi-Paxos does not make that step meaningless. It tries to reuse its result.</p>
-<p>Suppose leader <code>L</code> establishes ballot <code>17</code> with acceptors <code>A1</code>, <code>A2</code>, and <code>A3</code>. A quorum has promised not to accept lower ballots. If no higher ballot appears and the same leader remains active, <code>L</code> can send accepts for new slots under that established ballot:</p>
-<div class="codehilite"><pre><span></span><code>Phase 1 once:
-  L -&gt; quorum: prepare(17)
-  quorum -&gt; L: promise(17, accepted history)
+<p>The exact wire format varies by implementation. The safety job does not: a successful Phase 1 response means the acceptor promises not to accept lower ballots and reports prior accepted evidence for the relevant instances. Lamport's state-machine description shows one proposal number used across many instances; acceptors need detailed replies only where an earlier Phase 2 message exists.</p>
+<p>For each slot, <code>L</code> now applies the same selection rule from the previous lesson:</p>
+<div class="codehilite"><pre><span></span><code>highest accepted value reported for this slot
+  -&gt; carry that value forward
 
-Steady state:
-  L -&gt; quorum: accept(17, slot 41, command A)
-  L -&gt; quorum: accept(17, slot 42, command B)
-  L -&gt; quorum: accept(17, slot 43, command C)
+no accepted value reported by the preparing quorum for this slot
+  -&gt; choose a new client command for that slot
 </code></pre></div>
 
-<p>This is the amortization. The cost of establishing a safe leadership context is spread across many entries instead of paid separately for each one.</p>
-<p>The important word is "context." Multi-Paxos does not say a leader may ignore earlier accepted values. During leadership establishment, the proposer must still account for any prior accepted history revealed by the quorum. Once that has been reconciled, the leader can drive new empty slots more cheaply because the quorum has already agreed to respect that ballot.</p>
-<h2>Worked Example: Slots 41, 42, and 43</h2>
-<p>Use five acceptors, where any three form a quorum. A metadata service has a stable leader <code>L</code> at ballot <code>17</code>.</p>
-<p>The leader receives three client commands:</p>
-<div class="codehilite"><pre><span></span><code>slot 41: create /teams/search
-slot 42: set owner = node-7
-slot 43: grant lease to worker-12
+<p>This rule is per slot. Finding an accepted command at slot <code>42</code> does not force that command into slot <code>43</code>; it constrains only its own Paxos instance.</p>
+<h3>2. The leader uses Phase 2 for the recovered and new slots</h3>
+<p>Once <code>L</code> has established ballot <code>17</code>, it sends accepts under that same ballot:</p>
+<div class="codehilite"><pre><span></span><code>L -&gt; quorum: accept(17, slot 42, recovered value)
+L -&gt; quorum: accept(17, slot 43, new client command)
 </code></pre></div>
 
-<p>If the cluster repeated single-decree Paxos from scratch, every slot would require a new prepare round before the accept round:</p>
-<div class="codehilite"><pre><span></span><code>slot 41: prepare -&gt; promise -&gt; accept -&gt; accepted
-slot 42: prepare -&gt; promise -&gt; accept -&gt; accepted
-slot 43: prepare -&gt; promise -&gt; accept -&gt; accepted
+<p>Each slot becomes chosen only when a majority accepts the same proposal for that slot. The leader can often pipeline several Phase 2 requests; it need not wait for slot <code>42</code> to be learned before sending a proposal for slot <code>43</code>. But replicas must not pretend that an out-of-order learned suffix is an already applicable history. A gap still matters to application.</p>
+<h3>3. The fast path lasts only while the ballot does</h3>
+<p>If the leader can continue communicating with a majority and no higher ballot preempts it, later slots can use only the Phase 2 exchange:</p>
+<div class="codehilite"><pre><span></span><code>client command -&gt; L assigns next free slot -&gt; accept(17, slot, command) -&gt; majority acceptance
 </code></pre></div>
 
-<p>Under a stable Multi-Paxos leader, the common path is shorter:</p>
-<div class="codehilite"><pre><span></span><code>slot 41: accept -&gt; accepted
-slot 42: accept -&gt; accepted
-slot 43: accept -&gt; accepted
+<p>That is the latency win. It is not a weaker quorum rule; every chosen slot still has majority acceptance. The removed work is the repeated preparation, not the evidence that makes a value chosen.</p>
+<h2>Worked Trace: Recover One Slot, Then Append Two More</h2>
+<p>The following state and timing are illustrative. The previous leader failed while slot <code>41</code> was known chosen, <code>42</code> had an accepted but not yet chosen command, and <code>43</code> was empty.</p>
+<div class="codehilite"><pre><span></span><code>slot 41: create /teams/search             chosen already
+slot 42: set owner = node-6               accepted by A2 and A3 only
+slot 43: no accepted value
 </code></pre></div>
 
-<p>The entries are still chosen by quorum evidence. If <code>L</code> gets accepts from a majority for slot <code>42</code>, then later leadership attempts must preserve that chosen history. The optimization is about removing repeated setup round trips from the normal append path, not about weakening the evidence required for a decision.</p>
-<p>This is why Multi-Paxos is a practical bridge from Paxos as a theorem-shaped mechanism to Paxos as a replicated-log engine.</p>
-<h2>When the Fast Path Stops Being Safe Enough</h2>
-<p>The fast path depends on the leader's ballot remaining the active authority. If another proposer appears with ballot <code>18</code>, acceptors may promise to the newer ballot. Once that happens, <code>L</code> can no longer assume that its ballot is still the one the quorum will follow.</p>
-<p>Several operational conditions can break the steady state:</p>
-<ul>
-<li>leader process crashes or pauses</li>
-<li>network delay makes followers suspect the leader is gone</li>
-<li>multiple proposers retry aggressively</li>
-<li>disk or replication stalls make the leader look unhealthy</li>
-<li>a reconfiguration changes which quorum must be contacted</li>
-</ul>
-<p>When that happens, the system has to return to the setup logic: establish a new ballot, learn relevant accepted history, and only then continue safely. That fallback is not a failure of Multi-Paxos. It is the safety boundary that keeps the optimization honest.</p>
-<p>The design trade-off is direct:</p>
-<div class="codehilite"><pre><span></span><code>stable leadership:
-  fewer round trips per entry
-  clearer hot path
-  better throughput
-
-leader churn:
-  more prepare rounds
-  more contention
-  slower log progress
+<p><code>A2</code> and <code>A3</code> alone are not a majority of five, so slot <code>42</code> is not chosen. Still, a new leader cannot replace it casually: its accepted evidence must be carried forward if it appears in the Phase 1 quorum.</p>
+<h3>Starting state</h3>
+<table>
+<thead>
+<tr>
+<th>Acceptor</th>
+<th>Highest relevant accepted evidence before ballot 17</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>A1</code></td>
+<td>slot <code>41</code>: create <code>/teams/search</code></td>
+</tr>
+<tr>
+<td><code>A2</code></td>
+<td>slot <code>41</code>: create <code>/teams/search</code>; slot <code>42</code>: set owner = <code>node-6</code></td>
+</tr>
+<tr>
+<td><code>A3</code></td>
+<td>slot <code>41</code>: create <code>/teams/search</code>; slot <code>42</code>: set owner = <code>node-6</code></td>
+</tr>
+<tr>
+<td><code>A4</code></td>
+<td>slot <code>41</code>: create <code>/teams/search</code></td>
+</tr>
+<tr>
+<td><code>A5</code></td>
+<td>slot <code>41</code>: create <code>/teams/search</code></td>
+</tr>
+</tbody>
+</table>
+<h3>Step 1: <code>L</code> establishes ballot 17</h3>
+<p><code>L</code> prepares <code>A2,A3,A4</code>, a majority. They persist a promise not to accept lower ballots and return their accepted state. For slot <code>42</code>, <code>L</code> sees <code>set owner = node-6</code> from <code>A2</code> and <code>A3</code>. For slot <code>43</code>, nobody reports an accepted value.</p>
+<table>
+<thead>
+<tr>
+<th>Slot</th>
+<th>What the Phase 1 quorum reported</th>
+<th>What <code>L</code> may send in Phase 2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>42</code></td>
+<td>accepted <code>set owner = node-6</code></td>
+<td>exactly that recovered value</td>
+</tr>
+<tr>
+<td><code>43</code></td>
+<td>no accepted value</td>
+<td>any client command, e.g. <code>grant lease to worker-12</code></td>
+</tr>
+<tr>
+<td><code>44</code></td>
+<td>no accepted value</td>
+<td>any next client command, e.g. <code>set quota = 20</code></td>
+</tr>
+</tbody>
+</table>
+<p>Why is one accepting report enough to constrain <code>L</code>? The leader does not need to prove that slot <code>42</code> was previously chosen. It needs to preserve values that its preparing quorum says may be safety-relevant. That conservative rule is what makes later leadership compatible with any hidden majority evidence.</p>
+<h3>Step 2: the leader completes the recovered slot</h3>
+<p><code>L</code> sends <code>accept(17, slot 42, set owner = node-6)</code> to <code>A2,A3,A4</code>. All three accept. Slot <code>42</code> is now chosen by a majority, even though the leader did not choose its content from a new client request.</p>
+<div class="codehilite"><pre><span></span><code>recovery result:
+  slot 41 = create /teams/search          chosen
+  slot 42 = set owner = node-6            chosen
 </code></pre></div>
 
-<p>The protocol is therefore sensitive to election behavior, timeout choices, backoff, and operational health. Multi-Paxos makes the common case faster by betting that one leader will usually remain dominant long enough to amortize Phase 1.</p>
-<h2>Why This Points Toward Raft</h2>
-<p>Multi-Paxos often becomes leader-shaped in practice. Once one proposer is stable, engineers naturally talk about a leader driving the log and followers accepting entries. The safety argument is still Paxos-style, but the operational model starts to sound like a leader-based replication system.</p>
-<p>Raft takes that tendency and makes it explicit. Instead of presenting stable leadership as an optimization around Paxos, Raft builds the protocol around terms, elections, leaders, followers, log replication, and commit rules from the start.</p>
-<p>That does not make Raft "safer than Paxos" in a simple sense. It makes the leader-centered structure easier to see, implement, and debug. Multi-Paxos is the bridge: it shows why a leader is useful before the next lesson explains how Raft turns that usefulness into a primary design principle.</p>
-<h2>Common Misreadings</h2>
-<p>"Multi-Paxos removes Phase 1" is too strong. Multi-Paxos reuses Phase 1 while the leadership context remains valid. When leadership is contested, Phase 1 comes back.</p>
-<p>"The leader can append anything once elected" is wrong. The leader must preserve accepted history discovered during leadership establishment, and each slot still needs quorum acceptance.</p>
-<p>"Multi-Paxos is a different safety theory" is also wrong. The safety core is still quorum intersection plus ballot discipline. The optimization changes the common-case cost, not the meaning of a chosen value.</p>
+<h3>Step 3: the same ballot drives the steady path</h3>
+<p>For slots <code>43</code> and <code>44</code>, Phase 1 found no accepted values. <code>L</code> may assign the two new client commands and send Phase 2 requests under ballot <code>17</code>:</p>
+<div class="codehilite"><pre><span></span><code>accept(17, slot 43, grant lease to worker-12)
+accept(17, slot 44, set quota = 20)
+</code></pre></div>
+
+<p>If a majority accepts each request, both slots are chosen. The leader did not re-run prepare for each one because ballot <code>17</code> already establishes the relevant promise context. A learner can now apply the contiguous sequence <code>41</code> through <code>44</code>.</p>
+<p><strong>So far:</strong> Multi-Paxos earns its fast path by doing the recovery work once per leadership period. The leader first preserves old accepted evidence; only empty slots become places for new commands.</p>
+<h2>When the Fast Path Ends</h2>
+<p>Suppose another proposer successfully prepares ballot <code>18</code> with a quorum. The <code>17</code> promises no longer guarantee that <code>L</code> can obtain accepts. An <code>accept(17, ...)</code> request reaching an acceptor that promised <code>18</code> is rejected or ignored. <code>L</code> must stop treating its ballot as active authority.</p>
+<p>That is not a safety failure. It is the protocol exposing its boundary: a leader may continue the fast path only while it has a ballot that a reachable quorum will honor. The new proposer must repeat the recovery step before it can safely move the log forward.</p>
+<p>The same boundary appears operationally when a leader process pauses, a network partition splits communication, disks make replication slow, or timeout policy starts multiple candidates. Useful signals include rising prepare counts, higher-ballot rejections, leader changes, and time spent waiting for quorum acknowledgments. These are progress and performance signals, not evidence that two values were chosen for a slot.</p>
+<h2>Trade-offs and Limits</h2>
+<p>The trade-off is clear. Multi-Paxos improves steady-state append latency and throughput by amortizing Phase 1 across many slots. It costs more recovery logic: a new leader must locate accepted values, fill or preserve gaps safely, and make its ballot durable before it relies on it. It also makes leader stability materially important to performance.</p>
+<p>This is a good fit when a replicated service has a mostly stable leader and an ordered write stream. It becomes risky when leader churn is frequent enough that the system spends most of its time in preparation rather than Phase 2. No choice of timeout turns a slow node into a definitely failed node; timeouts help pick a new attempt for progress, while the Paxos evidence rules protect safety.</p>
+<p>Multi-Paxos does not by itself define every product-level choice: client acknowledgement semantics, deterministic application, membership changes, snapshots, and read consistency still need separate rules. It only gives the log's repeated agreement mechanism a usable common case.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “Multi-Paxos eliminates Phase 1.”</p>
+<p><strong>Why it is tempting:</strong> The normal append trace can show only accepts and acknowledgements.</p>
+<p><strong>Better model:</strong> Phase 1 is amortized, not deleted. It is needed after a leader change or when a higher ballot preempts the old leader.</p>
+<p><strong>Confusion:</strong> “A stable leader can choose any value in every slot.”</p>
+<p><strong>Why it is tempting:</strong> The leader owns the normal append path.</p>
+<p><strong>Better model:</strong> It may choose a new value only for a slot whose prepare evidence is empty. A reported accepted value for that slot must be carried forward.</p>
+<p><strong>Confusion:</strong> “A chosen slot is immediately safe to apply anywhere.”</p>
+<p><strong>Why it is tempting:</strong> The slot has majority evidence.</p>
+<p><strong>Better model:</strong> A replica needs the chosen commands in log order to apply a deterministic state machine safely. Later slots can be learned before an earlier gap is repaired.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> During Phase 1 at ballot <code>30</code>, a new leader learns that slot <code>52</code> has accepted value <code>X</code>, while slots <code>53</code> and <code>54</code> have no accepted values in the quorum replies. Which values may it send in Phase 2?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It must send <code>X</code> for slot <code>52</code>. It may choose new client commands for <code>53</code> and <code>54</code>. The restriction is per slot, not a rule that makes every later slot repeat <code>X</code>.</p>
+<p><strong>Check:</strong> A leader at ballot <code>30</code> receives a rejection that reports ballot <code>31</code>. Can it safely keep treating Phase 2 at ballot <code>30</code> as its fast path?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The higher ballot is evidence that some acceptor has promised a newer attempt. The old leader must stop relying on ballot <code>30</code>; a proposer at the newer ballot must recover the relevant accepted history before continuing.</p>
+<h2>Practice: Trace a Short Leader Change</h2>
+<p>Five acceptors use quorums of three. Old leader <code>L1</code> accepted <code>remove node-9</code> for slot <code>80</code> at <code>A1,A2</code>, then failed. New leader <code>L2</code> prepares ballot <code>41</code> with <code>A2,A3,A4</code>. Its replies show <code>remove node-9</code> at <code>A2</code> for slot <code>80</code>, no accepted value for slot <code>81</code>, and no accepted value for slot <code>82</code>.</p>
+<p>What Phase 2 proposals should <code>L2</code> send if the next two client commands are <code>create /ops</code> and <code>set quota = 50</code>? Explain what must happen before replicas apply slot <code>81</code>.</p>
+<p><strong>Model answer:</strong> <code>L2</code> must first propose <code>remove node-9</code> at slot <code>80</code>, because the Phase 1 quorum reported that accepted value. It may propose <code>create /ops</code> at <code>81</code> and <code>set quota = 50</code> at <code>82</code>, all under ballot <code>41</code>. Each slot still needs majority acceptance. Replicas apply slot <code>81</code> only after the contiguous prefix includes a chosen slot <code>80</code>; a later chosen slot does not skip a missing earlier decision.</p>
 <h2>Connections</h2>
-<p>The previous lesson explained why a later Paxos attempt must respect accepted history. This lesson keeps that same safety rule but asks how a system can avoid paying the full setup cost for every slot in a long log.</p>
-<p>The next lesson on Raft makes the leader role more explicit. Multi-Paxos prepares that shift by showing why stable leadership is not merely convenient; it is the main way consensus becomes usable for repeated decisions.</p>
+<p>The previous lesson provided the single-decree rule: a later ballot learns accepted history from an overlapping quorum and carries it forward. Multi-Paxos repeats that rule per log slot, then amortizes Phase 1 during stable leadership.</p>
+<p>The next lesson, Raft, makes the leader-shaped control path explicit through terms, elections, and roles. It is not “Paxos with better safety”; it is another crash-fault consensus design organized to make leader authority easier to inspect.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a><ul>
-<li>Focus: Revisit the single-decree core and notice what the log optimization tries not to repeat.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://paxos.systems/paper/">Paxos Made Moderately Complex</a><ul>
-<li>Focus: Useful for seeing Paxos ideas in a more implementation-minded replicated-log form.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Compare Raft's explicit leader structure with the leader-shaped steady state of Multi-Paxos.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a> — Focus: read the state-machine implementation and its recovery of accepted log instances before the Phase 2 steady path.</li>
+<li>[PAPER] <a href="https://paxos.systems/paper/">Paxos Made Moderately Complex</a> — Focus: inspect an implementation-oriented vocabulary for ballots, slots, and leader recovery.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: compare Multi-Paxos's leader-shaped steady state with Raft's explicit leadership design.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Multi-Paxos exists because replicated logs need many safe decisions, not one isolated chosen value.</li>
-<li>The core optimization is reusing a stable ballot and leadership context so Phase 1 is not repeated for every slot in the common case.</li>
-<li>The safety story remains Paxos-style quorum intersection; the trade-off is increased dependence on stable leadership and well-behaved contention control.</li>
+<li>A replicated log is many Paxos decisions, one protected value per slot, plus ordered application.</li>
+<li>Multi-Paxos first uses Phase 1 to establish a ballot and recover accepted slot values; it then uses Phase 2 for new unconstrained slots.</li>
+<li>The fast path preserves the same quorum safety requirement as single-decree Paxos; it only avoids repeated preparation while leadership is stable.</li>
+<li>A higher ballot, an unreachable majority, or leader churn ends the fast path without permitting conflicting chosen values.</li>
+<li>The cost of better steady-state latency is recovery complexity and dependence on stable leadership for progress.</li>
 </ul>
 </section>
 
@@ -227,7 +330,7 @@ leader churn:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

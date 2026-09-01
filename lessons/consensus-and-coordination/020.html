@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,126 +81,270 @@
 <section class="stack-block lesson-content-shell">
   <h1>Coordination APIs: Locks, Leases, Watches, and Compare-And-Swap</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Coordination APIs turn consensus history into usable authority primitives, with a trade-off between expressive low-level operations and safer contracts that expose revisions, leases, watches, and stale-client failure modes.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Design a controller-election API that exposes the preconditions and evidence its clients need.</p>
+</li>
+<li>
+<p>Trace a safe recovery from a missed watch event through snapshot, revision, and conditional update.</p>
+</li>
+<li>
+<p>Explain why a lease grants temporary coordination authority but fencing protects the resource that can be harmed.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A coordination API is safe when it turns hidden consensus evidence into explicit revisions, conditions, expiry rules, recovery paths, and tokens that clients and protected resources can enforce.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a platform team exposes a consensus store to application teams. If the only interface is "write keys and read keys," every team will invent its own locking, leadership, rollout, and watch logic on top. Some of those inventions will work in tests and fail when a client pauses, a watch disconnects, or two controllers race.</p>
-<p>Coordination APIs package consensus into safer primitives. Compare-and-swap turns an update into a guarded decision. Leases and sessions give ownership expiry semantics. Watches expose committed history as a recovery stream. Locks and elections combine those pieces into common authority patterns.</p>
-<p>The misconception is that the consensus protocol is the product API. It is not. The protocol protects the store's history. The API decides what application developers are allowed to claim from that history, how they prove freshness, and how they recover when their assumptions become stale.</p>
-<p>The design pressure is practical: the API should make the safe path obvious. A low-level key-value interface is expressive, but it can push every client into rebuilding the same fragile coordination patterns. A sharper API can prevent common split-brain, stale-read, and missed-watch mistakes.</p>
-<h2>Compare-And-Swap Turns State Into a Guarded Decision</h2>
-<p>Compare-and-swap, often exposed as a transaction or conditional update, says:</p>
-<div class="codehilite"><pre><span></span><code>if revision(key) == R:
-    write new value
+<p>Atlas offers a raw key-value store backed by consensus. A deployment team needs one active controller for <code>payments</code>. The quickest interface looks harmless:</p>
+<div class="codehilite"><pre><span></span><code>write /leaders/payments = controller-a
+read  /leaders/payments
+</code></pre></div>
+
+<p>It leaves the crucial questions to every client. Did <code>controller-a</code> win a race or overwrite another owner? What happens when it crashes? How does a watcher know it missed an event? What tells the workload database that a resumed former controller is stale?</p>
+<p>Consensus can protect the store's history, but a raw <code>get</code> and <code>put</code> API does not automatically give application code a safe authority contract. A coordination API must expose the evidence that makes the safe path usable.</p>
+<p>For Atlas, that means four connected pieces:</p>
+<ul>
+<li><strong>compare-and-swap (CAS)</strong> turns “write this” into “write this only if the state I inspected is still current”;</li>
+<li>a <strong>lease or session</strong> gives ownership an expiry and loss rule;</li>
+<li>a <strong>watch with revisions</strong> lets a client recover a current view after a disconnect;</li>
+<li>a monotonically increasing <strong>fencing token</strong> lets the workload database reject stale controller actions.</li>
+</ul>
+<p>The goal is not to make clients incapable of mistakes. The goal is to make stale assumptions and recovery boundaries visible instead of letting every team rebuild them from a convenient <code>put</code>.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>The deployment platform promises two things:</p>
+<ol>
+<li>At most one controller has current coordination authority for <code>payments</code> at a time.</li>
+<li>A previous controller that pauses, loses its session, or misses watch events cannot successfully overwrite work accepted from a newer controller.</li>
+</ol>
+<p>Those promises involve different actors.</p>
+<table>
+<thead>
+<tr>
+<th>Actor</th>
+<th>Needs to know</th>
+<th>API evidence it needs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Controller</td>
+<td>Whether it won ownership and when that claim becomes stale</td>
+<td>Conditional result, revision, lease state, token</td>
+</tr>
+<tr>
+<td>Standby controller</td>
+<td>When ownership changed or disappeared</td>
+<td>Snapshot revision, ordered watch events, resync rule</td>
+</tr>
+<tr>
+<td>Workload database</td>
+<td>Which controller request may change assignments</td>
+<td>Monotonic fencing token on each protected write</td>
+</tr>
+<tr>
+<td>Operator</td>
+<td>Whether recovery is working or a controller is guessing</td>
+<td>Watch cancellation, compaction, session-loss, and token-rejection signals</td>
+</tr>
+</tbody>
+</table>
+<p>The API's job is to make these evidence paths explicit. It should not make a controller infer authority from an old cache or a successful TCP connection.</p>
+<h2>The Naive Design</h2>
+<p>The first design gives every controller these operations:</p>
+<div class="codehilite"><pre><span></span><code>GET(key)
+PUT(key, value)
+WATCH(key)
+</code></pre></div>
+
+<p>Two controllers can both read “no leader,” then both write themselves as leader. A process that crashes may leave its key forever. A watch can disconnect after a change, leaving a controller with an old local cache. Even if the store serializes writes, the application cannot tell whether its own decision was based on the same state that the store later changed.</p>
+<p>Adding a lock name alone does not repair this design. A lock that says only “acquired” still leaves open the same questions: which revision records it, when it expires, how a client detects loss, and whether an external database refuses an old owner.</p>
+<p>The pressure becomes visible after a pause:</p>
+<div class="codehilite"><pre><span></span><code>controller A writes itself as owner
+A pauses
+controller B writes itself as owner
+A resumes and writes workload assignments
+</code></pre></div>
+
+<p>The store may correctly order both writes. The workload database still receives a dangerous action from <code>A</code> unless the authority evidence reaches that database.</p>
+<h2>A Better Boundary: Guarded Ownership Records</h2>
+<p>Atlas defines an ownership record with fields that clients can use:</p>
+<div class="codehilite"><pre><span></span><code>/leaders/payments = {
+  owner: controller-a,
+  lease_id: 17,
+  token: 41
+}
+revision: 900
+</code></pre></div>
+
+<p>The controller acquires it through a transaction, not an unconditional write:</p>
+<div class="codehilite"><pre><span></span><code>if key does not exist at current committed revision:
+    create ownership record attached to lease 17
+    allocate token 41
+    return revision 900 and token 41
 else:
-    fail and let the client retry with fresh state
+    fail with the current revision or conflict result
 </code></pre></div>
 
-<p>That is a small primitive with large consequences. It lets clients express "only perform this change if the world is still the world I inspected." Without that guard, two clients can read the same value and overwrite each other.</p>
-<p>In a coordination system, CAS protects decisions such as:</p>
+<p>This is compare-and-swap in its useful form. The precise comparison may be “key absent,” “modification revision equals <code>R</code>,” or another documented condition. The meaning is stable: the store decides whether the precondition and the write occur together in the committed order.</p>
+<p>A failed CAS is not a mysterious transient error. It says the controller's local story is stale. The controller must read or resync before deciding again. Retrying the same unconditional write would turn visible evidence into a hidden race.</p>
+<p>The token is separate from the revision. A revision records where this particular metadata change sits in store history. A fencing token represents a monotonically increasing authority generation that the protected database can compare. An API may derive or allocate these differently, but it must state their ordering and retention rules.</p>
+<h2>Lease Loss Is a State Change, Not a Hint</h2>
+<p>The ownership record is attached to a lease. The controller renews the lease while it is healthy. If renewal stops long enough under the service's documented session semantics, the coordination service expires the lease and removes or invalidates the attached ownership record.</p>
+<p>The client rule should be blunt:</p>
+<div class="codehilite"><pre><span></span><code>if lease renewal fails, session closes, or connectivity is uncertain:
+    stop protected work
+    treat ownership as lost until a new acquisition succeeds
+</code></pre></div>
+
+<p>This rule can feel conservative. It is necessary because a client cannot distinguish every pause from every partition using local time alone. A current lease record transfers coordination authority, but it does not stop a former owner from continuing to execute in memory. The fencing token from that record is what lets the downstream system reject the former owner later.</p>
+<p>The trade-off is liveness versus safety at the client boundary. Fast expiry releases work sooner after a failure but is more sensitive to pauses and renewal delays. Slow expiry reduces false loss but delays takeover. The API should expose the expiry and loss semantics rather than implying that “lock held” is a timeless fact.</p>
+<h2>Watches Need a Recovery Contract</h2>
+<p>A watch is not a guarantee that a client has seen every change forever. It is a stream beginning at a known point in committed history.</p>
+<p>Atlas gives a controller this recovery rule:</p>
+<div class="codehilite"><pre><span></span><code>1. Read a snapshot and remember its revision R.
+2. Build or replace the local cache from that snapshot.
+3. Watch changes after R.
+4. If the watch disconnects, resumes unsuccessfully, or reports compaction,
+   discard the assumed gap and repeat from a new snapshot.
+</code></pre></div>
+
+<p>The <code>R</code> boundary prevents the client from mixing an old snapshot with an arbitrary stream. A watch event later than <code>R</code> updates a known base. If the service has compacted the missing event history, it cannot honestly replay the gap. The correct response is a new snapshot, not a guessed cursor or an eternal retry.</p>
+<p>This is a clear example of a useful API failure: a compaction response tells the controller exactly when its cache is no longer a defensible reconstruction. The safe API gives that failure a name and a recovery path.</p>
+<h2>Worked Trace: One Election, One Lost Watch</h2>
+<p>The following revisions, lease IDs, and tokens are illustrative.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Store or client state</th>
+<th>API result</th>
+<th>Why it matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>A</code> creates lease <code>17</code></td>
+<td>Lease is live</td>
+<td>Ownership will have expiry semantics</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>A</code> CASes an absent <code>/leaders/payments</code> key</td>
+<td>Store creates owner <code>A</code>, token <code>41</code>, revision <code>900</code></td>
+<td>Only one conditional acquisition can win</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>B</code> reads a snapshot at revision <code>900</code></td>
+<td><code>B</code> watches from after <code>900</code></td>
+<td><code>B</code> has a recoverable baseline</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>A</code> pauses and stops renewal</td>
+<td>Lease <code>17</code> expires; the owner record changes at revision <code>904</code></td>
+<td>Coordination authority moves or becomes available</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>B</code>'s watch was disconnected and history through <code>904</code> is compacted</td>
+<td>API reports that it cannot resume</td>
+<td><code>B</code> must not trust its old cache</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>B</code> reads a fresh snapshot at revision <code>910</code></td>
+<td>It sees no owner, then acquires lease <code>22</code> with token <code>42</code></td>
+<td>Takeover uses current state and a new token</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>B</code> writes an assignment with token <code>42</code></td>
+<td>Database accepts it and records high-water token <code>42</code></td>
+<td>The protected resource knows newer authority</td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>A</code> resumes and sends a delayed write with token <code>41</code></td>
+<td>Database rejects <code>41</code> because <code>41 &lt; 42</code></td>
+<td>A stale process cannot win by waking up</td>
+</tr>
+</tbody>
+</table>
+<p>Notice the distinct safeguards. CAS prevents two acquisitions from both succeeding against the same precondition. The lease makes a crashed owner's record expire. Snapshot plus watch lets <code>B</code> recover its view. Fencing protects the action outside the coordination store. Removing any one leaves a different hole.</p>
+<h2>Operational Consequences</h2>
+<p>An API that exposes these primitives has costs. Conditional operations add retries when contention is real. Lease expiry can delay takeover. Watch streams require retention, compaction, and client resync. Tokens require every protected write path to perform a comparison. The alternative is not free simplicity; it is pushing the same hard decisions into every client library.</p>
+<p>Make the operational signals part of the contract:</p>
 <ul>
-<li>configuration updates,</li>
-<li>leader election records,</li>
-<li>lock acquisition,</li>
-<li>rollout state transitions,</li>
-<li>membership metadata.</li>
+<li>CAS conflict rate shows competing or stale decisions;</li>
+<li>lease-renewal failures and session closes show controllers that must stop work;</li>
+<li>watch cancellations, compacted revisions, and resync duration show cache-recovery pressure;</li>
+<li>rejected fencing tokens show delayed or stale actors reaching protected resources;</li>
+<li>unbounded lease or deduplication records show retention rules that are not being enforced.</li>
 </ul>
-<p>The important part is not only atomicity. It is evidence. A failed CAS tells the client its assumptions are stale and must be refreshed before it acts. That failure is a feature: it turns a hidden race into a visible retry path.</p>
-<p>CAS also sets a boundary around business logic. The client may calculate a desired change locally, but the coordination service decides whether the precondition still holds in the committed order.</p>
-<h2>Leases and Locks Need Expiry Semantics</h2>
-<p>A lock without failure handling is dangerous. If the owner crashes, does the lock last forever? If it expires, how does a resumed owner know it lost authority?</p>
-<p>This is why practical coordination APIs use sessions, leases, or TTL-bound ownership. A client owns something only while its lease remains valid. The service can revoke or expire that ownership when the client stops renewing.</p>
-<p>The lock or election API should expose enough information for clients and downstream systems to distinguish current authority from stale authority:</p>
-<div class="codehilite"><pre><span></span><code>acquire lease
-receive revision or fencing token
-act with token
-downstream validates token
-</code></pre></div>
-
-<p>That connects this API directly to fencing. A lock service can grant authority, but protected resources still need a way to reject stale actors. If the API says only "lock acquired" and hides the revision or token, it makes correct downstream enforcement harder.</p>
-<p>Good lock APIs are also honest about liveness. They define renewal deadlines, expiry behavior, session loss, and what a client must do after reconnecting. A client that lost its session should assume it lost ownership until it proves otherwise.</p>
-<h2>Watches Turn Committed History Into Reconciliation Input</h2>
-<p>Watches let clients observe changes from a known revision:</p>
-<div class="codehilite"><pre><span></span><code>watch /deployments from revision 1200
-</code></pre></div>
-
-<p>This is the backbone of many control planes. Controllers do not poll blindly. They watch ordered metadata changes, update local caches, and reconcile actual state toward desired state.</p>
-<p>Good watch APIs need clear semantics:</p>
+<p>These signals help an operator distinguish normal contention from an API client that is replaying unsafe local assumptions.</p>
+<h2>Design Review</h2>
+<p>Before exposing a coordination primitive, ask:</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>A safe answer includes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>What operation creates authority?</td>
+<td>A linearizable conditional write and its success evidence</td>
+</tr>
+<tr>
+<td>How does authority end?</td>
+<td>Lease/session loss, expiry behavior, and client stop-work rule</td>
+</tr>
+<tr>
+<td>How does a client learn it is stale?</td>
+<td>CAS conflict, revision change, watch failure, or session loss</td>
+</tr>
+<tr>
+<td>How does a client recover a missed stream?</td>
+<td>Snapshot at <code>R</code>, watch after <code>R</code>, and resync after compaction</td>
+</tr>
+<tr>
+<td>How is a stale actor stopped at the resource?</td>
+<td>Monotonic token checked on every protected action</td>
+</tr>
+</tbody>
+</table>
+<p>This is a situated API preference. A simple feature flag may need only CAS and revision. A scheduler that mutates an outside database needs the full chain because stale external work is harmful.</p>
+<h2>Practice: Review an Incomplete Lock API</h2>
+<p>An API offers <code>lock(name)</code> and returns <code>true</code> or <code>false</code>. It provides no lease ID, expiry event, revision, resume point, or fencing token. A billing worker uses <code>true</code> to charge a customer.</p>
+<p>Review the API.</p>
+<p><strong>A good answer should mention:</strong></p>
 <ul>
-<li>what revision the watch starts from,</li>
-<li>whether events are ordered per key, per prefix, or globally,</li>
-<li>what happens if the watcher falls too far behind,</li>
-<li>how the client resumes after disconnect,</li>
-<li>whether deletes, compaction, and lease expiry appear as explicit events.</li>
+<li>a conditional acquisition result tied to a revision or explicit precondition;</li>
+<li>session or lease loss and the rule that the worker stops on uncertainty;</li>
+<li>a snapshot-and-watch recovery path for standby workers;</li>
+<li>a monotonic token that the billing system checks before accepting a charge-related side effect;</li>
+<li>an idempotent operation identity, because fencing alone does not turn a lost reply into exactly-once billing.</li>
 </ul>
-<p>If those semantics are vague, controllers can miss changes, process stale state, or replay actions unsafely.</p>
-<p>The recovery contract is as important as the streaming contract. A useful watch API gives the client a stable way to say, "I last processed revision 1200; show me everything after that, or tell me I must resync from a fresh snapshot."</p>
-<h2>Worked Example: A Safer Leader Election API</h2>
-<p>Suppose a deployment controller needs exactly one active leader.</p>
-<p>The fragile version stores a key:</p>
-<div class="codehilite"><pre><span></span><code>/leaders/deploy = controller-a
-</code></pre></div>
-
-<p>That looks simple, but it leaves too many questions open. Did <code>controller-a</code> acquire the key conditionally? Does the key expire? What revision proves the current ownership? What should another controller watch? What happens when <code>controller-a</code> reconnects after a pause?</p>
-<p>A safer API sequence looks like this:</p>
-<div class="codehilite"><pre><span></span><code>create session or lease -&gt; lease_id=17
-CAS /leaders/deploy if missing -&gt; owner=controller-a, lease=17, token=41
-watch /leaders/deploy from revision R
-act only while lease is live
-include token=41 in protected downstream actions
-</code></pre></div>
-
-<p>Now the authority claim has evidence. The CAS prevents two simultaneous acquisitions. The lease gives failure semantics. The revision gives watchers a recovery point. The token gives downstream systems a way to reject stale work.</p>
-<h2>API Design Review</h2>
-<p>When designing a coordination API, ask four questions:</p>
-<ol>
-<li>Which operation creates authority?</li>
-<li>Which revision or token proves that authority?</li>
-<li>How does a client learn it is stale?</li>
-<li>How does a watcher recover after losing its stream?</li>
-</ol>
-<p>Those questions keep the API honest. They turn consensus from a hidden implementation detail into a usable control surface.</p>
-<p>Add three more questions for production use:</p>
-<ol>
-<li>What can a client cache, and what must be read linearly?</li>
-<li>What happens after compaction removes the revision a watcher wanted?</li>
-<li>Which operations are intentionally not provided because they are too easy to misuse?</li>
-</ol>
-<p>That last question is part of the API trade-off. A powerful primitive can support many designs, but a constrained primitive can encode the safety rules most clients should not have to rediscover.</p>
-<h2>Common Failure Modes</h2>
-<p>The failures usually come from missing evidence at the API boundary:</p>
-<ul>
-<li>a lock API returns ownership but no fencing token,</li>
-<li>a watch API streams changes but gives no reliable resume point,</li>
-<li>clients use cached reads for authority decisions,</li>
-<li>a CAS failure is treated as a transient error instead of stale assumptions,</li>
-<li>lease expiry is hidden behind client libraries until stale actors have already acted.</li>
-</ul>
-<p>These are not failures of Paxos or Raft alone. They are failures to expose the protocol's evidence in a form application code can use correctly.</p>
 <h2>Connections</h2>
-<p>The previous lesson showed why linearizable reads, leases, and fencing matter for authority. This lesson turns those ideas into API shape: revisions, tokens, conditional updates, and recovery contracts.</p>
-<p>The next lesson shifts from client-facing semantics to operations. Once a coordination API becomes a control-plane dependency, latency, disk behavior, network placement, and sizing determine whether those safe operations remain usable under load.</p>
+<p>The previous lesson established why a current authority read and fencing belong to different boundaries. This lesson turns that evidence into client-facing operations and recovery rules.</p>
+<p>The next lesson asks whether the consensus cluster can serve these contracts within a usable latency, disk, network, and failure-domain envelope.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://etcd.io/docs/">etcd API</a><ul>
-<li>Focus: Study transactions, watches, leases, and revisions as one API surface.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html">ZooKeeper Programmer's Guide</a><ul>
-<li>Focus: Compare znodes, watches, sessions, and ephemeral nodes.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a><ul>
-<li>Focus: Read for why coordination APIs need semantics beyond a raw consensus log.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://etcd.io/docs/">etcd API</a> — Focus: Transactions, leases, revisions, watches, compaction, and explicit consistency options.</li>
+<li>[DOC] <a href="https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html">ZooKeeper Programmer's Guide</a> — Focus: Sessions, ephemeral nodes, watches, and client recovery behavior.</li>
+<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a> — Focus: Why coordination APIs need explicit client-visible semantics beyond a raw consensus log.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Coordination APIs turn consensus history into guarded application decisions that clients can use without reimplementing the protocol.</li>
-<li>Compare-and-swap exposes stale assumptions instead of silently overwriting state.</li>
-<li>Locks and leases need explicit expiry, revision, session, and fencing-token semantics.</li>
-<li>Watches are safe only when clients can resume from known revisions or resync after falling behind.</li>
+<li>CAS turns a local assumption into a condition the coordination service evaluates atomically in its committed order.</li>
+<li>A lease gives ownership an expiry rule, but the client must stop work when it loses confidence in that lease.</li>
+<li>Watches are safe only with a snapshot revision and an honest resync path after a missed or compacted stream.</li>
+<li>Fencing tokens must reach the protected resource, which rejects stale actions after newer authority succeeds.</li>
+<li>A coordination API earns its extra surface area when it makes these safety and recovery rules easier to use than to bypass.</li>
 </ul>
 </section>
 
@@ -226,7 +374,7 @@ include token=41 in protected downstream actions
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

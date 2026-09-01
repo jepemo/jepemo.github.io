@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,125 +81,226 @@
 <section class="stack-block lesson-content-shell">
   <h1>Raft Design Principles and Strong Leadership</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Raft makes consensus easier to implement and operate by putting one explicit leader in charge of the normal log path, trading proposer flexibility for clearer authority.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace a Raft leader election through follower, candidate, and leader states.</p>
+</li>
+<li>
+<p>Use terms, vote rules, and log freshness to explain why an obsolete leader loses authority.</p>
+</li>
+<li>
+<p>Explain what strong leadership simplifies and why it makes leader stability a progress concern.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Raft makes one leader the only normal source of new log entries, while terms and majority elections make stale leaders step aside instead of turning uncertainty into competing writes.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine an engineer debugging a small consensus cluster at 03:00. Clients are timing out, replicas disagree about who should accept writes, and logs are not advancing. In a loosely proposer-shaped mental model, the engineer has to reason about overlapping attempts, ballots, accepted histories, and which proposer is currently dominant.</p>
-<p>Raft chooses a more direct shape. At any moment, a server is a follower, candidate, or leader. New log entries normally flow from the leader to followers. When followers stop hearing from a valid leader, they start an election. That structure does not make consensus easy, but it makes the moving parts easier to name.</p>
-<p>The non-obvious point is that Raft's major contribution is not a different safety ambition. It still needs a single committed history under crash faults. Its contribution is design for understandability: arrange the protocol so implementers and operators can track authority, terms, elections, and log movement without constantly re-deriving a Paxos-style proof.</p>
-<p>The trade-off is real. Strong leadership reduces ambiguity and proposer contention in the common case, but it concentrates progress around leader health. If leadership churns, the cluster spends its energy changing terms instead of advancing the log.</p>
-<h2>Why Raft Makes Leadership Explicit</h2>
-<p>Multi-Paxos already showed why stable leadership is useful: if one proposer can remain dominant, repeated log entries become much cheaper. Raft takes that operational reality and makes it the protocol's organizing principle.</p>
-<p>Instead of asking every implementation to infer a leader-shaped optimization from Paxos machinery, Raft names the roles directly:</p>
-<div class="codehilite"><pre><span></span><code>follower:
-  receives leader heartbeats
-  votes in elections
-  replicates entries from the leader
-
-candidate:
-  starts an election after timeout
-  asks peers for votes
-
-leader:
-  accepts client commands
-  sends log entries to followers
-  drives commit progress
+<p>A five-server coordination cluster has been healthy for hours. <code>S1</code> is leader, clients send it configuration changes, and the other servers receive the same log entries from it. Then <code>S1</code> pauses during a long disk stall. The other servers cannot know whether it crashed, is merely slow, or is separated by the network.</p>
+<p>The tempting model is: “a timeout proves the leader failed, so any server that times out can take over.” It is useful as a trigger for trying again. It is not safe enough as an authority rule. Two servers may time out at nearly the same time, and the old leader may wake up holding an apparently valid local view.</p>
+<p>Raft makes that uncertainty inspectable. Servers have explicit roles; a <strong>term</strong> numbers a leadership epoch; a candidate needs a majority of votes for its term; and a server that learns of a higher term stops acting on the old one. The protocol does not require clocks to prove failure. It uses timeouts to start an election, then uses durable term state and majority evidence to determine authority.</p>
+<p>This is Raft's strong-leadership shape: once elected, the leader is the normal origin of new log entries, and entries flow from leader to followers. That limits the number of histories the system must reason about at once.</p>
+<h2>The Situation: Three Roles and a Logical Clock</h2>
+<p>Raft runs under non-Byzantine crash and communication failures. At any moment, a server is in one of three roles:</p>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Follower</td>
+<td>Responds to leaders and candidates; normally does not start requests of its own.</td>
+</tr>
+<tr>
+<td>Candidate</td>
+<td>Starts an election after an election timeout, increments its term, votes for itself, and asks peers for votes.</td>
+</tr>
+<tr>
+<td>Leader</td>
+<td>Accepts client commands, replicates log entries to followers, and sends heartbeats.</td>
+</tr>
+</tbody>
+</table>
+<p>Terms are consecutive numbers used as a <strong>logical clock</strong>. They are not timestamps and do not say when a machine is physically newest. They let a server recognize information from an older leadership attempt.</p>
+<div class="codehilite"><pre><span></span><code>term 12: an election may have selected one leader
+term 13: a later election attempt; term 12 requests are stale to a term 13 server
 </code></pre></div>
 
-<p>That decomposition matters because consensus bugs often come from unclear authority boundaries. If two nodes both believe they can drive the log for the same leadership epoch, the system is in dangerous territory. Raft uses terms to make epochs explicit:</p>
-<div class="codehilite"><pre><span></span><code>term 8: one leader may drive the log
-term 9: a newer election can replace that authority
+<p>A term can end with no leader if candidates split the vote. The safety claim is narrower and more useful: <strong>at most one leader can be elected in a given term</strong>. A leader or candidate that sees a higher term updates its durable <code>currentTerm</code> and becomes a follower. A server rejects a request carrying a stale term.</p>
+<p>This gives each message a question to answer before its content matters:</p>
+<div class="codehilite"><pre><span></span><code>What term does this message claim, and is that term still current here?
 </code></pre></div>
 
-<p>A higher term supersedes a lower one. If a leader hears from a server with a higher term, it steps down. This gives operators and implementations a concrete question to ask: "which term am I in, and who is leader for that term?"</p>
-<h2>Strong Leadership in the Write Path</h2>
-<p>In Raft's normal case, a client command follows a simple path:</p>
-<div class="codehilite"><pre><span></span><code>client -&gt; leader -&gt; followers
+<h2>The Initial Model: A Timeout Elects a Replacement</h2>
+<p>We might initially say: “When a follower stops hearing heartbeats, it becomes the new leader.” This works in a toy system with one clear failure and no competing timeouts.</p>
+<p>It fails in the real pressure case. Silence has the same local appearance whether <code>S1</code> crashed or a heartbeat was delayed. If <code>S2</code> and <code>S3</code> both time out, declaring either one leader from its own timeout creates two self-authorized writers. The old <code>S1</code> might also resume and believe it is still leader in its old term.</p>
+<p>Raft replaces that local conclusion with a sequence:</p>
+<div class="codehilite"><pre><span></span><code>timeout
+  -&gt; candidate begins a newer term
+  -&gt; voters apply term and log rules
+  -&gt; majority vote establishes a leader for that term
+  -&gt; higher-term evidence demotes older authority
 </code></pre></div>
 
-<p>The alternative would be much harder to reason about:</p>
-<div class="codehilite"><pre><span></span><code>client -&gt; several possible writers -&gt; conflicting log proposals
+<p>The timeout starts a liveness attempt. The majority vote and term discipline carry the safety argument.</p>
+<h2>The Mechanism: Election Before the Write Path</h2>
+<p><strong>Plain meaning:</strong> Before one server directs new log entries, the cluster needs enough peers to recognize that server as the current leader and reject older leadership attempts.</p>
+<p><strong>In this scenario:</strong> A follower starts term <code>13</code>, requests votes, and becomes leader only when it has three votes in the five-server cluster. When the old term-<code>12</code> leader learns of term <code>13</code>, it steps down.</p>
+<p><strong>Technical name:</strong> Raft uses <strong>leader election</strong> and <strong>strong leadership</strong>. Leader election establishes a term's authority; strong leadership makes log entries flow only from that leader to other servers.</p>
+<h3>What a candidate changes before requesting votes</h3>
+<p>When a follower's election timeout expires without valid leader communication, it:</p>
+<ol>
+<li>increments <code>currentTerm</code>;</li>
+<li>becomes a candidate;</li>
+<li>votes for itself and records that vote durably;</li>
+<li>resets its election timer; and</li>
+<li>sends <code>RequestVote</code> to the other servers.</li>
+</ol>
+<p>A <code>RequestVote</code> includes the candidate's term and information about its last log entry: <code>lastLogTerm</code> and <code>lastLogIndex</code>. A voter grants at most one vote in a term, only if the request is not stale and the candidate's log is at least as up to date as its own.</p>
+<p>The log check prevents a candidate with an obviously older log from winning an election simply because it timed out first. The next lesson will examine how entries replicate and become committed; here, the important connection is that leader authority must not strand already committed history on an excluded server.</p>
+<h3>What the winner does</h3>
+<p>After a majority grants votes, the candidate becomes leader for that term. It immediately sends empty <code>AppendEntries</code> RPCs—heartbeats—to establish its leadership and prevent followers from timing out. Later, the same RPC carries actual log entries.</p>
+<div class="codehilite"><pre><span></span><code>leader -&gt; followers: AppendEntries(term, previous-log position, entries or none)
 </code></pre></div>
 
-<p>Strong leadership means followers do not independently create new log entries for the current term. They can reject invalid requests, vote, store replicated entries, and enforce safety checks, but they are not competing writers in the steady state.</p>
-<p>That choice simplifies the core mental model:</p>
-<div class="codehilite"><pre><span></span><code>one current leader owns the append path
-followers replicate and validate that path
-elections create a new term when authority is lost
+<p>Followers do not originate new log entries during normal operation. A client that contacts a follower is redirected or retried toward the leader. This one-way flow is the “strong” part of Raft leadership, not a claim that followers are unimportant: they vote, compare terms, verify log prefixes, store entries, and withhold the acknowledgements a leader needs for progress.</p>
+<h2>Worked Trace: <code>S1</code> Pauses, <code>S3</code> Wins Term 13</h2>
+<p>The states and timings below are illustrative. Five servers mean a majority of three. In term <code>12</code>, <code>S1</code> has been leader and sends regular heartbeats. All servers have the same last log entry: index <code>40</code>, term <code>12</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Server</th>
+<th>Initial role</th>
+<th><code>currentTerm</code></th>
+<th>Last log entry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>S1</code></td>
+<td>leader</td>
+<td><code>12</code></td>
+<td><code>(index 40, term 12)</code></td>
+</tr>
+<tr>
+<td><code>S2</code></td>
+<td>follower</td>
+<td><code>12</code></td>
+<td><code>(index 40, term 12)</code></td>
+</tr>
+<tr>
+<td><code>S3</code></td>
+<td>follower</td>
+<td><code>12</code></td>
+<td><code>(index 40, term 12)</code></td>
+</tr>
+<tr>
+<td><code>S4</code></td>
+<td>follower</td>
+<td><code>12</code></td>
+<td><code>(index 40, term 12)</code></td>
+</tr>
+<tr>
+<td><code>S5</code></td>
+<td>follower</td>
+<td><code>12</code></td>
+<td><code>(index 40, term 12)</code></td>
+</tr>
+</tbody>
+</table>
+<h3>Step 1: a timeout creates a candidate, not a leader</h3>
+<p><code>S1</code> pauses and its heartbeats stop reaching <code>S3</code>. After <code>S3</code>'s randomized election timeout expires, it changes its own durable state:</p>
+<div class="codehilite"><pre><span></span><code>S3: currentTerm 12 -&gt; 13
+S3: follower -&gt; candidate
+S3: votedFor = S3
 </code></pre></div>
 
-<p>This is why Raft feels different from learning Paxos. The learner does not first have to imagine many proposers racing and then discover that one usually wins. Raft starts with the leadership shape that real operators want to inspect.</p>
-<h2>Worked Example: A Leader Stops Sending Heartbeats</h2>
-<p>Consider a five-node Raft cluster. Server <code>S1</code> is leader in term <code>12</code>, and servers <code>S2</code> through <code>S5</code> are followers. The leader sends periodic heartbeats so followers know the current authority is still alive.</p>
-<p>The healthy picture is:</p>
-<div class="codehilite"><pre><span></span><code>term 12:
-  S1 = leader
-  S2 S3 S4 S5 = followers
+<p>It sends:</p>
+<div class="codehilite"><pre><span></span><code>S3 -&gt; S1,S2,S4,S5: RequestVote(
+  term = 13,
+  lastLogIndex = 40,
+  lastLogTerm = 12
+)
 </code></pre></div>
 
-<p>Now <code>S1</code> pauses long enough that <code>S3</code> stops receiving heartbeats. <code>S3</code> increments its term, becomes a candidate, and asks for votes:</p>
-<div class="codehilite"><pre><span></span><code>S3 -&gt; peers: RequestVote(term 13)
+<p>At this moment <code>S3</code> has only its own vote. It has a newer term, but it is not leader yet.</p>
+<h3>Step 2: voters make the authority visible</h3>
+<p><code>S2</code> receives the request. It sees that term <code>13</code> is newer than <code>12</code>, updates its <code>currentTerm</code>, and checks two conditions: it has not already voted in term <code>13</code>, and <code>S3</code>'s log is at least as up to date as <code>S2</code>'s. Both are true, so <code>S2</code> records and grants its one vote.</p>
+<p><code>S4</code> does the same. The tally is now:</p>
+<div class="codehilite"><pre><span></span><code>votes for S3 in term 13: S3, S2, S4
+majority required: 3
 </code></pre></div>
 
-<p>If <code>S3</code> wins a majority, it becomes leader for term <code>13</code>. When <code>S1</code> later wakes up and sees term <code>13</code>, it must step down. It cannot keep acting as term <code>12</code> leader just because it still has local state.</p>
-<p>This explicit state transition is the point:</p>
-<div class="codehilite"><pre><span></span><code>follower --timeout--&gt; candidate --wins majority--&gt; leader
-leader --hears higher term--&gt; follower
+<p><code>S3</code> becomes leader of term <code>13</code>. If <code>S5</code> had timed out at the same time, it might also have begun a candidacy, but it could not also gather the same majority's one vote in term <code>13</code>. A split vote can delay progress and start a later term; it does not elect two leaders in one term.</p>
+<h3>Step 3: the new leader establishes the normal path</h3>
+<p><code>S3</code> sends empty <code>AppendEntries(term=13)</code> heartbeats. <code>S2</code> and <code>S4</code> accept the term-<code>13</code> authority and remain followers. A new client command now follows one path:</p>
+<div class="codehilite"><pre><span></span><code>client -&gt; S3 (leader) -&gt; S2,S4,... (followers)
 </code></pre></div>
 
-<p>The system still relies on majority voting and log safety rules. But the operational story is now much easier to follow: terms order leadership epochs, and a majority decides which candidate can become the current leader.</p>
-<h2>What Strong Leadership Buys and Costs</h2>
-<p>Strong leadership buys clarity in the common case. Writes have a normal entry point, followers have a clear role, and debugging has concrete handles:</p>
-<ul>
-<li>current term</li>
-<li>current leader</li>
-<li>election timeout behavior</li>
-<li>follower vote decisions</li>
-<li>leader heartbeat health</li>
-</ul>
-<p>That clarity is not just aesthetic. Protocols that are easier to understand are easier to implement correctly, test under failure, and operate during incidents.</p>
-<p>The cost is concentration. The leader becomes the normal write coordinator, the source of heartbeats, and the node whose health heavily influences progress. A leader with slow disk, delayed network, or repeated process pauses can make the whole cluster look unstable even if most nodes are healthy.</p>
-<p>The practical trade-off is:</p>
-<div class="codehilite"><pre><span></span><code>Raft gains:
-  explicit roles
-  explicit terms
-  simpler common-case write path
-  clearer operational debugging
-
-Raft pays:
-  leader-centered throughput pressure
-  sensitivity to leader churn
-  election behavior that must be tuned carefully
+<p>The detail that matters is not that <code>S3</code> has a special personality. It has majority evidence in the current term, and followers use that term in every later interaction.</p>
+<h3>Step 4: the old leader wakes up</h3>
+<p>When <code>S1</code> resumes, it may still locally believe it is leader in term <code>12</code>. It sends a heartbeat carrying term <code>12</code> or receives a reply carrying term <code>13</code>. Either way, the higher term wins:</p>
+<div class="codehilite"><pre><span></span><code>S1 observes term 13 &gt; 12
+  -&gt; S1 updates currentTerm to 13
+  -&gt; S1 becomes follower
 </code></pre></div>
 
-<p>This trade-off is why the next step is log replication and commit semantics. Once one leader is in charge, the important question becomes: when has the leader replicated enough evidence that an entry is truly committed?</p>
-<h2>Common Misreadings</h2>
-<p>"Raft removes the hard part of consensus" is wrong. Raft still has to preserve one committed history under crash faults. It changes the organization of the protocol, not the seriousness of the safety problem.</p>
-<p>"Followers are passive" is also wrong. Followers vote, validate terms, accept or reject append requests, store log entries, and constrain what can become safely committed. They simply do not originate normal writes for the current term.</p>
-<p>"A leader is always safe because it is leader" misses the point. A leader is constrained by term and log rules. If it discovers a higher term, it steps down. If followers reject its append because their logs do not match, it must repair the log path rather than forcing arbitrary history.</p>
+<p><code>S1</code> cannot keep appending entries as a term-<code>12</code> leader. It must receive the new leader's log and rejoin as a follower. The term did not prove that <code>S1</code> crashed; it made the protocol reject stale authority even if <code>S1</code> was merely slow.</p>
+<p><strong>So far:</strong> Raft turns an ambiguous timeout into a controlled election. The leader is not the first server to suspect failure; it is the candidate whose current-term request earned a majority under the vote and log rules.</p>
+<h2>What Strong Leadership Changes</h2>
+<p>Before this design, we might picture several possible writers trying to advance a log while readers infer which attempt matters. After it, there is one normal write entry point: the elected leader chooses where to append a client command, then replicates it outward.</p>
+<p>That constraint reduces nondeterminism. Operators can inspect <code>currentTerm</code>, current role, leader heartbeats, vote requests, and leader changes instead of reconstructing a peer-to-peer proposal race. It also separates three jobs that can be reasoned about independently:</p>
+<div class="codehilite"><pre><span></span><code>leader election -&gt; who may direct the current log path
+log replication -&gt; how followers match and receive entries
+safety -&gt; why committed and applied history cannot conflict
+</code></pre></div>
+
+<p>The separation is a teaching and implementation choice, not a promise that the components are independent in every proof. For example, election voting consults log freshness precisely because later commit safety depends on leaders carrying the right history.</p>
+<h2>Trade-offs, Limits, and Signals</h2>
+<p>The trade-off is explicit. Strong leadership buys a simple normal write path, fewer competing writers, and clearer operational state. It costs leader-centered progress: the cluster needs a leader that can communicate with a majority, and all normal client writes pass through that leader.</p>
+<p>This works well when one leader is stable long enough to replicate entries and a majority can communicate. It can still stall when the leader pauses, when a network partition prevents any candidate from reaching a majority, or when multiple candidates repeatedly split votes. Randomized election timeouts reduce the chance of repeated collisions; they do not prove which server is healthy.</p>
+<p>Useful signals include an increasing <code>currentTerm</code>, frequent transitions to candidate, vote rejections due to stale logs, missed heartbeats, and repeated leader changes. They indicate liveness or performance trouble. They are not evidence that Raft's safety guarantees have been abandoned: a system may make no progress rather than permit two elected leaders in one term.</p>
+<p>Strong leadership also does not tell us when a replicated entry is <strong>committed</strong> or when it is safe to apply it to the state machine. A leader may have an entry locally without enough follower evidence. That distinction is the next lesson's central problem.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “A timeout proves the leader failed.”</p>
+<p><strong>Why it is tempting:</strong> A missing heartbeat is the only observation a follower has.</p>
+<p><strong>Better model:</strong> A timeout is a local suspicion that starts an election. Terms and majority votes, not the timeout alone, establish new authority.</p>
+<p><strong>Confusion:</strong> “Each term always has a leader.”</p>
+<p><strong>Why it is tempting:</strong> Diagrams often show a clean election followed by a leader.</p>
+<p><strong>Better model:</strong> A split vote can leave a term with no leader. Raft promises at most one elected leader per term, not guaranteed immediate success.</p>
+<p><strong>Confusion:</strong> “Followers are passive and irrelevant.”</p>
+<p><strong>Why it is tempting:</strong> Entries flow one way in the normal path.</p>
+<p><strong>Better model:</strong> Followers persist terms and votes, judge vote requests, validate append requests, retain logs, and form the majorities that constrain every leader.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> <code>S2</code> has already voted for <code>S3</code> in term <code>18</code>. Later in term <code>18</code>, <code>S4</code> asks <code>S2</code> for a vote with an equally up-to-date log. Should <code>S2</code> grant it?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. A server grants at most one vote per term. The rule prevents <code>S2</code> from helping two candidates each assemble a majority in the same term.</p>
+<p><strong>Check:</strong> A paused leader from term <code>18</code> resumes and receives a message carrying term <code>19</code>. What must it do before considering any client write?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It updates its term to <code>19</code> and becomes a follower. Its old leader role was valid only under term <code>18</code>; a higher term makes that authority stale.</p>
+<h2>Practice: Diagnose a Slow Election</h2>
+<p>Five servers have just lost their leader. <code>S2</code> times out first and starts term <code>27</code>, but its log ends at <code>(index 70, term 25)</code>. <code>S3</code> and <code>S4</code> each have <code>(index 72, term 26)</code>. <code>S2</code> asks both for votes. Before any candidate receives a majority, <code>S3</code> later times out and starts term <code>28</code> with its newer log.</p>
+<p>Which candidate can plausibly win, what must the old candidate do after it learns term <code>28</code>, and what does this episode show about timeout-based progress?</p>
+<p><strong>Model answer:</strong> <code>S2</code> should not receive votes from <code>S3</code> or <code>S4</code> because its last log term <code>25</code> is behind their term <code>26</code>; it cannot gain a majority from itself and the one remaining server alone. <code>S3</code> can plausibly win term <code>28</code> if it reaches a majority of voters that have not voted in that term and accept its up-to-date log. When <code>S2</code> learns of term <code>28</code>, it updates its term and reverts to follower. The timeouts created election attempts, but log freshness, one vote per term, and a majority determine safe authority; liveness may take more than one term.</p>
 <h2>Connections</h2>
-<p>Multi-Paxos arrived at stable leadership as an optimization. Raft makes that shape explicit from the start, which is why engineers often find it easier to discuss during production incidents.</p>
-<p>The next lesson depends on this leadership model. Once the leader owns the normal append path, we can inspect how <code>AppendEntries</code>, follower log checks, majority replication, and commit index movement turn proposed commands into durable state machine history.</p>
+<p>Multi-Paxos used stable leadership to amortize Phase 1. Raft turns that operational shape into the protocol's main interface: roles, terms, one normal writer, and an election that demotes stale authority.</p>
+<p>The next lesson follows the new leader's entries. It distinguishes a value that the leader merely appended from one that enough followers replicated and the state machine may safely apply.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Read the sections on understandability, decomposition, leader election, and strong leadership.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://raft.github.io/">The Raft Consensus Algorithm</a><ul>
-<li>Focus: Use the official resource hub for paper links, visual explanations, and implementation references.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://thesecretlivesofdata.com/raft/">The Secret Lives of Data: Raft</a><ul>
-<li>Focus: Helpful visualization for terms, elections, leadership, and replication flow.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: compare its decomposition, terms, election rules, and strong-leader property with the worked trace.</li>
+<li>[DOC] <a href="https://raft.github.io/">The Raft Consensus Algorithm</a> — Focus: use the official paper and reference materials to inspect role transitions and RPC fields.</li>
+<li>[ARTICLE] <a href="https://thesecretlivesofdata.com/raft/">The Secret Lives of Data: Raft</a> — Focus: visualize heartbeats, elections, and leader change after understanding the term rules.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Raft's design goal is to make consensus authority explicit enough that implementers and operators can reason about it directly.</li>
-<li>Strong leadership means the leader owns the normal append path while followers vote, validate, replicate, and enforce safety constraints.</li>
-<li>The trade-off is clarity versus concentration: Raft simplifies common-case reasoning, but progress becomes sensitive to leader health and election stability.</li>
+<li>Raft's terms are logical clocks for detecting stale leadership, not clocks that prove a failure.</li>
+<li>A follower becomes a candidate on timeout, but only a majority vote from eligible voters elects a leader for that term.</li>
+<li>Strong leadership makes new entries flow from one leader to followers, reducing normal-path ambiguity without removing the need for quorums.</li>
+<li>A higher term makes an old leader step down; a split vote may delay progress without creating two leaders in one term.</li>
+<li>Leader health and election stability are the cost of a clearer, leader-centered write path.</li>
 </ul>
 </section>
 
@@ -225,7 +330,7 @@ Raft pays:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

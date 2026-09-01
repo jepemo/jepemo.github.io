@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,152 +81,285 @@
 <section class="stack-block lesson-content-shell">
   <h1>Exactly-Once Semantics, Idempotency, and Deduplication</h1>
 <blockquote>
-<p><strong>The core idea</strong>: "Exactly once" is usually a scoped processing guarantee, not a universal delivery promise, so reliable systems combine bounded commits with idempotent effects and deduplication, accepting a trade-off between stronger safety and more state at the boundaries.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace why a lost response turns a retry into an ambiguous operation.</p>
+</li>
+<li>
+<p>Design a bounded retry contract with stable identity, durable outcomes, idempotency, and deduplication.</p>
+</li>
+<li>
+<p>Find where an “exactly once” claim stops applying and name the state needed to support it.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Safe retries come from making one logical operation recognizable and repeatable inside a declared boundary, not from assuming that the network will deliver it once.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a payment worker that reads <code>ChargeCustomer</code> from a queue, calls a payment provider, writes the result to a database, and emits <code>PaymentCaptured</code>. The worker successfully charges the card, then crashes before recording the result. When it restarts, the queue redelivers the message because the previous attempt was never acknowledged.</p>
-<p>The system is now in the uncomfortable space where distributed systems spend a lot of time: the operation may have happened, but the local service cannot prove exactly what completed before the crash. Retrying might fix a missed charge, or it might double-charge the customer. Avoiding all retries would hurt availability, but retrying blindly creates duplicate side effects.</p>
-<p>This is why "exactly once" must be treated carefully. Some platforms can provide exactly-once semantics inside a controlled boundary, such as reading from one log, updating managed state, and committing to another log transactionally. That is real and useful. It does not automatically make the whole business workflow exactly once, especially when external APIs, emails, payments, or human-visible side effects sit outside that boundary.</p>
-<p>The practical design goal is safe repetition. Idempotency makes repeated operations harmless. Deduplication recognizes repeated work using stable identity and memory. Exactly-once semantics, idempotency, and deduplication are related, but they solve different parts of the failure story.</p>
-<h2>Where Duplicates Come From</h2>
-<p>Duplicates are not rare bugs. They are a normal result of systems trying to recover from uncertainty.</p>
-<p>A client may retry an HTTP request after a timeout even though the server completed the first attempt. A broker may redeliver a message after a consumer crashes before acknowledgement. A producer may retry after an ambiguous write acknowledgement. A stream processor may replay records after a rebalance or checkpoint restore.</p>
-<div class="codehilite"><pre><span></span><code>consumer receives message
-consumer performs side effect
-consumer crashes before ack
-broker redelivers message
+<p>A checkout service asks a payment provider to charge EUR 40 for order <code>731</code>. The provider completes the charge, but the reply is lost. After a timeout, the checkout service knows only this:</p>
+<div class="codehilite"><pre><span></span><code>request sent
+reply not observed
 </code></pre></div>
 
-<p>The broker is not doing something wrong. From its perspective, redelivery is the safe move because it cannot assume the consumer completed the work. The application must decide whether the repeated work should be applied, suppressed, or transformed into a safe no-op.</p>
-<h2>Exactly-Once Semantics: A Bounded Contract</h2>
-<p>Exactly-once semantics means different things in different systems, so the first question is always: exactly once across which boundary?</p>
-<p>A stream processor may coordinate source offsets, processing state, and output writes so each input record contributes to managed output once, even across crash and retry:</p>
-<div class="codehilite"><pre><span></span><code>input log -&gt; processor state -&gt; output log
-        one coordinated commit boundary
-</code></pre></div>
-
-<p>Inside that boundary, the platform controls the relevant pieces. It can commit input progress and output atomically, or restore them together from a checkpoint. That can prevent a record from being double-applied to the managed output.</p>
-<p>The guarantee weakens when the workflow crosses a boundary the platform does not control:</p>
-<div class="codehilite"><pre><span></span><code>input log -&gt; processor -&gt; payment API
-input log -&gt; processor -&gt; email provider
-input log -&gt; processor -&gt; warehouse with separate commits
-</code></pre></div>
-
-<p>The processor can retry its own work, but it may not know whether the external side effect already happened. The lesson is not that exactly-once systems are fake. The lesson is that the guarantee is scoped. A precise exactly-once claim names the source, state, sink, commit protocol, and failure assumptions.</p>
-<h2>Idempotency: Making Repetition Harmless</h2>
-<p>An operation is idempotent when repeating it has the same effect as applying it once. Idempotency works at the effect boundary, where the business consequence happens.</p>
-<p>Some operations are naturally idempotent:</p>
+<p>It does not know whether the provider received nothing, charged the card and lost the reply, or is still working. Retrying with a fresh request may collect the missing payment. It may also create a second charge.</p>
+<p>The first model is tempting: send each command once, acknowledge it after success, and call the workflow “exactly once.” That model fits a process with no crashes and a network with no ambiguous timeouts. The lost reply is evidence that the model is too weak. Delivery count is not the same as effect count, and absence of a reply is not evidence that an effect did not happen.</p>
+<p>A stronger design gives all attempts for one logical operation the same identity. The receiver stores one authoritative outcome for that identity and returns that outcome to later attempts. This makes retries converge on one business result within a named scope.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>For order <code>731</code>, the checkout service needs a precise client-visible contract:</p>
+<blockquote>
+<p>Repeating the same charge operation with the same key and parameters will not create another charge while that key remains valid. A retry will return the first operation's stored outcome or a clear in-progress result.</p>
+</blockquote>
+<p>This promise says more than “the queue delivers once.” It names the logical operation, repeated behavior, parameter rule, returned result, and retention boundary.</p>
+<p>It also says less than “the entire business workflow happens exactly once.” The payment provider may protect the charge while an email provider sends two receipts. Each effect boundary needs its own contract.</p>
+<p>Three ideas support the promise:</p>
 <ul>
-<li><code>set order status = shipped</code></li>
-<li><code>replace profile email with x@example</code></li>
-<li><code>record result for request_id = abc if absent</code></li>
+<li><strong>Idempotency</strong> is the effect property: repeating the logical operation has no additional effect after the first successful application.</li>
+<li><strong>Deduplication</strong> is the recognition mechanism: stable identity plus remembered state lets the receiver detect another attempt.</li>
+<li><strong>Exactly-once semantics</strong> is a scoped claim: under stated failure assumptions, one input affects the managed state or output once inside a coordinated boundary.</li>
 </ul>
-<p>Other operations are not idempotent by default:</p>
-<ul>
-<li><code>increment balance by 10</code></li>
-<li><code>send another welcome email</code></li>
-<li><code>charge card 25 USD</code></li>
-</ul>
-<p>The non-idempotent operations can often be redesigned. A payment request can carry an idempotency key. An inventory reservation can use a stable reservation ID. A workflow step can record <code>step_id</code> completion before exposing the next transition.</p>
-<div class="codehilite"><pre><span></span><code>request_id=abc, amount=25
-first attempt: apply charge and remember abc
-retry: return stored result for abc
+<p>These ideas cooperate, but they are not synonyms. A dedupe cache can recognize a request without making an external charge idempotent. An idempotent <code>set status = paid</code> operation may be safe even if two messages reach it. A stream engine may update its managed state exactly once while an external API call remains outside that guarantee.</p>
+<h2>Why “Acknowledge After Success” Breaks</h2>
+<p>Consider this initial worker design:</p>
+<div class="codehilite"><pre><span></span><code>1. receive ChargeOrder(731, EUR 40)
+2. call payment provider
+3. write PAID in the order database
+4. acknowledge the queue message
 </code></pre></div>
 
-<p>The trade-off is that idempotency usually requires explicit operation identity, durable records, and careful response semantics. The reward is large: retries become part of the normal recovery path instead of a source of accidental multiplication.</p>
-<h2>Deduplication: Identity Plus Memory</h2>
-<p>Deduplication is a mechanism for detecting repeated work. It asks, "have I seen this operation before?"</p>
-<p>To answer that, the system needs three things:</p>
-<ul>
-<li>a stable identity, such as a request ID, message ID, producer sequence number, or business key</li>
-<li>remembered history, such as a table, cache, compacted topic, sequence tracker, or time window</li>
-<li>a rule for whether to suppress, replay a stored result, or accept the event</li>
-</ul>
-<div class="codehilite"><pre><span></span><code>event(id=abc) -&gt; unseen -&gt; apply and remember abc
-event(id=abc) -&gt; seen   -&gt; suppress or return stored result
-</code></pre></div>
-
-<p>Deduplication is powerful, but it is only as strong as its identity and retention model. If IDs change on retry, dedupe cannot recognize the repeat. If the remembered window expires too early, an old duplicate may be accepted. If the dedupe store is not updated atomically with the effect, a crash can still leave ambiguity.</p>
-<p>That is the core trade-off: stronger dedupe needs more durable memory, clearer identities, and more careful transaction boundaries.</p>
-<h2>Worked Example: Charging a Customer Safely</h2>
-<p>Start with a fragile workflow:</p>
-<div class="codehilite"><pre><span></span><code>message: charge order 123
-worker: call payment provider
-worker: write result
-worker: ack message
-</code></pre></div>
-
-<p>If the worker crashes after the provider call but before writing the result, retry is ambiguous.</p>
-<p>A safer design gives the operation a stable identity:</p>
-<div class="codehilite"><pre><span></span><code>idempotency_key = charge:order-123
-</code></pre></div>
-
-<p>The worker sends that key to the payment provider if the provider supports idempotent requests. It also records the key and result in its own database. On retry, the worker does not create a new charge intent; it asks for the result associated with the same key or returns the stored result.</p>
-<p>This still requires engineering discipline. The key must be stable across retries. The stored result must survive crashes. The code must handle "request in progress" and "provider result unknown" states. But the workflow has moved from "hope delivery happened once" to "make repeated attempts converge on one business effect."</p>
-<h2>Choosing the Tool</h2>
+<p>Each local step looks sensible. The failure appears between steps.</p>
+<p>The following trace uses illustrative times:</p>
 <table>
 <thead>
 <tr>
-<th>Concept</th>
-<th>Main Question</th>
-<th>Typical Mechanism</th>
-<th>Main Trade-off</th>
+<th>Time</th>
+<th>Checkout worker sees</th>
+<th>Payment provider sees</th>
+<th>Queue sees</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Exactly-once semantics</td>
-<td>Can this bounded pipeline avoid double-apply?</td>
-<td>Coordinated commits, transactions, checkpointed source and sink state</td>
-<td>Strong but scoped; external side effects often sit outside</td>
+<td>10:00:00.000</td>
+<td>Receives message <code>m-88</code></td>
+<td>No request yet</td>
+<td><code>m-88</code> is in flight</td>
 </tr>
 <tr>
-<td>Idempotency</td>
-<td>If the operation repeats, is the effect still safe?</td>
-<td>Stable request keys, state transitions, stored results</td>
-<td>Requires business-level identity and response design</td>
+<td>10:00:00.030</td>
+<td>Sends charge request</td>
+<td>Starts a EUR 40 charge</td>
+<td>No acknowledgement</td>
 </tr>
 <tr>
-<td>Deduplication</td>
-<td>Can the system recognize repeated work?</td>
-<td>Message IDs, sequence numbers, dedupe tables, windows</td>
-<td>Requires memory, retention policy, and atomicity with effects</td>
+<td>10:00:00.110</td>
+<td>Still waiting</td>
+<td>Charge succeeds as <code>pay-501</code></td>
+<td>No acknowledgement</td>
+</tr>
+<tr>
+<td>10:00:02.000</td>
+<td>Times out; result unknown</td>
+<td>Charge remains successful</td>
+<td>No acknowledgement</td>
+</tr>
+<tr>
+<td>10:00:05.000</td>
+<td>Worker crashes</td>
+<td>Still has <code>pay-501</code></td>
+<td>Makes <code>m-88</code> available again</td>
 </tr>
 </tbody>
 </table>
-<p>Use exactly-once semantics when the platform controls the source, state, and sink well enough to commit them together. Use idempotency wherever a request may be repeated and the business effect must not multiply. Use deduplication when repeated messages or requests need to be recognized and suppressed.</p>
-<p>Most robust systems use more than one. A stream job may rely on exactly-once semantics for its managed logs, idempotent writes for an external sink, and dedupe tables for requests that cross service boundaries.</p>
-<h2>Common Misreadings</h2>
-<p>Exactly once does not mean no duplicate message can ever appear anywhere. It usually means a bounded pipeline can avoid applying the same input twice to a managed output under defined assumptions.</p>
-<p>Deduplication does not remove the need for idempotency. Dedupe windows can expire, IDs can be wrong, and external systems can retry independently. Idempotent effects are the stronger last line of defense.</p>
-<p>Retries are not the enemy. Unsafe retries are the enemy. Available systems need retries, so the design work is to give repeated attempts stable identity and safe effects.</p>
+<p>The queue is correct to redeliver. It cannot infer that the external charge succeeded. The worker is also correct to distrust the missing reply. Neither component has enough evidence to decide whether a second, newly identified charge is safe.</p>
+<p>Acknowledging before the provider call only reverses the danger: a crash can now lose the charge. Acknowledging after the call risks repetition. Changing the acknowledgement position cannot atomically join two independent systems.</p>
+<p>The missing design element is a durable identity that crosses the retry boundary and names the business operation, not merely one delivery attempt.</p>
+<h2>Build the Bounded Retry Contract</h2>
+<h3>1. Name the logical operation</h3>
+<p>The checkout service creates one stable key before its first attempt:</p>
+<div class="codehilite"><pre><span></span><code>operation_key = &quot;charge:order-731:v1&quot;
+</code></pre></div>
+
+<p>Every retry carries that same key. A random key generated inside the retry loop would identify attempts, not the logical operation, and deduplication would fail.</p>
+<p>The receiver must also bind the key to the relevant parameters. Reusing <code>charge:order-731:v1</code> with EUR 55 should return a conflict, not silently reuse the EUR 40 result. Stable identity means “the same intended operation,” not “any request that happens to reuse this string.”</p>
+<h3>2. Store one durable state for the key</h3>
+<p>A useful teaching model is a small state machine:</p>
+<div class="codehilite"><pre><span></span><code>UNSEEN
+  -&gt; IN_PROGRESS(amount=40)
+  -&gt; SUCCEEDED(provider_id=pay-501, amount=40)
+
+UNSEEN
+  -&gt; IN_PROGRESS(amount=40)
+  -&gt; RETRYABLE_FAILURE(reason=temporary_unavailable)
+</code></pre></div>
+
+<p>The record must live long enough to cover realistic late retries. If it exists only in worker memory, a restart erases the evidence. If it expires after ten minutes while clients may retry for a day, an old attempt can look new.</p>
+<p>The state transition that claims an unseen key must be conditional. Two concurrent attempts must not both observe <code>UNSEEN</code> and start separate effects. A uniqueness constraint, compare-and-swap, or transaction can make one attempt the owner and make the other observe <code>IN_PROGRESS</code>.</p>
+<h3>3. Make the effect repeatable at its own boundary</h3>
+<p>If the payment provider accepts idempotency keys, the checkout service forwards the same operation key on every provider call. The provider can then associate retries with one stored result. Official Stripe documentation, for example, specifies that retries using the same key return the saved result and that keys have a retention policy. That is a concrete API contract, not a property of HTTP delivery.</p>
+<p>If the provider offers no idempotent operation or status lookup, the checkout database cannot prove whether a timed-out external charge happened. A local dedupe row closes the local race; it does not make an uncontrolled external side effect atomic.</p>
+<p>This is the boundary to state honestly:</p>
+<div class="codehilite"><pre><span></span><code>checkout database transaction | payment provider API
+          controlled           | separately controlled
+</code></pre></div>
+
+<p>The design needs an idempotent provider contract, a provider operation identifier that can be queried, or a reconciliation path that can resolve <code>UNKNOWN</code>. Calling the local transaction “exactly once” does not bridge the gap.</p>
+<h3>4. Return the stored outcome</h3>
+<p>A duplicate request should not merely receive “ignored.” The client may have missed the only successful reply. Return the stored response or an explicit current state:</p>
+<div class="codehilite"><pre><span></span><code>same key + same parameters + SUCCEEDED
+  -&gt; return pay-501, already completed
+
+same key + same parameters + IN_PROGRESS
+  -&gt; return in progress; retry or poll according to contract
+
+same key + different parameters
+  -&gt; return conflict; key is bound to another operation
+</code></pre></div>
+
+<p>Persisting the outcome makes the API deterministic for retries. It also turns the dedupe record into part of the client-visible contract rather than an invisible performance cache.</p>
+<h2>Worked Path: The Lost Reply Revisited</h2>
+<p>Assume the provider supports stable idempotency keys and retains the first result. This is an explicit assumption for the example.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Step</th>
+<th>Attempt</th>
+<th>Durable evidence</th>
+<th>Decision</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td>Worker receives <code>m-88</code></td>
+<td>No local record for <code>charge:order-731:v1</code></td>
+<td>Insert <code>IN_PROGRESS</code> with amount EUR 40</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td>Worker calls provider with the key</td>
+<td>Provider records <code>SUCCEEDED(pay-501)</code></td>
+<td>Create one charge</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>Provider reply is lost</td>
+<td>Provider still has <code>pay-501</code>; local row is <code>IN_PROGRESS</code></td>
+<td>Outcome is locally unknown; do not invent success or failure</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td>Queue redelivers <code>m-88</code></td>
+<td>Same key and same amount are present</td>
+<td>Reuse the key instead of creating a new operation</td>
+</tr>
+<tr>
+<td style="text-align: right;">5</td>
+<td>Worker retries provider call</td>
+<td>Provider finds the stored result</td>
+<td>Return <code>pay-501</code>; create no new charge</td>
+</tr>
+<tr>
+<td style="text-align: right;">6</td>
+<td>Worker commits local outcome and acknowledges</td>
+<td>Local row is <code>SUCCEEDED(pay-501)</code></td>
+<td>Later retries return the same result</td>
+</tr>
+</tbody>
+</table>
+<p>The retry still happens. The message may still be delivered more than once. What converges is the business effect and its observable result inside the declared retention and provider contract.</p>
+<p>So far, the stronger model has replaced “one delivery” with “one durable operation identity.” That matters because crashes and timeouts can repeat attempts, but repeated attempts no longer need to create repeated effects.</p>
+<h2>Where Exactly-Once Semantics Fits</h2>
+<p>Some systems control a larger transactional boundary. A stream processor may coordinate replayable input positions, managed operator state, and a transactional output sink. After recovery, the system can replay an event while ensuring it affects managed state or the sink once.</p>
+<p>That is a meaningful exactly-once guarantee. It remains scoped. Apache Flink's documentation makes the distinction explicit: exactly once for managed state does not mean each event is physically processed once, and end-to-end exactly once requires replayable sources plus transactional or idempotent sinks.</p>
+<p>Use this review question for any exactly-once claim:</p>
+<div class="codehilite"><pre><span></span><code>Which source, state, and sink share the commit or recovery boundary?
+What happens at the first side effect outside it?
+</code></pre></div>
+
+<p>If the answer is only “the broker supports exactly once,” the client-visible contract is incomplete.</p>
+<h2>Compare the Design Options</h2>
+<table>
+<thead>
+<tr>
+<th>Design</th>
+<th>What it can promise</th>
+<th>State and cost</th>
+<th>Boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Blind retry</td>
+<td>Eventual attempts</td>
+<td>Little extra state</td>
+<td>Non-idempotent effects may repeat</td>
+</tr>
+<tr>
+<td>Natural idempotency</td>
+<td>Repetition converges, such as <code>set status = paid</code></td>
+<td>Usually simple</td>
+<td>Only operations with that effect shape</td>
+</tr>
+<tr>
+<td>Durable deduplication</td>
+<td>Repeated keys can reuse or suppress an outcome</td>
+<td>Identity, storage, atomic claim, retention</td>
+<td>Fails after expiry or outside the protected effect</td>
+</tr>
+<tr>
+<td>Coordinated transaction</td>
+<td>One commit across participating state and output</td>
+<td>Coordination, latency, compatible participants</td>
+<td>Cannot include arbitrary external systems</td>
+</tr>
+<tr>
+<td>Idempotent external API</td>
+<td>Safe retry at the provider boundary</td>
+<td>Provider key and result retention</td>
+<td>Limited to the provider's documented scope</td>
+</tr>
+</tbody>
+</table>
+<p>The preferred design depends on the effect. For a database status update, a conditional write may be enough. For a payment, stable identity and the provider's retry contract are essential. For a managed stream pipeline, coordinated checkpoints and a transactional or idempotent sink may justify an exactly-once claim.</p>
+<h2>Trade-offs, Limits, and Signals</h2>
+<p>The central trade-off is that safe retries buy predictable recovery by turning operation identity and outcomes into durable state, but that state adds storage, coordination, and lifecycle obligations:</p>
+<ul>
+<li><strong>Retention costs storage.</strong> The key must remain available for the longest supported retry horizon, plus clock and queue-delay margins appropriate to the system.</li>
+<li><strong>Atomic claims cost coordination.</strong> Conditional writes or transactions serialize competing attempts for the same key.</li>
+<li><strong>Stored failures need policy.</strong> A validation failure may be final, while a temporary provider outage may be retryable. Caching every failure forever can freeze a recoverable operation.</li>
+<li><strong>Identity has a scope.</strong> Include tenant, operation type, and version when the same business identifier can name different actions.</li>
+<li><strong>Downstream effects remain separate.</strong> One protected charge does not deduplicate an email, shipment, or analytics event.</li>
+</ul>
+<p>Useful signals include duplicate-hit rate, key-conflict rate, operations stuck in <code>IN_PROGRESS</code>, age of the oldest unresolved operation, dedupe-store write failures, provider lookups for ambiguous outcomes, and retries arriving after key expiry.</p>
+<p>The most dangerous signal is an unresolved operation older than the provider's lookup or key-retention window. At that point, automated retry may no longer distinguish “not done” from “done but forgotten.” The system needs reconciliation or human review rather than optimistic repetition.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A client times out and retries with a new random idempotency key. Will the receiver reliably recognize the retry?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The new key identifies a new operation. A retry must reuse the identity created for the original logical operation.</p>
+<p><strong>Check:</strong> A stream processor checkpoints its local state but sends emails through a non-idempotent external API. Is the email workflow exactly once?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The checkpoint can protect managed processor state, but the email call crosses into a separate effect boundary. Recovery can repeat it unless the sink is transactional, idempotent, or reconciled through another durable protocol.</p>
+<h2>Practice: Review a Reservation API</h2>
+<p>An inventory API receives <code>Reserve(sku-9, quantity=2)</code>. Clients may retry for 48 hours. The team proposes keeping request IDs in an in-memory cache for one hour and returning <code>200 ignored</code> for a duplicate.</p>
+<p>Redesign the smallest safe retry contract. State the identity, durable states, concurrency rule, result behavior, retention rule, and one boundary the design cannot protect.</p>
+<p><strong>Model answer:</strong> Create one reservation key per logical request, scoped by tenant and operation, and require retries to reuse it with identical parameters. Store <code>IN_PROGRESS</code>, <code>SUCCEEDED(reservation_id)</code>, and clearly classified failure states durably. Claim an unseen key with a uniqueness constraint or compare-and-swap so concurrent attempts cannot both reserve stock. Return the stored reservation result, not only “ignored.” Retain the record for at least the supported 48-hour retry horizon with an operational margin. This contract still cannot make a separately called shipping or notification API idempotent; that boundary needs its own identity and outcome record.</p>
 <h2>Connections</h2>
-<p>The previous lesson on checkpointing showed how systems resume from durable boundaries. Exactly-once claims depend on those boundaries being aligned: input position, processing state, and output commit must agree after recovery.</p>
-<p>The next lesson turns to production coordination systems such as etcd, Consul, and ZooKeeper. Their leases, watches, and compare-and-swap primitives are often used to build the identities, ownership boundaries, and state transitions that make retry-heavy workflows safer.</p>
+<p>The previous lesson tied recovery to snapshots, checkpoints, and log positions. This lesson adds the client boundary: after replay, repeated work must still converge on a safe effect.</p>
+<p>The next lesson compares production coordination systems. Their conditional writes and authoritative metadata can help claim an operation key, but consensus does not make an external payment or email atomic. The effect contract still matters.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://kafka.apache.org/documentation/#semantics_eos">Apache Kafka Documentation: Exactly Once Semantics</a><ul>
-<li>Focus: How Kafka scopes exactly-once behavior to producer, transaction, and stream-processing boundaries.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.stripe.com/api/idempotent_requests">Stripe Docs: Idempotent Requests</a><ul>
-<li>Focus: How stable request keys make payment-style retries safe at an external API boundary.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/">Apache Flink Documentation: Fault Tolerance</a><ul>
-<li>Focus: How checkpointing supports consistent recovery in stateful stream processing.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: The broader relationship between at-least-once delivery, idempotency, transactions, and stream processing.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://docs.stripe.com/api/idempotent_requests">Stripe: Idempotent Requests</a> — Focus: Saved responses, parameter checks, key reuse, and retention at an external API boundary.</li>
+<li>[DOC] <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/">Apache Flink: Fault Tolerance</a> — Focus: The distinction between replay, exactly-once managed state, and end-to-end sink requirements.</li>
+<li>[DOC] <a href="https://kafka.apache.org/43/design/design/#messagesemantics">Apache Kafka: Design — Message Delivery Semantics</a> — Focus: Producer idempotence, transactions, consumer offsets, and the boundary of Kafka's guarantee.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Retries, transactions, stream processing, and the limits of end-to-end delivery claims.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Exactly-once semantics is usually scoped to a controlled source-state-sink boundary, not an end-to-end promise for every side effect.</li>
-<li>Idempotency makes repeated requests converge on one effect, which is often the practical foundation for safe retries.</li>
-<li>Deduplication needs stable identity and remembered history; without both, duplicate suppression becomes guesswork.</li>
+<li>A timeout creates an unknown outcome; it does not prove that an operation failed.</li>
+<li>Stable operation identity, durable outcome memory, and an atomic claim let retries converge on one result.</li>
+<li>Idempotency protects the effect, while deduplication recognizes repeated attempts; neither is a synonym for delivery count.</li>
+<li>Exactly-once semantics is meaningful only when its source, state, sink, failure assumptions, and external boundaries are named.</li>
+<li>Retention and unresolved-operation signals are correctness concerns because forgotten identity can make an old retry look new.</li>
 </ul>
 </section>
 
@@ -252,7 +389,7 @@ worker: ack message
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

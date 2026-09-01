@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,116 +81,175 @@
 <section class="stack-block lesson-content-shell">
   <h1>ZAB and Total Order Broadcast in Practice</h1>
 <blockquote>
-<p><strong>The core idea</strong>: ZAB packages leader-based replication as total order broadcast, so ZooKeeper replicas deliver the same coordination updates in the same order after safe recovery.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace how ZAB turns a client update into an ordered, committed ZooKeeper proposal.</p>
+</li>
+<li>
+<p>Explain why a new leader must activate and synchronize a history before accepting new proposals.</p>
+</li>
+<li>
+<p>Distinguish total-order delivery from packet arrival order and from a guarantee that every read is fresh.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> ZAB lets ZooKeeper replicas deliver one ordered stream of committed updates, and it makes a new leader repair that stream before it is allowed to extend it.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a ZooKeeper ensemble storing coordination state for a control plane. Clients create znodes, update configuration, publish leader-election markers, and set watches. The system does not merely need those writes to appear on several machines. It needs every correct replica to deliver the same stream of state changes in the same order.</p>
-<p>If one replica applies <code>disable shard X</code> before <code>promote shard Y</code>, while another observes the reverse order, clients can see contradictory control-plane behavior. Even if both updates eventually arrive everywhere, the service has broken the ordered story its users depend on.</p>
-<p>ZAB is easiest to understand from that pressure. It is a leader-based atomic broadcast protocol for ZooKeeper's world: one leader sequences proposals, followers acknowledge them, committed updates are delivered in total order, and leader changes go through recovery before new broadcast continues.</p>
-<p>The trade-off is that ZAB buys a coherent ordered history and a strong recovery story, but pays with leader dependence, synchronization complexity, and throughput shaped by ordered delivery.</p>
-<h2>Total Order Broadcast Is the Service Shape</h2>
-<p>Paxos is often introduced as choosing one value. Raft is often introduced as an understandable replicated log under strong leadership. ZAB is more naturally framed as total order broadcast:</p>
-<div class="codehilite"><pre><span></span><code>all correct replicas deliver the same updates
-in the same relative order
+<p>A control plane uses a three-server ZooKeeper ensemble to coordinate a handoff. It stores a marker saying that worker group <code>blue</code> is draining, then a marker saying that worker group <code>green</code> may accept work.</p>
+<p>The tempting model is: “The data is replicated, so it is fine if every server eventually receives both writes.” That works only when the relative order of the writes has no meaning. Here it does. A replica that applies <code>green may accept work</code> before <code>blue is draining</code> describes a different coordination history.</p>
+<p>The harder moment comes when the leader fails halfway through a proposal. Some replicas may have written it to durable storage; others may not have seen it. A replacement leader cannot safely start assigning fresh sequence numbers merely because an election named it leader.</p>
+<p>ZAB, ZooKeeper's atomic broadcast protocol, addresses both pressures. It makes committed messages deliver in one total order, and it separates a leader's <strong>activation</strong> from normal broadcast. The activation phase establishes a history that is safe to continue. Only then may the new leader accept client updates.</p>
+<h2>The Small Situation: One Update Stream, Three Partial Views</h2>
+<p>Call the current leader <code>L</code> and the followers <code>F1</code> and <code>F2</code>. A majority is two servers. The following is a teaching trace; the zxids are illustrative.</p>
+<div class="codehilite"><pre><span></span><code>committed history on all three servers
+
+17:44  worker/blue = ready
+17:45  worker/green = standby
 </code></pre></div>
 
-<p>For ZooKeeper-style coordination, that is the right abstraction. The service is used for metadata, locks, naming, watches, and configuration. Those are control-plane objects where ordering carries meaning.</p>
-<p>A simplified broadcast path looks like this:</p>
-<div class="codehilite"><pre><span></span><code>client write
-  -&gt; leader sequences proposal
-  -&gt; followers acknowledge
-  -&gt; quorum evidence makes it safe
-  -&gt; replicas deliver the update in order
+<p>The control plane sends two ordered updates:</p>
+<div class="codehilite"><pre><span></span><code>u46: worker/blue  = draining
+u47: worker/green = accepting-work
 </code></pre></div>
 
-<p>The important word is "deliver." Network messages can arrive in different physical orders. Total order broadcast is not a promise about raw packet arrival. It is a protocol guarantee about logical delivery order: once updates are delivered to the service state, every correct replica observes the same sequence.</p>
-<p>This makes ZAB feel close to a replicated log, but the framing is useful. It keeps attention on the client-visible stream of coordination events rather than on one isolated consensus decision.</p>
-<h2>Recovery Before Broadcast</h2>
-<p>Leader-based ordering is not enough by itself. A leader can fail after sending some proposals to some followers. One follower may have seen more of the old suffix than another. If a new leader starts broadcasting immediately, it may extend an unsafe or inconsistent history.</p>
-<p>ZAB therefore has two broad regimes:</p>
-<div class="codehilite"><pre><span></span><code>recovery / synchronization
-normal broadcast
+<p>The intended service story is <code>u46</code> then <code>u47</code>. That does not mean that every packet must travel through the network in a globally identical physical order. It means that if one correct ZooKeeper server delivers <code>u46</code> before <code>u47</code>, every correct server that delivers both must deliver them in that same order.</p>
+<p>This distinction matters because network delivery is local. A packet can be delayed on the path to <code>F2</code> while reaching <code>F1</code> quickly. ZAB's job is to turn those different observations into one logical delivery sequence, not to make the network behave as one cable.</p>
+<h2>The Initial Model: Elect a Leader, Then Continue Writing</h2>
+<p>It is reasonable to think that a new election solves the failure. The elected server has a new epoch, so perhaps it can immediately accept <code>u47</code> and call it the next update.</p>
+<p>That approach works when all replicas already have the same durable prefix. It fails when the old leader left partial work behind. Consider this intermediate state after <code>L</code> begins proposing <code>u46</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Server</th>
+<th>Has proposal <code>17:46</code>?</th>
+<th>Has a commit decision?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>L</code></td>
+<td>yes</td>
+<td>maybe</td>
+</tr>
+<tr>
+<td><code>F1</code></td>
+<td>yes</td>
+<td>maybe</td>
+</tr>
+<tr>
+<td><code>F2</code></td>
+<td>no</td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<p>An acknowledgement is not merely “I received a packet.” In ZooKeeper's protocol, it means the server has recorded the proposal in persistent storage. A quorum of acknowledgements is the evidence that lets the leader commit a proposal and tell replicas to deliver its message.</p>
+<p>Now let <code>L</code> crash. <code>F1</code> knows more than <code>F2</code>, but neither follower can infer the full global state from that fact alone. If <code>F2</code> became active and immediately proposed a fresh suffix, it could try to build on a history that ignores a proposal that a quorum had already made durable or committed.</p>
+<p>The missing idea is not another ordinary client write. It is a phase that establishes which history the new leader is allowed to extend.</p>
+<h2>The Better Model: Activation Before Active Broadcast</h2>
+<p><strong>Plain meaning:</strong> The replacement leader first gets a quorum onto a compatible history. It proves that it can safely continue the old stream before it starts a new one.</p>
+<p><strong>In this scenario:</strong> The new leader learns the relevant highest history from a quorum, synchronizes followers to its chosen history, and commits a leader-activation proposal. It does not accept <code>u47</code> until that activation completes.</p>
+<p><strong>Technical name:</strong> ZooKeeper calls the protocol <strong>ZAB</strong> (ZooKeeper Atomic Broadcast). Its two broad phases are <strong>leader activation</strong> and <strong>active messaging</strong>. ZAB identifies proposals with a <strong>zxid</strong>, which contains an epoch and a counter. A new leader uses a new epoch, so a zxid also makes leadership transitions visible in the ordered history.</p>
+<p>During active messaging, the leader assigns proposals in order, sends them in that order to followers, waits for quorum acknowledgements, and issues commits in order. Followers process commits in order and deliver a proposal's message only once it is committed.</p>
+<div class="codehilite"><pre><span></span><code>client update
+  -&gt; leader assigns zxid and sends proposal in order
+  -&gt; replicas persist and acknowledge it
+  -&gt; quorum evidence lets the leader issue COMMIT
+  -&gt; replicas deliver the message in zxid order
 </code></pre></div>
 
-<p>During recovery, the newly elected leader has to establish a history that is safe to continue. The ensemble must converge on a valid prefix before new ordered updates resume.</p>
-<p>A useful timeline:</p>
-<div class="codehilite"><pre><span></span><code>old leader broadcasts proposals
-old leader crashes mid-stream
-new leader is elected
-new leader synchronizes history with followers
-normal ordered broadcast resumes
+<p>The protocol's central service property is stronger than “every write reaches several machines.” It is a stream property:</p>
+<div class="codehilite"><pre><span></span><code>if any server delivers a before b,
+every server delivers a before b.
 </code></pre></div>
 
-<p>This is the same family of concern we saw in Raft: do not expose or extend unstable history casually after leadership changes. ZAB packages that concern around the needs of atomic broadcast. The new leader's job is not just "be in charge"; it must restore a safe sequence and then extend it.</p>
-<h2>Worked Example: Two Coordination Updates</h2>
-<p>Suppose a control plane needs to perform two writes:</p>
-<div class="codehilite"><pre><span></span><code>u1: disable shard X
-u2: promote shard Y
+<p>Reliable delivery adds the other half: a message delivered by one server is eventually delivered by all servers. The mechanism uses quorum intersection so that a leader selected from a quorum cannot lose the evidence of an already committed proposal.</p>
+<h2>A Worked Trace: A Leader Dies Between Proposal and Next Write</h2>
+<p>Start from the common committed prefix ending at <code>17:45</code>.</p>
+<h3>Step 1: <code>L</code> proposes the draining marker</h3>
+<p><code>L</code> receives <code>u46</code> and assigns zxid <code>17:46</code>. It sends the proposal to <code>F1</code> and <code>F2</code> in that order relative to earlier proposals.</p>
+<div class="codehilite"><pre><span></span><code>L  -&gt; F1: PROPOSAL 17:46, blue = draining
+L  -&gt; F2: PROPOSAL 17:46, blue = draining
 </code></pre></div>
 
-<p>If all replicas deliver <code>u1</code> before <code>u2</code>, clients see one coherent transition:</p>
-<div class="codehilite"><pre><span></span><code>disable old path
-then promote replacement
+<p><code>F1</code> persists it and acknowledges. <code>F2</code> is slow and has not received it yet. With <code>L</code> and <code>F1</code>, the ensemble has a majority. The leader can commit <code>17:46</code> and send a <code>COMMIT</code> message. Suppose <code>L</code> crashes immediately after <code>F1</code> receives that commit, before <code>F2</code> receives either message.</p>
+<div class="codehilite"><pre><span></span><code>L:  17:46 persisted and committed, then crashes
+F1: 17:46 persisted and delivered
+F2: last known state is still 17:45
 </code></pre></div>
 
-<p>If some replicas deliver <code>u2</code> first, clients may route traffic to a promoted shard while another part of the system still believes shard <code>X</code> is active. The problem is not only durability. It is the semantic order of control-plane state.</p>
-<p>ZAB's leader sequences these updates so followers can deliver one ordered history:</p>
-<div class="codehilite"><pre><span></span><code>zxid 100: disable shard X
-zxid 101: promote shard Y
+<p>The important observation is that <code>F2</code> being behind does not erase the committed update. <code>L</code> and <code>F1</code> formed a quorum, and any future quorum intersects it. That intersection is why the recovery phase has a route back to the evidence.</p>
+<h3>Step 2: election names a candidate; activation earns authority</h3>
+<p>Assume <code>F1</code> becomes the candidate chosen to lead. Election alone is not permission to broadcast. The candidate must see the highest relevant zxid from the followers involved in the quorum and establish the new epoch.</p>
+<p><code>F1</code> therefore synchronizes the history. In this trace, it sends the missing <code>17:46</code> proposal and commit information to <code>F2</code>, bringing <code>F2</code> to the same delivered prefix. A follower that instead contained an uncommitted higher suffix could be told to discard that suffix when the quorum evidence shows it was not committed. This is a recovery rule, not a guess based on which server looks newest.</p>
+<p>Once a quorum has synchronized with the new leader, <code>F1</code> proposes and commits <code>NEW_LEADER</code> for epoch <code>18</code>. The details vary with the implementation's recovery messages, but the safety boundary is stable: the new leader does not accept ordinary proposals until this activation proposal is committed.</p>
+<div class="codehilite"><pre><span></span><code>before activation completes: no ordinary new proposal
+after activation completes: 18:0 NEW_LEADER is committed
+then:                       18:1 may be assigned to u47
 </code></pre></div>
 
-<p>The exact implementation details are deeper than this lesson needs, but the idea of a monotonically ordered proposal stream matters. The protocol gives each update a place in the sequence, gathers enough acknowledgement, and then delivers updates in order.</p>
-<p>When leadership changes, recovery protects that sequence. A new leader must not decide that <code>zxid 101</code> happened before <code>zxid 100</code>, or invent a fresh suffix while followers still disagree about what was safely accepted.</p>
-<h2>Why ZAB Fits ZooKeeper</h2>
-<p>ZooKeeper is not mainly a bulk storage engine. It is a coordination substrate. Its users build higher-level behavior on top of ordered metadata:</p>
-<ul>
-<li>leader election recipes</li>
-<li>service discovery state</li>
-<li>configuration changes</li>
-<li>locks and barriers</li>
-<li>watches over changing znodes</li>
-</ul>
-<p>Those workloads are especially sensitive to ordering mistakes. A high-throughput data store may be able to tolerate temporary divergence for some data types. A coordination service often cannot, because other systems use its state to decide who is allowed to act.</p>
-<p>ZAB's package fits that workload:</p>
-<div class="codehilite"><pre><span></span><code>gain:
-  one ordered stream of coordination updates
-  leader-based sequencing
-  explicit recovery before resumed broadcast
+<h3>Step 3: active messaging resumes in one order</h3>
+<p>Now <code>F1</code> can accept <code>u47</code>, give it zxid <code>18:1</code>, collect persistent acknowledgements from a quorum, issue <code>COMMIT</code>, and let every replica deliver it after <code>17:46</code>.</p>
+<div class="codehilite"><pre><span></span><code>delivered stream
 
-pay:
-  dependence on a healthy leader regime
-  synchronization work after leader changes
-  latency/throughput constraints from ordered delivery
+17:45  worker/green = standby
+17:46  worker/blue  = draining
+18:0   NEW_LEADER (protocol transition, not a client message)
+18:1   worker/green = accepting-work
 </code></pre></div>
 
-<p>That trade-off is why ZAB is worth seeing beside Paxos and Raft. It shows that consensus-adjacent mechanisms are shaped by the service abstraction they expose. ZooKeeper exposes ordered coordination state, so its replication protocol is naturally explained as total order broadcast with recovery.</p>
-<h2>Common Misreadings</h2>
-<p>"ZAB is just Raft with different names" is too flat. Both are leader-based and both protect an ordered history, but Raft is usually presented as an understandable replicated log, while ZAB is packaged around atomic broadcast and ZooKeeper recovery.</p>
-<p>"Total order means packets arrive in the same order" is wrong. Raw network arrival can differ. The guarantee is about the logical order in which updates are delivered to the replicated service.</p>
-<p>"Once a new leader exists, broadcast can resume immediately" misses the recovery requirement. Leadership can change while a suffix is only partially propagated, so the new leader must first synchronize on safe history.</p>
+<p><code>F2</code> may have learned the individual packets late, but it cannot legally deliver <code>18:1</code> before <code>17:46</code>. The ordered stream survives the leader change because activation repaired the prefix before normal broadcast resumed.</p>
+<p><strong>So far:</strong> ZAB uses a leader for fast, ordered broadcast, but it does not trust the bare fact of leadership after a failure. Quorum-backed synchronization and activation turn a candidate into a leader that has earned a safe suffix to extend.</p>
+<h2>What This Changes for a ZooKeeper Client</h2>
+<p>Before this model, it is easy to say, “The leader puts writes in order.” After it, the more useful statement is: “The system has a committed delivery stream, and a replacement leader must recover that stream before it creates more of it.”</p>
+<p>This helps explain why zxids are meaningful diagnostics. They expose the order of proposals and encode an epoch change. A gap between replicas' zxids can point to a follower that needs synchronization; repeated epoch changes can point to leadership instability. These are observations to investigate, not proof that one particular client operation failed.</p>
+<p>There is also a boundary that deserves careful wording. Total-order delivery of committed messages does <strong>not</strong> mean every read from every ZooKeeper server is fresh. ZooKeeper's ordinary reads can be served locally and can be stale. Its writes are linearizable, but a client that needs a read to reflect a particular synchronization point must use the service's documented synchronization or quorum-aware pattern for its version and use case. Ordered broadcast solves the write-history problem; it is not a universal freshness guarantee.</p>
+<h2>Costs, Failure Boundaries, and Signals</h2>
+<p>ZAB improves a coordination service's ability to expose one recoverable sequence of changes. <strong>The trade-off</strong> is a leader-centered write path, persistent acknowledgements, quorum availability, and an activation pause after leader changes.</p>
+<p>It helps when the ensemble can form a quorum and replicas can synchronize. It can stop making progress when the leader loses quorum, storage is too slow for acknowledgements, or leader changes repeat before activation completes. Safety can remain intact while client writes wait.</p>
+<p>Useful signals include a growing gap in zxids between peers, followers repeatedly resynchronizing, proposals waiting for quorum acknowledgements, long leader-activation periods, and frequent epoch changes. These signals say that the ordered path is struggling. They do not justify bypassing ordering or treating an uncommitted proposal as delivered.</p>
+<p>ZAB also does not make external side effects transactional. If a watcher receives an ordered state change and then triggers an email, a network call, or a workload migration, that external action still needs its own retry and idempotency design. ZAB orders ZooKeeper's state changes; it does not automatically order every consequence outside ZooKeeper.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “Total order means every packet arrives everywhere in the same physical order.”</p>
+<p><strong>Why it is tempting:</strong> The word “broadcast” sounds like one simultaneous network event.</p>
+<p><strong>Better model:</strong> Network paths can differ. The guarantee is the logical order in which committed messages are delivered by the replicated service.</p>
+<p><strong>Confusion:</strong> “Electing a new leader makes it safe to accept a new write immediately.”</p>
+<p><strong>Why it is tempting:</strong> Election decides who will coordinate next.</p>
+<p><strong>Better model:</strong> Election chooses a candidate. Leader activation first synchronizes a safe history and commits the transition that permits normal proposals.</p>
+<p><strong>Confusion:</strong> “A higher zxid on one server always means that server's suffix is committed.”</p>
+<p><strong>Why it is tempting:</strong> Higher numbers feel more authoritative.</p>
+<p><strong>Better model:</strong> A proposal must have quorum-backed commit evidence. Recovery uses quorum information to retain committed history and discard an uncommitted suffix when appropriate.</p>
+<p><strong>Confusion:</strong> “A totally ordered write stream makes all reads linearizable.”</p>
+<p><strong>Why it is tempting:</strong> One ordered history sounds like every observer must see the same newest state.</p>
+<p><strong>Better model:</strong> Ordered committed writes and read freshness are separate guarantees. Local reads can be stale.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> <code>F2</code> did not receive proposal <code>17:46</code> before the old leader crashed, but <code>L</code> and <code>F1</code> had committed it. Can a newly active leader deliver a new client update before recovering <code>17:46</code> to <code>F2</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The leader must first activate a safe, synchronized history with a quorum. Extending the stream before that step could make a later update appear before a committed predecessor at a replica that was behind.</p>
+<p><strong>Check:</strong> Does a high zxid by itself prove that its proposal was delivered?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It identifies a proposal's position, including its epoch and counter, but delivery requires the proposal's quorum-backed commit decision.</p>
+<h2>Practice: Review a Failover Claim</h2>
+<p>An operator says: “Our leader failed after proposal <code>41:9</code>. Replica <code>R1</code> has it on disk, <code>R2</code> does not, and <code>R3</code> has just won the election. We should immediately accept the next client write as <code>42:1</code>; <code>R2</code> will catch up later.”</p>
+<p>Write a short review of this claim. State what <code>R3</code> must do first, why the disk record on <code>R1</code> is not alone enough to classify <code>41:9</code> as committed, and one operational signal that would make you pause the change.</p>
+<p><strong>Model answer:</strong> <code>R3</code> must complete leader activation: obtain the relevant quorum history, synchronize followers to the safe prefix, and commit the activation transition before accepting ordinary proposals in its epoch. <code>R1</code>'s record proves that one replica persisted <code>41:9</code>, not that a quorum acknowledged and committed it. The review should pause on a missing quorum, a growing zxid gap, repeated leader activation, or storage latency that prevents acknowledgements. The safe outcome may retain or discard <code>41:9</code> depending on the quorum-backed recovery evidence; it must not be decided by a single replica's suffix.</p>
 <h2>Connections</h2>
-<p>The previous Raft lessons focused on leader authority, commit, and membership. ZAB keeps the same broad safety concerns but reframes them around ZooKeeper's need for total ordered delivery.</p>
-<p>The next lesson compares primary-backup, multi-leader, and leaderless replication. ZAB is a useful bridge because it shows one strong leader-based design where ordered coordination state is worth the cost.</p>
+<p>The previous lesson used Raft joint consensus to preserve an authority bridge while membership changes. ZAB addresses a different transition: a leader change. In both cases, a new authority cannot skip the evidence that connects it to the old history.</p>
+<p>The next lesson compares primary-backup, multi-leader, and leaderless replication. ZAB is a concrete primary-backup-style coordination design whose ordered write path is worth its cost when the service's state decides who may act.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf">ZooKeeper: Wait-free Coordination for Internet-scale Systems</a><ul>
-<li>Focus: Understand the service model and why ordered coordination state matters.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://web.stanford.edu/class/cs347/reading/zab.pdf">Zab: High-performance Broadcast for Primary-Backup Systems</a><ul>
-<li>Focus: Study the protocol's broadcast and recovery framing.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://zookeeper.apache.org/doc/current/recipes.html">ZooKeeper Recipes and Solutions</a><ul>
-<li>Focus: Connect total ordered coordination state to locks, leader election, queues, and barriers.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://zookeeper.apache.org/doc/current/zookeeperInternals.html">ZooKeeper Internals: Atomic Broadcast</a> — Focus: read the guarantees, leader-activation, and active-messaging sections together.</li>
+<li>[PAPER] <a href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf">ZooKeeper: Wait-free Coordination for Internet-scale Systems</a> — Focus: connect the service's coordination goals to its replicated implementation.</li>
+<li>[PAPER] <a href="https://web.stanford.edu/class/cs347/reading/zab.pdf">Zab: High-performance Broadcast for Primary-Backup Systems</a> — Focus: compare its recovery and broadcast phases with the worked trace.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>ZAB is best understood as leader-based total order broadcast with explicit recovery before normal broadcast resumes.</li>
-<li>ZooKeeper-style coordination workloads need one coherent order of metadata and control-plane updates, not just eventual replication of bytes.</li>
-<li>The design trade-off is ordered safety and recovery clarity in exchange for leader dependence and synchronization cost.</li>
+<li>ZAB gives ZooKeeper a total order of committed message delivery, not a guarantee about raw packet arrival.</li>
+<li>A proposal is delivered only after quorum-backed commit evidence; persistence at one replica is not enough.</li>
+<li>A new leader must synchronize and activate a safe history before it resumes normal broadcast.</li>
+<li>zxids make proposal order and epoch changes visible, which makes them useful recovery diagnostics.</li>
+<li>Ordered writes do not by themselves make every local read fresh or make external side effects transactional.</li>
 </ul>
 </section>
 
@@ -216,7 +279,7 @@ pay:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

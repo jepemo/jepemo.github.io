@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,142 +81,260 @@
 <section class="stack-block lesson-content-shell">
   <h1>Jepsen-Style Verification and Failure Injection</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Jepsen-style verification turns failure injection into evidence by checking whether the client-visible history still satisfies a stated contract, with a trade-off between stronger confidence and the cost of precise workloads, faults, and invariants.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Turn a distributed-system promise into operations, a history, and a checkable invariant.</p>
+</li>
+<li>
+<p>Choose a fault schedule that challenges the assumptions behind that promise.</p>
+</li>
+<li>
+<p>Interpret a counterexample or a clean run without claiming more certainty than the test earned.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Failure injection becomes verification only when a recorded client history is checked against an explicit model of what the system was allowed to do.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>A platform team deploys a coordination service for controller leadership. In staging, the service elects one leader, survives a node restart, and accepts reads and writes during a demo. In production, a partition and a long process pause occur at the same time, and two controllers both complete leader-only actions while each believes its lease is valid.</p>
-<p>That coordination service passed ordinary integration tests and still told users an impossible story. It looked healthy from the outside, but its observable behavior violated the contract the rest of the platform depended on.</p>
-<p>The hard question is not "did the cluster stay up?" It is "did the system tell users a story that could be true under the semantics it claimed?" Jepsen-style verification answers that by treating the system as a producer of histories: clients invoke operations, failures disturb the environment, operations return results, and a checker asks whether those results can be explained by the promised model.</p>
-<p>Fault injection is only the stimulus. The verification target is the observable history. That distinction is what separates useful adversarial testing from chaos that merely creates impressive logs.</p>
-<h2>The Contract Is a History Claim</h2>
-<p>Suppose a lock service claims mutual exclusion: at most one client can hold the lock at a time. Under normal testing, one client acquires the lock, releases it, and another client acquires it later. That proves little about partitions, pauses, or ambiguous retries.</p>
-<p>A Jepsen-style test runs several clients concurrently, records every operation, and preserves enough timing information to reason about overlap:</p>
-<div class="codehilite"><pre><span></span><code>client A: invoke acquire
-client B: invoke acquire
-client A: acquire -&gt; ok
-client B: acquire -&gt; ok
+<p>Atlas has a controller lease for a critical rollout job. In staging, the team kills the leader process. Another controller takes over, dashboards become green, and the test passes.</p>
+<p>At first, that seems like evidence of safety: the cluster recovered. But recovery answers a liveness question—did useful work resume? It does not answer the safety question: did a paused former leader perform an action after a newer leader had authority?</p>
+<p>The difference becomes visible only in the client-visible history. Imagine that controller A pauses, its lease expires, controller B becomes leader, and then A wakes up with stale local state. If both A and B complete a protected action, a healthy dashboard cannot tell us whether the system maintained exclusive authority.</p>
+<p>Jepsen-style verification makes that story inspectable. A workload invokes operations. A fault process disrupts the environment. Clients record invocations and results. A checker asks whether the completed results can fit the stated contract. The fault is pressure; the history is evidence.</p>
+<h2>The Production Symptom</h2>
+<p>The user-facing symptom is not necessarily an outage. Atlas might deploy two conflicting rollout plans, remove the wrong instance, or record a successful command from an actor that no longer owns the role.</p>
+<p>Logs alone are hard to interpret because each component saw only part of the event. Controller A believes its earlier lease is still valid. Controller B sees that it acquired a newer lease. The protected deployment API may see two requests without knowing which one should have authority.</p>
+<p>The initial test model is therefore too weak:</p>
+<div class="codehilite"><pre><span></span><code>inject fault -&gt; cluster elects a leader -&gt; inspect health -&gt; pass
 </code></pre></div>
 
-<p>If both clients are told they acquired the same exclusive lock during overlapping intervals, the system may have emitted an impossible history. The checker does not need to know every internal detail of the implementation. It asks whether there is any legal ordering of completed operations that satisfies the advertised contract.</p>
-<p>For a key-value store, the contract might be linearizability. For a queue, it might be no lost acknowledged messages. For a lease system, it might be no overlapping valid ownership without fencing. The exact invariant depends on what the system promised.</p>
-<h2>Fault Injection Is the Means</h2>
-<p>The fault injector makes the world hostile enough to expose mistaken assumptions:</p>
-<ul>
-<li>network partitions</li>
-<li>asymmetric packet loss</li>
-<li>process crashes and restarts</li>
-<li>process pauses</li>
-<li>slow disks</li>
-<li>clock jumps</li>
-<li>delayed or dropped acknowledgements</li>
-<li>client retries through uncertain outcomes</li>
-</ul>
-<p>Those faults matter because real distributed systems often fail at the boundary between algorithm and implementation. A paper protocol may assume clean crash-stop failures, while the production system sees GC pauses, kernel scheduling delays, disk stalls, misconfigured timeouts, overloaded clients, and partial network reachability.</p>
-<p>The workflow usually looks like this:</p>
-<div class="codehilite"><pre><span></span><code>workload clients -&gt; system under test -&gt; operation history
-                         ^                     |
-                         |                     v
-                    fault injector          checker
+<p>It works for checking whether replacement occurs. It becomes insufficient when the promise is “only the current leader may change deployment state.” The missing element is a history-level invariant that can reject an impossible combination of successful results.</p>
+<h2>Write the Claim Before the Fault</h2>
+<p>For this lesson, Atlas gives each successful leadership acquisition an increasing fencing epoch. The deployment API persists the highest epoch it has accepted for this role.</p>
+<p>The contract is:</p>
+<blockquote>
+<p>Once the deployment API has accepted an action carrying epoch <code>8</code>, it must reject every later action carrying an earlier epoch such as <code>7</code>.</p>
+</blockquote>
+<p>This is deliberately narrower than “the entire cluster is correct.” It names the protected resource, the observable successful action, and the stale-actor boundary.</p>
+<p>Plain meaning:</p>
+<div class="codehilite"><pre><span></span><code>An old leader may still wake up, but it must not make the protected system go backward.
 </code></pre></div>
 
-<p>The fault injector tries to make hidden races visible. The checker decides whether the observed results still fit the contract.</p>
-<h2>Invariant Checking Is the Point</h2>
-<p>A test that kills nodes and then says "the cluster recovered" is not enough. Recovery is useful, but semantic correctness is the claim that matters.</p>
-<p>Good checks are specific:</p>
-<ul>
-<li>linearizable reads and writes</li>
-<li>no lost acknowledged writes</li>
-<li>no duplicate lock ownership</li>
-<li>monotonically increasing fencing tokens</li>
-<li>unique IDs under concurrent allocation</li>
-<li>no stale reads after a successful write when the API claims strong consistency</li>
-</ul>
-<p>The sharper the invariant, the more useful the test. A vague claim like "the system handles failure" is hard to falsify. A concrete claim like "no two successful lock holders overlap" gives the checker something to prove or disprove.</p>
-<p>The trade-off is precision cost. Someone has to define the workload, collect reliable histories, model the expected behavior, and interpret counterexamples. That work is expensive, but it is the work that turns failure injection into engineering evidence.</p>
-<h2>Worked Example: Testing a Lease-Based Leader</h2>
-<p>Imagine a service that uses a coordination store to elect one active controller. The intended invariant is:</p>
-<div class="codehilite"><pre><span></span><code>At any real moment, at most one controller may perform leader-only actions.
+<p>In Atlas:</p>
+<div class="codehilite"><pre><span></span><code>acquire(A) -&gt; epoch 7
+acquire(B) -&gt; epoch 8
+apply(A, epoch 7) after B&#39;s accepted epoch 8 -&gt; must fail
 </code></pre></div>
 
-<p>A useful Jepsen-style workload might have several clients repeatedly try to acquire leadership, renew the lease, perform a small leader-only write with a fencing token, and release or lose leadership.</p>
-<p>The fault model might include:</p>
-<ul>
-<li>pausing the current leader long enough for its lease to expire</li>
-<li>partitioning the leader from the coordination store</li>
-<li>delaying renewals and acknowledgements</li>
-<li>restarting coordination-store nodes during lease churn</li>
-</ul>
-<p>The checker then looks for histories where two controllers both completed leader-only writes with overlapping claims, or where a stale controller performed an action after a newer fencing token existed.</p>
-<p>This is stronger than asking whether the leader eventually recovered. It asks whether the system preserved the safety property while recovering.</p>
-<h2>Choosing a Useful Test</h2>
-<p>A common mistake is to combine every fault with every workload and hope something meaningful appears. Better tests start narrower.</p>
+<p>Technical name: this is a fencing invariant. It checks the enforcement point, not merely the coordination-store record. A lease can remove A's ownership record; fencing tests whether the target rejects A when A keeps running anyway.</p>
+<p>For other systems, choose a different claim. A linearizable register needs an ordering of reads and writes consistent with real-time precedence. A queue may need “no acknowledged message is lost.” A lock may need “no two successful holders overlap.” Do not test a guarantee the API never promises.</p>
+<h2>The Test Pieces</h2>
+<p>The following four pieces form a useful Jepsen-style test:</p>
 <table>
 <thead>
 <tr>
-<th>Claim</th>
-<th>Workload</th>
-<th>Faults Likely to Falsify It</th>
+<th>Piece</th>
+<th>Atlas example</th>
+<th>Why it matters</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Linearizable KV writes</td>
-<td>Concurrent reads, writes, compare-and-swap</td>
-<td>Partitions, leader failover, dropped acknowledgements</td>
+<td><strong>Workload</strong></td>
+<td>Clients acquire, renew, apply a fenced rollout, read current epoch, and release</td>
+<td>Exercises the claimed contract</td>
 </tr>
 <tr>
-<td>Exclusive lock ownership</td>
-<td>Concurrent acquire, renew, release</td>
-<td>Pauses, partitioned clients, session expiry</td>
+<td><strong>History recorder</strong></td>
+<td>Records invocation, completion, client, epoch, result, and operation ID</td>
+<td>Lets a checker reconstruct what users observed</td>
 </tr>
 <tr>
-<td>No lost acknowledged events</td>
-<td>Produce, acknowledge, consume, recover</td>
-<td>Broker crashes, disk stalls, client retries</td>
+<td><strong>Fault process</strong></td>
+<td>Pauses a leader, partitions it from the store, delays a renewal, restarts a store node</td>
+<td>Challenges the assumptions that make leadership safe</td>
 </tr>
 <tr>
-<td>Monotonic reads</td>
-<td>Repeated reads after writes across clients</td>
-<td>Replica lag, stale routing, failover</td>
+<td><strong>Checker</strong></td>
+<td>Rejects a successful stale epoch after a newer epoch was accepted</td>
+<td>Turns the history into evidence</td>
 </tr>
 </tbody>
 </table>
-<p>The goal is not maximum drama. The goal is a sharp contract, a workload that exercises the contract, and faults that attack the assumptions behind it.</p>
-<h2>Reading the Results</h2>
-<p>When a checker finds a violation, the output is usually a counterexample: a small slice of history that cannot be reconciled with the claimed model. That counterexample is more valuable than a large pile of logs because it gives the team a specific impossible story to explain.</p>
-<p>Sometimes the result is not a product bug. It may reveal that the documented guarantee was weaker than expected, that the client library used the wrong read mode, or that the test workload assumed a contract the API never promised. That is still useful. Verification clarifies the contract as much as it tests the implementation.</p>
-<p>When no violation appears, the result is not a proof of correctness. It is evidence under the chosen workload and fault model. The right conclusion is disciplined: "we did not find a violation for this claim under these faults," not "the system is correct forever."</p>
-<h2>Common Misreadings</h2>
-<p>Jepsen-style testing is not just killing nodes. The faults are useful only because the test records histories and checks them against an explicit model.</p>
-<p>Availability is not the same as correctness. A system can remain responsive while returning stale reads, losing acknowledged writes, or allowing duplicate ownership.</p>
-<p>Bigger chaos is not automatically better. A precise invariant with relevant faults usually teaches more than a broad failure storm with manual log inspection.</p>
+<p>The test does not need access to every protocol message. Jepsen describes this as opaque-box testing: real binaries run in a real cluster, while the test checks observable behavior. That is valuable because production users also observe results, not internal intentions.</p>
+<h2>Worked Trace: Finding a Stale Leader</h2>
+<p>The following is a synthetic trace. The times and identifiers are illustrative, not a report from a real cluster.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Client observation</th>
+<th>Store or target state</th>
+<th>What the checker records</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>12:00:00</td>
+<td>A acquires leadership</td>
+<td>lease owner A, epoch 7</td>
+<td><code>acquire(A) -&gt; ok(7)</code></td>
+</tr>
+<tr>
+<td>12:00:01</td>
+<td>A applies rollout <code>r-41</code></td>
+<td>target accepts epoch 7</td>
+<td><code>apply(A, 7, r-41) -&gt; ok</code></td>
+</tr>
+<tr>
+<td>12:00:02</td>
+<td>Fault process pauses A</td>
+<td>A sends no renewals</td>
+<td><code>fault: pause(A)</code></td>
+</tr>
+<tr>
+<td>12:00:12</td>
+<td>Lease expires; B acquires leadership</td>
+<td>lease owner B, epoch 8</td>
+<td><code>acquire(B) -&gt; ok(8)</code></td>
+</tr>
+<tr>
+<td>12:00:13</td>
+<td>B applies rollout <code>r-42</code></td>
+<td>target stores highest epoch 8</td>
+<td><code>apply(B, 8, r-42) -&gt; ok</code></td>
+</tr>
+<tr>
+<td>12:00:15</td>
+<td>A resumes and retries</td>
+<td>A still has epoch 7 locally</td>
+<td><code>fault: resume(A)</code></td>
+</tr>
+<tr>
+<td>12:00:16</td>
+<td>A applies rollback <code>r-40</code></td>
+<td>target returns <code>ok</code></td>
+<td><code>apply(A, 7, r-40) -&gt; ok</code></td>
+</tr>
+</tbody>
+</table>
+<p>The last result is a counterexample. Once the target accepted epoch <code>8</code>, it also accepted stale epoch <code>7</code>. The violation is not “A sent a request.” A may send stale requests in any distributed system. The violation is that the protected target reported success.</p>
+<p>Now compare a repaired system. The final row becomes:</p>
+<div class="codehilite"><pre><span></span><code>apply(A, 7, r-40) -&gt; rejected_stale_epoch
+</code></pre></div>
+
+<p>The old process still exists, the pause still happened, and the cluster may still have imperfect clocks. The design earns safety at the target boundary by checking a durable monotonic value.</p>
+<p>So far, the history has made the stronger model concrete: do not infer exclusive authority from a clean failover; test whether stale authority is rejected after the failover.</p>
+<h2>From a Trace to a Checker</h2>
+<p>For a small fencing test, the checker can maintain one value:</p>
+<div class="codehilite"><pre><span></span><code>highest_accepted_epoch = 0
+
+for each successful apply(epoch):
+    if epoch &lt; highest_accepted_epoch:
+        report violation
+    highest_accepted_epoch = max(highest_accepted_epoch, epoch)
+</code></pre></div>
+
+<p>This teaching model assumes completed successful actions are ordered by the target's durable acceptance record. A real checker must define how it handles concurrent and unknown operations. A timeout may mean an operation did not reach the target, or that it reached the target and its reply was lost. Do not silently treat every timeout as failure.</p>
+<p>For linearizability, the model is different. Herlihy and Wing define a history as invocation and response events and ask whether completed operations can correspond to a legal sequential execution while respecting non-overlapping real-time order. The checker has to reason about concurrent intervals, not merely sort by client timestamps.</p>
+<p>This is why an invariant should be as small as possible. A tiny model with clear operation semantics is easier to challenge and trust than a vague statement that “the system handled chaos.”</p>
+<h2>Choose Faults That Attack the Claim</h2>
+<p>The goal is not maximum drama. Choose faults that make the invariant's assumptions questionable:</p>
+<table>
+<thead>
+<tr>
+<th>Claim</th>
+<th>Useful workload</th>
+<th>Faults that create pressure</th>
+<th>Evidence to keep</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fencing rejects stale leaders</td>
+<td>Acquire and apply with epochs</td>
+<td>Pause owner, delay renewals, partition owner from store</td>
+<td>Accepted epochs and target responses</td>
+</tr>
+<tr>
+<td>Linearizable register</td>
+<td>Concurrent read, write, compare-and-swap</td>
+<td>Partition, leader failover, dropped replies</td>
+<td>Invocation/response intervals and values</td>
+</tr>
+<tr>
+<td>No lost acknowledged writes</td>
+<td>Write, acknowledge, restart, read</td>
+<td>Process crashes, disk disruption, dropped acknowledgements</td>
+<td>Acknowledged write IDs and recovered state</td>
+</tr>
+<tr>
+<td>Watch resync is correct</td>
+<td>Read snapshot, watch, reconcile</td>
+<td>Disconnect, compaction, rapid updates</td>
+<td>Snapshot revision, event range, final cache</td>
+</tr>
+</tbody>
+</table>
+<p>A client pause is especially valuable for lease-based coordination because it separates two ideas that are easy to conflate: the coordination service can transfer authority, while the old client can remain alive and confused. A fault schedule should expose that gap.</p>
+<h2>Trade-offs and Limits of This Test</h2>
+<p>The trade-off is that a sharp history checker gives stronger evidence than a broad recovery demo, but it costs careful operation semantics, reliable recording, representative fault injection, and time to minimize failures. A tiny fencing model can prove that one target rejects stale epochs; it does not establish linearizability for every API, prove the coordination protocol correct, or cover every production workload.</p>
+<p>The boundary is visible when the checker cannot explain an operation outcome. A timeout, partial log, or undocumented client retry rule should become an explicit <code>unknown</code> case or a repair to the instrumentation—not an invisible assumption that makes the history look clean.</p>
+<h2>Reading Results Honestly</h2>
+<p>When the checker finds a violation, preserve the smallest history that demonstrates it, the fault schedule, system version and configuration, random seed if available, and the raw evidence needed to reproduce it. The immediate triage question is: did the implementation violate the stated contract, or did the test assert a stronger contract than the system documented?</p>
+<p>Both answers are useful. A stale read in a mode documented as eventually consistent is a test-design mismatch. A stale action accepted after an advertised fencing contract is an implementation or integration problem. The history makes that distinction discussable.</p>
+<p>When a run is clean, report the scope honestly:</p>
+<blockquote>
+<p>Under this workload, fault schedule, configuration, and checker, no violation was found.</p>
+</blockquote>
+<p>That is evidence, not a proof. Jepsen's own analysis material notes that these tests are nondeterministic and can find errors but cannot prove correctness. Increase confidence with varied seeds, repeated runs, focused regressions, and new workloads when the product or client contract changes.</p>
+<h2>Mitigation and Prevention</h2>
+<p>When a counterexample appears, do not begin by adding more random faults. First make the contract and enforcement point explicit. For the Atlas case:</p>
+<ol>
+<li>Make the target persist and compare fencing epochs on every leader-only action.</li>
+<li>Return a distinct stale-epoch error so the old leader stops and resynchronizes.</li>
+<li>Add the counterexample as a deterministic regression test.</li>
+<li>Re-run the focused workload with the original pause and partition schedule.</li>
+</ol>
+<p>The prevention is not “never pause.” It is designing operations so a pause cannot turn old authority into accepted work.</p>
+<h2>Signals to Watch</h2>
+<p>An operational verification run should expose its own evidence:</p>
+<ul>
+<li>number of completed, failed, and unknown operations;</li>
+<li>fault start and end times, including which client or node was affected;</li>
+<li>checker result and a minimized counterexample when it fails;</li>
+<li>highest accepted fencing epoch and rejected-stale count;</li>
+<li>watch cancellations, reconnects, or compaction events when the contract includes resync;</li>
+<li>test seed, software version, configuration, and topology.</li>
+</ul>
+<p>The signal that a result is weak is a history with missing operation outcomes or a checker whose model does not state what <code>timeout</code>, <code>retry</code>, and concurrency mean. Repair the instrumentation or the model before declaring the system safe.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A test pauses the leader, another client becomes leader, and dashboards show one healthy leader after recovery. Has the test established that stale leader actions were impossible?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It established that leadership recovered. To establish the safety claim, clients must attempt and record protected actions, and a checker must reject a history where an earlier epoch succeeds after a newer one.</p>
+<p><strong>Check:</strong> A client times out while applying epoch <code>8</code>. Should the checker always record that operation as failed?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The result may be unknown: the target could have accepted the action and the reply could have been lost. The model must say how unknown operations are treated rather than silently erasing uncertainty.</p>
+<h2>Practice: Design a Failure Test for a Watch Client</h2>
+<p>A controller reads a snapshot at revision <code>500</code>, watches configuration changes, and rebuilds its local cache after a disconnection. The team claims, “after recovery, the cache eventually equals the authoritative state and never applies an update older than its snapshot.”</p>
+<p>Specify a focused test. Name the operations to record, a fault schedule, the invariant, and the evidence that would make a failure reproducible.</p>
+<p><strong>Model answer:</strong> Record snapshot reads with their revision and contents, watch starts and cancellations, every received event with revision, cache updates, and a final authoritative read. Disconnect the controller while writing revisions <code>501</code> through <code>520</code>, optionally compact history before it reconnects, then restore connectivity. Check that the controller takes a new snapshot when it cannot continue from its old revision; its final cache must equal the final authoritative state, and it must not apply an event at or before the revision represented by its replacement snapshot. Preserve the snapshot revisions, event sequence, final state, disconnect/compaction times, client logs, and random seed.</p>
 <h2>Connections</h2>
-<p>The previous lesson covered etcd, Consul, and ZooKeeper as production coordination systems. Jepsen-style verification is one way to test whether those systems and their client usage preserve the guarantees that higher-level control planes depend on.</p>
-<p>The next capstone asks where consensus belongs in a control plane. Verification is part of that design boundary: if a component relies on one authoritative story, the team should know which invariant protects that story and how it will be challenged under failure.</p>
+<p>The previous lesson showed that coordination clients need snapshot-and-watch recovery and fencing at the protected boundary. This lesson turns those design requirements into histories and invariants that can be challenged under pause, partition, and retry.</p>
+<p>The next capstone asks where consensus belongs in a control plane. Its answer is incomplete until every authority claim has a corresponding failure test and checker.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a><ul>
-<li>Focus: Real examples of distributed systems evaluated through histories, faults, and invariant checking.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://jepsen.io/">Jepsen Project Site</a><ul>
-<li>Focus: The testing approach, terminology, and style of evidence.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a><ul>
-<li>Focus: The formal model behind many "single-copy" correctness claims.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: How consistency models and failure assumptions show up in practical data systems.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a> — Focus: Opaque-box, generative tests that construct concurrent histories and check them against models under partial failure.</li>
+<li>[SOURCE] <a href="https://github.com/jepsen-io/jepsen">Jepsen Open-Source Framework</a> — Focus: The framework's workload, nemesis/fault, and checker structure.</li>
+<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a> — Focus: Invocation/response histories and real-time ordering for a linearizability claim.</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.6/learning/api/">etcd API</a> — Focus: A concrete coordination API whose revisions, watches, and leases can become testable client contracts.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Jepsen-style verification checks client-visible histories against explicit correctness claims under adversarial faults.</li>
-<li>Fault injection creates pressure, but invariant checking turns that pressure into evidence.</li>
-<li>The best tests start with a sharp guarantee, a workload that exercises it, and faults likely to expose where the implementation violates its assumptions.</li>
+<li>A fault test is verification only when it checks a recorded history against a named contract.</li>
+<li>Fencing tests whether a protected target rejects stale actors; successful failover alone does not establish that safety property.</li>
+<li>The best fault schedule attacks the assumptions behind one narrow invariant instead of creating unstructured chaos.</li>
+<li>A clean run is bounded evidence under its workload and fault model, never a general proof of correctness.</li>
+<li>Counterexamples, unknown outcomes, seeds, and fault timelines are operational artifacts, not debugging leftovers.</li>
 </ul>
 </section>
 
@@ -242,7 +364,7 @@ client B: acquire -&gt; ok
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

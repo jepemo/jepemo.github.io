@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,118 +81,148 @@
 <section class="stack-block lesson-content-shell">
   <h1>Raft Membership Changes and Joint Consensus</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Raft treats membership change as a consensus decision because changing voters changes the quorum rules that define authority.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain why changing voters changes the safety argument, not merely cluster metadata.</p>
+</li>
+<li>
+<p>Trace the joint-consensus transition from an old configuration to a new one.</p>
+</li>
+<li>
+<p>Identify why a configuration entry must be committed through the log before it changes authority.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Raft changes membership through a joint configuration that requires both the old and new quorums, so authority cannot jump between two non-overlapping majorities.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a five-node Raft cluster that needs to replace two machines during a datacenter migration. The current voters are <code>A B C D E</code>, and the intended future voters are <code>C D E F G</code>. It is tempting to treat this as a configuration update: write the new list somewhere and move on.</p>
-<p>That instinct is dangerous. In consensus, membership is not just metadata. It defines who can vote, who counts toward a majority, which leader can be legitimate, and which log entries can be committed.</p>
-<p>The non-obvious problem is that an abrupt membership change can create two different definitions of "majority" at the same time. One group may still act under the old configuration while another acts under the new one. If those groups do not overlap correctly, the system can split authority and risk incompatible committed histories.</p>
-<p>Joint consensus is Raft's safety mechanism for this transition. For a while, the cluster respects both the old and new configurations, so commitment must satisfy both authority rules before the system finishes moving to the new membership. The trade-off is extra protocol steps and operational care in exchange for preserving quorum overlap while the rules are changing.</p>
-<h2>Membership Is the Shape of Authority</h2>
-<p>Raft's earlier rules assumed a fixed voting set. In a fixed five-node cluster, a majority is any three voters. That majority rule is what lets the system elect a leader and commit log entries.</p>
-<p>When membership changes, the majority rule changes too.</p>
-<p>Consider a smaller example:</p>
+<p>A five-node Raft cluster must replace two machines. The simple plan is tempting: update the voter list from <code>{A,B,C,D,E}</code> to <code>{C,D,E,F,G}</code>, then let the new list take effect immediately.</p>
+<p>That plan treats membership as ordinary configuration. It is not. Membership defines which acknowledgements elect leaders and commit log entries. If some servers use the old rule while others use the new one, two groups can each obtain what looks locally like a majority and direct incompatible histories.</p>
+<p>Raft prevents that abrupt authority change with <strong>joint consensus</strong>. It first commits a configuration that contains both old and new voter sets. While this joint configuration is active, a decision needs a majority of the old set <em>and</em> a majority of the new set. Only after that joint configuration is committed does the leader append the final new configuration, which then commits under the new configuration's quorum rule.</p>
+<p>The extra step is not ceremony. It is the bridge that preserves quorum overlap while the definition of a quorum changes.</p>
+<h2>The Small Situation: Majorities Can Stop Intersecting</h2>
+<p>Use a deliberately small example:</p>
 <div class="codehilite"><pre><span></span><code>old configuration: {A, B, C}
 new configuration: {C, D, E}
 </code></pre></div>
 
-<p>Under the old configuration, <code>{A, B}</code> is a majority. Under the new configuration, <code>{D, E}</code> is a majority. Those two groups do not overlap:</p>
+<p>In the old configuration, <code>{A,B}</code> is a majority. In the new configuration, <code>{D,E}</code> is a majority. These two groups do not overlap.</p>
 <div class="codehilite"><pre><span></span><code>old majority: A B
 new majority:     D E
-
 overlap: none
 </code></pre></div>
 
-<p>If the system allows both groups to act as authoritative at the same time, one side could elect or follow a leader under the old rules while the other side accepts a different leader under the new rules. That is exactly the split-brain shape consensus protocols are built to prevent.</p>
-<p>The core principle is:</p>
-<div class="codehilite"><pre><span></span><code>changing membership changes the quorum system
-changing the quorum system changes the safety argument
+<p>If <code>A,B</code> can still elect or commit under the old rule while <code>D,E</code> can already do so under the new rule, no acceptor bridges the two claims. The system has recreated the split-authority shape consensus was meant to avoid.</p>
+<p>The problem is not that the old and new <em>sets</em> share <code>C</code>. Different servers can learn a configuration entry at different times, leaders can fail mid-change, and partitions can isolate the shared server. The protocol needs a rule that makes every committed transition carry evidence from both authority systems.</p>
+<h2>The Initial Model: Commit the New Voter List Once</h2>
+<p>We might say: “Put the new voter list in the log. Once a majority commits it, everyone switches to the new rule.” This works only if every relevant server changes its interpretation at the same instant, which a distributed system cannot assume.</p>
+<p>The pressure appears during propagation. Some nodes may already be using the new list; others may still be communicating under the old list. A server cannot infer from silence whether a peer has applied the configuration, is slow, or is unreachable. A leader crash at this point makes the ambiguity worse.</p>
+<p>The missing model is a period where no side may act alone. Joint consensus supplies that period.</p>
+<h2>The Mechanism: Commit a Bridge Before the Destination</h2>
+<p><strong>Plain meaning:</strong> Before retiring old voters or trusting new voters alone, require a decision that the old authority and new authority both recognize.</p>
+<p><strong>In this scenario:</strong> The leader first appends <code>C_old,new</code>, then commits it under joint rules. It next appends <code>C_new</code>; that entry commits under the new configuration's rule. Only then is the new configuration the sole quorum rule.</p>
+<p><strong>Technical name:</strong> Raft calls this <strong>joint consensus</strong>. The joint configuration is the temporary voter set whose commit and election decisions require separate majorities of both configurations.</p>
+<h3>The transition</h3>
+<div class="codehilite"><pre><span></span><code>1. old configuration C_old is active
+2. append and commit joint configuration C_old,new
+3. operate using both old-majority and new-majority evidence
+4. append C_new and commit it with a C_new majority
+5. operate using only the new-majority rule
 </code></pre></div>
 
-<p>That is why reconfiguration has to be represented and committed through the consensus log, not treated as an out-of-band admin action.</p>
-<h2>How Joint Consensus Preserves Overlap</h2>
-<p>Joint consensus avoids an abrupt jump from old rules to new rules. Instead, it goes through a transitional configuration that includes both:</p>
-<div class="codehilite"><pre><span></span><code>C_old,new = old configuration + new configuration
+<p>During step 3, the combined configuration is not “all nodes must reply.” It is stricter and more precise:</p>
+<div class="codehilite"><pre><span></span><code>commit or election evidence
+  = majority(C_old) AND majority(C_new)
 </code></pre></div>
 
-<p>During this joint phase, decisions must satisfy the rules of both configurations. At a high level:</p>
-<div class="codehilite"><pre><span></span><code>1. Commit joint configuration C_old,new.
-2. While joint config is active, commitment must satisfy old and new rules.
-3. Commit final configuration C_new.
-4. After C_new commits, only the new rules remain.
+<p>This requirement means any successful decision crosses the transition boundary. A quorum from the old configuration alone is insufficient; a quorum from the new configuration alone is insufficient.</p>
+<p>Configuration entries are log entries. They are replicated, committed, and applied using the same evidence boundary as other commands. A leader cannot safely treat an out-of-band administrative edit as equivalent to a committed membership change.</p>
+<h2>Worked Trace: Replace Two Voters Without Two Authorities</h2>
+<p>The larger transition is:</p>
+<div class="codehilite"><pre><span></span><code>C_old = {A, B, C, D, E}
+C_new = {C, D, E, F, G}
 </code></pre></div>
 
-<p>The point is not that every node in both sets must acknowledge every entry. The point is that the protocol prevents either the old or new membership from acting alone during the dangerous transition.</p>
-<p>A useful mental model:</p>
-<div class="codehilite"><pre><span></span><code>before:
-  authority = old majority
-
-during joint consensus:
-  authority = old-majority evidence + new-majority evidence
-
-after:
-  authority = new majority
+<p>Both sets use quorums of three. <code>C,D,E</code> overlap, but the leader still follows the joint protocol because membership knowledge is not instantaneous.</p>
+<h3>Step 1: commit the joint configuration</h3>
+<p>Leader <code>C</code> appends a log entry declaring <code>C_old,new</code>. It replicates the entry until both requirements hold:</p>
+<table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Example acknowledgements</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>majority of old <code>{A,B,C,D,E}</code></td>
+<td><code>A,C,D</code></td>
+</tr>
+<tr>
+<td>majority of new <code>{C,D,E,F,G}</code></td>
+<td><code>C,D,F</code></td>
+</tr>
+</tbody>
+</table>
+<p>The acknowledgements overlap here, but overlap is not required to be the same physical reply set. What matters is that the collected evidence contains an old majority and a new majority. Servers that add the joint entry begin using its rules; once it is committed, the joint configuration is the authoritative bridge for the next step.</p>
+<h3>Step 2: a failure during the joint period</h3>
+<p>Suppose <code>C</code> crashes after <code>C_old,new</code> committed but before the final configuration. A new leader must be elected under the joint rule. Candidate <code>D</code> cannot win with votes only from old voters <code>A,B,D</code>; it also needs a new-side majority. It cannot win with only new voters <code>D,F,G</code>; it also needs an old-side majority.</p>
+<p>This feels slower because it is stricter. That is the point. Neither half can claim exclusive authority while the log says the cluster is changing its quorum system.</p>
+<p>The same rule applies to committing ordinary entries during this period. An entry accepted only by <code>A,B,D</code> is not committed, even though that is an old majority. An entry accepted only by <code>D,F,G</code> is not committed either. It needs evidence satisfying both configurations.</p>
+<h3>Step 3: commit the final configuration</h3>
+<p>The elected leader appends <code>C_new = {C,D,E,F,G}</code>. Because the committed joint entry makes this transition safe, the final entry is committed with a majority of <code>C_new</code>. After that commit, only <code>C_new</code> defines election and commit majorities.</p>
+<div class="codehilite"><pre><span></span><code>for the joint entry: old majority AND new majority
+for the final C_new entry: C_new majority
+after final commit: new majority only
 </code></pre></div>
 
-<p>This keeps a bridge between the two quorum systems. Any committed transition has to pass through overlapping authority rather than letting two non-overlapping majorities independently decide the future.</p>
-<h2>Worked Example: Replacing Two Nodes</h2>
-<p>Suppose the cluster moves from:</p>
-<div class="codehilite"><pre><span></span><code>old: A B C D E
-new: C D E F G
-</code></pre></div>
-
-<p>The old and new configurations share <code>C D E</code>, but the system still must not simply flip a switch. Different servers can learn about the new configuration at different times, and leaders can fail mid-transition.</p>
-<p>The safer path is:</p>
-<div class="codehilite"><pre><span></span><code>leader appends C_old,new
-followers replicate it
-C_old,new is committed under joint rules
-cluster now uses joint authority
-leader appends C_new
-C_new is committed
-cluster now uses new authority
-</code></pre></div>
-
-<p>During the joint phase, a leader has to think in both worlds. An entry that would be accepted by an old majority alone is not enough if it fails the new-side rule. An entry accepted by the new side alone is not enough if the old side has not been safely bridged.</p>
-<p>That extra step is the price of avoiding a period where old and new voters can each believe they have exclusive authority.</p>
-<h2>Operational Timing Still Matters</h2>
-<p>Joint consensus gives the safety structure, but production reconfiguration can still fail operationally if timing is careless.</p>
-<p>A new node may be far behind the log. If it becomes a voter too early, it can make elections or commit progress harder. A leader may be unstable. If leadership churns during a membership change, operators can see symptoms such as repeated elections, slow commits, or confusing quorum failures. A network partition can make one side of the transition look healthy while the full joint rule is not actually satisfiable.</p>
-<p>The practical discipline is:</p>
-<ul>
-<li>catch up new nodes before relying on them as voters</li>
-<li>avoid chaining multiple membership changes casually</li>
-<li>avoid reconfiguration during known leader instability</li>
-<li>treat config entries as consensus-critical log entries</li>
-<li>watch commit progress, election churn, and follower lag during the transition</li>
-</ul>
-<p>The trade-off is deliberate: joint consensus slows and complicates membership change, but it prevents the system from changing the definition of authority faster than the log can safely record and preserve.</p>
-<h2>Common Misreadings</h2>
-<p>"A committed config entry should switch everyone instantly" is too simple. Servers may learn, replicate, and apply configuration changes at different times, so the transition has to preserve safety while knowledge spreads.</p>
-<p>"Adding a node means it should vote immediately" is often unsafe. A badly lagging future voter can destabilize progress. Many systems separate catching up a new node from making it part of the active voting set.</p>
-<p>"Reconfiguration is separate from consensus" is wrong. Reconfiguration changes who participates in consensus. It is part of the protocol's authority mechanism.</p>
+<p><strong>So far:</strong> joint consensus makes the definition of authority change through an authoritative history. A leader change or a delayed configuration message cannot let two non-overlapping majorities skip that bridge.</p>
+<h2>What This Changes Operationally</h2>
+<p>Before joint consensus, an operator may imagine adding or removing voters as an atomic control-plane edit. After it, the important question is: “Which configuration entry is committed, and which quorum rule is active for this log position?”</p>
+<p>This changes safe operational behavior. A new node usually needs to catch up before relying on it as a voter; otherwise it can make elections and commit progress harder. Operators should avoid stacking changes while one transition is incomplete. They should also distinguish a learner or non-voting replica from an active voter: receiving the log is useful, but voting changes the proof obligation.</p>
+<p>These are situated operational preferences, not claims that every Raft implementation exposes identical APIs. The invariant is stable: a change to who counts must be committed under rules that preserve a bridge from the old authority to the new one.</p>
+<h2>Trade-offs, Limits, and Signals</h2>
+<p>Joint consensus improves safety during configuration change. The trade-off is extra log entries, stricter temporary quorum requirements, and more ways for a change to wait on lagging or unavailable voters.</p>
+<p>It helps when the system can still contact an old majority and a new majority. It can stall when a partition leaves only one side reachable, when a newly added voter is too far behind, or when leadership churn prevents either configuration entry from committing. Safety can hold while the membership operation makes no progress.</p>
+<p>Useful signals are a configuration entry that remains uncommitted, election attempts that cannot satisfy both majorities, growing replication lag on prospective voters, and repeated leader changes during the joint phase. These signal a progress boundary; they do not justify bypassing the joint rule.</p>
+<p>Joint consensus also does not solve disaster recovery, data loss, or client-facing API design. Those decisions require later lessons. Its narrow job is to prevent membership change from creating two independent definitions of legitimate quorum evidence.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “The new configuration is safe as soon as one server receives it.”</p>
+<p><strong>Why it is tempting:</strong> A configuration is a small, readable value.</p>
+<p><strong>Better model:</strong> It changes quorum authority, so it becomes active only through the protocol's committed transition.</p>
+<p><strong>Confusion:</strong> “Joint consensus requires every old and new server.”</p>
+<p><strong>Why it is tempting:</strong> The joint set contains all of them.</p>
+<p><strong>Better model:</strong> It requires a majority of each configuration, not unanimous acknowledgement.</p>
+<p><strong>Confusion:</strong> “A majority from either side is enough during the transition.”</p>
+<p><strong>Why it is tempting:</strong> Each side has a familiar majority rule.</p>
+<p><strong>Better model:</strong> The joint period deliberately requires both. That is how it prevents old-only and new-only authority from diverging.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> During a joint configuration, an entry has acknowledgements from an old majority but not a new majority. Is it committed?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The joint rule needs both an old-configuration majority and a new-configuration majority. The missing new-side evidence means the entry remains tentative.</p>
+<p><strong>Check:</strong> Why is it unsafe to switch directly between <code>{A,B,C}</code> and <code>{C,D,E}</code> even though both configurations contain <code>C</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Old majority <code>{A,B}</code> and new majority <code>{D,E}</code> do not intersect. During asynchronous propagation, each group could otherwise act under a different rule without a shared voter carrying evidence between them.</p>
+<h2>Practice: Review a Membership Plan</h2>
+<p>A service moves from <code>{A,B,C,D,E}</code> to <code>{B,C,D,F,G}</code>. The operator proposes: add <code>F,G</code> as immediate voters, remove <code>A,E</code>, and restart the leader if the change seems slow.</p>
+<p>Write a safer sequence. Your answer should name the joint configuration, the quorum rule while it is active, the final configuration, and one signal that should make the operator pause rather than force progress.</p>
+<p><strong>Model answer:</strong> First catch up <code>F,G</code> as non-voting replicas where the implementation supports that role. Then append and commit <code>C_old,new</code>; while it is active, require a majority of old voters and a majority of new voters for elections and commitment. Append <code>C_new</code> only after that joint entry is committed, then commit <code>C_new</code> with a new-configuration majority and retire <code>A,E</code> from the active voter set. Pause if the joint configuration cannot commit, if follower lag is growing, or if leader churn prevents the required quorum evidence. Restarting a leader does not bypass the quorum proof.</p>
 <h2>Connections</h2>
-<p>The previous lesson separated replication from commitment. Reconfiguration extends that distinction: the cluster must ask not only whether an entry is committed, but which membership rules define the quorum evidence for that commitment.</p>
-<p>The next lesson on ZAB broadens the view from Raft's log mechanics to total order broadcast in ZooKeeper. Both topics keep returning to the same operational concern: after leader changes and membership pressure, replicas must continue one authoritative ordered history.</p>
+<p>The previous lesson separated replicated, committed, and applied states. Joint consensus extends that reasoning: configuration is also a log value, but it changes the quorum rule that makes later entries committed.</p>
+<p>The next lesson compares this leader-recovery and ordering problem with ZooKeeper's ZAB protocol. The vocabulary changes, but the recurring requirement remains one recoverable authoritative history after failure.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Read the membership-change sections with attention to how quorum definitions change.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://raft.github.io/">The Raft Consensus Algorithm</a><ul>
-<li>Focus: Use the official resource hub for paper links, diagrams, and implementation references.</li>
-</ul>
-</li>
-<li>[DISSERTATION] <a href="https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf">Consensus: Bridging Theory and Practice</a><ul>
-<li>Focus: Useful deeper treatment of Raft design choices and practical reconfiguration concerns.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: read the membership-change section for its joint-majority rule and the reason configuration changes use the log.</li>
+<li>[DISSERTATION] <a href="https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf">Consensus: Bridging Theory and Practice</a> — Focus: use the extended discussion to distinguish the invariant from implementation-specific operational choices.</li>
+<li>[DOC] <a href="https://raft.github.io/">The Raft Consensus Algorithm</a> — Focus: find the official paper and supporting explanations before mapping the rule to a particular system.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Membership change is a consensus safety problem because it changes who counts toward authoritative majorities.</li>
-<li>Joint consensus preserves overlap by requiring the transition to satisfy old and new authority rules before finalizing the new configuration.</li>
-<li>The operational trade-off is extra sequencing and monitoring in exchange for avoiding split authority during reconfiguration.</li>
+<li>Membership determines which votes and acknowledgements count, so it is part of consensus safety.</li>
+<li>A direct switch can expose non-overlapping old and new majorities; joint consensus preserves a bridge.</li>
+<li>During the joint phase, elections and commitment require a majority of both configurations.</li>
+<li>Configuration entries must be replicated and committed through the log before they change authority.</li>
+<li>The safety cost is stricter temporary availability and a slower, more observable transition.</li>
 </ul>
 </section>
 
@@ -218,7 +252,7 @@ cluster now uses new authority
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

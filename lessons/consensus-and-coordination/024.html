@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -79,167 +83,379 @@
 <section class="stack-block lesson-content-shell">
   <h1>Final Capstone: Consensus-Backed Control Plane Architecture</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A consensus-backed control plane is ready when it can defend exactly which state needs one authoritative history, with a trade-off between strong coordination guarantees and the latency, operational discipline, recovery complexity, and failure testing those guarantees require.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Defend a control-plane authority boundary, including the state that earns consensus cost and the state that does not.</p>
+</li>
+<li>
+<p>Trace a deployment change from conditional write through commit, deterministic apply, watch recovery, lease authority, and fenced external action.</p>
+</li>
+<li>
+<p>Review the architecture against safety invariants, operational signals, recovery boundaries, and an explicit crash-fault versus Byzantine decision.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A consensus-backed control plane is credible only when every authority claim has a committed history, a recoverable API path, a protected side-effect boundary, and a failure test that could disprove it.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine you are designing the control plane for a regional compute platform. It stores desired deployments, elects controllers, publishes service endpoints, recovers from member failure, and exposes watches to agents across the fleet. Some state needs one authoritative story. Some state is important but should stay out of the consensus path.</p>
-<p>The design task is to defend that boundary. Consensus is valuable when disagreement about authority would make the platform unsafe. It is harmful when teams push high-volume, low-authority data through it because "important" was confused with "must be serialized."</p>
-<p>The misconception is that a consensus-backed design is correct once it names Raft, Paxos, etcd, or ZooKeeper. The actual design must specify the committed state, the API semantics, the read and lease guarantees, the recovery path, and the evidence that proves the system survives failure.</p>
-<p>Strong coordination buys clarity of authority, but it spends latency, operational discipline, and a tighter failure envelope. A good architecture makes that exchange visible enough to review.</p>
-<h2>Scenario and Constraints</h2>
-<p>The platform needs these capabilities:</p>
+<p>Aurora's scheduler may receive committed deployment revision <code>901</code> while a former scheduler is still paused with lease token <code>8</code>. The important design move is to follow authority all the way to its consequence. Agreement inside a metadata cluster is not enough if a controller applies the wrong command, a watch misses an update, a former lease holder can still write outside the cluster, or recovery silently changes which history is trusted. The architecture is coherent only when its authority records, state-machine rules, API results, protected targets, operating limits, and failure tests tell one compatible story.</p>
+<h2>The Scenario</h2>
+<p>Aurora is a regional compute platform. Operators submit desired deployments. One scheduler per shard turns those deployments into assignments in an external workload database. Agents watch configuration changes. The control plane must survive one zone loss, recover controllers after pauses, and make it possible to explain what happened after a failed rollout.</p>
+<p>The team proposes a simple slogan: “Put the control plane in consensus.” That is a useful beginning, not an architecture. It leaves unresolved which facts enter the log, what a successful API response means, whether a returning controller can still act, how watches recover, and what recovery can honestly claim after quorum loss.</p>
+<p>This capstone turns the slogan into a defensible design. It does not prescribe a vendor or implement a full protocol. It asks for evidence at each boundary.</p>
+<h2>Constraints</h2>
+<p>Aurora must meet these constraints:</p>
 <ul>
-<li>store desired deployment state,</li>
-<li>elect one active scheduler per shard,</li>
-<li>expose watches so controllers can reconcile,</li>
-<li>assign monotonically increasing revisions,</li>
-<li>recover from one zone failure,</li>
-<li>avoid stale controllers mutating external resources,</li>
-<li>keep telemetry and bulk logs outside the consensus store.</li>
+<li>An acknowledged desired deployment change must survive a leader change under the chosen crash-fault protocol.</li>
+<li>A scheduler cannot use stale authority to overwrite a newer scheduler's assignment.</li>
+<li>Controllers reconnecting after a missed watch event rebuild state rather than guessing what they missed.</li>
+<li>External assignment requests are safe to retry after a lost response.</li>
+<li>The coordination cluster remains useful under one zone loss and exposes when latency is outside the lease and control-loop budget.</li>
+<li>Member replacement with quorum preserves continuity through the protocol; recovery without quorum names its data-loss boundary.</li>
+<li>Telemetry, logs, and artifacts do not become part of the critical quorum write path.</li>
+<li>The team states whether its trust boundary needs crash-fault or Byzantine protection.</li>
 </ul>
-<p>The system has three zones. The first target is a three-member consensus cluster, one member per zone. Writes must commit through quorum. Controllers use watches from known revisions. Lease grants include fencing tokens that downstream resources check.</p>
-<p>That architecture is intentionally narrow. It uses consensus for control decisions, not for every event the platform observes.</p>
-<h2>Authority Boundary</h2>
-<p>Start with the boundary:</p>
-<div class="codehilite"><pre><span></span><code>inside consensus:
-  desired deployment specs
-  scheduler lease ownership
-  rollout phase and gates
-  service endpoint authority
-  membership metadata
-  monotonically increasing revisions
-
-outside consensus:
-  metrics
-  logs
-  traces
-  large artifacts
-  image layers
-  derived caches
-  high-volume status samples
+<p>The non-goals matter too. Aurora is not a globally ordered log for every agent event, a general analytics warehouse, or a proof that every external workload operation happened exactly once. Those needs use other systems and their own contracts.</p>
+<h2>Design Goal</h2>
+<p>The architecture must make one narrow promise:</p>
+<div class="codehilite"><pre><span></span><code>For each protected decision, the platform can identify
+the committed authority record, the current actor allowed to use it,
+the recovery path if that actor is stale, and the evidence that rejects
+an older action at the protected resource.
 </code></pre></div>
 
-<p>The inside set is small because it answers authority questions. Who owns the scheduler shard? Which deployment spec is current? Which rollout gate is open? Which member set can decide history?</p>
-<p>The outside set can be large, useful, and operationally critical without needing consensus serialization. Logs, metrics, and artifacts need durability and retrieval, but they usually do not need one global order that every controller must agree on before acting.</p>
-<p>The review question is:</p>
-<div class="codehilite"><pre><span></span><code>Would two different answers make the platform unsafe?
+<p>The reasonable initial design stores every deployment object, heartbeat, pod status, log, lease, and scheduler event in the consensus service. Controllers read whichever local cache they have and call the workload database after seeing an owner key.</p>
+<p>It fails in two ways. Bulk data makes every authority decision pay unnecessary storage, replication, compaction, and recovery cost. More importantly, a local cache and an owner key do not stop a paused scheduler from acting after a successor takes over.</p>
+<p>The stronger design separates <strong>authority</strong>, <strong>observation</strong>, and <strong>execution</strong>. Consensus produces a small ordered history for decisions whose disagreement would create conflicting authority. Controllers derive work from that history. External resources enforce the authority generation they accept.</p>
+<h2>Proposed Model</h2>
+<p>Aurora runs three crash-fault voters, one in each of three zones. A majority can continue after one voter/zone loss if the remaining two are healthy and the network path between them is usable. The exact consensus implementation may be Raft-like, Paxos-like, or another correct crash-fault design; the API contract below does not assume a product.</p>
+<div class="codehilite"><pre><span></span><code>operator API
+   | conditional desired-state command
+   v
+consensus-backed metadata and replicated state machine
+   | committed revisions, lease/token generations, operation records
+   v
+controllers ---- fenced, idempotent requests ----&gt; workload database
+   ^                                              |
+   | snapshot + watch recovery                    | accepted-token high-water mark
+   |                                              v
+status, logs, metrics, artifacts, traces &lt;--- observation systems
 </code></pre></div>
 
-<p>If yes, the state may belong in consensus. If no, a cheaper replicated store, event pipeline, object store, or cache is probably the better fit.</p>
-<h2>API Walkthrough</h2>
-<p>The control plane exposes a small API surface:</p>
-<div class="codehilite"><pre><span></span><code>put-if-revision(key, expected_revision, value)
-grant-lease(role, ttl) -&gt; token
-watch(prefix, from_revision)
-snapshot-status()
-member-status()
-</code></pre></div>
-
-<p>Desired state changes use conditional writes so operators and automation do not overwrite stale state silently. Scheduler leadership uses leases with fencing tokens. Watchers resume from revisions and rebuild local caches after disconnect. Snapshot, compaction, and membership status are first-class because recovery time matters.</p>
-<p>The API should force clients to handle stale assumptions. A failed <code>put-if-revision</code> means the client must re-read and recompute. A lost lease means the controller must stop acting until it obtains a fresh token. A watch that falls behind compaction must return a clear resync signal instead of silently skipping history.</p>
-<h2>Worked Flow: Deployment Update</h2>
-<div class="codehilite"><pre><span></span><code>operator submits desired deployment v12
-client reads current revision 481
-client writes put-if-revision(/deploy/app, 481, v12)
-consensus commits revision 482
-watchers receive revision 482
-active scheduler reconciles desired state to actual resources
-downstream writes include scheduler fencing token
-</code></pre></div>
-
-<p>This flow ties each action to evidence. The desired state update is guarded by a revision. Watchers know which committed revision they are processing. The scheduler acts only while it has current lease authority. Downstream resources can reject stale scheduler writes.</p>
-<p>The same flow also shows what should not be in consensus. Per-pod logs, trace spans, image blobs, and high-frequency health samples may be related to the deployment, but they do not define the authoritative desired state. They should not share the critical write path.</p>
+<h3>Authority Boundary</h3>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Inside consensus?</th>
+<th>Why</th>
+<th>Outside-boundary rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Desired deployment generation, immutable spec reference/hash</td>
+<td>Yes</td>
+<td>Controllers need one target to reconcile</td>
+<td>Store the bulky manifest payload in artifact storage</td>
+</tr>
+<tr>
+<td>Shard ownership, lease state, fencing generation</td>
+<td>Yes</td>
+<td>Conflicting owners can make unsafe assignments</td>
+<td>Workload database checks the generation on every protected write</td>
+</tr>
+<tr>
+<td>Conditional-update revision and membership metadata</td>
+<td>Yes</td>
+<td>They define current preconditions and who can decide history</td>
+<td>Retain and compact according to documented recovery rules</td>
+</tr>
+<tr>
+<td>Durable operation record for dangerous retries</td>
+<td>Yes or transactionally durable with the effect</td>
+<td>Retries need one stable outcome/in-progress state</td>
+<td>Bound retention to the supported retry horizon</td>
+</tr>
+<tr>
+<td>Pod health, capacity sample, and current agent status</td>
+<td>Usually no</td>
+<td>They are frequent observations that can be rebuilt</td>
+<td>Use them as reconciliation input, not authority alone</td>
+</tr>
+<tr>
+<td>Logs, traces, metrics, image layers, large manifests</td>
+<td>No</td>
+<td>They need throughput, storage, and query features rather than a single decision order</td>
+<td>Keep a reference/hash in authority state when integrity matters</td>
+</tr>
+</tbody>
+</table>
+<p>The question behind every row is: “Would two different answers grant incompatible authority or change a protected decision?” Importance alone is not enough to earn consensus cost.</p>
+<h3>Service and API Contracts</h3>
+<p>The state machine applies only the committed command prefix. A controller never treats a proposal or a local leader receipt as an applied service result.</p>
+<table>
+<thead>
+<tr>
+<th>Contract</th>
+<th>Aurora's rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Desired-state update</td>
+<td><code>put_if_revision(key, R, command)</code> succeeds only if the inspected revision remains current; success returns committed revision <code>R+1</code></td>
+</tr>
+<tr>
+<td>State-machine apply</td>
+<td>Same committed command plus same replicated state produces the same internal result on every replica</td>
+</tr>
+<tr>
+<td>Current authority read</td>
+<td>A leader uses its documented current-read path and serves only state applied through that read boundary</td>
+</tr>
+<tr>
+<td>Lease loss</td>
+<td>Renewal failure, closed session, or uncertainty means the controller stops protected work until a new acquisition succeeds</td>
+</tr>
+<tr>
+<td>Watch recovery</td>
+<td>Read snapshot at revision <code>R</code>, watch after <code>R</code>, and resync from a new snapshot after disconnect/compaction gap</td>
+</tr>
+<tr>
+<td>External action</td>
+<td>Include fencing token and stable operation ID; target rejects older tokens and returns stored result or in-progress state for retries</td>
+</tr>
+<tr>
+<td>Reconfiguration</td>
+<td>Change voting membership through the protocol while a valid old quorum exists; do not use a normal-replacement claim after quorum loss</td>
+</tr>
+</tbody>
+</table>
+<p>These are design contracts, not implementation details to postpone. Without them, an API user cannot tell what evidence a revision, lease, response, or error carries.</p>
+<h2>Walkthrough: One Deployment Change</h2>
+<p>The following identifiers and revisions are illustrative.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Committed or observed state</th>
+<th>Action</th>
+<th>Evidence and boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>payments</code> is desired generation <code>41</code>, revision <code>900</code></td>
+<td>Operator reads revision <code>900</code> and prepares immutable spec hash <code>h42</code></td>
+<td>The operator has a precondition, not permanent ownership</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Command <code>set payments=42, hash=h42, expected=900</code> enters the log</td>
+<td>Consensus commits it at revision <code>901</code>; replicas deterministically apply it</td>
+<td>Desired generation <code>42</code> is now shared service state</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Scheduler B holds lease generation/token <code>8</code></td>
+<td>B snapshots through <code>901</code>, sees observed <code>41</code>, and creates <code>operation_id=deploy:payments:42</code></td>
+<td>B has a recoverable state base and current authority evidence</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Operation record says <code>IN_PROGRESS</code></td>
+<td>B calls workload database with generation <code>42</code>, hash <code>h42</code>, token <code>8</code>, and operation ID</td>
+<td>Target can distinguish stale authority and a retry from a new operation</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Database accepts the action but reply is lost</td>
+<td>B treats the client outcome as unknown, not failed</td>
+<td>Consensus did not make the network reply atomic</td>
+</tr>
+<tr>
+<td>6</td>
+<td>B retries the same operation ID and token</td>
+<td>Database returns stored accepted result</td>
+<td>One protected effect, repeatable controller result</td>
+</tr>
+<tr>
+<td>7</td>
+<td>B's watch later disconnects after revision <code>905</code> and cannot resume due to compaction</td>
+<td>B snapshots at <code>912</code>, replaces cache, then watches after <code>912</code></td>
+<td>Recovery has a known boundary instead of an assumed gap</td>
+</tr>
+</tbody>
+</table>
+<p>This trace connects several lessons. Quorum evidence preserves the command history across future leaders. Deterministic apply makes revision <code>901</code> mean the same state to each replica. CAS prevents an operator from silently writing over a newer desired state. Snapshot plus watch makes controller recovery bounded. Fencing makes the workload database refuse a stale scheduler. Idempotency handles a lost reply without pretending that a timeout identifies the result.</p>
 <h2>Failure Review</h2>
-<p>A credible design names the failures it expects and the evidence that preserves safety.</p>
-<p>Partition between zones:</p>
-<ul>
-<li>a majority side continues,</li>
-<li>minority-side leaders cannot commit new authority,</li>
-<li>stale actors are fenced by newer tokens,</li>
-<li>clients on the minority side receive errors or stale-only responses.</li>
-</ul>
-<p>Slow disk on the leader:</p>
-<ul>
-<li>commit latency rises,</li>
-<li>alerts fire on fsync and proposal latency,</li>
-<li>leadership movement is investigated, not treated as ordinary noise,</li>
-<li>controllers back off instead of creating retry storms.</li>
-</ul>
-<p>Watcher falls behind compaction:</p>
-<ul>
-<li>client receives a clear compaction or revision-too-old error,</li>
-<li>client reloads from snapshot or current state,</li>
-<li>reconciliation remains idempotent.</li>
-</ul>
-<p>Controller pauses after receiving a lease:</p>
-<ul>
-<li>lease expires,</li>
-<li>a newer controller receives a newer token,</li>
-<li>downstream systems reject the old token when the paused controller resumes.</li>
-</ul>
-<p>Permanent quorum loss:</p>
-<ul>
-<li>ordinary progress stops,</li>
-<li>the disaster recovery runbook distinguishes member replacement from forced recovery,</li>
-<li>operators state which snapshot or survivor is being trusted,</li>
-<li>downstream teams know whether acknowledged writes may be lost.</li>
-</ul>
-<p>The design is not trying to hide these trade-offs. It is trying to make them reviewable.</p>
-<h2>Invariants and Tests</h2>
-<p>The architecture is not ready until its guarantees are testable.</p>
-<p>Core invariants include:</p>
-<ul>
-<li>at most one active scheduler per shard can successfully mutate downstream resources,</li>
-<li>every applied deployment revision came from a committed <code>put-if-revision</code>,</li>
-<li>watchers either process every relevant revision or perform a full resync,</li>
-<li>stale lease tokens are rejected outside the consensus store,</li>
-<li>member replacement preserves committed history unless the runbook explicitly enters forced recovery,</li>
-<li>telemetry and artifacts cannot block consensus commits by sharing the critical path.</li>
-</ul>
-<p>Failure tests should exercise partitions, process pauses, slow disks, compaction gaps, client retries, leader changes, member replacement, snapshot restore, and forced recovery drills. Jepsen-style history checking is useful because it tests the claim the architecture makes, not just the happy path implementation.</p>
-<h2>Crash-Fault or Byzantine?</h2>
-<p>For this regional compute platform, crash-fault consensus is probably the right default if all consensus members live inside one administrative trust boundary. The dominant risks are slow disks, partitions, bad placement, stale controllers, operator mistakes, and recovery ambiguity.</p>
-<p>Byzantine consensus becomes relevant if the control plane spans organizations, untrusted operators, public validators, or adversarial infrastructure. Then the design must add stable identities, key management, authenticated votes, quorum certificates, and a stronger threat model.</p>
-<p>The capstone decision is not "which protocol is more advanced?" It is "which fault model matches the trust boundary we actually have?"</p>
-<h2>Readiness Check</h2>
-<p>Before this control plane is ready, the team should be able to answer:</p>
+<p>An architecture becomes credible when each failure has a safety statement, an expected behavior, and a signal that reveals a broken assumption.</p>
+<table>
+<thead>
+<tr>
+<th>Failure pressure</th>
+<th>Expected behavior</th>
+<th>Violation or signal</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leader crashes after a client request but before commit evidence</td>
+<td>Client does not receive a durable-success claim; later history may omit the proposal</td>
+<td>An acknowledged desired revision disappears after recovery</td>
+</tr>
+<tr>
+<td>Old scheduler pauses; successor gets token <code>9</code> after token <code>8</code></td>
+<td>Workload database accepts <code>9</code> and rejects later <code>8</code></td>
+<td>A protected write succeeds with token below its high-water mark</td>
+</tr>
+<tr>
+<td>Controller watch disconnects and history is compacted</td>
+<td>Controller fetches new snapshot and reconciles</td>
+<td>Controller continues from an unproven old cache</td>
+</tr>
+<tr>
+<td>Slow leader disk or overloaded write path</td>
+<td>Tail commit latency, retries, and watch pressure rise; controllers fail safe on lease uncertainty</td>
+<td>Quorum exists but lease/control-loop budget is exceeded</td>
+</tr>
+<tr>
+<td>One zone fails</td>
+<td>Remaining two voters may continue if their path is healthy</td>
+<td>Minority side claims it can commit new authority</td>
+</tr>
+<tr>
+<td>One voter is lost while a quorum remains</td>
+<td>Replacement catches up and membership transition is committed by the protocol</td>
+<td>An operator file edit creates an independent voter set</td>
+</tr>
+<tr>
+<td>Quorum is permanently lost</td>
+<td>Ordinary progress stops; recovery source and data-loss boundary are authorized and recorded</td>
+<td>Forced bootstrap is described as fully continuous without evidence</td>
+</tr>
+</tbody>
+</table>
+<p>The values in a production alert policy depend on the lease duration, client workload, and recovery objective. What must not vary is the causal interpretation: a leader indicator alone does not prove the cluster can still supply authority within the needed time.</p>
+<h2>Trade-offs and Fault Model</h2>
+<p>The trade-off is deliberate. Consensus gives a compact, defensible history for authority. It costs quorum latency, durable storage behavior, careful client recovery, and operational discipline around member placement and replacement. The small metadata boundary reduces that cost; it does not remove it.</p>
+<p>Three voters across three zones are a reasonable crash-fault choice when Aurora trusts the operators and machines as non-malicious participants and wants to survive one zone loss. The design must still handle software bugs, slow disks, partitions, stale controllers, and recovery mistakes; crash-fault consensus does not make those disappear.</p>
+<p>Aurora should consider Byzantine protocols only if its actual trust boundary includes replicas or operators that may intentionally equivocate, forge operational claims through compromised identities, or act adversarially across organizations. That choice requires stable identities, key lifecycle control, authenticated votes, certificate verification, different quorum thresholds, and a more complex operational model. BFT is not a remedy for an oversized watch workload or an unfenced workload database.</p>
+<p>The situated decision for the stated regional platform is crash-fault consensus plus strong client and target-side enforcement. It becomes risky when the administration boundary is no longer trusted; the signal is a threat model that includes arbitrary participant behavior rather than ordinary crash and delay.</p>
+<h2>Evidence and Readiness</h2>
+<p>Aurora must test the claims, not merely check that a leader election occurred. Its verification plan records client invocation/result histories, revisions, commit/apply boundaries, lease generations, operation IDs, and workload-database acceptance decisions.</p>
+<table>
+<thead>
+<tr>
+<th>Invariant</th>
+<th>Workload and fault</th>
+<th>Evidence of success</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Desired state is not lost after acknowledgement</td>
+<td>Conditional writes during leader crash and delayed replies</td>
+<td>Every acknowledged revision appears in a later authoritative snapshot</td>
+</tr>
+<tr>
+<td>Only current scheduler can change assignments</td>
+<td>Pause old scheduler, issue new lease, resume old scheduler</td>
+<td>Target rejects any action with an older token after newer token succeeds</td>
+</tr>
+<tr>
+<td>Controllers converge after watch gaps</td>
+<td>Disconnect, compact history, make rapid desired-state changes</td>
+<td>Cache rebuilt from snapshot equals authoritative state</td>
+</tr>
+<tr>
+<td>Retry does not duplicate protected work</td>
+<td>Crash/lost reply after database acceptance</td>
+<td>Same operation identity returns one stored result/effect</td>
+</tr>
+<tr>
+<td>Reconfiguration preserves continuity with quorum</td>
+<td>Replace a voter after snapshot/log catch-up</td>
+<td>New configuration retains committed history through a leader change</td>
+</tr>
+<tr>
+<td>Forced recovery is honest</td>
+<td>Simulate permanent quorum loss and bootstrap chosen source</td>
+<td>Runbook records source, recovery revision, clients needing reconciliation, and old-authority fencing</td>
+</tr>
+</tbody>
+</table>
+<p>Jepsen-style fault injection is useful because it treats the history and checker as first-class evidence. A dashboard becoming green after a restart is liveness evidence. It does not prove that an old token was rejected or that an acknowledged desired revision survived.</p>
+<h2>Final Challenge</h2>
+<p>A later proposal makes three changes to “simplify” Aurora:</p>
 <ol>
-<li>Which state is authoritative and why?</li>
-<li>Which operations require linearizable reads?</li>
-<li>Which leases need fencing tokens?</li>
-<li>What metrics warn that consensus latency is leaving the safe envelope?</li>
-<li>How does a watcher resume after disconnect or compaction?</li>
-<li>What is the exact recovery path after quorum loss?</li>
-<li>Which invariants will be tested under partitions, pauses, retries, and slow disks?</li>
-<li>What state is deliberately outside consensus, and what stores it instead?</li>
-<li>What is the trust boundary: crash-fault only or Byzantine?</li>
+<li>Store all pod logs and image manifests in the consensus service so every controller reads one system.</li>
+<li>Let controllers continue after a watch disconnect because their caches were current recently.</li>
+<li>Remove workload-database token checks because the lease record is already strongly consistent.</li>
 </ol>
-<p>If any answer is vague, the design is not finished.</p>
+<p>Review the proposal.</p>
+<p><strong>Model answer:</strong> Keep desired generation, immutable artifact reference/hash, conditional revision, controller lease/token generation, and dangerous-operation identity inside the authority boundary. Put logs and artifact payloads in observation and artifact systems; their volume would make every consensus commit and recovery more expensive without adding authority. A controller with a watch gap must resync from a snapshot because “recently current” does not identify missed changes. Removing target-side fencing is unsafe: an old controller can resume after a successor obtains a newer token. The failure test pauses token <code>8</code>, lets token <code>9</code> successfully assign a workload, then resumes token <code>8</code>; the database must reject the old request.</p>
+<h2>Readiness Rubric</h2>
+<p>The team may call the architecture ready only when it can answer all of these with a contract, trace, and test:</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Ready answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Which state earns consensus cost?</td>
+<td>It names a conflicting authority or protected decision, not merely importance</td>
+</tr>
+<tr>
+<td>What does an acknowledged write mean?</td>
+<td>Commit/apply boundary and client result semantics are explicit</td>
+</tr>
+<tr>
+<td>How does a controller recover?</td>
+<td>Snapshot revision, watch resume/resync, and idempotent reconciliation are specified</td>
+</tr>
+<tr>
+<td>What stops stale work?</td>
+<td>Fencing token reaches every protected write path</td>
+</tr>
+<tr>
+<td>Which operational envelope is required?</td>
+<td>Tail latency, disk, network, watch, and recovery signals have service-specific budgets</td>
+</tr>
+<tr>
+<td>How does membership change?</td>
+<td>Healthy-quorum transition is distinct from forced recovery after quorum loss</td>
+</tr>
+<tr>
+<td>Which fault model is assumed?</td>
+<td>Crash-fault or Byzantine choice matches the real trust boundary and costs</td>
+</tr>
+<tr>
+<td>How can claims fail a test?</td>
+<td>Workloads, faults, histories, and checkers make violations observable</td>
+</tr>
+</tbody>
+</table>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://etcd.io/docs/">etcd Documentation</a><ul>
-<li>Focus: Use the API and operations docs as a concrete reference for revisions, watches, leases, and cluster operation.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://kubernetes.io/docs/reference/using-api/api-concepts/">Kubernetes API Concepts</a><ul>
-<li>Focus: Study resource versions, watches, and reconciliation patterns.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a><ul>
-<li>Focus: Compare lock service API semantics with the capstone boundary.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a><ul>
-<li>Focus: Use failure analyses as prompts for invariant and history testing.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://etcd.io/docs/">etcd Documentation</a> — Focus: Concrete API, watch, lease, recovery, and operational semantics for a coordination system.</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/reference/using-api/api-concepts/">Kubernetes API Concepts</a> — Focus: Resource versions, watches, and reconciliation boundaries in a control-plane API.</li>
+<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a> — Focus: Coordination API semantics and the client-visible authority contract.</li>
+<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a> — Focus: Fault histories and checkers as evidence for distributed-system claims.</li>
+<li>[PAPER] <a href="https://arxiv.org/abs/1803.05069">HotStuff: BFT Consensus in the Lens of Blockchain</a> — Focus: The additional authenticated evidence and quorum structure needed for an adversarial trust boundary.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A consensus-backed control plane should protect authority, not absorb every important byte.</li>
-<li>API semantics, leases, watches, fencing, membership, and recovery are part of the consensus design.</li>
-<li>The architecture needs explicit boundaries for authoritative state, high-volume non-authoritative data, and trust assumptions.</li>
-<li>The design is ready only when its invariants and recovery claims can be tested under realistic failure.</li>
+<li>Consensus belongs on small authority decisions; observations, telemetry, and bulky artifacts need other storage paths.</li>
+<li>A credible control plane connects committed history, deterministic apply, guarded APIs, watch recovery, and fenced external action.</li>
+<li>Quorum survival is not enough when the cluster cannot meet the latency and recovery budgets of its authority contracts.</li>
+<li>Normal replacement preserves continuity through a healthy quorum; forced recovery chooses and documents a recovery boundary.</li>
+<li>The architecture is complete only when its authority claims, fault model, and operational limits are testable under the failures it expects.</li>
 </ul>
 </section>
 
@@ -269,7 +485,7 @@ downstream writes include scheduler fencing token
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

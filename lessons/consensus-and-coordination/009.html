@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,139 +81,196 @@
 <section class="stack-block lesson-content-shell">
   <h1>Replication Models: Primary-Backup, Multi-Leader, and Leaderless</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Replication models are coordination choices because each one decides where writes become authoritative and where the system pays to reconcile disagreement.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Locate the authority boundary in primary-backup, multi-leader, and leaderless designs.</p>
+</li>
+<li>
+<p>Choose a replication model from a data item's conflict cost, locality needs, and availability requirements.</p>
+</li>
+<li>
+<p>Predict which evidence, repair work, or operational signal each model makes important.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Replication models do not remove coordination; they decide whether the system pays for it before a write, while reconciling several writers, or while reading and repairing replicas.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a product with three kinds of data: account balances, shopping carts, and user preference toggles. Copying each kind of data to several machines is easy to say, but the hard question is different: where is a write allowed to become real?</p>
-<p>For account balances, a single strongly controlled write path may be worth the latency because conflicting updates are expensive. For shopping carts, local writes from multiple devices or regions might be acceptable if the merge behavior is clear. For preferences, a leaderless or eventually repaired model may be enough if "last update wins" or another simple rule is acceptable.</p>
-<p>Primary-backup, multi-leader, and leaderless replication are three answers to that authority question. They are not just deployment diagrams. They move coordination cost to different moments: before the write, after the write, or across read/write quorum and repair paths.</p>
-<p>The trade-off is the whole point. Primary-backup buys clarity by centralizing authority. Multi-leader buys locality by accepting reconciliation. Leaderless buys availability and flexibility by pushing authority into quorums, version metadata, and repair semantics.</p>
-<h2>Authority, Not Just Copies</h2>
-<p>A system can have many physical copies while still having one logical write authority. Another system can have many write authorities and therefore more conflict risk. A third system can avoid a permanent leader and instead decide whether enough replicas have participated.</p>
-<p>The useful comparison is:</p>
-<div class="codehilite"><pre><span></span><code>Model           Where writes become authoritative
---------------  ---------------------------------------------
-Primary-backup  one primary path
-Multi-leader    several regional or shard-local leaders
-Leaderless      replica quorums plus version/repair semantics
+<p>A travel-booking service runs in Europe and North America. Its designers want one replication policy for every piece of state because one policy sounds easier to operate.</p>
+<p>The service stores three very different things:</p>
+<div class="codehilite"><pre><span></span><code>seat/AB123/17A       one traveler may hold it
+trip/481/notes       two travelers may edit it from different regions
+user/92/last-viewed  a low-stakes “recently viewed hotel” value
 </code></pre></div>
 
-<p>This framing helps avoid a common mistake: choosing a replication model by how scalable it sounds rather than by how the data behaves under conflict.</p>
-<p>A balance transfer, a collaborative document edit, and a preference toggle do not have the same conflict cost. A replication model that is excellent for one may be dangerous or needlessly expensive for another.</p>
-<h2>Primary-Backup: Pay Early for a Clear Writer</h2>
-<p>Primary-backup centralizes normal write authority. Clients send writes to the primary; backups learn from it.</p>
-<div class="codehilite"><pre><span></span><code>client -&gt; primary -&gt; backups
+<p>All three values can have replicas in both regions. But copying bytes is not the hard question. The hard question is: <strong>when two requests disagree or a region is disconnected, which request is allowed to become authoritative?</strong></p>
+<p>A seat can be sold only once. A note can often preserve two independent additions. A recently viewed hotel can tolerate a stale value or a simple reconciliation rule. Treating those objects as if they had the same conflict cost either makes the low-stakes path needlessly slow or makes the seat unsafe.</p>
+<p>Primary-backup, multi-leader, and leaderless replication are three ways to put that authority boundary in different places. The names describe a family of designs, not one fixed implementation. Their useful comparison is about where a write is admitted, what evidence makes it acceptable, and who must clean up disagreement later.</p>
+<h2>The Small Situation: Same Copies, Different Promises</h2>
+<p>Keep the three objects in view. The product needs a different promise for each one.</p>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th>What a bad conflict costs</th>
+<th>Useful promise</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>seat/AB123/17A</code></td>
+<td>two people may believe they hold the same seat</td>
+<td>one controlled decision before confirmation</td>
+</tr>
+<tr>
+<td><code>trip/481/notes</code></td>
+<td>a collaborator's edit may disappear</td>
+<td>preserve or explicitly resolve concurrent edits</td>
+</tr>
+<tr>
+<td><code>user/92/last-viewed</code></td>
+<td>a recommendation is briefly less relevant</td>
+<td>keep serving through a replica fault and reconcile later</td>
+</tr>
+</tbody>
+</table>
+<p>This table is a teaching model, not a universal schema rule. A real product may decide that trip notes need stronger control, or that a “last viewed” value carries privacy or billing meaning. The point is to name the object-level promise before selecting a topology.</p>
+<h2>The Initial Model: More Replicas Mean More Safety</h2>
+<p>The first reasonable design says: send every write to three replicas. If one replica is slow, return after the other two respond. That improves durability in many situations, but it does not say what concurrent writers mean.</p>
+<p>Imagine a partition between Europe and North America. An agent in each region tries to reserve <code>seat/AB123/17A</code>. If both local replica groups can accept the request independently, each can return success without knowing about the other. Replication will eventually reveal the disagreement, but there is no safe merge rule for “two people own one seat.”</p>
+<p>The same pattern is not automatically bad for the trip notes. Two independent additions can be represented as two edits and merged. The <code>last-viewed</code> value may even accept a policy such as replacing an older value, if the product explicitly accepts the loss of the older update.</p>
+<p>So “replicate to several nodes” is incomplete. It tells us how many copies participate, but not where authority lives or what happens when copies disagree. The stronger model is to move coordination deliberately to the point where its cost is acceptable.</p>
+<h2>The Better Model: Choose Where Disagreement Is Paid For</h2>
+<p><strong>Plain meaning:</strong> A replication design decides whether one writer prevents conflicts early, several writers accept them and reconcile later, or replicas use quorum and version evidence without a fixed writer.</p>
+<p><strong>In this scenario:</strong> Use a tightly controlled write path for the seat, allow regional note writes only with an explicit merge rule, and use a leaderless-style replica set only for the low-cost <code>last-viewed</code> value if its reconciliation behavior is acceptable.</p>
+<p><strong>Technical names:</strong> These choices are commonly called <strong>primary-backup</strong>, <strong>multi-leader</strong>, and <strong>leaderless replication</strong>.</p>
+<div class="codehilite"><pre><span></span><code>primary-backup: one normal writer sequences updates
+multi-leader:   several normal writers accept updates, then exchange them
+leaderless:     replicas and configured quorum/version rules decide participation
 </code></pre></div>
 
-<p>That model is attractive when the system needs a simple answer to "what order did writes happen in?" The primary becomes the normal sequencer for a shard, log, or piece of metadata.</p>
-<p>It often fits:</p>
-<ul>
-<li>consensus-backed logs</li>
-<li>metadata stores</li>
-<li>strongly ordered control paths</li>
-<li>data where conflicting writes are costly</li>
-</ul>
-<p>The benefit is a cleaner correctness story. The system can make most write conflicts disappear by not allowing several normal writers for the same authority domain.</p>
-<p>The cost is concentration:</p>
-<ul>
-<li>the primary can become a bottleneck</li>
-<li>write locality is constrained</li>
-<li>failover behavior matters a lot</li>
-<li>backup lag affects read freshness and recovery</li>
-</ul>
-<p>Primary-backup is therefore not "simple and free." It pays coordination cost before or during the write so the rest of the system has less reconciliation to do later.</p>
-<h2>Multi-Leader: Buy Local Writes, Own Conflicts</h2>
-<p>Multi-leader replication lets several leaders accept writes, often in different regions or sites:</p>
-<div class="codehilite"><pre><span></span><code>region A leader &lt;----async----&gt; region B leader
-region B leader &lt;----async----&gt; region C leader
+<p>None of these labels alone guarantees a particular consistency level, latency, or failure behavior. Reply rules, replication mode, read routing, membership, versioning, and application semantics still matter. The label is useful because it reveals the first place to look for authority and reconciliation.</p>
+<h2>Worked Design: Three Paths Through the Same Product</h2>
+<h3>Path 1: Primary-backup pays before confirming the seat</h3>
+<p>For <code>seat/AB123/17A</code>, designate one normal write authority for the seat's partition. A client in Europe may reach it directly or through a regional gateway.</p>
+<div class="codehilite"><pre><span></span><code>traveler request
+  -&gt; seat primary checks “is 17A already held?”
+  -&gt; primary records and replicates the decision
+  -&gt; reply follows the system&#39;s configured acknowledgement policy
 </code></pre></div>
 
-<p>This can be the right shape when local write latency and regional autonomy matter. A user in Europe can write to a European leader while a user in Asia writes to an Asian leader, even if the inter-region link is slow or temporarily impaired.</p>
-<p>The price is that several writes can be legitimate at the same time. That means global order is no longer simple. Conflicts are not protocol accidents; they are part of the design surface.</p>
-<p>Multi-leader works best when at least one of these is true:</p>
-<ul>
-<li>conflicts are rare</li>
-<li>conflicts are easy to merge</li>
-<li>users can resolve conflicts explicitly</li>
-<li>the product can tolerate temporary divergence</li>
-<li>the data model has natural commutative operations</li>
-</ul>
-<p>The practical question is not "can we run more leaders?" It is:</p>
-<div class="codehilite"><pre><span></span><code>Can this product survive several valid writers before reconciliation finishes?
+<p>The key benefit is not that the primary has magic knowledge. It is that normal conflicting requests meet at the same authority boundary before the service promises a hold. The primary can order “hold for Maya” and “hold for Luis” and reject or queue the later one.</p>
+<p>The acknowledgement policy still matters. An implementation might wait for a backup, for a quorum, or for a weaker asynchronous condition before replying. Those choices change durability and failover risk. They do not change the central design move: normal writes do not race through two independent authorities.</p>
+<p>If the primary becomes unreachable, the system must either fail over through a safe mechanism or temporarily refuse new seat holds. That is an availability cost chosen to avoid inventing a merge for double booking.</p>
+<h3>Path 2: Multi-leader accepts local note edits, then owns the conflict</h3>
+<p>For <code>trip/481/notes</code>, Europe and North America can each accept a local write. The regional leaders later replicate accepted edits to each other.</p>
+<div class="codehilite"><pre><span></span><code>Europe:        add “passport check”
+North America: add “airport transfer”
+                 \             /
+                  \-- merge ---/
 </code></pre></div>
 
-<p>If the answer is no, multi-leader can look fast in the happy path and become expensive during every edge case.</p>
-<h2>Leaderless: Move Coordination into Quorums and Repair</h2>
-<p>Leaderless replication removes the fixed primary role. Clients can write to a replica set, and the system uses quorum choices, version metadata, read repair, anti-entropy, and merge policy to converge.</p>
-<div class="codehilite"><pre><span></span><code>client -&gt; replicas
-          write quorum
-          read quorum
-          versioning / repair / merge
+<p>If the notes model records independent additions, the product can merge both changes. Local writing is attractive because neither traveler has to wait for an inter-region round trip.</p>
+<p>Now change the edit: both travelers replace the same itinerary title with different text while the regions are partitioned. Both writes were locally legitimate. The replication protocol cannot learn the intended product answer from topology alone. The design needs a stated rule: show both versions, pick a defined winner, merge structured fields, or ask a user to resolve it.</p>
+<p>This is the real cost of multi-leader. It moves coordination out of the immediate write path and into conflict detection, reconciliation, and user experience. A system that quietly overwrites a conflict has still chosen a merge rule; it has merely hidden it.</p>
+<h3>Path 3: Leaderless moves evidence and repair into the replica set</h3>
+<p>For <code>user/92/last-viewed</code>, suppose a leaderless-style store places the key on three replicas. The following values are illustrative:</p>
+<div class="codehilite"><pre><span></span><code>N = 3 replicas
+W = 2 acknowledgements required for this write
+R = 2 replicas consulted for this read
 </code></pre></div>
 
-<p>This model can improve availability and locality because no single always-current leader has to be reachable for every operation. But leaderless does not mean "no coordination." It means coordination has moved.</p>
-<p>Instead of asking one leader for the authoritative write path, the system asks:</p>
-<div class="codehilite"><pre><span></span><code>Did enough replicas participate?
-Can reads observe enough evidence?
-Can divergent versions be detected and repaired?
-Does the application know how to merge conflict?
+<p>With ordinary fixed replica sets, <code>W + R &gt; N</code> means a write quorum and a read quorum intersect. That shared replica can carry useful version evidence. It does not, by itself, settle every real implementation question: a system may use temporary substitutes, asynchronous repair, configurable consistency levels, or concurrent versions.</p>
+<p>Here a request writes <code>last-viewed = hotel-7</code> to two replicas while the third is slow. A later read consults two replicas. If it sees an older value and a newer version, the store or client can use the version information to select or reconcile the result and repair the stale replica later.</p>
+<div class="codehilite"><pre><span></span><code>write: replica A &lt;- hotel-7, replica B &lt;- hotel-7
+read:  replica B -&gt; hotel-7, replica C -&gt; hotel-3
+then:  return/reconcile according to version policy; repair C when appropriate
 </code></pre></div>
 
-<p>The hidden cost is real:</p>
-<ul>
-<li>quorum tuning becomes part of correctness and latency</li>
-<li>stale reads become possible under weaker settings</li>
-<li>version vectors or similar metadata may be needed</li>
-<li>read repair and anti-entropy become operationally important</li>
-<li>application merge logic can become the hardest part</li>
-</ul>
-<p>Leaderless systems are strongest when availability and partition tolerance matter, and when the data model can absorb reconciliation without surprising users.</p>
-<h2>Worked Example: Three Data Types</h2>
-<p>Take three fields in the same product.</p>
-<div class="codehilite"><pre><span></span><code>account_balance
-shopping_cart
-theme_preference
+<p>This path has no permanent primary for the key. It has not escaped coordination. It relies on quorum choice, version metadata, repair, and a definition of what to do with concurrent values. Dynamo is a classic example of this design space: it used versioning and application-assisted conflict resolution to favor high availability for selected workloads.</p>
+<p><strong>So far:</strong> the three models move the same burden rather than deleting it. Primary-backup constrains writers early. Multi-leader permits several writers and makes conflict handling a first-class product feature. Leaderless designs make quorum evidence, versions, and repair part of the data contract.</p>
+<h2>The Design Review: Start With the Conflict, Not the Product Name</h2>
+<p>Before this lesson, the team might ask, “Which database gives us the most replicas and the lowest latency?” After it, the more useful review starts with the object:</p>
+<div class="codehilite"><pre><span></span><code>1. What conflicting writes can occur for this key or aggregate?
+2. What is the cost of accepting both while disconnected?
+3. Is there a correct merge rule that the product can explain?
+4. Must a write wait for one authority, a quorum, or a remote region?
+5. What evidence will a reader or repair job need later?
 </code></pre></div>
 
-<p>For <code>account_balance</code>, conflicting writes can lose money or create double-spend behavior. A primary-backed or consensus-backed model may be worth the coordination cost.</p>
-<p>For <code>shopping_cart</code>, two devices may add different items while disconnected. A multi-leader or leaderless model can work if the merge rule is "union added items, preserve removals carefully."</p>
-<p>For <code>theme_preference</code>, the system may accept a much weaker rule, such as the most recent timestamped preference wins. A leaderless or eventually repaired path may be acceptable because the cost of conflict is low.</p>
-<p>The same replication model across all three may be either too strict or too loose. The right design follows the data's conflict semantics.</p>
-<h2>Comparison and Misreadings</h2>
-<p>A compact way to remember the trade-off:</p>
-<div class="codehilite"><pre><span></span><code>Model           Main gain                 Main cost
---------------  ------------------------  -------------------------------
-Primary-backup  simple authority/order    bottleneck and failover pressure
-Multi-leader    local writes/autonomy     conflict handling later
-Leaderless      availability/flexibility  quorum, repair, and merge logic
-</code></pre></div>
-
-<p>"Multi-leader is just faster primary-backup" is wrong. It creates several legitimate write authorities, which means reconciliation becomes a core responsibility.</p>
-<p>"Leaderless removes coordination" is also wrong. It removes one coordination shape and replaces it with quorum math, version tracking, and repair.</p>
-<p>"Primary-backup is always safest" is too broad. It may be safest for a particular invariant, but it can be too expensive for workloads that need regional locality or high availability under partitions.</p>
+<p>For the seat, a single authority or consensus-backed boundary is usually the better fit because the conflict is not safely mergeable. For notes, multi-leader is a situated preference when local writes matter and the product has a credible merge and audit story. For <code>last-viewed</code>, leaderless replication can be a good fit when availability and locality matter more than an immediately uniform view.</p>
+<p>This does not mean a real service should run three unrelated databases by default. It means a broad “one policy everywhere” decision needs a reason. A single system can also offer different consistency and conflict policies, while a service boundary can separate data with fundamentally different promises.</p>
+<h2>Consequences, Trade-offs, and Limits</h2>
+<p>The <strong>trade-off</strong> is where disagreement becomes visible and expensive.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>What improves</th>
+<th>What costs more</th>
+<th>Signal near the boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Primary-backup</td>
+<td>simple normal write authority</td>
+<td>primary latency, failover safety, and availability during loss</td>
+<td>primary queueing, replica lag, or repeated failover</td>
+</tr>
+<tr>
+<td>Multi-leader</td>
+<td>local writes and regional autonomy</td>
+<td>conflict detection, merge design, and reconciliation delay</td>
+<td>replication backlog, divergent versions, or rising conflict rate</td>
+</tr>
+<tr>
+<td>Leaderless</td>
+<td>no fixed primary and configurable replica participation</td>
+<td>quorum tuning, version handling, repair, and stale/conflicting reads</td>
+<td>repair backlog, inconsistent replicas, or quorum timeouts</td>
+</tr>
+</tbody>
+</table>
+<p>These are not scorecards where one row always wins. A primary can be geographically close to its writers. A multi-leader system can reject some conflicts. A leaderless system can be configured for stronger reads. The table identifies the questions that remain after the label.</p>
+<p>The boundary is especially important across objects. A leaderless <code>last-viewed</code> write and a primary-backed seat hold do not automatically form one transaction just because they live in the same product. Cross-object invariants need their own authority and commit boundary. Replication topology alone does not create it.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “Multi-leader is primary-backup with more primaries, so it is simply faster.”</p>
+<p><strong>Why it is tempting:</strong> Local writes can avoid a remote round trip.</p>
+<p><strong>Better model:</strong> It creates several legitimate writers. The saved time moves into conflict detection and reconciliation whenever their writes overlap.</p>
+<p><strong>Confusion:</strong> “Leaderless means no coordination.”</p>
+<p><strong>Why it is tempting:</strong> There is no named primary.</p>
+<p><strong>Better model:</strong> Coordination moves into quorum thresholds, version evidence, anti-entropy, and merge rules.</p>
+<p><strong>Confusion:</strong> “A leaderless quorum always returns one obvious newest value.”</p>
+<p><strong>Why it is tempting:</strong> Quorum intersection sounds like a universal latest-value guarantee.</p>
+<p><strong>Better model:</strong> It provides useful overlap under its assumptions, but concurrent writes, temporary replicas, and chosen consistency settings can still require version-aware reconciliation.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> Two regions must accept <code>seat/AB123/17A</code> holds while disconnected. The product cannot ever confirm two holds. Is multi-leader a good default for this object?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It would allow two locally valid writers unless an additional shared authority boundary prevented that. Because the conflict cannot be merged after confirmation, a controlled writer or consensus-backed decision is the safer fit.</p>
+<p><strong>Check:</strong> A leaderless store reads two replicas and observes two concurrent versions of a trip-note title. Is “return whichever response arrived first” a valid conflict policy?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It is a policy only if the product explicitly accepts arbitrary data loss. Usually the system should expose or apply a defined version-aware merge rule; arrival time does not express user intent.</p>
+<h2>Practice: Review One Proposed Policy</h2>
+<p>A team proposes: “Use multi-leader replication for all travel data. It gives each region fast writes, and conflicts are rare.” Their application includes seats, collaborative notes, and recently viewed hotels.</p>
+<p>Write a review. Identify one object that should not use this policy by default, one object for which it could be appropriate only with a named merge rule, and one signal that should make the team investigate whether its reconciliation cost is growing.</p>
+<p><strong>Model answer:</strong> Seats should not use multi-leader by default because independently confirmed holds are not safely mergeable; they need one controlled authority boundary. Collaborative notes can use it when the product defines how independent and conflicting edits are merged or presented. A growing cross-region replication backlog, more divergent versions, or an increasing conflict-resolution rate signals that the assumed reconciliation cost is no longer small. Recently viewed hotels may instead suit a leaderless or eventually reconciled path if the product accepts its freshness boundary.</p>
 <h2>Connections</h2>
-<p>The previous lesson showed ZAB as a strong leader-based design for ordered coordination state. Primary-backup lives near that world: one normal authority makes ordering easier.</p>
-<p>The next lesson on distributed logs sharpens the same question. Logs give ordered histories, but the scope of that order depends on partitioning, authority, and the replication model underneath.</p>
+<p>The ZAB lesson showed why ZooKeeper pays for a leader-based, totally ordered write path: coordination state decides who may act. This lesson generalizes the choice. The more expensive a conflict is, the more deliberately a system should constrain where normal writes become authoritative.</p>
+<p>The next lesson narrows from replication topology to distributed logs. A log is an ordered history, but its ordering scope depends on the authority and partitioning boundary beneath it.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Read the replication chapters for a clear comparison of leader-based, multi-leader, and leaderless designs.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
-<li>Focus: Study leaderless-style ideas such as quorums, versioning, sloppy quorum, hinted handoff, and repair.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Use Raft as a contrast point for a strongly leader-centric replicated log.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a> — Focus: trace how versioning, quorum-like coordination, and application-assisted reconciliation support its availability goal.</li>
+<li>[DOC] <a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html">Apache Cassandra: Dynamo</a> — Focus: compare the Dynamo-inspired terms with an implementation's current consistency choices.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: contrast a strongly leader-based replicated log with the authority choices in this lesson.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Replication models differ mainly by where write authority lives: one primary, several leaders, or quorum-backed replica sets.</li>
-<li>There is no free model; each trade-off moves cost among write latency, locality, conflict handling, failover, and repair.</li>
-<li>Workload semantics decide the right choice: the more expensive a conflict is, the more deliberately the system should constrain where writes become authoritative.</li>
+<li>Replication begins with copies, but design begins with the authority and conflict contract for each object.</li>
+<li>Primary-backup reduces normal write conflicts by constraining where they can be accepted.</li>
+<li>Multi-leader earns local writes only when the product owns a credible reconciliation rule.</li>
+<li>Leaderless replication replaces a permanent writer with quorum evidence, versioning, and repair work.</li>
+<li>A replication model for one object does not automatically protect invariants that span several objects.</li>
 </ul>
 </section>
 
@@ -239,7 +300,7 @@ Leaderless      availability/flexibility  quorum, repair, and merge logic
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

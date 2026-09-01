@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,151 +81,153 @@
 <section class="stack-block lesson-content-shell">
   <h1>Consensus Systems in Production: etcd, Consul, and ZooKeeper</h1>
 <blockquote>
-<p><strong>The core idea</strong>: etcd, Consul, and ZooKeeper turn expensive consensus into practical control-plane primitives, and the main trade-off is paying quorum cost for small authoritative metadata instead of treating them like general-purpose databases.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Turn a control-plane requirement into the watch, lease, session, and revision semantics it needs.</p>
+</li>
+<li>
+<p>Choose a coordination-system shape from explicit workload and failure constraints rather than brand familiarity.</p>
+</li>
+<li>
+<p>Review a client design for stale ownership, missed notifications, and misuse of consensus-backed storage.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Choose etcd, Consul, or ZooKeeper by the authority and client contract you need—revisioned control-plane state, service discovery and health, or session-oriented coordination—not because all three can store data.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>A platform team needs one place to record who owns a leader lease, which services are healthy, which configuration version is active, and which controllers should react to a change. That state is small compared with user data, but it is high value: if two nodes disagree about it, the platform can split brain.</p>
-<p>This is the job of production coordination systems. They are not attractive because they are convenient key-value stores. They are attractive because they give engineers an API for small pieces of state that must be ordered, watched, leased, or tied to session membership under failure.</p>
-<p>etcd, Consul, and ZooKeeper all sit in that family, but they do not invite the same design. etcd feels like a replicated control-plane key-value store with watches, leases, and compare-and-swap style transactions. Consul combines coordinated server-side state with service discovery, health checks, sessions, and operational datacenter workflows. ZooKeeper offers a hierarchical coordination namespace with sessions, watches, ephemeral nodes, and a long history in distributed infrastructure.</p>
-<p>The mistake is to choose one because "it stores data." The better question is: what coordination shape does this platform need, and is the state important enough to pay consensus cost?</p>
-<h2>The Control-Plane Workload</h2>
-<p>Imagine a scheduler managing a fleet of workers. It needs to know which scheduler instance is leader, which workers are alive, which jobs are assigned, and which configuration revision is active. Those decisions affect many services, so the system needs one authoritative story.</p>
-<p>That does not mean the coordination store should carry every request, metric, or business event. It should hold metadata whose disagreement is dangerous:</p>
-<ul>
-<li>leader-election records</li>
-<li>leases and ownership claims</li>
-<li>service registration and health metadata</li>
-<li>cluster membership and naming state</li>
-<li>small configuration values that must not split brain</li>
-<li>controller progress markers and coordination locks</li>
-</ul>
-<p>The workload is usually read-heavy, watch-heavy, and small-object oriented. Writes are meaningful and relatively scarce. If a team routes hot application traffic or large payloads through the same store, it turns a carefully protected control plane into a bottleneck.</p>
-<h2>What These Systems Package</h2>
-<p>All three systems provide a strongly coordinated core, but the surface primitives matter as much as the consensus protocol beneath them.</p>
-<table>
-<thead>
-<tr>
-<th>System</th>
-<th>Natural Mental Model</th>
-<th>Coordination Style</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>etcd</td>
-<td>Replicated control-plane KV</td>
-<td>Watches, leases, revisions, transactions</td>
-</tr>
-<tr>
-<td>Consul</td>
-<td>Discovery and health-aware coordination</td>
-<td>Service catalog, health checks, KV, sessions</td>
-</tr>
-<tr>
-<td>ZooKeeper</td>
-<td>Coordination tree</td>
-<td>Znodes, watches, sessions, ephemeral nodes</td>
-</tr>
-</tbody>
-</table>
-<p>etcd is strongly associated with Kubernetes-style control loops. Controllers watch a keyspace, observe revisions, compare current state with desired state, and write updates through a Raft-backed API. This fits systems that need a compact, strongly consistent metadata store for controllers.</p>
-<p>Consul is often a natural fit when service discovery and health are central to the workload. Its coordination story includes KV and sessions, but its operational value often comes from combining service registration, health checks, DNS/API discovery, and datacenter-aware workflows.</p>
-<p>ZooKeeper uses a tree of znodes and session-oriented primitives. Ephemeral nodes disappear when a session ends, making them useful for membership, presence, and leader-election patterns. Watches let clients react to changes, though watch semantics must be understood carefully rather than treated as a magical event stream.</p>
-<h2>Primitives Shape System Design</h2>
-<p>The coordination API changes how applications express ownership and change.</p>
-<div class="codehilite"><pre><span></span><code>controller / service / client
-          |
-          v
- [coordinated metadata system]
-   |          |          |
- watches    leases     sessions
- revisions  health     ephemeral nodes
+<p>The Atlas platform runs many short-lived worker services. Its controllers must agree on the active configuration revision. Services must find healthy peers. One older job framework elects a leader through a session-owned node.</p>
+<p>At first, the team sees one storage problem: “we need a distributed key-value store.” That sounds reasonable while the only task is reading a configuration value. It breaks when a controller disconnects during changes, a lease expires while its owner is paused, or a watch misses historical events after compaction. Storage alone does not tell the client what it may safely do.</p>
+<p>The real question is not which product is best. It is which coordination contract Atlas needs for each kind of state:</p>
+<div class="codehilite"><pre><span></span><code>authoritative desired state  -&gt; revision, conditional write, recoverable watch
+service reachability         -&gt; registration, health, discovery interface
+session-owned coordination   -&gt; session expiry, ephemeral ownership, resync
 </code></pre></div>
 
-<p>A lease says, "this ownership claim is valid only while renewal succeeds." That is useful for leader election and lock-like behavior, but it is not a timeless global mutex. A paused process can believe it still owns something after another node has legitimately taken over, so downstream systems may still need fencing tokens or revision checks.</p>
-<p>A watch says, "tell me when this coordinated state changes." That is useful for controllers and service discovery, but watches are not a substitute for durable event processing. Clients must handle reconnects, missed ranges, compaction, and resync from current state.</p>
-<p>A compare-and-swap transaction says, "write this only if the state still matches what I observed." That is powerful for safe updates, but it assumes the state being guarded is small and worth coordinating.</p>
-<h2>Worked Example: A Control Plane Choice</h2>
-<p>Suppose a platform needs three things:</p>
-<ul>
-<li>Kubernetes-style controllers reconciling desired state</li>
-<li>health-aware service discovery for application traffic</li>
-<li>classic session-based leader election for older distributed jobs</li>
-</ul>
-<p>If the central design is a Kubernetes-like control plane, etcd is the natural mental model: controllers read revisions, watch changes, and write small metadata updates through a replicated key-value API.</p>
-<p>If the central design is a service catalog with health checks, discovery, and operational integration across services, Consul may fit better. The service registry and health model are part of the product shape, not add-ons.</p>
-<p>If the platform already relies on tree-structured coordination, ephemeral membership nodes, and session semantics, ZooKeeper may be the clearer fit, especially in ecosystems that already speak its patterns.</p>
-<p>The choice is not a universal ranking. It is a fit between primitives and workload.</p>
-<h2>The Production Trade-Off</h2>
-<p>Consensus-backed coordination buys one authoritative answer for critical metadata. The price is real:</p>
-<ul>
-<li>writes pay quorum communication and durable log cost</li>
-<li>slow disks or slow peers can hurt the whole cluster</li>
-<li>quorum loss limits progress</li>
-<li>compaction, snapshots, and watch history need operational care</li>
-<li>client behavior under timeouts and session loss matters</li>
-</ul>
-<p>That trade-off is worth paying for a leader lease, cluster membership, or control-plane configuration that must not split brain. It is usually not worth paying for user profiles, telemetry, large documents, queue payloads, or high-volume business events.</p>
-<p>The rule of thumb is blunt: if the data is large, high-churn, user-facing, or merely convenient to store, it probably does not belong in the consensus store. If disagreement about it can break the control plane, it may.</p>
-<h2>Choosing Among Them</h2>
+<p>etcd, Consul, and ZooKeeper can all help build coordination systems, but their natural primitives lead clients toward different designs. The product name is the last part of the decision.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>Atlas needs to keep three promises separate:</p>
+<ol>
+<li><strong>Configuration authority:</strong> controllers must apply changes from one ordered, authoritative version of desired state.</li>
+<li><strong>Service discovery:</strong> callers should find currently healthy instances without treating a stale membership hint as ownership proof.</li>
+<li><strong>Leader ownership:</strong> a worker that lost its right to lead must stop acting, even if it wakes up late.</li>
+</ol>
+<p>The naive design puts all three into one generic “coordination database,” lets clients watch keys, and treats a successful lock acquisition as permanent authority. This works while connections stay up and the cluster is quiet. It becomes unsafe when the client has partial knowledge.</p>
+<p>For example, a watch notification says that something changed. It does not prove the client observed every transition while disconnected. A lease or session says the coordination service may remove an ownership record after its rules are met. It does not physically stop the old process from sending a request. The downstream system needs a revision or fencing value to reject a stale actor.</p>
+<h2>Start With the Coordination Shape</h2>
+<p>Before evaluating products, write the smallest contract for each record:</p>
 <table>
 <thead>
 <tr>
-<th>Need</th>
-<th>Likely Fit</th>
-<th>Reason</th>
+<th>Record</th>
+<th>Writer</th>
+<th>Reader reaction</th>
+<th>Failure boundary</th>
+<th>Required evidence</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Kubernetes-style controller metadata</td>
-<td>etcd</td>
-<td>Revisioned KV, watches, leases, and Raft-backed control-plane state</td>
+<td><code>desired/version</code></td>
+<td>Controller API</td>
+<td>Reconcile from a known revision</td>
+<td>Watch disconnect or compaction</td>
+<td>Current value plus revision</td>
 </tr>
 <tr>
-<td>Integrated service discovery and health catalog</td>
-<td>Consul</td>
-<td>Service registration, health checks, discovery APIs, KV, and sessions</td>
+<td><code>service/payments/instance-7</code></td>
+<td>Service agent</td>
+<td>Route only to an eligible instance</td>
+<td>Failed health check or deregistration</td>
+<td>Discovery/health semantics</td>
 </tr>
 <tr>
-<td>Session and ephemeral-node coordination tree</td>
-<td>ZooKeeper</td>
-<td>Znodes, watches, sessions, ephemeral presence, and classic coordination recipes</td>
+<td><code>leader/reconciler</code></td>
+<td>Candidate controller</td>
+<td>Perform leader-only work</td>
+<td>Lease/session loss or process pause</td>
+<td>Current ownership plus fencing value</td>
 </tr>
 </tbody>
 </table>
-<p>This table is not a replacement for operational evaluation. It is a way to start from the coordination shape rather than from branding. The real decision should also include operator familiarity, ecosystem integration, client library behavior, backup/restore procedures, and failure-mode testing.</p>
-<h2>Common Misreadings</h2>
-<p>These systems are not general-purpose application databases. They expose storage APIs, but they are optimized for small, critical metadata that benefits from strong coordination.</p>
-<p>A distributed lock is not automatically safe. Most lock-like APIs are lease or session based, so long pauses, timeouts, and delayed clients still require fencing, ownership checks, or idempotent downstream operations.</p>
-<p>Watches are not durable queues. They are coordination notifications that need resync logic, especially after reconnects, compaction, or long client pauses.</p>
+<p>This table prevents a common category error: treating all changing metadata as the same kind of truth. Desired state needs an authoritative history. Discovery needs a usable view of available instances. Leader election needs a way to deny stale leaders.</p>
+<h2>The Initial Design: Watch Events as the Whole State</h2>
+<p>Suppose a controller reads configuration at revision <code>840</code>, starts a watch, and updates its local cache whenever an event arrives.</p>
+<div class="codehilite"><pre><span></span><code>read desired state @ revision 840
+start watch after 840
+apply each received change
+</code></pre></div>
+
+<p>This is a good starting shape. It is efficient when the connection remains active and the watch can deliver the requested history.</p>
+<p>Now the controller loses its connection for ten minutes. During that time, Atlas writes revisions <code>841</code> through <code>970</code> and the coordination store compacts older history. The controller reconnects and asks to resume at <code>841</code>. It cannot safely assume a new watch alone will rebuild its cache; the historical range may be gone.</p>
+<p>etcd documents this explicitly: watches stream changes from a chosen revision, but a watcher that starts from or falls behind a compacted revision is canceled. The correction is not “never use watches.” The correction is to make resynchronization part of the client contract:</p>
+<div class="codehilite"><pre><span></span><code>1. read a complete current snapshot and its revision R
+2. reconcile local state with that snapshot
+3. watch from R + 1
+4. if the watch ends or reports compaction, repeat from step 1
+</code></pre></div>
+
+<p>The snapshot is the authority; events are the efficient way to stay current after that boundary.</p>
+<h2>The Better Model: Products Expose Different Contracts</h2>
+<h3>etcd: revisioned control-plane state</h3>
+<p>etcd is a natural fit when the main job is a compact, strongly coordinated key space that custom controllers read, compare, update, and watch. Its API exposes revisions, transactions with comparisons, watches from a revision, and leases with TTLs.</p>
+<p>In plain English, a revision lets a controller name the state it observed. A conditional transaction lets it say, “write this only if the state is still the version I checked.” A lease lets the cluster associate keys with liveness evidence; if keepalives stop and the lease expires, the attached keys are deleted.</p>
+<p>In Atlas, etcd fits <code>desired/version</code> and a controller ownership record when the controller also sends a fencing value to the thing it controls. The lease can remove the old record. The fencing value lets a database, worker, or API reject work from an earlier owner.</p>
+<h3>Consul: discovery and health-aware coordination</h3>
+<p>Consul is a natural fit when the central problem is service registration, health, and discovery across a changing service fleet. Its service catalog lets clients discover and monitor service instances; its sessions can be combined with the KV store for advisory locks and client-side leader election.</p>
+<p>This does not make every Consul session a proof that its holder is the only process still running. Consul documents lock acquisition as advisory: clients are expected to obey it. Session invalidation can release or delete associated locks, and TTL expiration is a lower bound for invalidation, not a promise that expiry occurs at one exact instant.</p>
+<p>That makes Consul a good fit for Atlas's service-discovery promise and for cooperative coordination among well-behaved clients. For an irreversible leader-only side effect, carry Consul's changing lock index or another monotonic fencing value to the downstream resource. Do not rely on elapsed TTL alone.</p>
+<h3>ZooKeeper: a session-oriented coordination tree</h3>
+<p>ZooKeeper is a natural fit when an ecosystem already uses its hierarchical znode model, session semantics, ephemeral nodes, sequential nodes, and coordination recipes. An ephemeral znode exists while the creating session remains active and is removed when the session ends. That directly represents “this registration belongs to this live session.”</p>
+<p>Its watch model also teaches an important client lesson. Standard ZooKeeper watches are one-time triggers. After receiving an event, a client must set another watch; changes can occur in the gap. While disconnected, the client receives no watches and should act conservatively until it reconnects and resynchronizes.</p>
+<p>For Atlas's older job framework, ZooKeeper can therefore be a good compatibility fit. The framework must still reconstruct state after reconnecting and ensure an old leader cannot perform a protected action after losing its session.</p>
+<h2>Worked Design Review: Atlas Chooses Boundaries</h2>
+<p>The team now reviews each promise against the system that owns its critical semantics. The following states and timings are illustrative.</p>
+<p>| Requirement | Candidate fit | Client rule | What can still fail |
+| --- | --- | --- |
+| Controllers reconcile <code>desired/version</code> | etcd | Read snapshot at revision <code>R</code>; watch from <code>R + 1</code>; resync after compaction or reconnect | A paused controller can act on stale cached work unless writes are conditional or fenced |
+| Callers locate healthy payment instances | Consul | Query discovery/health data; treat it as routing information, not leader authority | Health and reachability observations can lag; requests still need normal retry and failure handling |
+| Existing batch jobs use session-owned election | ZooKeeper | Re-read election state and re-arm watches after a session or connection event | A former leader may still run locally; protected targets need to reject stale epochs |</p>
+<p>The important design choice is not “run three databases for the same record.” Each record has one authoritative owner. Atlas might use etcd for the desired-state control plane, Consul for service discovery, and ZooKeeper only where the legacy framework already owns a separate election contract. Copying the same leader record among them would create competing authority.</p>
+<p>So far, we have moved from “pick a distributed store” to “assign one owner and one recovery rule to each coordination fact.” This matters because consensus makes a history defensible, but clients still need to recover after missed observations and stop when their authority becomes stale.</p>
+<h2>Trade-offs, Limits, and Signals</h2>
+<p>The trade-off is that consensus-backed coordination buys a clear answer for small, high-value metadata, but writes pay replication and durability costs and clients inherit recovery work.</p>
+<ul>
+<li><strong>Watch-based designs cost resync logic.</strong> A reconnect is not proof that no update was missed. Track watch cancellations, compaction responses, and time since the last successful snapshot.</li>
+<li><strong>Lease and session designs cost careful authority checks.</strong> They improve cleanup of ownership records, but a paused or partitioned process can continue locally. Track expired sessions, lease keepalive failures, rejected fencing values, and leader changes.</li>
+<li><strong>Discovery optimizes routing, not arbitrary transactions.</strong> Treat health data as a decision input under its documented freshness model, not as a substitute for an application's own correctness checks.</li>
+<li><strong>Small authoritative records are the intended workload.</strong> Large documents, high-volume telemetry, queue payloads, and hot business data make quorum latency and storage pressure part of the application hot path.</li>
+<li><strong>Multiple systems cost operational clarity.</strong> Use more than one only when their authority boundaries are explicit; otherwise the integration itself becomes a coordination problem.</li>
+</ul>
+<p>The boundary appears in a simple question: “If this client wakes up after a partition, what evidence lets it safely resume?” If the answer is only “its old local cache” or “its lease probably has not expired,” the design needs a snapshot, a current revision, or fencing before it acts.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> An etcd controller's watch is canceled because its requested revision was compacted. Should it start a new watch at the latest revision and keep its old cache?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It must first rebuild from a complete current read and record that snapshot's revision. A new watch then keeps that known state current. The old cache may omit changes that were compacted while the controller was away.</p>
+<p><strong>Check:</strong> A Consul session lock is released after its holder's TTL expires. Can the old holder safely keep issuing leader-only writes?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The holder may be paused or partitioned and unaware of the expiry. The protected target should verify a current fencing or sequencer value, not trust the former holder's local clock.</p>
+<h2>Practice: Review a “Universal Coordination Store” Proposal</h2>
+<p>A team proposes one consensus-backed store for 5 MB customer profiles, clickstream events, a service catalog, a controller's desired state, and a distributed lock. Clients maintain local caches solely from watch events and write leader-only jobs without a fencing value.</p>
+<p>Redesign the boundary. Decide which records belong in the coordination system, give the watch-recovery rule, and name the smallest protection needed for leader-only work.</p>
+<p><strong>Model answer:</strong> Keep small, high-value coordination facts such as desired state, ownership metadata, and perhaps service-catalog metadata in a system whose primitives match their contract. Move customer profiles and clickstream events to stores designed for application data and event throughput. For every cache, read a full snapshot at revision <code>R</code>, watch from <code>R + 1</code>, and resync after disconnect or compaction. Give each successful leader acquisition a monotonic fencing/epoch value and require the protected resource to reject requests with an older value. A lock record alone cannot stop a stale process.</p>
 <h2>Connections</h2>
-<p>The previous lesson on exactly-once, idempotency, and deduplication matters here because control-plane primitives often create the identities and ownership boundaries that make retries safe. A lease or compare-and-swap can coordinate a step, but the side effect still needs a safe boundary.</p>
-<p>The next lesson on Jepsen-style verification follows naturally. Systems that hold leader elections, leases, watches, and critical metadata need evidence that their observable behavior still satisfies the contract under partitions, pauses, failover, and client retries.</p>
+<p>The previous lesson showed how idempotency and durable operation identity make retries safe. Coordination primitives can decide who may attempt a step, but they do not make the external side effect idempotent; that boundary still needs its own contract.</p>
+<p>The next lesson uses Jepsen-style verification to turn these API claims into histories, faults, and invariants. A watch resync rule, lease-expiry response, and fencing check are all testable client-visible contracts.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://etcd.io/docs/">etcd Documentation</a><ul>
-<li>Focus: Watch, lease, transaction, revision, snapshot, and operational behavior for Raft-backed control-plane state.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs">Consul Documentation</a><ul>
-<li>Focus: Service discovery, health checks, sessions, KV, and datacenter-oriented operations.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://zookeeper.apache.org/doc/current/">Apache ZooKeeper Documentation</a><ul>
-<li>Focus: Znodes, sessions, watches, ephemeral nodes, and coordination recipes.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf">ZooKeeper: Wait-free Coordination for Internet-scale Systems</a><ul>
-<li>Focus: The coordination-service model and why ZooKeeper exposes primitives instead of a generic database.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.6/learning/api/">etcd API</a> — Focus: Revisions, transactions, watches, compaction responses, and TTL leases.</li>
+<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/use-case/service-discovery">Consul: Service Discovery</a> — Focus: Service catalog, health, and discovery semantics.</li>
+<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/automate/session">Consul Sessions and Distributed Locks</a> — Focus: Advisory locks, session invalidation, TTL limits, and the lock index as a sequencer.</li>
+<li>[DOC] <a href="https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html">ZooKeeper Programmer's Guide</a> — Focus: Session-bound ephemeral nodes, one-time watches, and safe behavior across disconnection.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>etcd, Consul, and ZooKeeper are coordination systems first; storage is the surface through which they expose strongly ordered metadata.</li>
-<li>The right choice depends on primitives and workload shape: controller KV, discovery and health, or session-oriented coordination tree.</li>
-<li>Consensus cost is worth paying for small critical control-plane state, not for bulk application data or high-throughput hot paths.</li>
+<li>etcd, Consul, and ZooKeeper are coordination systems whose API semantics matter more than their shared ability to store records.</li>
+<li>A watch is an incremental view after a known snapshot; reconnect and compaction require resynchronization.</li>
+<li>Leases and sessions clean up ownership records, but fencing is what lets a protected resource reject a stale actor.</li>
+<li>Use consensus-backed state for small facts whose disagreement is dangerous, and give every fact one authoritative owner.</li>
+<li>A product choice is defensible only when its revisions, health model, watches, sessions, and recovery behavior match the workload's contract.</li>
 </ul>
 </section>
 
@@ -251,7 +257,7 @@
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

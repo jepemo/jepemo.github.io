@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,121 +81,220 @@
 <section class="stack-block lesson-content-shell">
   <h1>Raft Log Replication and Commit Semantics</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Raft separates replication from commitment so followers can receive and repair log entries before the cluster exposes them as authoritative state.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace how <code>AppendEntries</code> proves a shared prefix and repairs a follower's divergent suffix.</p>
+</li>
+<li>
+<p>Distinguish an entry that is local, replicated, committed, and applied.</p>
+</li>
+<li>
+<p>Explain why a Raft leader counts replicas directly only for entries from its current term.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Raft lets a leader copy and repair tentative log entries, but exposes them to the state machine only after current-term quorum evidence makes the ordered prefix authoritative.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a Raft leader accepts a client command to create a namespace. It appends the command locally and sends it to followers. One follower stores it quickly, another is slow, and two others are temporarily unreachable. The command now exists on more than one machine, but the cluster should not yet treat it as durable committed truth.</p>
-<p>That gap is the key idea. Replication is a placement fact: where has the entry been stored? Commitment is a consensus fact: has the protocol gathered enough evidence that this entry belongs to the authoritative history future leaders must preserve?</p>
-<p>Raft needs the distinction because leaders can fail. A leader may replicate an entry to some followers and then disappear before the cluster has enough evidence to commit it. A later leader may have to repair or overwrite an uncommitted suffix. If the old leader had already exposed that suffix to users, the system would have made unstable history visible.</p>
-<p>The trade-off is that Raft accepts a little more bookkeeping and latency before applying commands, in exchange for a clearer safety boundary: only committed entries may affect the state machine.</p>
-<h2>AppendEntries Is a Consistency Check, Not Just Shipping</h2>
-<p>Raft's leader does not blindly copy log records to followers. Each append request carries information about the entry immediately before the new entries:</p>
-<div class="codehilite"><pre><span></span><code>AppendEntries:
-  term
-  leaderId
-  prevLogIndex
-  prevLogTerm
-  entries
-  leaderCommit
+<p>The leader of a five-node cluster receives <code>grant lease to worker-12</code>. It appends the command to its own log and sends it to four followers. One follower stores it; two replies are delayed; one server is unreachable.</p>
+<p>At first, the entry looks real. It is on disk in two places, including the leader. But the leader may crash before reaching a majority. A new leader might not contain that entry and may repair those two copies toward a different suffix. If the old leader had already applied the lease to the state machine, the service would have made a decision visible that the consensus protocol was not yet forced to preserve.</p>
+<p>Raft therefore separates four states:</p>
+<div class="codehilite"><pre><span></span><code>local       -&gt; stored only on this server&#39;s log
+replicated  -&gt; known stored on one or more followers too
+committed   -&gt; part of the authoritative log prefix
+applied     -&gt; executed by the state machine
 </code></pre></div>
 
-<p>The follower uses <code>prevLogIndex</code> and <code>prevLogTerm</code> to answer a simple question:</p>
-<div class="codehilite"><pre><span></span><code>Do my log and the leader&#39;s log share the prefix where this append begins?
+<p>The key correction is that “stored by a majority” is not a complete commit rule after a leadership change. A leader advances commit by counting a majority for an entry in its <strong>current term</strong>. That restriction protects old entries until a current leader has established an authoritative prefix around them.</p>
+<h2>The Situation: A Leader Replicates a Log, Not Individual Facts</h2>
+<p>Continue with the five-node Raft cluster from the previous lesson. <code>L</code> is the elected leader in term <code>9</code>; <code>F1</code> through <code>F4</code> are followers. A log entry contains a state-machine command and the term in which its leader received it:</p>
+<div class="codehilite"><pre><span></span><code>(index 41, term 9, command = grant lease to worker-12)
 </code></pre></div>
 
-<p>If the answer is yes, the follower can append the new entries after that point. If the answer is no, the follower rejects the request. The leader then backs up and tries an earlier prefix until it finds the place where the logs agree.</p>
-<p>The repair path looks like this:</p>
-<div class="codehilite"><pre><span></span><code>leader:   [1][2][3][4][5][6]
-follower: [1][2][3][X][Y]
-
-shared prefix: [1][2][3]
-divergent suffix on follower: [X][Y]
-leader replaces suffix with: [4][5][6]
+<p>The log is an ordered history. If two replicas apply different commands at index <code>41</code>, they can reach different states even if every later command is identical. Raft's safety target is therefore not merely “copies exist.” It is that a state machine never applies a different command at an already applied index.</p>
+<p>The leader keeps two useful progress values for each follower:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nextIndex[F]</code></td>
+<td>The next log index the leader will try to send to follower <code>F</code>.</td>
+</tr>
+<tr>
+<td><code>matchIndex[F]</code></td>
+<td>The highest index the leader knows follower <code>F</code> has stored.</td>
+</tr>
+<tr>
+<td><code>commitIndex</code></td>
+<td>Highest index the leader knows is committed.</td>
+</tr>
+<tr>
+<td><code>lastApplied</code></td>
+<td>Highest index already applied to the state machine.</td>
+</tr>
+</tbody>
+</table>
+<p>The first two guide network repair. The last two guard what becomes externally meaningful. All four move forward monotonically in the normal protocol; they are not interchangeable counters.</p>
+<h2>The Initial Model: Acknowledged Copy Means Commit</h2>
+<p>We might first think: “If the leader and one follower have an entry, the entry is replicated, so the client can treat it as complete.” This fits a two-node thought experiment where those two nodes happen to be the required quorum.</p>
+<p>It fails in a five-node cluster. Leader plus one follower is only two copies, not the required majority of three. More importantly, a later leader may have to remove an uncommitted suffix from a follower whose log diverged during an old leadership period. Local existence and even partial replication are evidence about storage, not yet a promise about the authoritative history.</p>
+<p>The stronger model has two parts:</p>
+<ol>
+<li>first, prove a follower shares the leader's prefix before extending it;</li>
+<li>then, advance the committed prefix only under Raft's term-aware quorum rule.</li>
+</ol>
+<h2>The Mechanism: Prove the Prefix, Then Extend It</h2>
+<p><strong>Plain meaning:</strong> Do not append after an unknown past. Find the last point where leader and follower agree, replace only the follower's uncommitted conflicting suffix, and apply only the prefix the leader has committed.</p>
+<p><strong>In this scenario:</strong> <code>L</code> sends <code>AppendEntries</code> with the index and term immediately before its new entries. A follower accepts only when that prior entry matches its own log.</p>
+<p><strong>Technical name:</strong> This is Raft's <strong>log-matching</strong> rule, carried by <code>AppendEntries</code> RPCs.</p>
+<h3><code>AppendEntries</code> is a consistency check</h3>
+<p>Each request includes:</p>
+<div class="codehilite"><pre><span></span><code>term          leader&#39;s current term
+leaderId      current leader identity
+prevLogIndex  index immediately before the new entries
+prevLogTerm   term at that index in the leader&#39;s log
+entries[]     entries to append; empty for a heartbeat
+leaderCommit  leader&#39;s commitIndex
 </code></pre></div>
 
-<p>This is how Raft maintains the log matching property: if two logs contain an entry with the same index and term, then they share the same prefix up to that entry. The property is not a magic result of having a leader. It comes from this repeated discipline: prove the prefix, then extend it.</p>
-<h2>Replicated, Committed, and Applied</h2>
-<p>Raft has three different states that are easy to collapse if you move too quickly:</p>
-<div class="codehilite"><pre><span></span><code>stored in a log      -&gt; replicated somewhere
-safe protocol truth  -&gt; committed
-visible behavior     -&gt; applied to the state machine
+<p>The follower first rejects a stale term. It then asks one narrow question:</p>
+<div class="codehilite"><pre><span></span><code>Do I have prevLogIndex, and does its term equal prevLogTerm?
 </code></pre></div>
 
-<p>A leader tracks follower progress with two useful pieces of state:</p>
-<ul>
-<li><code>nextIndex</code>: the next log index the leader will try to send to that follower</li>
-<li><code>matchIndex</code>: the highest log index the leader knows that follower has stored</li>
-</ul>
-<p>Suppose the leader has entries through index <code>43</code>:</p>
-<div class="codehilite"><pre><span></span><code>leader log:    40 41 42 43
-
-matchIndex:
-  leader    -&gt; 43
-  follower1 -&gt; 43
-  follower2 -&gt; 42
-  follower3 -&gt; 39
-  follower4 -&gt; 42
+<p>If no, the leader lowers <code>nextIndex</code> for that follower and tries an earlier prefix. If yes, the follower can safely compare the new entries: a conflict at the same index but a different term means it deletes that entry and everything after it, then appends the leader's suffix.</p>
+<p>Deleting here is not arbitrary data loss. A follower may discard only a divergent <strong>uncommitted</strong> suffix; a committed entry must be present in every later leader's log. The repair rule makes the visible log relation precise:</p>
+<div class="codehilite"><pre><span></span><code>same index and same term
+  -&gt; same complete prefix through that index
 </code></pre></div>
 
-<p>In a five-node cluster, a majority is three nodes. Here, a majority has stored at least index <code>42</code>. That makes index <code>42</code> a candidate for commit, but Raft includes one more important restriction: a leader commits entries from its current term by counting replicas. Once a current-term entry is committed, earlier entries become committed as part of the same prefix.</p>
-<p>That current-term rule prevents an old replicated entry from being declared committed too casually after leadership changes. The practical result is:</p>
-<div class="codehilite"><pre><span></span><code>do not apply merely because an entry exists
-do not apply merely because one leader wrote it locally
-apply after the commit index says the prefix is authoritative
+<h2>Worked Trace A: Repair a Follower Before Counting It</h2>
+<p>The following logs are illustrative. <code>L</code> is leader in term <code>9</code>. It shares entries <code>1</code> through <code>3</code> with <code>F4</code>, but <code>F4</code> kept an uncommitted suffix from an older leader.</p>
+<div class="codehilite"><pre><span></span><code>L:  [1:t4] [2:t4] [3:t5] [4:t8] [5:t9]
+F4: [1:t4] [2:t4] [3:t5] [4:t6] [5:t6]
 </code></pre></div>
 
-<p>This is the boundary that keeps the state machine from observing a log suffix that might still be repaired away.</p>
-<h2>Worked Example: The Entry That Exists but Must Not Run</h2>
-<p>Consider a five-node cluster in term <code>8</code>. Leader <code>L8</code> appends entry <code>50</code> with command <code>charge(invoice-7)</code>. It stores the entry locally and sends it to follower <code>F1</code>, but then crashes before reaching a majority.</p>
-<p>At that moment:</p>
-<div class="codehilite"><pre><span></span><code>L8: entry 50 present
-F1: entry 50 present
-F2: entry 50 absent
-F3: entry 50 absent
-F4: entry 50 absent
+<h3>Step 1: the optimistic append fails</h3>
+<p><code>L</code> initially believes <code>F4</code> may already have index <code>5</code>, so it sends an <code>AppendEntries</code> request whose previous entry is <code>(index 5, term 9)</code>. <code>F4</code> has index <code>5</code>, but its term is <code>6</code>, not <code>9</code>. It rejects the request.</p>
+<div class="codehilite"><pre><span></span><code>L -&gt; F4: prevLogIndex=5, prevLogTerm=9
+F4 -&gt; L: failure
 </code></pre></div>
 
-<p>The command exists on two machines. It is still not committed. A later leader in term <code>9</code> might not contain entry <code>50</code>, and it may repair the cluster toward a different suffix. If <code>charge(invoice-7)</code> had already been applied to the state machine, the system would have exposed a result that the consensus log was not forced to keep.</p>
-<p>Now compare a safer case. A leader in term <code>9</code> appends entry <code>51</code>, replicates it to a majority, and advances <code>commitIndex</code> to <code>51</code>. Once that happens, the state machines can apply committed entries in order:</p>
-<div class="codehilite"><pre><span></span><code>log present locally -&gt; commitIndex advances -&gt; lastApplied catches up
+<p>The rejection does not tell <code>L</code> to invent another history. It tells it that its assumed shared prefix was too long.</p>
+<h3>Step 2: the leader finds the shared prefix</h3>
+<p><code>L</code> decreases <code>nextIndex[F4]</code> and retries. It eventually reaches <code>(index 3, term 5)</code>, which <code>F4</code> does contain. Now the leader sends entries <code>4:t8</code> and <code>5:t9</code> after that verified point.</p>
+<div class="codehilite"><pre><span></span><code>L -&gt; F4: prevLogIndex=3, prevLogTerm=5,
+         entries=[4:t8, 5:t9]
 </code></pre></div>
 
-<p>This ordering is why Raft separates:</p>
-<ul>
-<li>the last log entry stored</li>
-<li>the highest committed index</li>
-<li>the highest applied index</li>
-</ul>
-<p>The log can contain tentative future history. The state machine should only see committed history.</p>
-<h2>Operational Failure Modes</h2>
-<p>Several production symptoms come from confusing these states.</p>
-<p>"The follower has the entry, so the client is safe" is too weak. One follower plus the leader is not necessarily enough in a five-node cluster. Client-visible durability depends on commitment, not mere presence on some disks.</p>
-<p>"Followers deleting entries means data loss" is also incomplete. If those entries were part of an uncommitted divergent suffix, deleting them is the repair mechanism that brings the follower back to the leader's authoritative prefix.</p>
-<p>"The leader wrote it locally, so it can apply immediately" breaks the safety boundary. The leader is a coordinator, not a one-node source of truth. Applying before commitment can expose state that leadership change might later invalidate.</p>
-<p>The trade-off is deliberate: waiting for commit may add latency and require retry behavior for clients, but it prevents unstable log suffixes from becoming externally visible system state.</p>
+<p><code>F4</code> sees a conflict at index <code>4</code>: it has term <code>6</code>, whereas the leader's entry has term <code>8</code>. It removes its entries <code>4:t6</code> and <code>5:t6</code>, then appends the leader's entries.</p>
+<div class="codehilite"><pre><span></span><code>F4 after repair: [1:t4] [2:t4] [3:t5] [4:t8] [5:t9]
+</code></pre></div>
+
+<p>Only now may <code>L</code> advance <code>matchIndex[F4]</code> to <code>5</code>. The follower is a repaired copy of the leader's log, not simply a machine that received a packet.</p>
+<h2>The Mechanism Continues: Commit Is Term-Aware Quorum Evidence</h2>
+<p>Replication says what a server has stored. The leader commits conservatively. It may advance <code>commitIndex</code> to an index <code>N</code> when:</p>
+<div class="codehilite"><pre><span></span><code>a majority has matchIndex &gt;= N
+and log[N].term == the leader&#39;s current term
+</code></pre></div>
+
+<p>The first condition gives quorum evidence. The second is Raft's current-term restriction. Once a leader commits a current-term entry, all earlier entries in its log also become committed as part of the same authoritative prefix.</p>
+<p>Why not count a majority for every old entry directly? Consider an entry from term <code>7</code> that happens to sit on a majority after a new leader starts term <code>8</code>. Without the restriction, a later sequence of failures can let different leaders infer incompatible things about an old entry's status. Raft instead requires the term-<code>8</code> leader to commit an entry of its own term; the protocol's leader-completeness and election rules then make the earlier prefix safe to treat as committed too.</p>
+<p>This is a safety rule, not a performance preference. It may delay confirmation of old work, but it prevents a new leader from calling an ambiguous old suffix committed merely because it sees several copies at one moment.</p>
+<h2>Worked Trace B: An Old Entry Waits for a Current-Term Anchor</h2>
+<p>Five servers need three acknowledgements for a majority. New leader <code>L8</code> begins term <code>8</code> with this entry already in its log:</p>
+<div class="codehilite"><pre><span></span><code>index 42: (term 7, set owner = node-6)
+</code></pre></div>
+
+<p><code>L8</code> sees that <code>S2</code> and <code>S3</code> also store index <code>42</code>. Counting <code>L8,S2,S3</code> gives three copies. Yet <code>L8</code> does <strong>not</strong> advance <code>commitIndex</code> to <code>42</code> merely by counting that old-term entry.</p>
+<p>Instead, <code>L8</code> appends a current-term entry at index <code>43</code>. A no-op is sufficient for the example; a real client command could serve the same purpose.</p>
+<table>
+<thead>
+<tr>
+<th>Index</th>
+<th>Entry</th>
+<th>Replicas known by <code>L8</code></th>
+<th>Commit result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>42</code></td>
+<td><code>(term 7, set owner = node-6)</code></td>
+<td><code>L8,S2,S3</code></td>
+<td>not counted directly by term-8 leader</td>
+</tr>
+<tr>
+<td><code>43</code></td>
+<td><code>(term 8, no-op)</code></td>
+<td><code>L8,S2,S3</code></td>
+<td>majority plus current term: commit <code>43</code></td>
+</tr>
+</tbody>
+</table>
+<p>When <code>L8</code> advances <code>commitIndex</code> to <code>43</code>, entry <code>42</code> becomes committed as part of the prefix. State machines may now apply <code>42</code> and then <code>43</code> in order.</p>
+<p>The no-op is a teaching model of a common protocol action, not a claim that every implementation uses exactly this message at exactly this moment. The invariant is the important part: a leader uses a current-term committed entry to establish the prefix that includes earlier entries.</p>
+<p><strong>So far:</strong> a follower's matching log can still contain tentative entries, and a majority of copies can still require a term-aware commit rule. Commitment is the point where the protocol, not an individual disk, makes the ordered prefix authoritative.</p>
+<h2>Apply Only the Committed Prefix</h2>
+<p>After the leader commits, it sends its <code>leaderCommit</code> in later <code>AppendEntries</code> messages. A follower advances its own <code>commitIndex</code> only up to the leader's announced committed index and no farther than the entries it has. Each server then advances <code>lastApplied</code> one entry at a time until it reaches <code>commitIndex</code>.</p>
+<div class="codehilite"><pre><span></span><code>stored in log -&gt; commitIndex moves -&gt; lastApplied moves -&gt; state machine changes
+</code></pre></div>
+
+<p>This ordering means a state machine never sees a suffix that leadership repair may still replace. It also means “committed” does not mean every follower has already applied the entry; a slow follower can learn and apply the committed prefix later.</p>
+<h2>Trade-offs, Limits, and Signals</h2>
+<p>The trade-off is explicit. Raft gains a clear boundary between tentative copying and authoritative state. It pays in quorum latency, stable storage, follower-progress bookkeeping, and retry traffic while lagging followers find a shared prefix.</p>
+<p>This works well when a leader can communicate with a majority. It can still stall when acknowledgements cannot reach a quorum, even if many replicas hold a new entry. It does not solve client retry semantics or external side effects by itself: an applied state-machine command still needs an idempotency or operation-identity design when a client misses its reply.</p>
+<p>Useful signals include growing <code>nextIndex</code> backtracking, a large gap between <code>lastLogIndex</code> and <code>matchIndex</code> for a follower, a stagnant <code>commitIndex</code>, and a widening <code>commitIndex - lastApplied</code> gap. They reveal different conditions: divergent or lagging replicas, unavailable quorum progress, and slow local application.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “A follower receiving an entry makes it committed.”</p>
+<p><strong>Why it is tempting:</strong> The entry is now durable in more than one place.</p>
+<p><strong>Better model:</strong> It is replicated. Commitment requires the leader's term-aware majority rule; then followers learn the committed index separately.</p>
+<p><strong>Confusion:</strong> “Repairing a follower deletes committed data.”</p>
+<p><strong>Why it is tempting:</strong> The follower can remove entries from its local log.</p>
+<p><strong>Better model:</strong> Raft repairs only an uncommitted conflicting suffix. A committed entry is protected by the protocol's election and log-completeness rules.</p>
+<p><strong>Confusion:</strong> “A majority for any term lets the new leader commit immediately.”</p>
+<p><strong>Why it is tempting:</strong> Majority counting was sufficient in the simple current-leader case.</p>
+<p><strong>Better model:</strong> The leader counts replicas directly for entries from its current term. Committing a current-term entry makes its earlier prefix committed too.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> <code>F4</code> rejects <code>AppendEntries(prevLogIndex=12, prevLogTerm=9)</code> because its entry at index <code>12</code> has term <code>8</code>. What should the leader infer?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The leader and follower do not share a prefix through index <code>12</code>. It lowers <code>nextIndex[F4]</code> and retries with an earlier previous entry; it must find the matching prefix before replacing the follower's conflicting suffix.</p>
+<p><strong>Check:</strong> A term-<code>20</code> leader finds that a majority stores entry <code>77</code> from term <code>19</code>, but no term-<code>20</code> entry has been committed. May it commit <code>77</code> solely by counting those copies?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. Raft's leader rule advances commit by counting replicas for an entry from the leader's current term. Once it commits a current-term entry after <code>77</code>, <code>77</code> becomes committed as part of the preceding prefix.</p>
+<h2>Practice: Inspect a Client Acknowledgement Boundary</h2>
+<p>In a five-server cluster, term-<code>31</code> leader <code>L</code> appends <code>rotate key K</code> at index <code>105</code>. <code>L</code>, <code>F1</code>, and <code>F2</code> store it; <code>F3</code> and <code>F4</code> are unreachable. The entry is from term <code>31</code>, and <code>L</code> knows the two follower acknowledgements. <code>F1</code> is slow to apply entries.</p>
+<ol>
+<li>Can <code>L</code> advance <code>commitIndex</code> to <code>105</code>?</li>
+<li>Can the state machine on <code>F1</code> remain temporarily behind while the entry is committed?</li>
+<li>If <code>F4</code> later returns with a conflicting uncommitted suffix, what must happen before it can apply index <code>105</code>?</li>
+</ol>
+<p><strong>Model answer:</strong></p>
+<ol>
+<li>Yes. <code>L,F1,F2</code> are a majority, and index <code>105</code> is from the leader's current term.</li>
+<li>Yes. Committed and applied are distinct. <code>F1</code> applies only as <code>lastApplied</code> catches up to its committed prefix.</li>
+<li>The leader must use <code>AppendEntries</code> prefix checks to find the common point, replace <code>F4</code>'s conflicting uncommitted suffix, replicate index <code>105</code>, and communicate the committed index. Only then can <code>F4</code> apply it.</li>
+</ol>
 <h2>Connections</h2>
-<p>The previous lesson introduced Raft's strong leader. This lesson shows what the leader actually coordinates: prefix checks, follower repair, replication progress, and commit advancement.</p>
-<p>The next lesson on membership change builds directly on commit semantics. Reconfiguration is hard because it changes who counts in the majority while the log still needs a single authoritative committed history.</p>
+<p>The previous lesson established who may direct the log. This lesson shows what that leader must do before a command becomes externally meaningful: prove prefixes, repair followers, gather term-aware commit evidence, then apply in order.</p>
+<p>The next lesson changes who counts as a quorum. Joint consensus builds on this same commit boundary because a configuration change is itself a log entry whose authority must survive different membership rules.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Read the log replication and safety sections while tracking append, commit, and apply as separate states.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://raft.github.io/">The Raft Consensus Algorithm</a><ul>
-<li>Focus: Use the official resource hub for diagrams and references that make replication flow concrete.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://thesecretlivesofdata.com/raft/">The Secret Lives of Data: Raft</a><ul>
-<li>Focus: Helpful visualization for leader append, follower catch-up, and commit progression.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: follow <code>AppendEntries</code>, <code>nextIndex</code>, <code>matchIndex</code>, and the current-term commit rule in the protocol summary and safety discussion.</li>
+<li>[DOC] <a href="https://raft.github.io/">The Raft Consensus Algorithm</a> — Focus: use the official reference material to inspect leader and follower state fields.</li>
+<li>[ARTICLE] <a href="https://thesecretlivesofdata.com/raft/">The Secret Lives of Data: Raft</a> — Focus: visualize follower catch-up only after tracing the commit rule on paper.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Raft append requests prove a shared prefix before extending a follower's log; replication is not blind copying.</li>
-<li>Replicated, committed, and applied are distinct states, and only committed entries should reach the state machine.</li>
-<li>Commit semantics trade a little latency and bookkeeping for a clear safety boundary against exposing unstable log history.</li>
+<li><code>AppendEntries</code> verifies a shared prefix before a follower extends or repairs its log.</li>
+<li>Local, replicated, committed, and applied are different states; only the committed prefix may reach the state machine.</li>
+<li>A leader advances commit by counting a majority for a current-term entry; earlier entries become committed with that established prefix.</li>
+<li>Follower suffix deletion is safe only because it repairs uncommitted divergence under an authoritative leader.</li>
+<li>Raft trades extra acknowledgement and repair work for a clear boundary against exposing unstable history.</li>
 </ul>
 </section>
 
@@ -221,7 +324,7 @@ F4: entry 50 absent
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

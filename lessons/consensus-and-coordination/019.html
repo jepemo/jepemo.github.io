@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,112 +81,219 @@
 <section class="stack-block lesson-content-shell">
   <h1>Linearizable Reads, Leader Leases, and Fencing</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Linearizable reads make authority decisions reflect the current committed order, with a trade-off between low-latency reads and the evidence needed to prove that a leader, lease holder, or controller is still current.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace the evidence a leader needs before returning a current coordination read.</p>
+</li>
+<li>
+<p>Explain when a lease is a conditional read optimization rather than permanent authority.</p>
+</li>
+<li>
+<p>Show how fencing makes a paused former controller unable to change a protected resource.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A current read needs evidence that the leader and its applied state are still current; a fencing token makes an old actor harmless when that evidence later becomes stale.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a controller reads "I own the scheduler lease" from a consensus store and starts placing workloads. Then it pauses during a long garbage collection or loses contact with the cluster during a network partition. Another controller obtains a newer lease and starts placing workloads too. If the old controller wakes up and can still act on stale authority, the consensus store may have chosen correctly while the external system still suffers split-brain behavior.</p>
-<p>Linearizable reads are about making authority visible at the moment a decision is made. Leader leases are a performance tool for serving some reads without a quorum round trip each time. Fencing is the defensive layer that makes stale authority harmless when an old actor wakes up and tries to act anyway.</p>
-<p>The common misconception is that a leader can safely serve every read from local memory because it was leader recently. In reality, leadership can become stale. A read that grants permission to mutate the world needs evidence that it reflects the current committed order, not merely a plausible local cache.</p>
-<h2>Linearizable Reads Need Fresh Authority</h2>
-<p>A linearizable read behaves as if it occurred at one instant between request and response. For a coordination service, this matters when the read answers questions like:</p>
+<p>Atlas has two scheduler controllers, <code>A</code> and <code>B</code>, and a separate workload database. Only the current controller may assign a job. Controller <code>A</code> was leader a moment ago, so its local memory says it owns token <code>41</code>. Then <code>A</code> pauses during a long runtime pause and loses contact with the consensus cluster. The remaining replicas elect <code>B</code> and give it a newer token, <code>42</code>.</p>
+<p>The easy model says: “<code>A</code> was leader, so <code>A</code> can read its own state and continue.” The model works only while <code>A</code> has evidence that it is still leader. After a partition or pause, <code>A</code> cannot learn from its local log alone whether the cluster has advanced without it.</p>
+<p>Three mechanisms address different parts of this problem:</p>
 <ul>
-<li>who owns this lease?</li>
-<li>what is the current configuration?</li>
-<li>has this lock been released?</li>
-<li>what revision should my controller act on?</li>
+<li>a <strong>linearizable read</strong> returns a value that can be placed at one instant between the request and response;</li>
+<li>a <strong>leader lease</strong> can reduce the cost of some current reads, but only under explicit timing assumptions;</li>
+<li>a <strong>fencing token</strong> is checked by the protected workload database, so delayed actions from <code>A</code> lose to token <code>42</code>.</li>
 </ul>
-<p>Serving those reads from a stale leader can break correctness. A former leader may still have a plausible local log, but after a partition it might not know that a newer term exists or that a newer owner has been elected.</p>
-<p>Consensus systems use different techniques to make authority reads safe:</p>
-<ul>
-<li>route the read through the normal log path,</li>
-<li>confirm current leadership with a quorum before serving,</li>
-<li>use a lease only under explicit timing assumptions,</li>
-<li>attach revisions so clients can reason about freshness.</li>
-</ul>
-<p>The fastest method is not always the right method. A dashboard read can tolerate staleness more often than a lease read that grants permission to mutate the world.</p>
-<h2>Read Paths and Their Cost</h2>
-<p>There are several common read paths, and each one buys latency with a different kind of evidence.</p>
-<p>The most conservative path is to put the read through the replicated log, sometimes as a no-op or read barrier. Once that entry is committed, the leader knows all prior writes that could affect the read are ordered before it. This is simple to reason about, but it adds log traffic and commit latency.</p>
-<p>A cheaper path is to confirm leadership with a quorum before serving the read. Raft-style read index mechanisms use this idea: the leader establishes that it is still the current leader and that its commit index is safe enough for the read. This avoids appending every read to the log, but it still needs communication with a majority when the leader does not already have fresh evidence.</p>
-<p>The fastest path is a lease read. The leader serves locally while it believes a lease is valid. That can be correct only if the system's timing assumptions are strong enough to prevent another valid leader from existing during the same interval.</p>
-<p>Some systems also expose explicitly stale or serializable reads. Those are useful for metrics, browsing, or low-risk caches, but they should not be used to grant locks, elect owners, approve writes, or make irreversible decisions.</p>
-<h2>Leader Leases Are Timing Contracts</h2>
-<p>A leader lease says, roughly, "for this bounded interval, no other leader should be valid." That can make reads cheaper because the leader may serve them without a full round trip to a quorum each time.</p>
-<p>But a lease is a timing contract, not a proof of permanent leadership. Its safety relies on assumptions:</p>
-<ul>
-<li>clocks do not drift beyond the tolerated bound,</li>
-<li>pauses and scheduling delays stay within the model,</li>
-<li>lease expiry is interpreted conservatively,</li>
-<li>election and renewal rules prevent overlapping authority,</li>
-<li>clients and downstream systems respect the lease token.</li>
-</ul>
-<p>If those assumptions are wrong, the system may create overlapping authority.</p>
-<div class="codehilite"><pre><span></span><code>old leader pauses
-new leader obtains lease
-old leader resumes and acts
+<p>They complement rather than replace one another. A fresh read does not prevent a controller from being paused after the read. A lease does not stop a process from sending a delayed request. A fencing token does not tell a controller which desired state it missed.</p>
+<h2>The Situation: A Read That Grants Authority</h2>
+<p>Not every read has the same consequence. Atlas can show a slightly stale replica count on a dashboard without harming a job. It cannot safely use a stale value to answer “may I assign this job?”</p>
+<table>
+<thead>
+<tr>
+<th>Read</th>
+<th>Staleness consequence</th>
+<th>Suitable evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dashboard: current queue length</td>
+<td>An operator may see an older number</td>
+<td>Explicitly stale read can be acceptable</td>
+</tr>
+<tr>
+<td>Controller: current job owner</td>
+<td>Two controllers may both act</td>
+<td>Current, ordered authority evidence</td>
+</tr>
+<tr>
+<td>Client: was configuration revision <code>901</code> applied?</td>
+<td>A follow-up write may use a wrong premise</td>
+<td>Revision-aware or linearizable read</td>
+</tr>
+<tr>
+<td>Workload database: may token <code>41</code> write?</td>
+<td>A former controller may overwrite newer work</td>
+<td>Target-side comparison with highest accepted token</td>
+</tr>
+</tbody>
+</table>
+<p>A linearizable read does not mean “the value is true forever.” It means the response reflects a single point during this read's execution. If a client will act later, it still needs a conditional update, a new read, or an enforcement token appropriate to that later action.</p>
+<h2>The Initial Model: Serve from the Leader's Local Memory</h2>
+<p>Suppose <code>A</code> was leader in term <code>9</code>. It has applied through index <code>120</code> and remembers that it owns scheduler token <code>41</code>.</p>
+<div class="codehilite"><pre><span></span><code>if local_role == leader:
+    return owner=A, token=41
 </code></pre></div>
 
-<p>This is why lease design must include conservative expiry, monotonic revisions, and operational limits around clock behavior and pauses. A lease-based read can be a good optimization, but it should be treated as a claim with preconditions, not as a shortcut around consensus safety.</p>
-<h2>Fencing Makes Stale Actors Lose</h2>
-<p>Fencing is the defensive move that protects the external world from stale lease holders. Each grant carries a monotonically increasing token, epoch, term, or revision. Downstream systems reject actions with older tokens.</p>
-<div class="codehilite"><pre><span></span><code>lease token 41 -&gt; old controller
-lease token 42 -&gt; new controller
-
-storage accepts writes with token 42
-storage rejects token 41
-</code></pre></div>
-
-<p>Without fencing, a consensus store can correctly elect the new owner while an old owner still corrupts an external resource. With fencing, the stale owner may wake up, but its authority is no longer accepted.</p>
-<p>This pattern is essential for locks, schedulers, primary ownership, storage writers, and any system where a coordinator's decision authorizes side effects outside the consensus store.</p>
-<h2>Worked Example: A Stale Scheduler Lease</h2>
-<p>Consider a scheduler controller that writes assignments to a separate workload database.</p>
+<p>This is fast. It also has no freshness proof. During a partition, <code>A</code> may be isolated with one follower while the other three replicas elect <code>B</code> in term <code>10</code>. <code>B</code> commits a new owner record with token <code>42</code>. <code>A</code>'s memory is internally consistent but no longer current.</p>
+<p>The evidence from the previous lesson explains why the larger side can advance: its quorum intersects the history that later leaders must preserve. The isolated former leader cannot infer that it still holds authority merely because it has not received a revocation message. Silence can mean delay, partition, or replacement.</p>
+<p>The stronger model asks two separate questions before <code>A</code> returns an authority read:</p>
 <ol>
-<li>Controller <code>A</code> reads the coordination store and receives lease token <code>41</code>.</li>
-<li><code>A</code> pauses before writing the assignment.</li>
-<li>The lease expires, and controller <code>B</code> receives token <code>42</code>.</li>
-<li><code>B</code> writes new assignments with token <code>42</code>.</li>
-<li><code>A</code> resumes and tries to write with token <code>41</code>.</li>
+<li>Does <code>A</code> have evidence that it is still the current leader for this read?</li>
+<li>Has <code>A</code> applied enough committed state to answer at that evidence boundary?</li>
 </ol>
-<p>If the workload database does not check tokens, both controllers can write. The consensus store has not failed; the authority did not reach the resource being protected.</p>
-<p>With fencing, the workload database records the highest token it has accepted and rejects lower tokens. <code>A</code> can still send a delayed request, but the protected resource refuses to honor stale authority. The correctness boundary moves from "the old actor never wakes up" to "the old actor cannot successfully act."</p>
-<h2>Operational Failure Modes</h2>
-<p>The main failures are predictable:</p>
+<h2>The Better Model: Establish a Read Boundary</h2>
+<p>A conservative path puts a read barrier through the replicated log. Once the barrier is committed and applied, the leader can return a state-machine result that includes earlier committed writes. This is easy to reason about, but it adds log work and latency.</p>
+<p>A common alternative is a quorum-confirmed read, often described as a read-index style path. The leader contacts a quorum in its current term and receives confirmation that it still leads. That establishes a safe read index <code>R</code>. The leader then waits until its state machine has applied through at least <code>R</code> before answering from local state.</p>
+<div class="codehilite"><pre><span></span><code>quorum confirms current leadership
+    -&gt; leader obtains read boundary R
+    -&gt; leader waits for applied_index &gt;= R
+    -&gt; leader reads state and replies
+</code></pre></div>
+
+<p>The wait matters. Quorum confirmation alone can show that the leader is current, while its local state machine might still lag behind the committed boundary. Reading before application could return an older owner even though the current log already contains the new one.</p>
+<p>This is a teaching model, not a claim that every consensus API uses the same message sequence. Some systems expose a built-in linearizable read; others append a no-op or read barrier; details depend on protocol and implementation. The invariant is the same: the reply must be tied to evidence of current leadership and a state machine applied far enough to reflect the relevant committed history.</p>
+<h2>A Worked Trace: From Current Read to a Fenced Write</h2>
+<p>The following trace uses illustrative terms, indexes, and tokens.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Consensus state</th>
+<th>Controller or database action</th>
+<th>What is established</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>A</code> has term <code>9</code>, token <code>41</code>, applied index <code>120</code></td>
+<td><code>A</code> begins an authority read</td>
+<td>Its old memory alone is not enough</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>A</code> cannot obtain a quorum after a partition</td>
+<td><code>A</code> must not claim a current read</td>
+<td>Lack of quorum confirmation blocks the fast path</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Remaining quorum elects <code>B</code> in term <code>10</code></td>
+<td><code>B</code> commits owner <code>B</code>, token <code>42</code>, at index <code>121</code></td>
+<td>A newer authority record has durable evidence</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>B</code> confirms leadership with a quorum and obtains read boundary <code>121</code></td>
+<td><code>B</code> waits until <code>applied_index &gt;= 121</code></td>
+<td><code>B</code> can read the current owner result</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Workload database has accepted token <code>42</code></td>
+<td><code>B</code> writes assignment <code>job-7 -&gt; node-3</code> with token <code>42</code></td>
+<td>The protected target records the high-water token</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>A</code> resumes with a delayed request carrying token <code>41</code></td>
+<td>Database compares <code>41 &lt; 42</code> and rejects it</td>
+<td>Old process may run, but old authority cannot succeed</td>
+</tr>
+</tbody>
+</table>
+<p>Step 6 is why fencing belongs at the protected target. A consensus cluster cannot prevent <code>A</code> from waking up or prevent a delayed network packet from arriving. The workload database can reject authority that is older than the authority it already accepted.</p>
+<p><strong>Question:</strong> Could <code>A</code> use a linearizable read after it resumes, see token <code>42</code>, and then safely send the old request with token <code>41</code>?</p>
+<p><strong>Answer:</strong> No. The new read corrects <code>A</code>'s knowledge, but it does not retroactively make the old request safe. <code>A</code> must abandon or rebuild the action using current state. The database's token check remains the final protection if <code>A</code> races or behaves incorrectly.</p>
+<p>So far, the read path makes a present-tense claim about coordination state. Fencing makes a future side effect compare its authority against the target's present record.</p>
+<h2>Leader Leases: A Fast Path with Preconditions</h2>
+<p>A leader lease is a bounded claim that no other valid leader can exist during a specified interval. When an implementation can justify that claim, it may serve some linearizable reads without contacting a quorum for every one.</p>
+<p>The lease is not a universal shortcut. Its correctness depends on the implementation's named assumptions, such as conservative clock bounds, monotonic time measurement, bounded lease duration, renewal rules, and an election protocol that prevents overlap under those bounds. Long process pauses and clock anomalies are part of the safety analysis, not mere operational inconveniences.</p>
+<p>The trade-off is explicit:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>What it buys</th>
+<th>What it costs or assumes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Log/read barrier</td>
+<td>Straightforward current-read evidence</td>
+<td>Replication round and added latency</td>
+</tr>
+<tr>
+<td>Quorum-confirmed read</td>
+<td>Avoids appending every read</td>
+<td>A quorum communication round when fresh evidence is needed</td>
+</tr>
+<tr>
+<td>Leader lease</td>
+<td>Very low per-read coordination cost</td>
+<td>Strong, carefully enforced timing assumptions and conservative expiry</td>
+</tr>
+<tr>
+<td>Explicitly stale read</td>
+<td>Low latency and high availability</td>
+<td>Cannot grant authority or validate a current precondition</td>
+</tr>
+</tbody>
+</table>
+<p>Choose the path by the claim the read supports. A metrics screen may intentionally choose stale data. A lease grant, lock owner, or update precondition normally needs evidence that is current enough for that authority decision.</p>
+<h2>Where It Breaks</h2>
+<p>Leases and linearizable reads do not solve every authority problem.</p>
 <ul>
-<li>stale leaders serving authority reads,</li>
-<li>leases built on clock assumptions nobody measured,</li>
-<li>external systems accepting old tokens,</li>
-<li>clients treating a cached read as a current grant,</li>
-<li>APIs that expose a lock but no revision, token, or epoch,</li>
-<li>dashboards and controllers sharing the same stale-read path.</li>
+<li>A lease can be misconfigured or its timing assumptions can be violated. The signal is clock-skew alarms, long pauses, missed renewal deadlines, or overlapping-leader reports.</li>
+<li>A current read can become old before the client acts. The signal is a failed compare-and-swap or a rejected token; the response is to refresh the decision rather than retrying blindly.</li>
+<li>Fencing works only when every protected write path checks the monotonic token. The signal is a downstream action that succeeds with a token lower than a previously accepted one.</li>
+<li>A token may order authority without carrying the desired workload state. The controller still needs revisions, resync, and idempotent operation identity from the earlier lessons.</li>
 </ul>
-<p>The fix is to tie reads, grants, and actions to evidence: quorum confirmation, committed revisions, lease tokens, and downstream fencing checks. A design review should ask where authority is created, how freshness is proven, and which downstream system refuses stale requests.</p>
+<p>The important boundary is this: consensus can make the current owner record authoritative, but protection is incomplete until the resource that can be harmed rejects stale owners.</p>
+<h2>Trace It Yourself</h2>
+<p><strong>Check:</strong> A leader has just received quorum confirmation for read boundary <code>200</code>, but its local <code>applied_index</code> is <code>198</code>. May it return the state-machine result for a linearizable read at boundary <code>200</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It has evidence that it is current enough to establish the boundary, but its state machine has not executed entries <code>199</code> and <code>200</code>. It must apply through at least <code>200</code> before returning a result that claims to include that boundary.</p>
+<h2>Practice: Review a Lease API Claim</h2>
+<p>An API returns <code>owner=A</code> from a locally cached leader lease. It gives callers no revision or token. A caller later uses that result to delete a shared resource.</p>
+<p>Review the design.</p>
+<p><strong>A good answer should mention:</strong></p>
+<ul>
+<li>whether the read is linearizable or intentionally stale, and what evidence makes that claim true;</li>
+<li>if a lease fast path is used, its bounded timing assumptions and expiry behavior;</li>
+<li>a revision or fencing token that represents the authority the caller obtained;</li>
+<li>target-side rejection of an older token after a newer one succeeds;</li>
+<li>a conditional operation or fresh read if the action depends on state that may change between reading and acting.</li>
+</ul>
 <h2>Connections</h2>
-<p>The previous lesson explained how quorum intersection preserves commit evidence across leadership changes. This lesson asks how a read proves it is observing that current evidence before granting authority.</p>
-<p>The next lesson turns these ideas into coordination APIs: locks, leases, watches, and compare-and-swap. Those APIs are safe only when they expose revisions, tokens, and recovery behavior clearly enough that clients cannot mistake stale observations for current authority.</p>
+<p>The previous lesson explained why quorum intersection preserves evidence across leaders. Here that evidence becomes a safe read boundary and an external enforcement token.</p>
+<p>The next lesson turns these requirements into usable coordination APIs: compare-and-swap, leases, watches, and recovery contracts.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a><ul>
-<li>Focus: Study locks, leases, sessions, and client-visible coordination semantics.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://etcd.io/docs/">etcd API Guarantees</a><ul>
-<li>Focus: Use the docs to connect revisions, watches, leases, and consistency guarantees.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Read the sections on leader completeness, terms, and linearizable reads.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/spanner-googles-globally-distributed-database/">Spanner: Google's Globally-Distributed Database</a><ul>
-<li>Focus: Read for timing assumptions, external consistency, and the cost of stronger time guarantees.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby Lock Service for Loosely-Coupled Distributed Systems</a> — Focus: Locks, leases, sessions, and client-visible coordination semantics.</li>
+<li>[DOC] <a href="https://etcd.io/docs/">etcd API Guarantees</a> — Focus: Revisions, linearizable reads, leases, and watch recovery semantics.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: Terms, leader completeness, and the conditions behind safe leader reads.</li>
+<li>[PAPER] <a href="https://research.google/pubs/spanner-googles-globally-distributed-database/">Spanner: Google's Globally-Distributed Database</a> — Focus: Timing assumptions and the cost of stronger time guarantees.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Linearizable reads need evidence that the answer reflects current committed authority, especially when the read grants permission to act.</li>
-<li>Leader leases reduce read latency only under explicit timing assumptions about clocks, pauses, renewals, and elections.</li>
-<li>Fencing tokens protect external systems by making stale actors lose even when they resume and send delayed requests.</li>
+<li>A linearizable authority read needs current-leader evidence and a state machine applied through the read boundary.</li>
+<li>A current read is not a promise that the state remains current when a client acts later.</li>
+<li>Leader leases can reduce read latency only under explicit, conservatively enforced timing assumptions.</li>
+<li>Fencing moves enforcement to the protected resource, which rejects actions carrying an older token.</li>
+<li>Revisions, conditional operations, and idempotent action identities complete the gap between learning authority and using it safely.</li>
 </ul>
 </section>
 
@@ -212,7 +323,7 @@ storage rejects token 41
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

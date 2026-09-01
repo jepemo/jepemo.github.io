@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,123 +81,150 @@
 <section class="stack-block lesson-content-shell">
   <h1>Distributed Logs and Ordering Guarantees</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Distributed logs turn events into durable histories, but every ordering guarantee has a scope: one log, one partition, one key, or a deliberately expensive global boundary.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace how a keyed event becomes an ordered record and a consumer advances through that record's partition.</p>
+</li>
+<li>
+<p>State the scope of an ordering guarantee instead of calling a whole event platform “ordered.”</p>
+</li>
+<li>
+<p>Identify why replay, retries, and cross-partition workflows need rules beyond append order.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A distributed log gives durable ordered histories, but the order belongs to a named boundary—usually one partition—not automatically to every event in the system.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine an e-commerce system publishing <code>OrderPlaced</code>, <code>InventoryReserved</code>, <code>PaymentCaptured</code>, and <code>EmailScheduled</code> events. Several consumers depend on that event history: billing, fulfillment, analytics, and fraud detection. The log is not just moving messages from producers to workers. It is creating a shared record that consumers can replay, resume, and use as evidence of what happened.</p>
-<p>The trap is assuming that "the log is ordered" means "the whole platform has one global order." A single replicated log may provide one ordered history. A partitioned log usually provides order only within each partition. Across partitions, there is no free answer to which event came first unless the system adds more coordination.</p>
-<p>That scope is the central design decision. If all events for one <code>order_id</code> stay in the same partition, that order can have a coherent sequence while the platform still scales across many orders. If related events are split across keys or logs, the application must not invent a global order the infrastructure did not promise.</p>
-<p>The trade-off is direct: stronger global order gives simpler reasoning, but costs throughput, locality, and availability. Partitioned order gives parallelism, but pushes causal reasoning and cross-entity coordination back into the application.</p>
-<h2>A Log Is Shared History With Positions</h2>
-<p>A queue is often described as work waiting for workers. A log is better described as a durable sequence of facts with positions.</p>
-<div class="codehilite"><pre><span></span><code>producers ---&gt; [ distributed log ]
-                  0 1 2 3 4 5 ...
-                    ^     ^
-                    |     |
-              consumer A  consumer B
+<p>An order service publishes events for <code>order-7</code>: it is placed, inventory is reserved, payment is captured, and fulfillment can begin. Billing, fulfillment, fraud detection, and analytics all read the events.</p>
+<p>It is tempting to say, “Put events in a distributed log; the log keeps them in order.” That is a good start for one append-only sequence. It breaks when the service scales. A partitioned log contains several ordered sequences at once, and consumers can make progress through them at different speeds.</p>
+<p>The important design question is therefore not “Does this platform support ordering?” It is: <strong>which events must share an order, and what key places them inside that same ordered history?</strong></p>
+<p>For the order workflow, <code>order_id</code> is a useful key. It lets every event for <code>order-7</code> occupy one partition and therefore one local sequence. It does not create a total order between <code>order-7</code> and every other order, and it does not make retries or external side effects disappear.</p>
+<h2>The Small Situation: Two Orders, Two Histories</h2>
+<p>Use a topic called <code>order-events</code> with two partitions. The offsets below are illustrative positions, not timestamps.</p>
+<div class="codehilite"><pre><span></span><code>partition 0                         partition 1
+
+offset 88: OrderPlaced(order-8)     offset 420: OrderPlaced(order-7)
+offset 89: PaymentCaptured(order-8) offset 421: InventoryReserved(order-7)
+                                    offset 422: PaymentCaptured(order-7)
 </code></pre></div>
 
-<p>The same records can be read by many independent consumers. Each consumer tracks where it is in the history, often through an offset or equivalent position.</p>
-<p>That gives the log several useful properties:</p>
+<p>The producer uses <code>order_id</code> as its partition key. All <code>order-7</code> records go to partition 1; all <code>order-8</code> records happen to go to partition 0. Within partition 1, <code>420 -&gt; 421 -&gt; 422</code> is a meaningful append order.</p>
+<p>The number <code>422</code> does not say that <code>PaymentCaptured(order-7)</code> happened after <code>PaymentCaptured(order-8)</code> at offset <code>89</code>. Offsets belong to different histories. Comparing their integers across partitions is like comparing page 89 in one book with page 422 in another.</p>
+<p>This small fact prevents a large class of accidental guarantees. The platform can process many orders in parallel because it does not first establish one global sequence for all of them.</p>
+<h2>The Initial Model: A Topic Is One Ordered Queue</h2>
+<p>The first model works for a single unpartitioned log: producers append records, and every consumer reads positions in order.</p>
+<div class="codehilite"><pre><span></span><code>0 -&gt; 1 -&gt; 2 -&gt; 3 -&gt; 4
+</code></pre></div>
+
+<p>It becomes incomplete after partitioning. A topic is now a collection of logs. A consumer group may own one or more partitions, and each partition is assigned to one group member at a time. The group can process partition 0 and partition 1 concurrently. That parallelism is the reason to partition; it also means the group has no one automatic interleaving of their records.</p>
+<p>The naive model also hides recovery. A consumer may process a record, crash before recording its new position, and later process the same record again. The log can still be perfectly ordered. Repeated work is a question of consumer progress and side effects, not evidence that append order failed.</p>
+<p>The missing model is a log as a set of durable, partition-scoped histories plus a separately managed record of each consumer's progress.</p>
+<h2>The Better Model: Positions, Keys, and Consumer Progress</h2>
+<p><strong>Plain meaning:</strong> A log assigns each record a durable position in one history. A key chooses the history; a consumer position says how far one reader has progressed through it.</p>
+<p><strong>In this scenario:</strong> <code>order_id=order-7</code> routes the workflow to partition 1. Fulfillment reads offsets <code>420</code>, <code>421</code>, and <code>422</code> in that order, recording progress so it can resume after a failure.</p>
+<p><strong>Technical names:</strong> The ordered history is a <strong>partition</strong>. Its record position is an <strong>offset</strong>. A set of cooperating readers is a <strong>consumer group</strong>, and its stored position is a <strong>committed offset</strong> or equivalent checkpoint.</p>
+<div class="codehilite"><pre><span></span><code>producer
+  -&gt; choose partition from the key
+  -&gt; append a record at the next partition offset
+
+consumer group member
+  -&gt; fetch records from its assigned partition in offset order
+  -&gt; process them
+  -&gt; record how far it has safely progressed
+</code></pre></div>
+
+<p>The phrase “safely progressed” carries a design choice. If processing a record triggers an external action, the consumer must decide how its effect and its checkpoint relate. A log offset is evidence about reading a record; it is not evidence that an email, payment, or database transaction outside the log occurred exactly once.</p>
+<h2>A Worked Trace: One Order, a Retry, and a Restart</h2>
+<p>Assume the fulfillment consumer owns partition 1. Its next stored position is offset <code>420</code>.</p>
+<h3>Step 1: append the order's local history</h3>
+<p>The order service appends the three events with the same key:</p>
+<div class="codehilite"><pre><span></span><code>P1 / 420  OrderPlaced(order-7)
+P1 / 421  InventoryReserved(order-7)
+P1 / 422  PaymentCaptured(order-7)
+</code></pre></div>
+
+<p>The producer's configured acknowledgement and retry behavior determine when it receives a successful response and how it handles an uncertain response. A timeout is not proof that the broker rejected the append. Retrying carelessly can result in a duplicate logical event, even though each physical record still has a well-defined partition offset.</p>
+<p>For this lesson, assume one copy of each record was appended. The consumer reads them in the order shown.</p>
+<h3>Step 2: process and checkpoint</h3>
+<p>Fulfillment processes offsets <code>420</code> and <code>421</code>. It checks that the order exists and that inventory is reserved. It then records its next position as <code>422</code>—meaning it has safely finished records before <code>422</code> and should resume at <code>422</code> after a restart.</p>
+<div class="codehilite"><pre><span></span><code>processed:          420, 421
+next position:      422
+</code></pre></div>
+
+<p>This checkpoint is local to the fulfillment consumer group. Analytics may be at offset <code>420</code>; fraud detection may have replayed from <code>0</code>. Many consumers can derive independent views from the same partition because a log is a reusable history, not a one-use handoff.</p>
+<h3>Step 3: an external effect exposes the boundary</h3>
+<p>At offset <code>422</code>, fulfillment calls an external warehouse API to create a packing task. The API accepts the request, but the consumer crashes before it commits its next position, <code>423</code>.</p>
+<p>After reassignment or restart, a consumer receives offset <code>422</code> again. This is the safe default for avoiding a lost record: the checkpoint did not claim progress that was never durably recorded. But the warehouse might now see the same request twice.</p>
+<div class="codehilite"><pre><span></span><code>warehouse task created
+consumer crashes
+offset 423 was not committed
+-&gt; offset 422 is replayed
+</code></pre></div>
+
+<p>The append order is intact. The application still needs an idempotency key, a deduplication record, or an atomic boundary appropriate to the warehouse call. Those techniques are the next lesson's focus. Here, the lesson is that replay changes delivery work without changing the partition's order.</p>
+<h3>Step 4: order ends at the partition boundary</h3>
+<p>Meanwhile, another consumer processes partition 0 quickly and sees <code>PaymentCaptured(order-8)</code> before fulfillment reaches <code>PaymentCaptured(order-7)</code>. That scheduling fact does not violate anything. The topic promised each partition's order, not a global completion sequence across the topic.</p>
+<p>If a business invariant really spans two orders or two keys—for example, “only the first 100 orders may claim a limited promotion”—keying by <code>order_id</code> is not enough. The service needs an explicit shared authority or coordination boundary for the promotion. A consumer cannot reconstruct a global order from two local offsets.</p>
+<p><strong>So far:</strong> a partition gives a durable sequence and a recoverable reading position. The key decides which events receive that sequence together. Cross-partition relationships, duplicate effects, and global resource limits remain application or coordination work.</p>
+<h2>What This Changes in a Design Review</h2>
+<p>Before this model, a team may say, “All order events go to Kafka, so consumers see the workflow in order.” After it, a precise statement is possible:</p>
+<div class="codehilite"><pre><span></span><code>All events for one order_id share one partition.
+Within that partition, consumers process records in offset order.
+Consumers may replay records after failure.
+No global order is promised across different order_ids or partitions.
+</code></pre></div>
+
+<p>That statement creates better questions:</p>
 <ul>
-<li>consumers can resume after crashes</li>
-<li>new services can replay old history</li>
-<li>delayed consumers can catch up at their own pace</li>
-<li>audit and repair jobs can reread from a known point</li>
-<li>multiple systems can derive different views from the same facts</li>
+<li>Which key contains the invariant that needs serial processing?</li>
+<li>Can a hot key make one partition a throughput bottleneck?</li>
+<li>What does a consumer's committed offset mean relative to its side effect?</li>
+<li>If two streams must be related, what correlation ID, state check, or coordination mechanism makes the relation explicit?</li>
 </ul>
-<p>This is why logs sit close to coordination. A consumer can ask, "What have I processed?" and answer with an offset. A service can rebuild state by replaying the same sequence. A replicated state machine can use an ordered log to drive deterministic apply.</p>
-<p>The cost is that the log becomes an important boundary. Retention, duplicate handling, producer retry behavior, consumer commits, and partitioning all affect what the application can safely infer from the history.</p>
-<h2>Ordering Scope Is the Real Contract</h2>
-<p>Ordering guarantees are real, but they are never floating in the abstract. They are attached to a scope.</p>
-<p>One unpartitioned log can expose a sequence like:</p>
-<div class="codehilite"><pre><span></span><code>e1 -&gt; e2 -&gt; e3 -&gt; e4
-</code></pre></div>
-
-<p>A partitioned log exposes several local sequences:</p>
-<div class="codehilite"><pre><span></span><code>partition 0: a1 -&gt; a2 -&gt; a3
-partition 1: b1 -&gt; b2 -&gt; b3
-partition 2: c1 -&gt; c2 -&gt; c3
-</code></pre></div>
-
-<p>Inside a partition, order is meaningful. Across partitions, the log usually does not promise a single interleaving. Asking whether <code>a2</code> happened before <code>b2</code> may be outside the contract.</p>
-<p>This is why partition keys are architecture decisions. If the application needs all events for an order to be processed sequentially, key by <code>order_id</code>. If it needs all events for a customer account to be sequential, key by <code>customer_id</code>. If it needs a global ordering across all events, it is asking for a much tighter coordination boundary.</p>
-<p>The useful habit is to say the guarantee out loud:</p>
-<div class="codehilite"><pre><span></span><code>order per partition
-order per entity key
-order per stream
-global order across everything
-</code></pre></div>
-
-<p>Each phrase implies a different cost profile.</p>
-<h2>Worked Example: One Order, Many Workflows</h2>
-<p>Suppose an order emits these events:</p>
-<div class="codehilite"><pre><span></span><code>OrderPlaced(order-7)
-InventoryReserved(order-7)
-PaymentCaptured(order-7)
-EmailScheduled(order-7)
-</code></pre></div>
-
-<p>If every event for <code>order-7</code> goes to the same partition, consumers can process that order's sequence in order:</p>
-<div class="codehilite"><pre><span></span><code>partition 4:
-  OrderPlaced -&gt; InventoryReserved -&gt; PaymentCaptured -&gt; EmailScheduled
-</code></pre></div>
-
-<p>The system can still process other orders in parallel on other partitions:</p>
-<div class="codehilite"><pre><span></span><code>partition 1: order-2 events
-partition 4: order-7 events
-partition 9: order-11 events
-</code></pre></div>
-
-<p>That design buys per-order ordering without forcing every event in the company through one global sequence.</p>
-<p>Now change the design. Put inventory events in one log, payment events in another, and email events in a third. Each log may preserve its own order perfectly, but the application no longer has one authoritative sequence for the whole order workflow. If it needs to reason about cross-log causality, it must add explicit correlation, idempotency, state checks, or another coordination mechanism.</p>
-<p>The log did not fail. The order guarantee changed because the scope changed.</p>
-<h2>Operations Can Distort What Order Feels Like</h2>
-<p>A correct log can still surprise teams during normal operations.</p>
-<p>Retries can produce duplicates. Replay can make old events appear again to a consumer that reset its offset. Consumer group rebalances can pause ownership of a partition and resume from the last committed position. Leader failover can preserve the log prefix while changing latency. A slow consumer can lag behind without the log being out of order.</p>
-<p>The practical ordering guarantee is a combination:</p>
-<div class="codehilite"><pre><span></span><code>ordering guarantee
-  = log structure
-  + partition key
-  + producer retry discipline
-  + consumer ownership model
-  + offset management
-  + recovery behavior
-</code></pre></div>
-
-<p>So "the broker guarantees order" is only the beginning. The application must also handle duplicates, choose keys carefully, commit offsets at the right time, and design consumers to be idempotent when replay is possible.</p>
-<p>The trade-off repeats: logs make durable replay and ordered processing easier, but they make ordering scope, offset discipline, and duplicate handling part of the application contract.</p>
-<h2>Common Misreadings</h2>
-<p>"We use a distributed log, so events are globally ordered" is usually wrong. Ask whether order is per log, per partition, per key, or truly global.</p>
-<p>"A duplicate means the log violated ordering" is also wrong. Duplicates can come from retries, replay, or consumer failure. Append order and delivery semantics are separate concerns.</p>
-<p>"One global log would be simpler, so it is always better" ignores scale. A single sequence can be mentally clean while becoming a throughput, availability, and locality bottleneck.</p>
+<p>Choosing <code>order_id</code> is a situated preference when each order can be handled independently. If stock allocation or a promotion quota spans many orders, the boundary must change. “Use a globally ordered topic” is one possible answer, but it is a costly coordination decision, not a default cure.</p>
+<h2>Trade-offs, Limits, and Signals</h2>
+<p>Partitioned logs make durable replay and local ordering scalable. <strong>The trade-off</strong> is that one global story becomes many local stories, and the application must name the relations that cross them.</p>
+<p>They help when an entity key captures the unit of sequential work. They cost parallelism when one key becomes hot, and they cost reasoning when a workflow spreads across keys or topics. A log does not protect an external side effect from repetition, does not turn offsets into wall-clock time, and does not create atomic transactions across arbitrary consumers and services.</p>
+<p>Useful signals include consumer lag per partition, unequal traffic that makes one partition hot, a rising rate of duplicate-effect suppression, increasing retries from producers, and repeated rebalances that delay consumers. These signals distinguish a throughput problem, a progress problem, and a semantics problem. They do not mean the log has “lost order.”</p>
+<p>Retention is another boundary. Replay is only available while the required records remain retained and accessible. A consumer reset is powerful precisely because it can rerun history; it should therefore be an intentional operational action, not a substitute for understanding the consumer's checkpoint and side effects.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “A topic is a globally ordered queue.”</p>
+<p><strong>Why it is tempting:</strong> A topic has one name, and each partition is ordered.</p>
+<p><strong>Better model:</strong> A partitioned topic contains several ordered logs. State the partition key and the order scope before relying on it.</p>
+<p><strong>Confusion:</strong> “A duplicate means the log delivered records out of order.”</p>
+<p><strong>Why it is tempting:</strong> The same event appears twice in a consumer's work.</p>
+<p><strong>Better model:</strong> A retry or replay can repeat a record while preserving its position. Ordering and exactly-once effects are separate promises.</p>
+<p><strong>Confusion:</strong> “A larger offset happened later in the real world.”</p>
+<p><strong>Why it is tempting:</strong> Offsets look like increasing timestamps.</p>
+<p><strong>Better model:</strong> An offset orders records only in its own partition. It is not a cross-partition clock; the next lesson introduces tools for reasoning about those relationships.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> <code>OrderPlaced(order-7)</code> is at partition 1 offset 420, while <code>PaymentCaptured(order-8)</code> is at partition 0 offset 89. Which happened first according to the log?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The log does not define that comparison. The offsets belong to different partitions. You need a separate contract or evidence if the application needs a cross-order relation.</p>
+<p><strong>Check:</strong> A consumer's next stored position is 422. Which records has it safely completed in this example?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It has completed offsets before 422: 420 and 421. On restart it should resume at 422, so 422 must still be safe to replay.</p>
+<h2>Practice: Review a Partitioning Plan</h2>
+<p>A team plans to key <code>OrderPlaced</code>, <code>InventoryReserved</code>, and <code>PaymentCaptured</code> by <code>order_id</code>, but it will key a shared promotion counter by <code>campaign_id</code>. It claims that the event log will therefore serialize every order's payment and ensure no more than 100 claims of the campaign.</p>
+<p>Review the claim. Name what the chosen keys do guarantee, what they do not guarantee about the campaign limit, and one signal you would monitor after launch.</p>
+<p><strong>Model answer:</strong> Keying the order events by <code>order_id</code> gives each order a local partition order, so one consumer can process that order's workflow sequentially. The shared campaign counter is a different key and may be in a different partition; the log does not create one atomic, globally ordered limit across all orders. The campaign needs its own shared authority or coordination mechanism. Monitor hot-partition traffic for the campaign key, consumer lag, duplicate suppression, or producer retries; each can reveal pressure on the chosen boundary.</p>
 <h2>Connections</h2>
-<p>The previous lesson compared replication models by where write authority lives. Distributed logs make that concrete: a leader-backed partition can offer a strong local append order, while partitioning spreads authority and parallelism across many local histories.</p>
-<p>The next lesson on logical, vector, and hybrid logical clocks picks up where logs stop. Once work spans several partitions, streams, or regions, clocks and causality metadata help describe relationships the log no longer orders globally.</p>
+<p>The previous lesson located authority in primary-backup, multi-leader, and leaderless models. A partitioned log makes one of those boundaries tangible: each partition gives a local append history while partitioning spreads the workload across several histories.</p>
+<p>The next lesson adds logical, vector, and hybrid clocks. They help describe causal and concurrent relationships once a workflow no longer fits inside one partition's simple offset order.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://kafka.apache.org/documentation/#design">Apache Kafka Documentation: Design</a><ul>
-<li>Focus: Study partitions, offsets, consumer groups, and replication as the practical shape of log guarantees.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://notes.stephenholiday.com/Kafka.pdf">Kafka: a Distributed Messaging System for Log Processing</a><ul>
-<li>Focus: Read for the original log-processing model and why durable ordered streams are useful.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: Use Raft's replicated log as a contrast for consensus-backed ordered state machine apply.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Read the log, replication, and stream-processing chapters with ordering scope in mind.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://kafka.apache.org/documentation/">Apache Kafka Documentation</a> — Focus: begin with key concepts, then inspect the design material for partitions, offsets, replication, and consumer groups.</li>
+<li>[PAPER] <a href="https://notes.stephenholiday.com/Kafka.pdf">Kafka: a Distributed Messaging System for Log Processing</a> — Focus: compare its original log-processing model with the partition-scoped trace.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: contrast a consensus-managed replicated log with an application-facing partitioned event log.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A distributed log is a shared durable history with positions, replay, and recovery semantics, not just a message pipe.</li>
-<li>Order always has a boundary: per log, partition, key, or a deliberately coordinated global scope.</li>
-<li>The trade-off is stronger global order versus throughput and parallelism; scaling often means fragmenting order and making causality explicit elsewhere.</li>
+<li>A distributed log is a reusable, durable history with positions; it is more than a message pipe.</li>
+<li>An offset orders records within one partition, not across the platform or in physical time.</li>
+<li>The partition key is a correctness decision because it chooses the scope of sequential processing.</li>
+<li>Replay protects against lost progress but can repeat external work, so consumers need their own effect boundary.</li>
+<li>Cross-partition invariants require explicit correlation or coordination beyond local append order.</li>
 </ul>
 </section>
 
@@ -223,7 +254,7 @@ partition 9: order-11 events
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

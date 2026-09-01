@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -79,201 +83,332 @@
 <section class="stack-block lesson-content-shell">
   <h1>Control Plane Consensus Boundary Design Review</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A control-plane consensus boundary should include only the metadata that needs one authoritative story, because the trade-off for safety is quorum cost, replay complexity, and stricter verification under failure.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Defend which control-plane facts need one authoritative history and which must remain outside consensus.</p>
+</li>
+<li>
+<p>Walk through a controller update across revision, lease, fencing, replay, and external side-effect boundaries.</p>
+</li>
+<li>
+<p>Review the architecture with explicit invariants, recovery rules, operational signals, and failure tests.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A control plane earns consensus cost only for small facts whose disagreement grants unsafe authority; controllers then turn those facts into idempotent, fenced, recoverable action outside the consensus path.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a multi-cluster workload platform. It needs desired deployment state, controller leadership, service registration, node membership, health-driven failover decisions, and a stream of changes that controllers can watch. It also produces logs, metrics, traces, status blobs, image metadata, and high-volume workload events.</p>
-<p>The tempting design is to put everything "important" into the consensus store. That sounds safe, but it usually creates an overloaded control plane. Consensus is excellent for small facts whose disagreement can make the platform unsafe. It is a poor fit for bulk data, telemetry, large payloads, or hot request paths.</p>
-<p>This capstone turns the first consensus arc into an architecture review. The question is not "does the design use consensus?" The question is "does it put the right facts behind consensus, keep the rest outside, give controllers a safe reconciliation model, and define how the guarantees will be verified under failure?"</p>
-<h2>Scenario and Requirements</h2>
-<p>The platform has three regional clusters and a shared control plane. Operators declare desired deployments through an API. Controllers reconcile actual state toward that desired state. If the active controller pauses or loses connectivity, another controller must take over without creating conflicting actions.</p>
-<p>The design must support:</p>
+<p>Consensus is not a general-purpose importance marker. It is a costly way to establish one history when disagreement would allow incompatible authority. A control plane therefore keeps its desired decision, ownership, and anti-stale-action evidence small and explicit. It lets status, telemetry, and large payloads use systems optimized for observation and transport, then makes the join between those systems safe through versions, hashes, epochs, and replay rules.</p>
+<p>The practical test is ownership of a harmful transition. If two answers could safely coexist—for example, two independent health samples—replication into an observation system may be enough. If two answers would let separate controllers roll out different generations or both delete the same protected resource, the system needs an authoritative decision and an enforcement point. This test keeps the boundary comprehensible as requirements grow.</p>
+<h2>The Scenario</h2>
+<p>Atlas runs deployments across three clusters. Operators submit a desired rollout: which version should run, how many replicas belong in each cluster, and which generation supersedes the last one. Controllers read that desired state and make changes in external systems.</p>
+<p>The platform has a tempting first design: put every important thing in one consensus-backed store. Deployment manifests, live pod status, request logs, metrics, image metadata, controller leases, and every emitted event all feel important.</p>
+<p>It works in a small demo. Then one controller pauses, a watch disconnects, a new controller takes over, and telemetry spikes during the recovery. Now the store is expected to be the deployment database, event bus, audit archive, health system, lock service, and source of controller authority at once.</p>
+<p>The stronger model is narrower. Consensus protects decisions that must have one authoritative story. Other systems hold bulk data, observations, artifacts, and derived views. Controllers bridge those boundaries with revisions, idempotency, fencing, and recovery rules.</p>
+<p>This capstone does not introduce a new consensus algorithm. It asks whether the architecture already built from the preceding lessons keeps the same safety story from API request to recovery and verification.</p>
+<h2>Constraints</h2>
+<p>Atlas must satisfy these requirements:</p>
 <ul>
-<li>desired state for deployments and rollouts</li>
-<li>lease-based controller leadership</li>
-<li>cluster and node membership metadata</li>
-<li>service registration that must not split brain</li>
-<li>watchable metadata changes for controllers</li>
-<li>bounded recovery after restarts and log growth</li>
-<li>explicit verification of the safety claims</li>
+<li>An acknowledged desired-state change must not disappear after a leader change.</li>
+<li>At most one current controller may perform role-specific, dangerous actions.</li>
+<li>A paused former controller must not be able to overwrite work from its successor.</li>
+<li>Controllers must recover from restart, reconnect, and watch gaps without trusting an old cache.</li>
+<li>Retrying a controller action must not create a second irreversible effect.</li>
+<li>The control plane must remain usable when logs grow and when a minority of nodes is unavailable.</li>
+<li>Operators must be able to test the important claims under pause, partition, dropped reply, restart, and replay.</li>
 </ul>
-<p>The design does not need the consensus store to hold every observation the platform produces. Request logs, raw metrics, traces, large manifests, image artifacts, and high-volume per-pod status churn can be durable and important without requiring serialized consensus.</p>
-<h2>Boundary Decision</h2>
-<p>The first review move is to classify state by the damage caused by disagreement.</p>
+<p>Some constraints are intentionally outside this capstone. Atlas does not try to make every workload event globally ordered, provide a general analytics system, or teach a complete protocol implementation. Those are separate scalability and data-system problems.</p>
+<h2>The Boundary We Need to Draw</h2>
+<p>The decisive question is not “is this data important?” It is “would disagreement about this fact grant conflicting authority or change a protected decision?”</p>
 <table>
 <thead>
 <tr>
 <th>State</th>
-<th>Put in Consensus?</th>
-<th>Reason</th>
+<th>Consensus-backed?</th>
+<th>Why</th>
+<th>Outside-boundary rule</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Desired deployment spec and rollout generation</td>
+<td>Desired deployment generation and spec hash</td>
 <td>Yes</td>
-<td>Controllers need one authoritative target</td>
+<td>Controllers need one target to reconcile</td>
+<td>Store large manifests elsewhere; retain a content reference and hash here</td>
 </tr>
 <tr>
-<td>Controller lease holder and fencing token</td>
+<td>Controller lease owner and fencing epoch</td>
 <td>Yes</td>
-<td>Split ownership can create conflicting actions</td>
+<td>Two accepted owners can cause conflicting changes</td>
+<td>Every protected target rejects older epochs</td>
 </tr>
 <tr>
-<td>Cluster membership metadata</td>
+<td>Membership and rollout ownership metadata</td>
 <td>Yes</td>
-<td>Routing and failover depend on one coordinated view</td>
+<td>The control plane needs one defensible view</td>
+<td>Keep membership observations and logs distinct from authority</td>
 </tr>
 <tr>
-<td>Service endpoint intent</td>
-<td>Usually yes</td>
-<td>Discovery decisions can become unsafe if they diverge</td>
+<td>Idempotency record for a dangerous action</td>
+<td>Usually yes or transactionally durable with its effect</td>
+<td>Retries must converge on one result</td>
+<td>Retain it for the supported retry horizon</td>
 </tr>
 <tr>
-<td>Raw request logs</td>
+<td>Current pod status and health observations</td>
+<td>Usually no</td>
+<td>They are frequent, partial, and can be rebuilt</td>
+<td>Treat them as inputs to reconciliation, not authority by themselves</td>
+</tr>
+<tr>
+<td>Request logs, traces, metrics, and clickstream events</td>
 <td>No</td>
-<td>They need durable storage, not serialized control decisions</td>
+<td>They need throughput, retention, and queryability</td>
+<td>Preserve them in observability or event systems</td>
 </tr>
 <tr>
-<td>Metrics and traces</td>
+<td>Images, manifests, and large artifacts</td>
 <td>No</td>
-<td>High-volume observation data belongs outside the consensus path</td>
-</tr>
-<tr>
-<td>Large image artifacts or manifests</td>
-<td>No</td>
-<td>Store references in the control plane, not the payloads</td>
-</tr>
-<tr>
-<td>Controller local cache</td>
-<td>No</td>
-<td>It can be rebuilt from authoritative metadata</td>
+<td>Size and transfer do not need a serialized decision path</td>
+<td>Consensus stores immutable references and expected hashes</td>
 </tr>
 </tbody>
 </table>
-<p>The test is not "is this important?" The test is "does this fact define authority, ownership, desired state, or a decision that must not split brain?"</p>
-<p>That gives a crisp boundary: consensus protects decisions; other storage systems carry bulk data, observations, artifacts, and derived views.</p>
-<h2>Architecture Review</h2>
-<p>A reasonable architecture has a small consensus-backed metadata store at the center, with controllers watching it and reconciling the outside world.</p>
-<div class="codehilite"><pre><span></span><code>operator/API
-    |
-    v
-consensus-backed metadata store
-    |       |        |
- watches  leases   revisions
-    |
-    v
-controllers
-    |
-    v
-clusters, schedulers, service discovery, external systems
+<p>This boundary makes one subtle distinction visible: a controller can use health evidence to decide what to attempt, but a health report alone does not grant exclusive authority. The authoritative decision and the observation that informs it have different jobs.</p>
+<h2>The Naive Design and Its Failure</h2>
+<p>The naive controller keeps a local cache from watch events and treats a lease record as permission forever:</p>
+<div class="codehilite"><pre><span></span><code>watch desired state
+if local lease says &quot;I am leader&quot;:
+    apply every cached change
 </code></pre></div>
 
-<p>The store is authoritative for desired state, ownership, and membership. Controllers are responsible for turning that state into action. This separation matters because consensus can decide what should happen, but controllers still have to handle retries, partial failures, duplicate observations, and external side effects.</p>
-<p>The design should make controller actions idempotent where possible. A controller that sees the same desired deployment generation twice should converge on the same result, not create duplicate external work. If an action cannot be naturally idempotent, it needs a stable operation ID, a fencing token, or a stored completion record.</p>
-<h2>Recovery and Replay</h2>
-<p>The control plane must remain recoverable as its metadata history grows. If every controller restart requires replaying years of control-plane updates, correctness will not matter during an incident because recovery will be too slow.</p>
-<p>The design needs explicit recovery boundaries:</p>
-<ul>
-<li>snapshots for restoring the control-plane state machine quickly</li>
-<li>compaction or retention rules for old watch history</li>
-<li>controller checkpoints or local caches that can be discarded and rebuilt</li>
-<li>rules for resyncing after a watch gap</li>
-<li>request IDs or revisions that make replay safe</li>
-</ul>
-<p>One safe pattern is:</p>
-<div class="codehilite"><pre><span></span><code>restore snapshot at revision R
-replay committed metadata changes after R
-controllers resync current desired state
-controllers resume idempotent reconciliation
+<p>This works while the watch is continuous and the controller stays connected. It breaks under ordinary partial failure.</p>
+<p>Assume controller A read desired generation <code>41</code> and acquired fencing epoch <code>7</code>. A then pauses. Its lease expires, controller B acquires epoch <code>8</code>, and an operator submits generation <code>42</code>. B applies the new generation. When A wakes up, its cache may still contain generation <code>41</code> and it may still believe it has permission to act.</p>
+<p>Two repairs are needed:</p>
+<ol>
+<li><strong>Resynchronize state.</strong> A controller rebuilds from a current authoritative snapshot at revision <code>R</code>, then watches changes after <code>R</code>. If its watch disconnects or cannot resume after compaction, it starts from a new snapshot rather than trusting its old cache.</li>
+<li><strong>Fence external action.</strong> The deployment target accepts action only when the supplied epoch is current enough. A's request with epoch <code>7</code> must be rejected after B's epoch <code>8</code> is accepted.</li>
+</ol>
+<p>Neither repair replaces the other. A current cache does not stop a stale actor, and fencing does not tell a controller which desired state it missed.</p>
+<h2>Proposed Model</h2>
+<p>Atlas separates authority, observation, and execution:</p>
+<div class="codehilite"><pre><span></span><code>operator API
+    |
+    | conditional write: desired generation + immutable spec reference
+    v
+consensus-backed metadata
+    | revisions, leases, fencing epochs, idempotency records
+    v
+controllers ----&gt; external deployment API / clusters
+    |                    ^
+    | watches and resync  | epoch + operation identity required
+    v                    |
+observability, health, status, artifacts
 </code></pre></div>
 
-<p>The key is that resync from current state must be correct. Watches are useful for efficiency, but controllers should not depend on an endless perfect event stream. If they miss a range, they should rebuild from the authoritative state and continue.</p>
+<p>The metadata store is authoritative for the desired generation, controller role, and coordination records. It does not become the canonical home of every observed status update. Controllers continuously compare desired state with observed state and issue safe, repeatable actions.</p>
+<p>The relevant contracts are explicit:</p>
+<table>
+<thead>
+<tr>
+<th>Contract</th>
+<th>Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Desired-state write</td>
+<td>Update generation only through a conditional write against the revision the operator reviewed; return the committed revision.</td>
+</tr>
+<tr>
+<td>Controller recovery</td>
+<td>Read a complete snapshot at revision <code>R</code>, reconcile, then watch from <code>R + 1</code>; resync after a gap.</td>
+</tr>
+<tr>
+<td>Leader-only action</td>
+<td>Attach the current fencing epoch; the target persists its highest accepted epoch and rejects an earlier one.</td>
+</tr>
+<tr>
+<td>Retry</td>
+<td>Reuse a stable operation ID and return a stored outcome or an explicit in-progress state.</td>
+</tr>
+<tr>
+<td>External artifact</td>
+<td>Store its immutable reference and expected hash in authoritative metadata; fetch the payload outside consensus.</td>
+</tr>
+</tbody>
+</table>
+<p>These are teaching contracts, not a vendor configuration. A real system must choose the exact read mode, transaction semantics, failure detector, retention, and target enforcement that its API documents.</p>
+<h2>Walkthrough: One Rollout Through the Boundary</h2>
+<p>The following trace uses illustrative revisions and epochs.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Authoritative state</th>
+<th>Controller action</th>
+<th>Safety evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Operator writes <code>payments</code> generation <code>42</code>, spec hash <code>h42</code>, revision <code>901</code></td>
+<td>API returns success after the store's commit rule</td>
+<td>Acknowledged revision <code>901</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Controller B reads snapshot at <code>901</code> and owns role epoch <code>8</code></td>
+<td>It sees desired <code>42</code> differs from observed <code>41</code></td>
+<td>Snapshot revision and lease/epoch record</td>
+</tr>
+<tr>
+<td>3</td>
+<td>B creates <code>operation_id=deploy:payments:42</code></td>
+<td>It records <code>IN_PROGRESS</code> durably before retrying external work</td>
+<td>Stable identity across retries</td>
+</tr>
+<tr>
+<td>4</td>
+<td>B calls the deployment API with generation <code>42</code>, hash <code>h42</code>, epoch <code>8</code>, and the operation ID</td>
+<td>Target accepts and stores its highest epoch</td>
+<td>Fenced target response</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Reply is lost after acceptance</td>
+<td>B cannot infer success from its timeout</td>
+<td>Operation remains unknown or in progress</td>
+</tr>
+<tr>
+<td>6</td>
+<td>B retries with the same identity and epoch</td>
+<td>Target returns the stored outcome</td>
+<td>One external effect, repeatable client result</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Watch disconnects during later updates</td>
+<td>B reads a new snapshot and reconciles before resuming</td>
+<td>New revision boundary, not an assumed event gap</td>
+</tr>
+</tbody>
+</table>
+<p>Notice where consensus stops. It made the desired generation and epoch authoritative. It did not atomically deploy a container, deliver a network reply, or make the external API idempotent by itself. The deployment target and operation record must carry those semantics.</p>
+<p>So far, the architecture has a complete first-pass story: consensus decides a small desired state; controllers observe and reconcile; fencing limits stale authority; stable identity makes retries safe; snapshots and resync make recovery bounded.</p>
 <h2>Failure Review</h2>
-<p>The design is incomplete until it names the invariants it relies on. For this platform, good invariants include:</p>
-<ul>
-<li>at most one active controller may perform leader-only actions for a role</li>
-<li>acknowledged desired-state writes are not lost</li>
-<li>controllers observe deployment generations in an order consistent with the store</li>
-<li>stale leaders cannot perform accepted actions after a newer fencing token exists</li>
-<li>controller restart and replay do not duplicate dangerous external side effects</li>
-<li>quorum loss stops unsafe progress rather than creating split-brain authority</li>
-</ul>
-<p>Those claims suggest concrete failure tests:</p>
+<p>An architecture is not ready until it states the safety properties it relies on and the fault that could reveal each one.</p>
 <table>
 <thead>
 <tr>
 <th>Invariant</th>
-<th>Faults to Challenge It</th>
+<th>Failure pressure</th>
+<th>What counts as a violation</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Single active controller</td>
-<td>Pause the leader, partition it from the store, delay lease renewals</td>
+<td>Acknowledged desired writes survive recovery</td>
+<td>Leader restart, dropped reply, slow disk</td>
+<td>A later snapshot omits an acknowledged generation</td>
 </tr>
 <tr>
-<td>No lost acknowledged writes</td>
-<td>Restart leaders, drop acknowledgements, slow disks during commits</td>
+<td>Stale leaders cannot change deployment state</td>
+<td>Pause old leader, expire lease, resume it after a successor acts</td>
+<td>Target accepts an older fencing epoch</td>
 </tr>
 <tr>
-<td>Ordered observation</td>
-<td>Force watch reconnects, compaction gaps, controller restarts</td>
+<td>Controllers converge after watch gaps</td>
+<td>Disconnect, compact history, rapid writes</td>
+<td>Final controller cache differs from authoritative state</td>
 </tr>
 <tr>
-<td>No stale side effects</td>
-<td>Let an old leader resume after lease expiry and attempt action</td>
+<td>Retries do not duplicate deployment effects</td>
+<td>Crash after target call, retry after lost reply</td>
+<td>Same operation ID creates two accepted deployments</td>
 </tr>
 <tr>
-<td>Safe replay</td>
-<td>Crash controllers after external calls but before local acknowledgement</td>
+<td>Quorum loss prevents unsafe authority</td>
+<td>Partition the metadata cluster</td>
+<td>Conflicting authoritative generations are acknowledged</td>
 </tr>
 </tbody>
 </table>
-<p>This is where Jepsen-style thinking fits the architecture. The team should collect observable histories and check the claims, not merely kill nodes and inspect logs manually.</p>
-<h2>Design Review Checklist</h2>
-<p>A strong answer to this capstone should be able to defend these points:</p>
+<p>Use Jepsen-style thinking here. Record client invocations and results, the fault schedule, revisions, epochs, and operation identities. A green dashboard after failover is useful liveness evidence, but it does not disprove a stale action or lost acknowledged write.</p>
+<h2>Trade-offs and Operational Evidence</h2>
+<p>The trade-off is deliberate: consensus supplies a defensible history for small control facts, but it adds replication latency, quorum dependence, compaction and snapshot operations, and careful client recovery. Putting bulk state into the same path turns those costs into the platform's hot path.</p>
+<p>The boundary becomes risky when these signals appear:</p>
 <ul>
-<li>The consensus store holds small authoritative metadata, not bulk application data.</li>
-<li>Every value in the store has a reason to need one ordered control-plane story.</li>
-<li>Controllers can recover from restart by resyncing from current authoritative state.</li>
-<li>Watch gaps, duplicate observations, and retries are expected, not exceptional.</li>
-<li>Leases are paired with fencing or revision checks where stale actors could cause harm.</li>
-<li>Snapshots and compaction keep recovery bounded.</li>
-<li>The most important safety claims are written as testable invariants.</li>
+<li>increasing time from desired-state write to committed revision;</li>
+<li>watch cancellations, compaction responses, or controllers acting from an old snapshot;</li>
+<li>lease keepalive failures, leadership churn, or rejected stale fencing epochs;</li>
+<li>operations stuck in <code>IN_PROGRESS</code> after a lost reply or controller restart;</li>
+<li>recovery time from snapshot plus log tail exceeding the operational budget;</li>
+<li>metadata-store growth caused by payloads, unbounded event history, or unexpired dedupe records;</li>
+<li>a verification run with unknown outcomes that its checker cannot model.</li>
 </ul>
-<p>If one of those points is missing, the design may still work in the happy path, but it has not earned confidence under failure.</p>
-<h2>Common Misreadings</h2>
-<p>Important data does not automatically belong in consensus. Some important data needs durability, queryability, or retention, but not one globally serialized control decision.</p>
-<p>The control plane does not make controllers trivial. Controllers still need safe replay, lease handling, idempotent actions, and resync behavior after missed watches.</p>
-<p>An architecture diagram is not enough. The design is operationally complete only when recovery boundaries and failure-verification plans are explicit.</p>
+<p>The right response is not automatically to reduce safety. For example, a large manifest can move to artifact storage while the control plane keeps its immutable reference and hash. A slow watch client can resync from snapshot. A dangerous external target can add epoch enforcement. Each mitigation preserves the authority boundary instead of hiding it.</p>
+<h2>Evidence and Readiness</h2>
+<p>Use this review rubric before calling the design ready:</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Ready when</th>
+<th>Not ready when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Does each consensus record earn its cost?</td>
+<td>It names authority, ownership, or one desired decision</td>
+<td>It is stored there only because it is convenient or important</td>
+</tr>
+<tr>
+<td>Can a controller restart safely?</td>
+<td>It has a snapshot, revision, watch-resume, and resync rule</td>
+<td>It relies on a perfect event stream or unbounded cache</td>
+</tr>
+<tr>
+<td>Can an old controller harm the system?</td>
+<td>The target enforces fencing, and retries carry stable identity</td>
+<td>The lease record is the only protection</td>
+</tr>
+<tr>
+<td>Can effects be replayed safely?</td>
+<td>The operation boundary returns a durable outcome</td>
+<td>The controller assumes a timeout means failure</td>
+</tr>
+<tr>
+<td>Can the team test the claim?</td>
+<td>Invariants, workloads, faults, and checker evidence are named</td>
+<td>The plan says only “test failover”</td>
+</tr>
+</tbody>
+</table>
+<p>This is a design defense, not an implementation certification. The next lessons deepen what makes state-machine application, commit evidence, and safe reads work internally. This capstone only requires that the API and operational boundaries already make those future proof obligations visible.</p>
+<h2>Final Challenge</h2>
+<p>Atlas proposes one change: store live pod status, ten-minute debug logs, and full image manifests in the consensus store so controllers can read everything from one place. In exchange, it removes fencing because the lease record is “already strongly consistent.”</p>
+<p>Review the proposal. State what remains inside consensus, what moves outside, what authoritative references remain, and which invariant would catch the fencing regression.</p>
+<p><strong>Model answer:</strong> Keep desired deployment generation, the immutable manifest hash/reference, controller role, fencing epoch, and idempotency record for the dangerous action in authoritative metadata. Keep live status, debug logs, and image payloads in systems designed for observation and artifact storage; controllers may read them as reconciliation inputs. Removing fencing is unsafe because a paused former controller can still act after a new lease owner exists. Test by pausing epoch <code>7</code>, allowing epoch <code>8</code> to deploy, then resuming epoch <code>7</code>; the protected deployment API must reject the older epoch. A successful stale action is the violation.</p>
 <h2>Connections</h2>
-<p>The previous lessons on logs, clocks, snapshots, exactly-once boundaries, production coordination systems, and Jepsen-style verification all appear in this design. A consensus-backed control plane is where those ideas stop being isolated mechanisms and become one system boundary.</p>
-<p>The next lesson on state machine replication deepens the internals behind this boundary: consensus chooses a command sequence, and deterministic state machines turn that sequence into authoritative service state.</p>
+<p>The previous lesson supplied the verification loop: contract, workload, fault, history, checker. This capstone applies that loop to a full control-plane boundary.</p>
+<p>The next lesson begins the deeper pass. It explains how the committed command history inside the authority boundary becomes deterministic shared service state.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://etcd.io/docs/">etcd Documentation</a><ul>
-<li>Focus: Watches, leases, revisions, snapshots, and operational behavior in a production coordination store.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://kubernetes.io/docs/reference/using-api/api-concepts/">Kubernetes API Concepts</a><ul>
-<li>Focus: Desired state, resource versions, watches, and controller-style API usage.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a><ul>
-<li>Focus: The replicated log and state machine model behind many control planes.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a><ul>
-<li>Focus: How production systems are evaluated against explicit failure-time invariants.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.6/learning/api/">etcd API</a> — Focus: Revisions, transactions, watches, compaction, and leases for a coordination API.</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/reference/using-api/api-concepts/">Kubernetes API Concepts</a> — Focus: Resource versions, watches, desired-state APIs, and client recovery patterns.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: The replicated log and commit model behind the authority boundary.</li>
+<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a> — Focus: Histories, faults, and checkers for production-facing safety claims.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Consensus should protect authority, ownership, and desired state, not absorb every important byte the platform touches.</li>
-<li>A control plane is the combination of authoritative metadata, watchable change, controller reconciliation, recovery boundaries, and safe side-effect handling.</li>
-<li>A design is not complete until its safety claims are written as invariants and challenged under realistic failure.</li>
+<li>Consensus should protect small authority decisions, not every important byte in the platform.</li>
+<li>A safe controller combines current authoritative state, watch resync, fencing, and idempotent external action.</li>
+<li>A lease transfers coordination authority but does not stop a stale process; the protected target must enforce epochs.</li>
+<li>Snapshots, compaction, and operation identity make recovery and retries bounded rather than hopeful.</li>
+<li>The design is ready to implement only when its authority claims have concrete failure tests and observable evidence.</li>
 </ul>
 </section>
 
@@ -303,7 +438,7 @@ controllers resume idempotent reconciliation
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

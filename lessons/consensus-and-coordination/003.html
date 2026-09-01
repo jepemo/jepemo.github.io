@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,118 +81,252 @@
 <section class="stack-block lesson-content-shell">
   <h1>Paxos Fundamentals: Single-Decree Consensus</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Single-decree Paxos preserves safety by forcing every new proposal attempt to learn enough accepted history that it cannot choose a conflicting value.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace <code>prepare</code>, <code>promise</code>, <code>accept</code>, and <code>chosen</code> for one Paxos decision.</p>
+</li>
+<li>
+<p>Decide when a later proposer may choose a new value and when it must carry an earlier value forward.</p>
+</li>
+<li>
+<p>Separate Paxos safety from the conditions that let one proposer make progress.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A later Paxos attempt may get a newer ballot, but it must first learn the accepted history held by an overlapping quorum and continue that history safely.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine three acceptors trying to choose one configuration value. Proposer <code>P1</code> starts with value <code>A</code> and reaches some acceptors, but messages are delayed before the result is widely known. A little later, proposer <code>P2</code> starts a higher-priority attempt and wants value <code>B</code>.</p>
-<p>The danger is not that two proposers exist. Distributed systems often have retries, restarts, and competing leaders. The danger is that a later proposer might act as if earlier attempts left no trace. If value <code>A</code> was already close to being chosen, <code>P2</code> must not accidentally choose conflicting value <code>B</code>.</p>
-<p>Single-decree Paxos is the safety core for that situation. Its message flow is not ceremony. It is a way to transfer the obligation to respect history from older attempts to newer attempts. The trade-off is sharp: Paxos gives an elegant crash-fault safety argument for one decision, but the full two-phase shape is awkward and expensive if repeated from scratch for every log slot.</p>
-<h2>The Problem: Later Attempts Must Respect Earlier Evidence</h2>
-<p>Paxos relies on quorum intersection. If one majority might already have accepted a value, any later majority must overlap it somewhere.</p>
-<p>With three acceptors:</p>
+<p>Three acceptors must choose one value for a configuration switch. The choices are deliberately small: <code>X</code> means “use configuration X”; <code>Y</code> means “use configuration Y.” Two proposers can be active because an earlier proposer can pause, a retry can begin, or two machines can both suspect that they should lead.</p>
+<p>At first, a newer attempt seems simple. Proposer <code>P2</code> chooses ballot <code>11</code>, which is higher than <code>P1</code>'s ballot <code>10</code>, so perhaps <code>P2</code> may simply send <code>accept(11, Y)</code> and move on.</p>
+<p>That model works only when no earlier attempt has left safety-relevant evidence. It breaks when <code>P1</code> may already have caused <code>X</code> to be accepted by enough acceptors to be chosen. A late message cannot erase that fact. If <code>P2</code> chose <code>Y</code> independently, the system could have two different chosen values for the same decision.</p>
+<p>Paxos prevents that outcome with a small discipline: before issuing a value at ballot <code>11</code>, <code>P2</code> asks a majority what they have already accepted and obtains promises that they will not accept lower ballots. The responses constrain the value <code>P2</code> may issue. A higher ballot orders the attempt; it does not give its proposer permission to overwrite history.</p>
+<h2>The Small Situation: One Decision, Three Roles</h2>
+<p>This is <strong>single-decree</strong> Paxos: one run chooses one value. It is not yet a replicated log. The same process may play more than one role in a real system, but separating the roles makes the mechanism easier to inspect.</p>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>In this lesson</th>
+<th>What it can do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Proposer</td>
+<td><code>P1</code> or <code>P2</code></td>
+<td>Starts an attempt with a unique ballot number and selects a safe value to issue.</td>
+</tr>
+<tr>
+<td>Acceptor</td>
+<td><code>A1</code>, <code>A2</code>, <code>A3</code></td>
+<td>Records promises and accepted proposals; contributes evidence toward a choice.</td>
+</tr>
+<tr>
+<td>Learner</td>
+<td>a client or replica</td>
+<td>Learns that a proposal was accepted by a majority.</td>
+</tr>
+</tbody>
+</table>
+<p>With three acceptors, any two are a majority. The important fact is not the number three. It is intersection:</p>
 <div class="codehilite"><pre><span></span><code>earlier majority: A1 A2
 later majority:      A2 A3
 
 overlap: A2
 </code></pre></div>
 
-<p>That overlap is the bridge between attempts. If <code>A2</code> remembers that an earlier proposal was accepted, a later proposer can discover that fact and avoid choosing a conflicting value.</p>
-<p>Ballot numbers give proposal attempts an order:</p>
-<div class="codehilite"><pre><span></span><code>ballot 10: P1 tries value A
-ballot 11: P2 tries value B
+<p>Any majority that might choose a value and any later majority that prepares an attempt share at least one acceptor. That shared acceptor is the path by which evidence can travel from an old attempt to a new one.</p>
+<p>An acceptor keeps two pieces of state, durably in a practical crash-recovery implementation:</p>
+<div class="codehilite"><pre><span></span><code>highest promised ballot
+highest accepted proposal, if any: (ballot, value)
 </code></pre></div>
 
-<p>A higher ballot is not a wall-clock timestamp and does not mean "my value should win because I arrived later." It means the proposer is trying to run a newer attempt that acceptors may promise to follow. But the newer attempt is constrained: before it freely proposes a value, it has to ask an overlapping quorum what accepted history already exists.</p>
-<p>The safety intuition is:</p>
-<div class="codehilite"><pre><span></span><code>ballots order attempts
-quorums overlap attempts
-Phase 1 transfers accepted history into the newer attempt
+<p>The durable-storage detail matters. If <code>A2</code> forgot a promise or an accepted proposal after a restart, a later attempt could fail to discover the very evidence the safety argument needs. The example assumes crash faults and uncorrupted messages, not Byzantine acceptors that lie about their state.</p>
+<h2>The Initial Model: The Newest Ballot Wins</h2>
+<p>We might first think: “Ballot <code>11</code> is newer than ballot <code>10</code>, so <code>P2</code> can choose its preferred value <code>Y</code>.” This fits a quiet system where <code>P1</code> never received any acceptance, or where <code>P2</code> has already checked a majority and learned that none of them accepted anything.</p>
+<p>It becomes insufficient when messages are delayed. <code>P1</code> may have sent an <code>accept(10, X)</code> request before it paused. <code>P2</code> cannot tell from its own local state whether that request reached one acceptor, two acceptors, or none. A proposal accepted by a majority is <strong>chosen</strong>; one accepted by only one acceptor is not chosen, but it can still constrain the next attempt.</p>
+<p>That last point is intentionally conservative. Paxos does not ask <code>P2</code> to solve the harder question “was <code>X</code> definitely chosen?” before acting. It uses a rule that preserves any accepted value that could be relevant through the quorum evidence it gathers.</p>
+<p>The missing mechanism is therefore not a clock or a winner announcement. It is a way to make a later attempt inherit the only history it can safely continue.</p>
+<h2>The Better Mechanism: Prepare, Promise, Then Accept</h2>
+<p><strong>Plain meaning:</strong> Before proposing a value, ask enough durable witnesses what they remember and ask them not to accept an older competing attempt.</p>
+<p><strong>In this scenario:</strong> <code>P2</code> asks a majority, for example <code>A2</code> and <code>A3</code>, about ballot <code>11</code>. Each useful reply both raises the acceptor's promise and reports its highest accepted proposal.</p>
+<p><strong>Technical name:</strong> This first round is <strong>Phase 1</strong>, or <em>prepare/promise</em>. The proposal round is <strong>Phase 2</strong>, or <em>accept/accepted</em>.</p>
+<h3>Phase 1: establish a safe attempt</h3>
+<p><code>P2</code> chooses a proposal number that is unique and higher than any it knows it has used:</p>
+<div class="codehilite"><pre><span></span><code>P2 -&gt; A2, A3: prepare(11)
 </code></pre></div>
 
-<h2>Phase 1: Prepare and Promise</h2>
-<p>Suppose <code>P2</code> wants to run ballot <code>11</code>. It begins with:</p>
-<div class="codehilite"><pre><span></span><code>P2 -&gt; quorum: prepare(11)
+<p>If an acceptor has not already promised a higher ballot, it persists and returns:</p>
+<div class="codehilite"><pre><span></span><code>promise: do not accept future proposals numbered below 11
+accepted: my highest accepted (ballot, value), if I have one
 </code></pre></div>
 
-<p>An acceptor that grants the request makes a promise:</p>
-<div class="codehilite"><pre><span></span><code>I will not accept proposals from ballots lower than 11.
+<p>The promise controls the future. Once <code>A2</code> promises ballot <code>11</code>, it will not later accept a ballot <code>10</code> request that arrives late. The accepted report describes the past. Both parts are needed: reporting old evidence without blocking older accepts leaves a race; blocking older accepts without reporting old evidence loses the reason for the rule.</p>
+<p>When <code>P2</code> receives promises from a majority, it selects its Phase 2 value as follows:</p>
+<div class="codehilite"><pre><span></span><code>no responder reports an accepted proposal
+  -&gt; P2 may use any proposed value, such as Y
+
+one or more responders report accepted proposals
+  -&gt; P2 must use the value from the highest-numbered accepted proposal reported
 </code></pre></div>
 
-<p>That promise prevents older attempts from continuing underneath the newer one. But the promise is only half the point. The acceptor also reports the highest-numbered proposal it has already accepted, if any.</p>
-<p>That second part is the safety payload. It tells <code>P2</code> whether earlier accepted history constrains the safe value for this attempt.</p>
-<p>If the quorum reports no accepted value, <code>P2</code> can propose its own value. If any acceptor reports an accepted value, <code>P2</code> must carry forward the value with the highest accepted ballot among the reports.</p>
-<p>This is the rule that often feels strange on first read:</p>
-<div class="codehilite"><pre><span></span><code>The proposer may have to abandon its preferred value.
+<p>The choice is based on the highest <strong>accepted</strong> ballot in the replies, not merely the highest promise and not <code>P2</code>'s personal preference. In a valid run, all values that this rule can carry forward are compatible with any already chosen value.</p>
+<h3>Phase 2: try to make that safe value chosen</h3>
+<p>Only after that selection does <code>P2</code> issue a proposal:</p>
+<div class="codehilite"><pre><span></span><code>P2 -&gt; A2, A3: accept(11, selected value)
 </code></pre></div>
 
-<p>It does that because leadership in Paxos is not permission to ignore history. Leadership is permission to continue history safely.</p>
-<h2>Phase 2: Accept and Chosen</h2>
-<p>After Phase 1, the proposer has either learned that no relevant accepted value exists or adopted the safest value revealed by the quorum. Then it sends:</p>
-<div class="codehilite"><pre><span></span><code>P2 -&gt; quorum: accept(11, value)
+<p>An acceptor accepts it unless it has already promised a ballot higher than <code>11</code>. If the same <code>(11, selected value)</code> is accepted by a majority, that proposal and its value are <strong>chosen</strong>.</p>
+<div class="codehilite"><pre><span></span><code>chosen != every replica or client has heard the result
 </code></pre></div>
 
-<p>If a quorum accepts the same <code>(ballot, value)</code> pair, that value is chosen.</p>
-<p>A compact flow looks like this:</p>
-<div class="codehilite"><pre><span></span><code>Phase 1:
-  proposer -&gt; quorum: prepare(ballot)
-  quorum   -&gt; proposer: promise(ballot, highest accepted value if any)
-
-Phase 2:
-  proposer -&gt; quorum: accept(ballot, safe value)
-  quorum   -&gt; proposer: accepted(ballot, safe value)
-</code></pre></div>
-
-<p>The system does not need every acceptor to know immediately that the value is chosen. A value is chosen when the quorum evidence is strong enough. Learning and dissemination can happen afterward. That distinction matters because many protocol bugs come from confusing "some node learned it" with "a quorum made it durable enough that later attempts must preserve it."</p>
-<h2>Worked Example: Why P2 Cannot Freely Choose B</h2>
-<p>Use three acceptors: <code>A1</code>, <code>A2</code>, and <code>A3</code>.</p>
-<p><code>P1</code> sends <code>accept(10, A)</code> to <code>A1</code> and <code>A2</code>. Suppose <code>A1</code> accepts, but the message to <code>A2</code> is delayed. Then <code>P2</code> starts ballot <code>11</code> and contacts <code>A2</code> and <code>A3</code>.</p>
-<p>If <code>A2</code> had already accepted <code>(10, A)</code>, it would report that during Phase 1. Then <code>P2</code> would be forced to continue with value <code>A</code>, not its preferred value <code>B</code>.</p>
-<p>If no acceptor in <code>P2</code>'s quorum reports an accepted value, then no earlier chosen value can be hidden from the new quorum. That is the payoff from quorum intersection.</p>
-<p>The rule is conservative because uncertainty is the point. Paxos does not ask the proposer to know whether <code>A</code> was definitely chosen. It asks the proposer to preserve any value that might be safety-relevant according to quorum evidence.</p>
-<h2>Why Single-Decree Paxos Is Not the Whole Log</h2>
-<p>Single-decree Paxos chooses one value for one decision point. A replicated log needs many decisions:</p>
-<div class="codehilite"><pre><span></span><code>slot 41 -&gt; command A
-slot 42 -&gt; command B
-slot 43 -&gt; command C
-</code></pre></div>
-
-<p>Running the full leadership contest for every slot would be correct, but expensive. It adds round trips, creates more opportunities for proposer contention, and makes the hot path harder to operate.</p>
-<p>That is why the next lesson moves to Multi-Paxos. Multi-Paxos does not throw away the safety argument. It amortizes the expensive leadership setup across many slots when one proposer is stable enough to act as leader.</p>
-<p>So the right mental model is:</p>
-<div class="codehilite"><pre><span></span><code>single-decree Paxos:
-  minimal safety core for one chosen value
-
-Multi-Paxos:
-  reuse that safety core across a replicated log
-</code></pre></div>
-
-<h2>Common Misreadings</h2>
-<p>"The highest ballot always gets to choose its own value" is wrong. A higher ballot gives priority to the attempt, but Phase 1 may force the proposer to continue an earlier accepted value.</p>
-<p>"Phase 1 is just leader election" is incomplete. Phase 1 establishes priority, but it also transfers safety-relevant accepted history.</p>
-<p>"Chosen means everyone knows" is also wrong. Chosen means the quorum evidence is sufficient. Other replicas and clients may learn the chosen value later.</p>
+<p>Chosen is a fact about majority acceptance. Learners may discover it later through acceptor messages or a designated learner. This distinction lets a choice remain safe even when the news of the choice is delayed.</p>
+<h2>A Worked Trace: Two Similar Delays, Two Different Safe Choices</h2>
+<p>The following values and message timings are illustrative. They expose why Paxos distinguishes “accepted somewhere” from “chosen by a majority.”</p>
+<h3>Trace A: <code>X</code> was not chosen, so <code>P2</code> may choose <code>Y</code></h3>
+<p><code>P1</code> completed an earlier prepare round for ballot <code>10</code> and sent <code>accept(10, X)</code>. Only <code>A1</code> receives and accepts it before <code>P1</code> pauses.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Event</th>
+<th><code>A1</code></th>
+<th><code>A2</code></th>
+<th><code>A3</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>A1</code> accepts <code>(10, X)</code></td>
+<td>accepted <code>(10, X)</code></td>
+<td>no accepted value</td>
+<td>no accepted value</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>P2</code> sends <code>prepare(11)</code> to <code>A2</code>, <code>A3</code></td>
+<td>unchanged</td>
+<td>promises <code>11</code>; reports none</td>
+<td>promises <code>11</code>; reports none</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>P2</code> selects <code>Y</code></td>
+<td>unchanged</td>
+<td>no accepted value reported</td>
+<td>no accepted value reported</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>A2</code>, <code>A3</code> accept <code>(11, Y)</code></td>
+<td><code>(10, X)</code></td>
+<td><code>(11, Y)</code></td>
+<td><code>(11, Y)</code></td>
+</tr>
+</tbody>
+</table>
+<p>At time 1, <code>X</code> has one acceptance, not a majority. In Phase 1, the majority <code>A2,A3</code> reports no accepted proposal. Because all majorities intersect, an already chosen <code>X</code> could not be hidden entirely outside that preparing majority: a majority that chose <code>X</code> would share an acceptor with <code>A2,A3</code>, and that acceptor would report an accepted proposal.</p>
+<p>Therefore <code>P2</code> may choose <code>Y</code>, and it becomes chosen when <code>A2</code> and <code>A3</code> accept it. <code>A1</code> may later receive old messages, but its earlier lone acceptance of <code>X</code> cannot turn <code>X</code> into a conflicting chosen value; <code>A2</code> and <code>A3</code> have promised not to accept ballot <code>10</code> after their prepare replies.</p>
+<h3>Trace B: <code>X</code> was chosen, so <code>P2</code> must carry it forward</h3>
+<p>Change one delivery. Before pausing, <code>P1</code> reaches both <code>A1</code> and <code>A2</code> with <code>accept(10, X)</code>. That already chooses <code>X</code>, even if no learner has yet heard the result. Later <code>P2</code> prepares ballot <code>11</code> with <code>A2,A3</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Event</th>
+<th><code>A1</code></th>
+<th><code>A2</code></th>
+<th><code>A3</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>A1</code>, <code>A2</code> accept <code>(10, X)</code></td>
+<td>accepted <code>(10, X)</code></td>
+<td>accepted <code>(10, X)</code></td>
+<td>no accepted value</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>P2</code> sends <code>prepare(11)</code> to <code>A2</code>, <code>A3</code></td>
+<td>unchanged</td>
+<td>promises <code>11</code>; reports <code>(10, X)</code></td>
+<td>promises <code>11</code>; reports none</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>P2</code> selects the reported highest accepted value</td>
+<td>unchanged</td>
+<td>reports <code>(10, X)</code></td>
+<td>reports none</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>P2</code> sends <code>accept(11, X)</code></td>
+<td>unchanged</td>
+<td>may accept <code>(11, X)</code></td>
+<td>may accept <code>(11, X)</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>P2</code> wanted <code>Y</code>, but Phase 1 found <code>(10, X)</code> at the overlapping acceptor <code>A2</code>. The correct Phase 2 request is <code>accept(11, X)</code>, not <code>accept(11, Y)</code>. A later ballot may re-propose <code>X</code>; it cannot create a second chosen value.</p>
+<p><strong>So far:</strong> quorum intersection makes it impossible for a previously chosen value to be invisible to a later preparing majority. The prepare replies expose that evidence, and the selection rule turns the evidence into a constraint on the new proposal.</p>
+<h2>What the Mechanism Changes</h2>
+<p>Before this mechanism, a retrying proposer could treat silence and its own newer attempt as permission to overwrite the past. After it, a proposer may move forward only after a quorum gives it a consistent view of the accepted history relevant to safety.</p>
+<p>This is why Phase 1 is more than leader election. It gives an attempt priority over lower ballots, but it also transfers an obligation: if the quorum reports an accepted value, the new proposer inherits it. Ballots, promises, and quorum intersection work together; removing any one of them breaks the simple argument.</p>
+<h2>Cost, Limits, and Signals</h2>
+<p>This improves safety under message delay, retries, crashes, and overlapping proposers. The trade-off is explicit: Phase 1 needs a majority of replies before a proposer can issue its value, and acceptors must persist promises and accepted proposals before relying on them after restart.</p>
+<p>It also does not guarantee progress. Two proposers can repeatedly preempt one another: <code>P1</code> prepares ballot <code>10</code>, <code>P2</code> prepares <code>11</code>, <code>P1</code> retries with <code>12</code>, and neither completes Phase 2. The previous FLP lesson explains why timeouts and a stable leader are progress assumptions, not safety proofs. Paxos gets liveness when, for long enough, a distinguished proposer can communicate with a majority using a sufficiently high ballot.</p>
+<p>Useful signals at this boundary are repeated higher-ballot rejections, prepare retries, and a rising rate of abandoned proposals. They indicate proposer contention or a path that cannot reach a stable majority. They do not mean that Paxos has chosen two values; safety should hold while progress stalls.</p>
+<p>Single-decree Paxos also chooses only one decision. A replicated log needs one protected choice per slot. Re-running Phase 1 from scratch for each slot is safe but expensive, which is the pressure behind Multi-Paxos in the next lesson.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “The highest ballot gets to use any value.”</p>
+<p><strong>Why it is tempting:</strong> A higher ballot blocks lower ballots.</p>
+<p><strong>Better model:</strong> It gives the attempt priority, but Phase 1 may force its proposer to carry forward the highest accepted value reported by its majority.</p>
+<p><strong>Confusion:</strong> “An accepted value is already chosen.”</p>
+<p><strong>Why it is tempting:</strong> One acceptor has durable evidence for that value.</p>
+<p><strong>Better model:</strong> A value is chosen only when one proposal carrying it is accepted by a majority. A lone acceptance is not chosen, though it may still constrain a later proposer.</p>
+<p><strong>Confusion:</strong> “Chosen means every machine knows immediately.”</p>
+<p><strong>Why it is tempting:</strong> A client wants one visible answer.</p>
+<p><strong>Better model:</strong> Chosen is majority evidence; learning and dissemination are separate message flows and can happen later.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> <code>P2</code> receives Phase 1 replies from <code>A2</code> and <code>A3</code>. <code>A2</code> reports accepted <code>(7, X)</code> and <code>A3</code> reports accepted <code>(9, Y)</code>. What value must <code>P2</code> send in <code>accept(11, ?)</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> <code>Y</code>. The proposer selects the value associated with the highest-numbered <em>accepted</em> proposal among the majority's replies: ballot <code>9</code>, not ballot <code>7</code> and not a new preferred value.</p>
+<p><strong>Check:</strong> Why can <code>P2</code> propose <code>Y</code> in Trace A even though <code>A1</code> accepted <code>X</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The preparing majority <code>A2,A3</code> reported no accepted proposal. If <code>X</code> had already been chosen, a majority that accepted <code>X</code> would intersect <code>A2,A3</code>; the shared acceptor would report an accepted proposal. <code>A1</code>'s single acceptance did not choose <code>X</code>.</p>
+<h2>Practice: Diagnose a Rejected Proposal</h2>
+<p>Four acceptors, <code>A1</code> through <code>A4</code>, use any three as a quorum. <code>P1</code> has ballot <code>20</code> and <code>P2</code> has ballot <code>21</code>. <code>P1</code> completed Phase 1 with <code>A1,A2,A3</code>, but before its Phase 2 requests arrive, <code>P2</code> completes <code>prepare(21)</code> with <code>A2,A3,A4</code>. None of those replies reports an accepted proposal.</p>
+<ol>
+<li>What value may <code>P2</code> issue at ballot <code>21</code>?</li>
+<li>What should <code>A2</code> do if a delayed <code>accept(20, X)</code> arrives after it promised ballot <code>21</code>?</li>
+<li>If <code>P2</code> then receives acceptances from <code>A2,A3,A4</code>, what exactly has been established, and what may still be delayed?</li>
+</ol>
+<p><strong>Model answer:</strong></p>
+<ol>
+<li><code>P2</code> may issue any proposed value because its preparing quorum reported no accepted proposal.</li>
+<li><code>A2</code> must not accept it: its promise to ballot <code>21</code> rules out lower ballot <code>20</code>.</li>
+<li>The proposal <code>(21, chosen-value)</code> is chosen because a quorum accepted that same proposal. A learner, another replica, or the client may still not know it yet; notification is separate from the choice.</li>
+</ol>
 <h2>Connections</h2>
-<p>This lesson uses the FLP lesson's separation of safety and liveness. Paxos can preserve safety despite delays and competing proposers, but progress depends on the environment eventually allowing one proposer path to complete.</p>
-<p>It also sets up Multi-Paxos directly. Once the single-decree safety core is clear, the next optimization is easier to understand: avoid paying Phase 1 for every slot when a stable leader context can be reused.</p>
+<p>The previous lesson supplied the liveness boundary: silence and timeouts do not prove failure, so a protocol cannot promise progress in every asynchronous execution. Paxos uses that separation carefully—its safety rule does not rely on a timeout being correct.</p>
+<p>The next lesson reuses this same evidence-preserving mechanism across many log slots. Multi-Paxos makes the steady path faster by amortizing the expensive prepare phase while a leader remains stable.</p>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a><ul>
-<li>Focus: Read Phase 1 as the mechanism that discovers accepted history.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf">The Part-Time Parliament</a><ul>
-<li>Focus: Use the original framing after the safety story is familiar.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://paxos.systems/paper/">Paxos Made Moderately Complex</a><ul>
-<li>Focus: Good bridge from the single-decree idea toward implementation details.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a> — Focus: derive Phase 1 from the requirement that a higher proposal preserve already chosen values.</li>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf">The Part-Time Parliament</a> — Focus: read the original protocol framing after the two traces are comfortable.</li>
+<li>[ARTICLE/PAPER] <a href="https://paxos.systems/paper/">Paxos Made Moderately Complex</a> — Focus: connect the single-decree mechanism to a more implementation-oriented presentation.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Paxos preserves safety by making newer attempts learn accepted history from an overlapping quorum.</li>
-<li>Phase 1 is not ceremony; it both establishes ballot priority and transfers safety obligations.</li>
-<li>Single-decree Paxos is the safety foundation for one value, while replicated logs need optimizations such as Multi-Paxos.</li>
+<li>A single-decree Paxos run chooses one value when one proposal is accepted by a quorum.</li>
+<li>Phase 1 both blocks lower ballots and carries accepted evidence into the newer attempt.</li>
+<li>A newer proposer may choose freely only when its preparing quorum reports no accepted proposal; otherwise it carries forward the highest accepted value it learned.</li>
+<li>Safety can hold while progress fails: competing proposers and an unreachable majority can prevent a choice without allowing conflicting choices.</li>
+<li>Multi-Paxos keeps this safety argument and reduces the repeated Phase 1 cost across a log.</li>
 </ul>
 </section>
 
@@ -218,7 +356,7 @@ Multi-Paxos:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-01 14:33 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
