@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,111 +81,243 @@
 <section class="stack-block lesson-content-shell">
   <h1>Consistency Contracts and API Semantics</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A consistency model is an API contract about which stories clients are allowed to observe, and every stronger story buys clarity by spending latency, coordination, metadata, or availability under failure.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Turn a user-visible surprise into a precise read or write contract for one endpoint.</p>
+</li>
+<li>
+<p>Distinguish convergence, session guarantees, causal order, sequential consistency, and linearizability by the histories they rule out.</p>
+</li>
+<li>
+<p>Choose the weakest useful contract and name the routing, version, or coordination mechanism required to earn it.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A consistency model is not a database adjective; it is an API promise about which sequence of observations a client may rely on.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine an operations checklist used during a production incident. An engineer on mobile marks "database failover verified" as complete. A second engineer on the web dashboard refreshes the incident page. A third engineer opens the audit timeline to understand who did what. The same underlying replicated data now appears through three different user experiences.</p>
-<p>If the mobile engineer immediately sees the item incomplete again, that feels broken. If the dashboard lags for two seconds but eventually catches up, the team may tolerate it. If the audit timeline shows a follow-up comment before the checklist item that caused it, people may draw the wrong conclusion during a stressful incident.</p>
-<p>A consistency model names which of those observable histories are allowed. It is not just a storage-engine detail, and it is not the same thing as "fast" or "slow." It is the contract between the replicated system and the clients who are trying to make sense of its behavior.</p>
-<p>The useful design move is to stop asking whether the whole product is "eventually consistent" and start asking what each API must rule out. Some endpoints need a strong single-copy story. Others only need convergence, session stability, or causal ordering. The trade-off is that stronger contracts usually require more coordination or more metadata, especially across replicas.</p>
-<h2>Client Stories, Not Database Labels</h2>
-<p>The incident checklist stores task state in multiple replicas so the product remains responsive across regions. A client does not see the replicas directly. It sees a sequence of observations:</p>
-<div class="codehilite"><pre><span></span><code>t1  mobile client:  mark task complete
-t2  mobile client:  refresh task
-t3  web client:     refresh incident dashboard
-t4  audit client:   load event timeline
-</code></pre></div>
-
-<p>The consistency contract answers questions like:</p>
+<p>An incident team uses a replicated checklist. Priya is on a phone and marks <strong>database failover verified</strong> as complete. Leo refreshes the web dashboard. Marta opens the audit timeline to understand which action caused which follow-up.</p>
+<p>All three clients read copies of the same data. They do not need the same experience.</p>
 <ul>
-<li>Must the mobile client see its own write at <code>t2</code>?</li>
-<li>Must the web dashboard see the same value at <code>t3</code>?</li>
-<li>Must the audit timeline show the task completion before comments that depend on it?</li>
-<li>Must every client agree on one real-time order for all updates?</li>
+<li>Priya must not receive success and then immediately see the task as incomplete.</li>
+<li>Leo may tolerate a dashboard that is two seconds behind, as long as the page says so and does not jump backward for him.</li>
+<li>Marta must not see “rollback started” before the verified failover action it depends on.</li>
 </ul>
-<p>Those are API semantics. A vague promise like "replication is asynchronous" does not tell an application developer what behavior is safe to build on. A precise promise does:</p>
-<div class="codehilite"><pre><span></span><code>Endpoint                         Client-visible promise
--------------------------------  --------------------------------------------
-PATCH /tasks/:id/complete        writer receives a commit token
-GET /tasks/:id with token         must include at least that committed version
-GET /incident/:id/dashboard       may be up to 3 seconds stale
-GET /incident/:id/audit-log       must preserve cause-before-effect order
+<p>The tempting design is to put all three behind “the database replicates asynchronously.” It is attractive because it is short. It is not a contract. It does not tell Priya, Leo, or Marta which histories the API rules out.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>A consistency contract starts with the surprise a user must never see. In this incident tool, the relevant API questions are:</p>
+<div class="codehilite"><pre><span></span><code>PATCH /tasks/42/complete
+  What does 200 OK mean?
+
+GET /tasks/42
+  Must the writer see the completed task on the next read?
+
+GET /incidents/9/dashboard
+  How stale may the summary be for one viewer?
+
+GET /incidents/9/audit-log
+  Must a dependent event appear after the event it depends on?
 </code></pre></div>
 
-<p>This is why consistency belongs in API design, not only in database selection. The model determines what counts as a bug for a caller.</p>
-<h2>The Consistency Ladder</h2>
-<p>Different models rule out different surprising histories. A useful ladder is:</p>
-<div class="codehilite"><pre><span></span><code>weaker ------------------------------------------------------&gt; stronger
-eventual -&gt; read-your-writes -&gt; monotonic reads -&gt; causal -&gt; sequential -&gt; linearizable
+<p>Those are product and API questions. Replication only becomes meaningful after the promise is clear.</p>
+<h2>The Naive Design</h2>
+<p>Suppose every request goes to its nearest replica. A write is accepted in Madrid and is copied asynchronously to Virginia. Reads also use whichever replica is nearest.</p>
+<div class="codehilite"><pre><span></span><code>Priya&#39;s phone -&gt; Madrid:   PATCH /tasks/42/complete
+Madrid: task 42 = complete @18
+
+Priya&#39;s next read -&gt; Virginia: GET /tasks/42
+Virginia: task 42 = incomplete @17
 </code></pre></div>
 
-<p><strong>Eventual consistency</strong> promises convergence if writes stop for long enough. It does not promise that a client immediately sees its own write, that reads move forward, or that dependent actions appear in causal order. This is often enough for counters, cached summaries, or recommendation feeds.</p>
-<p><strong>Read-your-writes</strong> says that after a client successfully writes, that same client can read the result. In the checklist app, the mobile engineer should not mark a task complete and then immediately see it incomplete on refresh.</p>
-<p><strong>Monotonic reads</strong> say that once a client has observed a version, later reads by that client should not go backward. This matters for dashboards that refresh repeatedly. Seeing "failover verified" appear, disappear, and then reappear can be more confusing than seeing a slightly stale page for a short time.</p>
-<p><strong>Causal consistency</strong> says effects should not appear before their causes. If a comment says "verified after failover," the client should not observe that comment without also being able to observe the failover task it depends on.</p>
-<p><strong>Sequential consistency</strong> gives one global order that respects each client's program order, but it does not have to match real time. <strong>Linearizability</strong> adds the real-time rule: if operation A finished before operation B began, every observer must be able to understand the history in that order.</p>
-<p>Each step rules out more confusion. Each step also tends to cost more: extra coordination, larger version vectors, session tokens, quorum reads, leader routing, or waiting for remote replicas.</p>
-<h2>Worked Example: Three Endpoints, Three Contracts</h2>
-<p>The incident checklist does not need one consistency model for everything. It needs different contracts for different risks.</p>
-<p>For the task completion endpoint, read-your-writes is the minimum acceptable contract. When a client receives success from <code>PATCH /tasks/42/complete</code>, the response can include a version token:</p>
-<div class="codehilite"><pre><span></span><code>PATCH /tasks/42/complete  -&gt;  200 OK, version=task-42@v18
-GET /tasks/42?min_version=task-42@v18
+<p>The system may converge later. That is not enough for Priya. The API has already said the write succeeded, then displayed a state older than the acknowledged write.</p>
+<p>The same shape creates different harm for the other endpoints. Leo may be fine with a slightly stale dashboard. Marta is not fine with an audit story that shows an effect before its cause. The lesson is not “make every read linearizable.” It is “state what each endpoint must prevent.”</p>
+<h2>A Better Model: Histories Clients May Observe</h2>
+<p>Plain meaning:</p>
+<blockquote>
+<p>A consistency contract says which stories about reads and writes are legal for a caller to observe.</p>
+</blockquote>
+<p>In this scenario:</p>
+<blockquote>
+<p>Priya's successful update should remain visible to Priya. Leo's dashboard may lag within a stated budget. Marta's audit timeline should preserve cause before effect.</p>
+</blockquote>
+<p>Technical names:</p>
+<blockquote>
+<p><strong>Session guarantees</strong> constrain one client's successive observations. <strong>Causal consistency</strong> preserves cause-and-effect order. <strong>Linearizability</strong> gives each operation one point between request and response, so completed operations fit a real-time single-copy history.</p>
+</blockquote>
+<p>These models are not a universal “weak to strong” ladder. They rule out different bad histories and may require different mechanisms. Choose by the surprise the endpoint cannot tolerate.</p>
+<table>
+<thead>
+<tr>
+<th>Contract</th>
+<th>Rules out</th>
+<th>Does not automatically provide</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Eventual convergence</td>
+<td>Permanent divergence after writes stop</td>
+<td>Read-your-writes, monotonic reads, causal order, or a freshness bound</td>
+</tr>
+<tr>
+<td>Read-your-writes</td>
+<td>A session reading before its own acknowledged write</td>
+<td>Agreement among other clients or a global order</td>
+</tr>
+<tr>
+<td>Monotonic reads</td>
+<td>One session moving backward to an older observed version</td>
+<td>Seeing its own new write unless read-your-writes is also promised</td>
+</tr>
+<tr>
+<td>Causal consistency</td>
+<td>Observing an effect without an observed cause</td>
+<td>One total order for concurrent, unrelated updates</td>
+</tr>
+<tr>
+<td>Sequential consistency</td>
+<td>Histories that cannot fit one order respecting each client's program order</td>
+<td>Real-time ordering across clients</td>
+</tr>
+<tr>
+<td>Linearizability</td>
+<td>A completed operation appearing after a later-started operation</td>
+<td>Cheap reads, low latency, or availability during every failure</td>
+</tr>
+</tbody>
+</table>
+<h2>A Worked Contract Trace</h2>
+<p>Start with the task-completion endpoint. The product chooses read-your-writes for the writer.</p>
+<div class="codehilite"><pre><span></span><code>1. Priya -&gt; Madrid: PATCH /tasks/42/complete
+2. Madrid durably accepts task 42 = complete at revision 18.
+3. Madrid -&gt; Priya: 200 OK, observed_revision=18
+4. Priya -&gt; a nearby replica: GET /tasks/42, min_revision=18
 </code></pre></div>
 
-<p>The server can satisfy that read by routing to a replica that has applied version <code>v18</code>, waiting briefly for the local replica to catch up, or falling back to the leader. That may add latency, but it prevents the most personal and obvious inconsistency: "I just did this, and the system forgot."</p>
-<p>For the incident dashboard, the team may choose monotonic reads with a freshness budget. A stale dashboard is acceptable if it does not jump backward for the same viewer and if the UI knows the data may lag:</p>
-<div class="codehilite"><pre><span></span><code>dashboard contract:
-- may lag the write path by up to 3 seconds
-- must not show an older version than this client already saw
-- should expose last_refreshed_at for operational clarity
+<p>Step 4 is where the contract becomes real. A replica at revision 17 cannot return its old value as a successful answer to this request. The system has several possible ways to honor the token:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>What the read path does</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Route to the write authority</td>
+<td>Reads the known current path</td>
+<td>May add distance or concentrate load</td>
+</tr>
+<tr>
+<td>Wait for local catch-up</td>
+<td>Delays until the replica has revision 18</td>
+<td>Adds variable read latency</td>
+</tr>
+<tr>
+<td>Use a quorum or validated read</td>
+<td>Asks enough replicas for current evidence</td>
+<td>Adds coordination cost</td>
+</tr>
+</tbody>
+</table>
+<p>The client need not know which option the service uses. It needs to know what <code>min_revision=18</code> means and what happens if the deadline expires. A clear API might return a retryable <code>409</code> or <code>503</code> rather than silently returning revision 17.</p>
+<p><strong>So far:</strong> an asynchronous write pipeline can coexist with a session guarantee. The guarantee requires an extra read-path rule, not wishful language about replication.</p>
+<h2>Three Endpoints, Three Choices</h2>
+<p>The incident tool can now write a contract table.</p>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Promise</th>
+<th>Mechanism that earns it</th>
+<th>Explicit boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PATCH /tasks/42/complete</code></td>
+<td>Success includes a durable revision token</td>
+<td>Authoritative write path records revision 18</td>
+<td>A timeout may leave the client unsure whether the write committed</td>
+</tr>
+<tr>
+<td><code>GET /tasks/42?min_revision=18</code></td>
+<td>Never returns a version older than 18 as success</td>
+<td>Token-aware routing, waiting, or fallback</td>
+<td>May wait or return a retryable failure</td>
+</tr>
+<tr>
+<td><code>GET /dashboard</code></td>
+<td>May be at most 2 seconds old and never move backward in one session</td>
+<td>Freshness metadata plus session version tracking</td>
+<td>Not proof that a task write committed</td>
+</tr>
+<tr>
+<td><code>GET /audit-log</code></td>
+<td>Dependent events appear after their causes</td>
+<td>Causal dependencies or one ordered event stream</td>
+<td>Unrelated concurrent events need not have one “true” order</td>
+</tr>
+</tbody>
+</table>
+<p>For an authority-changing endpoint, the team may need linearizability. For example, assigning the only incident commander or approving an irreversible rollback may require every client to understand completed operations in real-time order. Herlihy and Wing describe this as each operation taking effect at some point between its call and response.</p>
+<p>That is powerful. It is not free. Across replicas, the service may need leader routing, quorum evidence, leases, or a read-index-like mechanism. During a partition, the endpoint may have to refuse instead of pretending it can preserve a real-time single answer.</p>
+<h2>The Trade-off</h2>
+<p>Before this lesson, a team might say, “We use eventual consistency.” After this lesson, it can state an endpoint contract with its price.</p>
+<div class="codehilite"><pre><span></span><code>This helps: Priya does not see her own acknowledged action disappear.
+This costs: Some reads route farther or wait for a replica to catch up.
+This can still fail: A client can lose the response to a committed write and need an idempotent retry path.
+The signal to watch: Token-wait latency, stale-read fallback rate, and the age of dashboard data.
 </code></pre></div>
 
-<p>For the audit timeline, causal ordering matters more than raw freshness. Showing a dependent comment before the task completion can create a false story. The system might attach causal dependencies to events or build the audit log from one ordered stream so clients do not observe effects without causes.</p>
-<p>The design is not "strong everywhere" or "weak everywhere." It is a set of promises matched to user harm.</p>
-<h2>Choosing the Weakest Useful Promise</h2>
-<p>The strongest model is not automatically the best model. Linearizability is excellent when clients need one real-time truth, such as acquiring a lock, assigning a unique incident commander, or authorizing an irreversible action. It is expensive when every dashboard read pays cross-region coordination just to avoid a harmless one-second lag.</p>
-<p>A practical review asks four questions:</p>
-<div class="codehilite"><pre><span></span><code>Question                                      Example answer
---------------------------------------------  -----------------------------------------
-Who is the observer?                          the writer, one session, all clients
-What surprise must be impossible?             seeing my own write disappear
-How long can stale state be acceptable?        3 seconds for dashboard summaries
-What cost can this endpoint pay?              wait on leader, quorum, token, or cache
-</code></pre></div>
-
-<p>The phrase "eventually consistent" is too broad unless it is paired with those answers. Eventual convergence might be fine for a derived count. It is usually too weak for a workflow step that a human just completed. Causal consistency might be enough for conversations and timelines. Linearizability may be reserved for authority-changing operations.</p>
-<p>This is the core API lesson: consistency is not only about where replicas live. It is about what histories callers are allowed to depend on.</p>
-<h2>Failure Modes</h2>
-<p><strong>Calling eventual consistency "slightly stale."</strong> Slightly stale is a freshness budget. Eventual consistency by itself also permits session surprises, non-monotonic reads, and temporary disagreement unless the system adds stronger guarantees.</p>
-<p><strong>Promising read-your-writes without routing or tokens.</strong> A client cannot rely on seeing its write if a later read can land on any lagging replica. The API needs a version token, sticky routing, leader reads, quorum reads, or another mechanism that makes the promise real.</p>
-<p><strong>Using linearizability as a default comfort blanket.</strong> Strong real-time order can simplify reasoning, but it may add latency and reduce availability during replica or network trouble. Spend it where the product needs that exact guarantee.</p>
-<p><strong>Forgetting that semantics cross service boundaries.</strong> If a task service promises causal order but the audit service consumes events asynchronously without dependencies, the user can still see effects before causes. The contract has to survive the full read path.</p>
+<p>The weakest useful promise is usually the best one. A dashboard can spend little coordination when the product accepts bounded staleness. An authority-changing write should spend more when a wrong answer would grant conflicting power. The right choice depends on named harm, not on a comforting database label.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> Eventual consistency means “slightly stale.”</p>
+<p><strong>Why it is tempting:</strong> Both phrases describe data that may arrive later.</p>
+<p><strong>Better model:</strong> Eventual convergence alone does not bound staleness or protect a session from moving backward. A freshness budget and session guarantee are separate promises.</p>
+<p><strong>Confusion:</strong> A commit token makes a later read fresh by itself.</p>
+<p><strong>Why it is tempting:</strong> The writer now knows revision 18.</p>
+<p><strong>Better model:</strong> The read path must honor the token by routing, waiting, or failing clearly. A token that no server checks is only a receipt.</p>
+<p><strong>Confusion:</strong> Causal order means every event has one global order.</p>
+<p><strong>Why it is tempting:</strong> The audit log looks like one timeline.</p>
+<p><strong>Better model:</strong> Causality orders an event after its known causes. Independent concurrent events may remain unordered unless the product pays for a stronger total-order contract.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> Priya receives <code>200 OK, observed_revision=18</code>. Her next <code>GET /tasks/42?min_revision=18</code> reaches a replica at revision 17. Which response honors read-your-writes?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The replica must wait, route elsewhere, or return a retryable outcome. Returning revision 17 as a normal success breaks the promise because the client has already observed a successful write at revision 18.</p>
+<p><strong>Check:</strong> The dashboard shows revision 18, then revision 17, then revision 18 again to the same viewer. Which guarantee is missing?</p>
+<p><strong>Answer:</strong> Monotonic reads. A bounded-staleness budget alone does not prevent one session from moving backward between reads.</p>
+<h2>Practice: Contract an Incident API</h2>
+<p>Add a <code>POST /rollbacks/approve</code> endpoint. Two operators may press approve during a partial network failure. An approved rollback triggers an external change that cannot safely run twice.</p>
+<p>Write the contract for the write and the immediate follow-up read. Name the user-visible failure response and the signal the operations team should monitor.</p>
+<p>A good answer should mention:</p>
+<ul>
+<li>One authoritative approval decision, often requiring linearizable or equivalently strong conditional-write semantics for this invariant.</li>
+<li>An idempotency key or approval identifier, because a lost response does not prove the write failed.</li>
+<li>A token-aware status read or authoritative fallback after approval.</li>
+<li>A retryable refusal when the service cannot establish current authority, rather than two independent approvals.</li>
+<li>Signals such as conditional-write conflicts, authority/read latency, and unresolved approval status.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="001.html">Partition-Time Guarantees: CAP and PACELC</a> explains why an authority-changing endpoint may refuse during a partition; this lesson turns that choice into an API promise.</li>
+<li><a href="003.html">Replication Topologies and Failure Domains</a> asks where the write authority, readers, and recovery copies should live so these contracts survive real failures.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a><ul>
-<li>Focus: Read for the real-time ordering rule that separates linearizability from weaker global-order models.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Time, Clocks, and the Ordering of Events in a Distributed System</a><ul>
-<li>Focus: Use this to connect causality, happened-before relationships, and observable order.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.cs.utexas.edu/users/lorenzo/corsi/cs380d/papers/SessionGuaranteesPDIS_1.pdf">Session Guarantees for Weakly Consistent Replicated Data</a><ul>
-<li>Focus: Pay attention to read-your-writes and monotonic-read guarantees as API-level promises.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Review the consistency and replication chapters for practical trade-offs between semantics and coordination.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.cs.cmu.edu/~wing/publications/HerlihyWing90.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a> — Focus: Compare the real-time rule with weaker contracts before demanding a single-copy history.</li>
+<li>[PAPER] <a href="https://citeseerx.ist.psu.edu/document?doi=d094e265d2c532b8646d0367709564744524b5a2&amp;repid=rep1&amp;type=pdf">Session Guarantees for Weakly Consistent Replicated Data</a> — Focus: Read the four per-session guarantees and the client observations each one protects.</li>
+<li>[PAPER] <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Time, Clocks, and the Ordering of Events in a Distributed System</a> — Focus: Use happened-before to separate causal order from a total order.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Connect models of consistency to replication and API design choices.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A consistency model is a contract over client-visible histories, not a vague label for a database.</li>
-<li>Different APIs in the same product can need different guarantees: convergence, session stability, causal order, or real-time global order.</li>
-<li>Stronger contracts rule out more confusing stories, but they usually spend coordination, metadata, latency, or availability under failure.</li>
-<li>Good API design names the weakest promise that still prevents the user-visible surprise the product cannot tolerate.</li>
-</ol>
+<ul>
+<li>A consistency contract describes histories clients may observe; it is not a blanket database label.</li>
+<li>The contract should start from a concrete user-visible surprise, such as seeing an acknowledged write disappear or seeing an effect before its cause.</li>
+<li>Tokens, routing, waiting, quorums, and ordered streams are useful only when they earn a named endpoint promise.</li>
+<li>Stronger guarantees reduce some surprises but add latency, coordination, or failure-time unavailability; use the weakest one that protects the invariant.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -210,7 +346,7 @@ What cost can this endpoint pay?              wait on leader, quorum, token, or 
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,138 +81,157 @@
 <section class="stack-block lesson-content-shell">
   <h1>Replication Topologies and Failure Domains</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A replication topology is not "how many copies exist"; it is a map of which failure domains, network paths, and replica roles must survive for writes, failover, and recovery to keep the promised consistency contract.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>map a replication layout to the failure domains and shared dependencies it really uses;</p>
+</li>
+<li>
+<p>distinguish its commit, failover, and repair paths;</p>
+</li>
+<li>
+<p>choose a topology that matches a stated latency and recovery promise.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Replica count is not resilience; a topology earns a guarantee only through the domains and paths that must still work when something fails.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine Harbor Point, a reservation platform for high-value municipal bond orders. The product team has already named its API contracts: an accepted reservation must not disappear or be double-booked, while regional dashboards may lag by a few seconds. The next design question sounds simple: where should the replicas live?</p>
-<p>The tempting answer is "three replicas." That answer is almost empty. Three processes on the same rack, three zones behind the same regional control plane, and three regions connected by a jittery wide-area network all have different latency, durability, and failover behavior.</p>
-<p>Topology is the missing layer between a client-visible guarantee and the replication mechanism that will implement it. If the reservation write requires a strong story, then the topology must say which replicas vote before success. If dashboards may be stale, then their replicas can sit on an asynchronous path. If disaster recovery matters, then the design must say where a surviving copy can be found and how it catches up.</p>
-<p>The trade-off is that every added failure domain changes the hot path somewhere. Moving a voter across a region boundary may improve disaster tolerance, but it can put WAN tail latency into normal commits and elections. Keeping all voters local may make writes fast, but it can leave the business with a non-zero recovery point after a regional event.</p>
-<h2>Failure Domains Before Replica Count</h2>
-<p>A failure domain is a boundary inside which failures are likely to correlate. A single machine can fail. So can a rack, a power zone, a provider region, a control plane, a fiber path, a DNS dependency, or an identity service that all replicas use to start and authenticate.</p>
-<p>Harbor Point's first topology sketch said this:</p>
-<div class="codehilite"><pre><span></span><code>reservation service: 3 replicas
+<p>At 10:02, an IAD availability zone loses power while a trader submits reservation <code>R-91</code>. The API must decide whether to acknowledge the write, and the on-call engineer must decide whether the remaining replicas can keep serving it. Harbor Point needs a replicated reservation shard. Someone proposes “three replicas plus a disaster-recovery copy.” It sounds like a design, but it leaves out the facts that decide whether a confirmation survives: where the voters are, which dependencies they share, and whether a remote copy is part of the acknowledgement rule.</p>
+<p>Three processes on one rack, three zones in one region, and three regions joined by a WAN all have different failure behavior. The useful unit is a <strong>failure domain</strong>: a boundary inside which failures may be correlated. It can be a host, rack, power zone, region, identity service, DNS dependency, backbone link, or backup store.</p>
+<p>The initial model is “more copies mean safer data.” It works only when the copies fail independently and the client promise says which copies must receive a write. The stronger model is a topology map with three visible paths: commit, failover, and repair.</p>
+<p>The immediate investigation has three questions. Which nodes can acknowledge <code>R-91</code> after the zone loss? Which nodes can choose the next authority if the leader was in the lost zone? And, if one surviving replica was already behind, can it repair from retained history or does it need a snapshot? A topology is useful when it answers those questions before an incident, not when it merely labels boxes as replicas.</p>
+<h2>Start From the Promise</h2>
+<p>Harbor Point has four product requirements:</p>
+<div class="codehilite"><pre><span></span><code>confirmed reservations: one ordered authority, no double booking
+East Coast writes: usually below 30 ms
+Dublin dashboard: may be up to five seconds stale
+whole primary-region loss: at most 60 seconds of accepted history lost
 </code></pre></div>
 
-<p>That is not enough to review. A useful sketch attaches each replica to the domains it depends on:</p>
-<div class="codehilite"><pre><span></span><code>reservation shard 184
-├── iad region
-│   ├── zone a: iad-db-1, leader, voter
-│   ├── zone b: iad-db-2, voter
-│   └── zone c: iad-db-3, voter
-└── dub region
-    └── zone a: dub-db-1, async replica
+<p>The last requirement is an RPO, not a claim of zero-loss regional failover. That difference determines whether a remote replica must vote before a success response.</p>
+<h2>Make the Domains Visible</h2>
+<p>The following sketch is a teaching model. It is useful because it names dependencies rather than merely counting processes.</p>
+<div class="codehilite"><pre><span></span><code>shard 184
+  iad zone A: iad-1, leader, voter
+  iad zone B: iad-2, voter
+  iad zone C: iad-3, voter
+  dub zone A: dub-1, asynchronous recovery replica
 
-shared dependencies:
-- global DNS
-- cloud identity control plane
-- private backbone between iad and dub
-- object storage bucket used for base backups
+shared dependencies: DNS, identity control plane,
+the IAD-DUB network path, and backup object storage
 </code></pre></div>
 
-<p>Now the review can ask real questions. Does the write path survive one zone loss? Yes, because the local quorum still has two voters. Does it survive the whole <code>iad</code> region with zero acknowledged data loss? No, because the Dublin copy is asynchronous. Can the Dublin replica be rebuilt if the object storage bucket is unavailable? Maybe not, because backup seeding is a separate dependency from steady-state replication.</p>
-<p>Counting replicas hides those answers. Modeling domains exposes them.</p>
-<h2>Three Paths Hidden in One Topology</h2>
-<p>Every topology creates at least three paths, and they do not fail in the same way.</p>
-<p>The <strong>commit path</strong> is the route a write must travel before the client receives success. If Harbor Point requires a reservation to be durable on two local voters before acknowledging, normal latency stays low but regional data loss remains possible. If one remote voter must confirm, regional durability improves but every write now depends on a wider network.</p>
-<p>The <strong>election or failover path</strong> is the set of replicas that can decide who is authoritative after a leader failure. A remote replica that receives data asynchronously may be useful for recovery but may not be eligible to become leader without manual checks. A remote voter can participate automatically, but then timeouts, leases, and quorum behavior must be tuned for remote delay.</p>
-<p>The <strong>repair path</strong> is how a lagging or replaced replica gets back to a complete prefix of history. This path is easy to ignore until a replica falls behind and the catch-up stream saturates the same link needed by user traffic.</p>
-<p>Two candidate layouts make the difference visible:</p>
-<div class="codehilite"><pre><span></span><code>Topology A: local voting quorum + remote async copy
+<p>This map supports questions a replica count cannot answer. Losing one IAD zone leaves two voters, so normal local quorum commits can continue. Losing IAD entirely leaves Dublin with only whatever it has durably replayed. Losing the object store may not stop normal replication, but it can prevent a replacement from being seeded or a recovery from being verified.</p>
+<p>The map also stops a common mistake: calling zones independent while placing every node behind the same authentication or network dependency. Independence is a claim to investigate, not a label inherited from a cloud diagram.</p>
+<h2>Two Designs, Three Paths</h2>
+<p>Compare two layouts for the same service.</p>
+<div class="codehilite"><pre><span></span><code>A. Local voting quorum + remote asynchronous replica
 
-client write
-   |
-   v
-iad-db-1 leader
-   |-- sync --&gt; iad-db-2 voter
-   |-- sync --&gt; iad-db-3 voter
-   `-- async -&gt; dub-db-1 disaster-recovery replica
+client -&gt; iad leader -&gt; iad voter 1 and iad voter 2
+                         \-&gt; async stream -&gt; Dublin
 
-Topology B: stretched voting quorum
+B. Stretched voting quorum
 
-client write
-   |
-   v
-iad-db-1 leader
-   |-- sync --&gt; iad-db-2 voter
-   `-- sync --&gt; dub-db-1 voter
+client -&gt; iad leader -&gt; iad voter and Dublin voter
 </code></pre></div>
 
-<p>Topology A is attractive when Harbor Point needs very low write latency and can tolerate a bounded recovery point objective for full-region loss. Topology B is attractive when an acknowledged reservation must survive the loss of the primary region. The cost is permanent exposure to the remote path: if Dublin is slow, normal writes, leader decisions, or failover behavior may become slow too.</p>
-<p>The topology is not just a diagram. It is a performance and failure contract.</p>
-<h2>Worked Example: Matching Topology to the Promise</h2>
-<p>Harbor Point writes down four product requirements:</p>
-<div class="codehilite"><pre><span></span><code>Requirement                                      Topology implication
------------------------------------------------  --------------------------------------
-accepted reservations must not double-book       one authority path for reservation writes
-East Coast writes should usually finish &lt; 30 ms   keep normal quorum near East Coast users
-regional dashboard may lag up to 5 seconds        async read replica is acceptable there
-full-region disaster may lose at most 60 seconds  remote async copy must stay within RPO
-</code></pre></div>
-
-<p>Those requirements point toward local voting plus remote asynchronous disaster recovery, not a stretched global quorum. The reservation write still needs one clear authority path, but the business has not demanded zero-data-loss regional failover. Paying remote quorum latency on every write would buy a stronger guarantee than the stated product promise.</p>
-<p>The resulting design might be:</p>
-<div class="codehilite"><pre><span></span><code>write authority:
-- leader and voters in three independent zones in `iad`
-- acknowledge after local majority has durably accepted the write
-
-remote recovery:
-- stream ordered changes to `dub`
-- alert if remote lag exceeds 30 seconds
-- declare regional RPO breach if lag approaches 60 seconds
-
-read scaling:
-- serve Dublin dashboards from `dub-db-1`
-- show `last_replicated_at`
-- route critical reservation reads back to the authority path
-</code></pre></div>
-
-<p>This design has a clear trade-off. It protects the strongest API contract for normal zone failures and gives fast writes. It does not claim zero-data-loss regional failover. That limitation is not a bug if the business accepts the RPO and the system monitors the async replica aggressively.</p>
-<p>If the business later changes the promise to "no acknowledged reservation may be lost even if <code>iad</code> disappears," the topology must change. A remote voter, a multi-region quorum system, or a different authority model becomes necessary. That new design would spend more latency and operational complexity to buy a stronger guarantee.</p>
-<h2>Topology Review Checklist</h2>
-<p>Before a replication design is approved, the team should be able to answer these questions without hand-waving:</p>
-<div class="codehilite"><pre><span></span><code>Question                                      Why it matters
---------------------------------------------  -----------------------------------------
-Which replicas vote on the write path?         defines commit latency and durability
-Which domains can fail independently?          separates real resilience from labels
-Which replicas can become authority?           shapes failover and split-brain risk
-How does a lagging replica catch up?           exposes repair bandwidth and retention
-What is the accepted RPO and RTO?              connects topology to business promise
-Which reads may use stale replicas?            prevents weak replicas from serving strong APIs
-</code></pre></div>
-
-<p>The last question ties this lesson back to consistency contracts. A replica topology can support multiple API semantics only if the routing layer respects the contract. A dashboard endpoint may read from a lagging replica. A reservation confirmation endpoint may need to read from the leader, a quorum, or a replica known to have applied a required version.</p>
-<p>Topology and API semantics must be reviewed together. Otherwise the system can be technically replicated and still violate the promise clients were told to trust.</p>
-<h2>Failure Modes</h2>
-<p><strong>Counting replicas instead of independent domains.</strong> Three replicas behind one shared storage service, identity dependency, or network edge can fail like one system. Review correlated dependencies, not only provider zone names.</p>
-<p><strong>Putting a remote voter on the hot path by accident.</strong> A configuration that improves regional durability may also import WAN latency into every commit and election. That trade-off is acceptable only when the stronger durability promise is intentional.</p>
-<p><strong>Treating async disaster recovery as zero-data-loss failover.</strong> A remote async replica can be excellent for bounded RPO, but it is not proof that every acknowledged write survived a primary-region loss.</p>
-<p><strong>Ignoring repair traffic.</strong> A topology can pass steady-state tests and still fail operationally when a replacement replica needs a large catch-up stream over a congested link.</p>
+<p>Each layout contains three paths.</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Question</th>
+<th>A: local quorum + async DR</th>
+<th>B: stretched quorum</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Commit</td>
+<td>What must acknowledge before success?</td>
+<td>Local majority.</td>
+<td>A quorum that includes the remote voter under this design.</td>
+</tr>
+<tr>
+<td>Failover</td>
+<td>Who can establish authority after loss?</td>
+<td>Local voters automatically; regional recovery uses the remote durable prefix and a runbook.</td>
+<td>Remote voter participates in the voting story.</td>
+</tr>
+<tr>
+<td>Repair</td>
+<td>How does a lagger return?</td>
+<td>Stream retained history or seed from snapshot.</td>
+<td>Same need, now sharing more critical WAN capacity.</td>
+</tr>
+</tbody>
+</table>
+<p>Neither layout is simply “better.” Layout A keeps ordinary commits close to IAD users. It is a good fit when the business accepts the stated regional RPO and monitors remote lag. Layout B can support a stronger regional durability promise, but it imports WAN delay and failure behavior into the normal write path. That is the trade-off: lower normal latency versus a stronger acknowledgement boundary.</p>
+<h2>A Worked Decision</h2>
+<p>At 10:00, an IAD zone fails. In layout A, <code>iad-1</code> is gone but <code>iad-2</code> and <code>iad-3</code> remain. They still form a local majority and can elect or confirm an authority according to the service protocol. Reservation writes continue with their normal acknowledgement rule.</p>
+<p>At 10:03, the IAD region is lost. Dublin has replayed through 10:02:20. Promoting it can make the service available again, but it cannot recover a write that was accepted at 10:02:50 unless that write reached Dublin. The design has not failed its stated 60-second RPO if the lag was within budget; it would fail a zero-loss regional contract.</p>
+<p>This trace changes the design conversation. “Dublin is a replica” becomes “Dublin is a recovery replica with this durable prefix, this promotion rule, and this measured loss boundary.” If product changes the promise to no acknowledged loss after regional failure, the commit path must include remote durability or a different globally coordinated mechanism.</p>
+<p>The repair path matters before disaster too. If Dublin is offline long enough that the leader cannot retain the needed history, it needs a snapshot from a known committed state. A topology that cannot seed, validate, and route that replacement has copies on paper but a weak recovery plan in practice.</p>
+<p>Consider a second failure at 10:04: one IAD survivor has only partial history because it was recovering when the zone failed. The remaining authority cannot simply count a process as useful because it is reachable. It needs a current committed prefix before that replica can acknowledge safely or serve a freshness-sensitive read. The repair path therefore consumes the same network, disk, and operational attention as the normal topology. A design that places every copy in independent zones but cannot replenish one after failure has resilience only for its first incident.</p>
+<p>That recovery capability must be exercised before production relies on it.</p>
+<h2>What This Changes</h2>
+<p>Before this model, a team might add replicas until a diagram looks redundant. After it, the team writes a contract beside each path:</p>
+<table>
+<thead>
+<tr>
+<th>Claim</th>
+<th>Evidence to require</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Zone failure does not lose acknowledged writes.</td>
+<td>Voters span the relevant zones and acknowledgement uses a surviving quorum.</td>
+</tr>
+<tr>
+<td>Regional loss stays inside the RPO.</td>
+<td>Remote durable lag and archive/recovery evidence stay inside the budget.</td>
+</tr>
+<tr>
+<td>Dashboard may be stale but confirmations may not.</td>
+<td>Routing separates the asynchronous read path from authority reads.</td>
+</tr>
+<tr>
+<td>A replacement can return safely.</td>
+<td>Retained history or snapshot, validation, and an epoch-aware promotion path exist.</td>
+</tr>
+</tbody>
+</table>
+<h2>Consequences, Trade-offs, and Limits</h2>
+<p>More distance can improve survivability, but it costs latency, operational complexity, and sensitivity to WAN failure. Keeping voters local gives predictable commits but leaves a recovery window for regional loss. An asynchronous replica can serve a stale dashboard; it cannot honestly serve a confirmation endpoint that promises the latest committed result.</p>
+<p>Topology alone does not solve corruption, duplicate client requests, or unsafe promotion. Watch remote durable lag, quorum health, shared-dependency failures, retained-log pressure, and restore validation. Those signals say when the map no longer supports the promise written beside it.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> Three voters run in separate zones but all depend on one identity service that is unavailable. Does “three-zone replication” guarantee write availability?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The identity service is a shared failure domain if writes or node operation depend on it. The topology must include such dependencies, not only machine placement.</p>
+<p><strong>Check:</strong> A remote asynchronous replica is 45 seconds behind and the published regional RPO is 60 seconds. May the team call this zero-loss failover?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It may still be inside the stated RPO, but a recent acknowledged write can be absent after regional promotion. Zero-loss requires a stronger acknowledgement boundary.</p>
+<h2>Practice: Review a Topology</h2>
+<p>Sketch a three-replica service with one remote copy. Name its failure domains, its commit acknowledgements, its regional-loss promise, and its repair source.</p>
+<p><strong>A good answer should mention:</strong> at least one shared dependency; whether the remote copy is synchronous or asynchronous; the RPO implied by that choice; which endpoints may use it for reads; and how a lagger receives retained log or a snapshot.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="002.html">Consistency Contracts and API Semantics</a> supplies the promises that topology must actually support.</li>
+<li><a href="004.html">Log Shipping and Ordered Apply</a> explains the ordered history that follows the chosen replication paths.</li>
+<li><a href="018.html">Replication Flow Control and Backpressure</a> makes the repair path operational when a follower falls behind.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Read the replication chapters for how topology choices change leader, follower, and multi-datacenter behavior.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a><ul>
-<li>Focus: Notice how replica placement, quorum choices, and latency are tied to the externally consistent transaction promise.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION">PostgreSQL Documentation: Synchronous Replication</a><ul>
-<li>Focus: Compare priority and quorum standbys as concrete examples of topology affecting commit behavior.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
-<li>Focus: Pay attention to preference lists and replica placement as part of the availability model.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally Distributed Database</a> — Focus: Relate placement and quorum choices to an explicit multi-region transaction promise.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION">PostgreSQL Synchronous Replication</a> — Focus: See how standby selection changes a commit acknowledgement boundary.</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo</a> — Focus: Examine replica placement and preference lists as availability design choices.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ol>
-<li>Replica count is not a resilience claim unless each replica is mapped to real failure domains and shared dependencies.</li>
-<li>A topology defines commit, election, and repair paths; all three must match the promised consistency and recovery behavior.</li>
-<li>Local quorum plus remote async replication buys low latency and bounded RPO, while stretched quorum buys stronger regional durability at normal-path cost.</li>
-<li>API routing must respect topology: stale replicas are fine for stale endpoints and dangerous for endpoints that promised a stronger story.</li>
+<li>A topology must name failure domains and shared dependencies, not only replica count.</li>
+<li>Commit, failover, and repair paths can have different participants and different failure behavior.</li>
+<li>Local quorum plus remote asynchronous recovery buys low latency and bounded regional loss; stronger regional durability moves remote cost onto the acknowledgement path.</li>
 </ol>
 </section>
 
@@ -238,7 +261,7 @@ Which reads may use stale replicas?            prevents weak replicas from servi
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

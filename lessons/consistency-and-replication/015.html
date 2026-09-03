@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -76,117 +80,159 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Secondary Indexes Across Shards</h1>
-<blockquote>
-<p><strong>The core idea</strong>: Once a table is sharded by one key and queried by another, a global secondary index becomes its own distributed data structure, with separate shards, separate write amplification, and separate correctness hazards that must stay aligned with the base rows.</p>
-</blockquote>
+<p>Harbor Point routes decisive reservation changes by <code>allocation_bucket_id</code>. That is deliberate: one shard owns a scarce bucket and can decide whether a hold, release, or confirmation is allowed. Then compliance asks a different question: “show every open reservation for issuer <code>CA-MUNI</code>, across all desks and allocation buckets.”</p>
+<p>The obvious answer is “add an index on <code>issuer_id</code>.” That helps inside one allocation-bucket shard, but the router still does not know which bucket owners contain <code>CA-MUNI</code>. It must ask them all. The lookup has become many quick local searches plus one slow cluster-wide fan-out.</p>
+<p>The stronger model is that an alternate-key lookup is a second distributed structure. A global secondary index has its own partition key, write path, lag, hotspots, and recovery story. It can make issuer queries targeted, but only when its relationship to the authoritative base row is designed explicitly.</p>
 <h2>Core Insight</h2>
-<p>Harbor Point now has a sharded reservation service whose strongest writes route by <code>allocation_bucket_id</code>. That is the right authority boundary for hold, release, extend, and confirm decisions: one shard owns the scarce allocation bucket and can decide the invariant locally. The trouble starts when compliance asks a different question during the market open: "show every open reservation for issuer <code>CA-MUNI</code>, across every desk and allocation bucket."</p>
-<p>The first instinct is usually too small: "add an index on <code>issuer_id</code>." A local index on each allocation shard helps only after the router has already asked that shard to search. The expensive part is still there. The router does not know which allocation-bucket owners contain open <code>CA-MUNI</code> rows, so it must fan out across the cluster and wait for the slowest useful answer.</p>
-<p>The real design shift is to treat the index as another sharded table with another authority rule. Harbor Point creates <code>gsi_open_by_issuer</code>, partitioned by <code>(issuer_id, status)</code>, where each entry points back to the base reservation's allocation bucket, row key, version, and current owner epoch. Now an issuer lookup can route to the relevant index shard first, find matching reservation IDs, and fetch or validate only the base rows it needs.</p>
-<p>That is the important mental model: a global secondary index is not a schema decoration. It is a second distributed write path. When reservation <code>R-88421</code> changes from <code>open</code> to <code>released</code> on the base shard, the system must also delete or invalidate the corresponding entry on index shard <code>I3</code>. If those state transitions drift apart, the issuer query is wrong even when every shard is healthy in isolation.</p>
-<h2>From Local Index to Global Lookup</h2>
-<p>Harbor Point's primary layout is still sensible. The base table is partitioned so decisive reservation writes stay close to the allocation bucket they modify. The problem is that production systems are rarely queried only by the key that defines write authority. Risk, compliance, search, and operations workflows ask for alternate access paths.</p>
-<p>Without a global secondary index, this query becomes scatter-gather over every allocation shard:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span>
-<span class="k">FROM</span><span class="w"> </span><span class="n">reservations</span>
-<span class="k">WHERE</span><span class="w"> </span><span class="n">issuer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;CA-MUNI&#39;</span>
-<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;open&#39;</span><span class="p">;</span>
+<p>The base reservation and its index entry answer different questions:</p>
+<div class="codehilite"><pre><span></span><code>base row, partitioned by allocation_bucket_id
+  “May this bucket confirm or release reservation R-88421?”
+
+global index, partitioned by issuer_id and status
+  “Which reservations might be open for CA-MUNI?”
 </code></pre></div>
 
-<p>Each shard can use its local <code>issuer_id</code> index to search quickly inside its own slice, but the router still has to ask all of them. The cluster has become "many efficient local lookups plus one expensive fan-out." That may work at small scale. It gets fragile once each shard has a different backlog, the endpoint has a real latency objective, and tail latency is tied to the slowest shard in the fan-out.</p>
-<p>A global secondary index changes the read shape by materializing a separately partitioned lookup structure:</p>
-<div class="codehilite"><pre><span></span><code>index key:   (issuer_id, status, reservation_id)
-payload:     allocation_bucket_id, row_pk, row_version, owner_epoch, desk_id, notional
-index shard: hash(issuer_id, status)
+<p>The first path owns the business decision. The second is a derived access path. Treating the index as independent truth creates two authorities; treating it as a local schema ornament hides a second distributed write. A good design keeps the base row authoritative while stating exactly how current the index is allowed to be.</p>
+<h2>From a Local Index to a Routed Lookup</h2>
+<p>Suppose the base table has many logical allocation buckets. Each shard can maintain a local index on <code>issuer_id</code>, but an issuer query still looks like this:</p>
+<div class="codehilite"><pre><span></span><code>router -&gt; bucket shard A: open CA-MUNI rows?
+router -&gt; bucket shard B: open CA-MUNI rows?
+router -&gt; bucket shard C: open CA-MUNI rows?
+... wait for the useful answers and merge them
 </code></pre></div>
 
-<p>With that structure, the issuer query routes to the index shard family for <code>CA-MUNI/open</code>:</p>
+<p>This is called scatter-gather. It may be acceptable for an occasional internal report. It becomes costly when the query sits on a market-open request path: fan-out spends network work on every shard and exposes the query's tail latency to the slowest needed shard.</p>
+<p>A global index changes the routing shape. Harbor Point materializes <code>open_by_issuer</code> with an index key based on <code>(issuer_id, status)</code> and an entry for each matching reservation.</p>
+<div class="codehilite"><pre><span></span><code>index key:
+  (issuer_id, status, reservation_id)
+
+index payload:
+  allocation_bucket_id, reservation_id, base_version,
+  owner_epoch, desk_id, notional
+
+index partition:
+  hash(issuer_id, status)
+</code></pre></div>
+
+<p>Now the read begins at one index partition rather than every base partition:</p>
 <div class="codehilite"><pre><span></span><code>GET /issuers/CA-MUNI/open-reservations
-        |
-        v
-index shard I3 for hash(&quot;CA-MUNI&quot;, &quot;open&quot;)
-        |
-        v
-reservation ids + allocation buckets + owner epochs
-        |
-        v
-fetch or validate base rows from current bucket owners
+  -&gt; index partition for (CA-MUNI, open)
+  -&gt; entries for matching reservation IDs
+  -&gt; optionally fetch or validate selected base rows
 </code></pre></div>
 
-<p>The payload choice matters. A pointer-style index stores only enough to find the base row, which keeps the index smaller and cheaper to update. A covering index duplicates read-mostly fields such as <code>desk_id</code>, <code>notional</code>, <code>reservation_ts</code>, or <code>limit_bucket</code>, which can avoid the second hop for some endpoints. Harbor Point has to decide whether the saved read latency is worth duplicating more bytes and widening every index update.</p>
-<p>The trade-off is concrete. The system gains a targeted lookup path for non-shard-key queries, but it also creates a second partition map and a second place where skew can appear. If one issuer dominates the morning, the problem moves from "all base shards are queried" to "one index shard is overloaded." Global indexes remove one form of fan-out while potentially concentrating another.</p>
-<h2>Maintaining the Index</h2>
-<p>Suppose desk <code>ALPHA</code> creates reservation <code>R-88421</code> for issuer <code>CA-MUNI</code>, and the base row lands on the owner for allocation bucket <code>173</code>. Harbor Point also wants that row to appear in <code>gsi_open_by_issuer</code> on index shard <code>I3</code>. One logical user action now produces at least two physical state changes:</p>
-<ol>
-<li>insert or update the base reservation on the owner of bucket <code>173</code></li>
-<li>insert or update the issuer index entry on <code>I3</code></li>
-</ol>
-<p>The same issue appears on updates. If <code>R-88421</code> changes from <code>open</code> to <code>released</code>, the old row contributed to the index and the new row no longer should. If the issuer changes from <code>CA-MUNI</code> to <code>NY-MUNI</code>, Harbor Point must delete the old index key and insert a new one on a different index shard. If bucket <code>173</code> moves from shard <code>B</code> to shard <code>F</code> during rebalancing, the index payload's owner information must change or be validated through a fresh partition map.</p>
-<p>That is why global indexes are maintained from <code>before</code> and <code>after</code> images, not from the SQL verb alone:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">issuer_index_mutations</span><span class="p">(</span><span class="n">before</span><span class="p">,</span> <span class="n">after</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">before</span> <span class="ow">and</span> <span class="n">before</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;open&quot;</span><span class="p">:</span>
-        <span class="k">yield</span> <span class="n">Delete</span><span class="p">(</span>
-            <span class="n">key</span><span class="o">=</span><span class="p">(</span><span class="n">before</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">,</span> <span class="s2">&quot;open&quot;</span><span class="p">,</span> <span class="n">before</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">),</span>
-            <span class="n">base_version</span><span class="o">=</span><span class="n">before</span><span class="o">.</span><span class="n">row_version</span><span class="p">,</span>
-        <span class="p">)</span>
+<p>The optional second hop exposes a design choice. A pointer index stores only enough to find the base row. It is compact and cheap to update, but a result needs a base-row read. A covering index copies the fields the endpoint needs, such as <code>desk_id</code> and <code>notional</code>. It can answer in one hop, but every copied byte widens the index and every changed copied field becomes index work.</p>
+<table>
+<thead>
+<tr>
+<th>Design</th>
+<th>Read path</th>
+<th>Write cost</th>
+<th>Freshness risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Local index on every base shard</td>
+<td>Fan out to all possible owners</td>
+<td>Low per shard</td>
+<td>No extra derived path, but slow global lookup</td>
+</tr>
+<tr>
+<td>Pointer global index</td>
+<td>Target index, then base row</td>
+<td>Index entry changes</td>
+<td>Index pointer or status can be stale</td>
+</tr>
+<tr>
+<td>Covering global index</td>
+<td>Target index only for projected fields</td>
+<td>More copied data and updates</td>
+<td>Returned payload itself can be stale</td>
+</tr>
+<tr>
+<td>No index, scheduled scan</td>
+<td>Broad offline read</td>
+<td>Minimal</td>
+<td>Not suitable for an interactive current query</td>
+</tr>
+</tbody>
+</table>
+<h2>The Second Write Path</h2>
+<p>Consider reservation <code>R-88421</code>, created in allocation bucket <code>173</code> for issuer <code>CA-MUNI</code>. The base owner writes the authoritative row. The index must also gain an entry, perhaps on index partition <code>I3</code>.</p>
+<div class="codehilite"><pre><span></span><code>before create
+  base bucket 173: no R-88421
+  index I3:         no (CA-MUNI, open, R-88421)
 
-    <span class="k">if</span> <span class="n">after</span> <span class="ow">and</span> <span class="n">after</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;open&quot;</span><span class="p">:</span>
-        <span class="k">yield</span> <span class="n">Put</span><span class="p">(</span>
-            <span class="n">key</span><span class="o">=</span><span class="p">(</span><span class="n">after</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">,</span> <span class="s2">&quot;open&quot;</span><span class="p">,</span> <span class="n">after</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">),</span>
-            <span class="n">allocation_bucket_id</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">allocation_bucket_id</span><span class="p">,</span>
-            <span class="n">row_pk</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">,</span>
-            <span class="n">base_version</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">row_version</span><span class="p">,</span>
-            <span class="n">owner_epoch</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">owner_epoch</span><span class="p">,</span>
-            <span class="n">desk_id</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">desk_id</span><span class="p">,</span>
-            <span class="n">notional</span><span class="o">=</span><span class="n">after</span><span class="o">.</span><span class="n">notional</span><span class="p">,</span>
-        <span class="p">)</span>
+after create
+  base bucket 173: R-88421, status=open, version=v41
+  index I3:         (CA-MUNI, open, R-88421) -&gt; bucket 173, v41, epoch 105
 </code></pre></div>
 
-<p>The hard part is deciding how strongly those mutations must line up with the base commit. A synchronous design updates the base row and the index entry in one distributed transaction. That gives Harbor Point the cleanest semantics: once the write commits, issuer queries see the new state immediately. The price is higher write latency, more coordination, and more distributed transaction failure handling.</p>
-<p>An asynchronous design commits the base row first, then derives index mutations from the ordered log or CDC stream. That usually scales writes better and isolates the index pipeline operationally, but it creates a visibility gap. The index may temporarily miss a new reservation or still expose a released one. If Harbor Point chooses that route, it needs explicit freshness metadata on the index path.</p>
-<p>Retries make the maintenance contract even stricter. If the system replays the same index mutation after a worker restart, the index must not silently duplicate entries. That is why practical designs keep stable row identifiers and versions in the index payload. A <code>Put</code> should overwrite the logical entry for <code>(issuer_id, status, reservation_id)</code> at a known version, and a <code>Delete</code> should be idempotent. Otherwise, normal retry behavior turns into correctness drift.</p>
-<h2>Freshness, Hotspots, and Repair</h2>
-<p>Once Harbor Point adds <code>gsi_open_by_issuer</code>, the index becomes part of the production surface, not just part of the schema. The team now needs index-specific metrics: write amplification per base mutation, lag between base commits and index application, query hit rate by index key, index-shard p99 latency, and mismatch counts from consistency checks. Without those signals, the team can see "issuer search is slow" but cannot tell whether the cause is a hot key, a lagging indexer, or stale payloads that trigger too many second-hop reads.</p>
-<p>Skew is the first operational hazard. If <code>CA-MUNI</code> is the busiest issuer on the platform, hashing only on <code>issuer_id</code> can make one index shard much hotter than the others. The fix depends on the query contract. Harbor Point can pre-split the issuer's index range, bucket the key with an extra dimension such as date window, or store multiple partitions for very hot issuers and accept a bounded fan-out across those buckets. None of these are free. They trade a single lookup for a slightly wider query in order to stop one shard from melting.</p>
-<p>The second hazard is divergence. The index can contain orphaned entries after failed deletes, stale owner-epoch payloads after row moves, or missing entries after log gaps. The only durable answer is repair tooling that treats the base table as the source of truth, scans a slice of reservations, regenerates the expected index entries, and compares them to what the index currently stores. In other words, Harbor Point must plan for index reconciliation before the first incident, not after one.</p>
-<p>This also explains why teams often classify a global secondary index as rebuildable derived state. If Harbor Point loses an index shard but still has the base rows plus a durable commit history, it can usually rebuild the index. The rebuild cost may be painful, but the data model remains recoverable. That classification matters for backup and restore: the system must know whether the index is part of the authoritative snapshot or whether it should be regenerated to a specific log position.</p>
-<p>Finally, the query semantics still matter after the index exists. A fast issuer lookup is not automatically a trustworthy one. If Harbor Point serves the result from an asynchronously maintained index and then from a lagging replica of that index shard, staleness compounds. The read contract must say whether issuer lookup is fully current, session-consistent, or merely bounded-stale. A global index makes the query cheaper. It does not eliminate the need to state what "correct enough right now" means.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>A released reservation still appears in <code>GET /issuers/CA-MUNI/open-reservations</code>.</strong> The base shard is current, but the global index is maintained asynchronously and has not yet applied the delete for the old <code>(issuer_id, status, reservation_id)</code> entry. If the read then goes to a replica of the index shard, the visibility gap is even larger. Expose an index freshness watermark, route session-sensitive issuer lookups through a path that can prove the required commit position, and fall back to the base owner or a stronger consistency mode when the index is behind.</p>
-<p><strong>One index shard is hot even though the base shards look balanced.</strong> The alternate lookup key is skewed. Sharding the base table by allocation bucket balanced the decisive write path, but the global index is partitioned by <code>issuer_id</code>, and a few issuers dominate query and update volume. Measure cardinality and request rate by index key, not just by shard. For hot issuers, pre-split or bucket the index key and let the router query a small bounded set of buckets instead of forcing one shard to absorb all traffic.</p>
-<p><strong>Index lookups return pointers that no longer match the base owner after a rebalance.</strong> The row moved, but the index payload still points to the previous owner epoch, or a retry reinserted an old pointer after the move had already completed. Store row version and owner epoch information with the index entry, make move operations update or invalidate index payloads as first-class mutations, and run reconciliation jobs that compare current base locations with index pointers.</p>
+<p>When the reservation becomes <code>released</code>, the base row changes first. The old index membership must disappear too:</p>
+<div class="codehilite"><pre><span></span><code>base mutation: status open -&gt; released, version v41 -&gt; v42
+index mutation: delete (CA-MUNI, open, R-88421) at or after v42
+</code></pre></div>
+
+<p>The update must be derived from the <em>before</em> and <em>after</em> images, not merely from an SQL verb. A change of issuer needs a delete from the old issuer partition plus an insert at the new one. A change of status can remove or add index membership. A bucket move needs the index pointer's owner epoch updated or safely re-resolved.</p>
+<div class="codehilite"><pre><span></span><code>derive_index_mutations(before, after):
+  remove the prior entry if before matched the index predicate
+  add the new entry if after matches the index predicate
+  carry reservation ID, base version, and routing epoch
+</code></pre></div>
+
+<p>Stable identity makes retries safe. The logical key <code>(issuer_id, status, reservation_id)</code> should not gain another entry when a worker replays the same message. A version-aware put may overwrite the same logical entry; a delete must be idempotent. Otherwise, ordinary at-least-once delivery produces duplicate or orphaned search results.</p>
+<h2>Choose the Alignment Contract</h2>
+<p>The hard design choice is when the index transition becomes visible relative to the base commit.</p>
+<h3>Synchronous alignment</h3>
+<p>A distributed transaction or equivalent coordinated protocol commits the base row and its index entry together. Then a query with the relevant consistency level can make the stronger statement: a committed base change is reflected by the index according to the transaction's isolation semantics.</p>
+<p>This is a good fit when the issuer lookup participates directly in a safety decision or a uniqueness rule. The trade-off is higher write latency, more cross-shard coordination, and a larger failure surface. It is not free merely because the index looks like a familiar database feature.</p>
+<h3>Asynchronous derivation</h3>
+<p>The base owner commits first, then an ordered log or change-data-capture consumer applies the index mutation. This often isolates the index pipeline and keeps the decisive reservation write fast. It also creates a window:</p>
+<div class="codehilite"><pre><span></span><code>10:00:00.010  base bucket 173 releases R-88421 at v42
+10:00:00.012  base commit is acknowledged
+10:00:00.040  index consumer applies delete on I3
+</code></pre></div>
+
+<p>Between those events, the global index can still list a released reservation. In the other direction, it can temporarily omit a newly opened one. That is not corruption if the contract says “eventually updated index”; it is corruption if the API claims a current, complete compliance answer.</p>
+<p>For an asynchronous index, publish the evidence of its limit: an index watermark, the source-log position processed, or a freshness age. A session-sensitive endpoint can wait for the index to reach a commit token, read the authoritative base path, or return a clear bounded-staleness result. Lesson 010's token rule applies to the index too; a fast derived read does not escape the need for proof.</p>
+<h2>Hotspots, Moves, and Repair</h2>
+<p>The index has a new partition key, so it creates a new distribution problem. Base buckets may be balanced while one issuer dominates both queries and updates. If <code>CA-MUNI</code> is unusually active, hashing only on <code>issuer_id</code> can make one index partition hot.</p>
+<p>Possible responses depend on the query contract:</p>
+<ul>
+<li>Split a hot issuer's index by a bounded dimension such as day or a small hash suffix, then query those few buckets.</li>
+<li>Keep a range key that supports the intended time or status scan.</li>
+<li>Refuse to use a global index for a pathological access pattern and supply an asynchronous report instead.</li>
+</ul>
+<p>The trade-off is again explicit: bucketing spreads write and read load, but reintroduces bounded fan-out. It is usually better to query four known index buckets than every base shard, but the number must be capped and measured.</p>
+<p>Row movement is another boundary. After bucket <code>173</code> migrates from shard <code>B</code> to shard <code>F</code>, a pointer that says “read B” can be obsolete. Store an owner epoch or route version in the index entry. On a mismatch, resolve the current base owner through the partition map instead of treating the old pointer as authority. The index helps locate data; it must not override the current ownership record.</p>
+<p>Finally, plan repair before the first outage. The base table is the source of truth, so a reconciliation job can scan a base-key range, derive the expected index entries, and compare or rebuild the index range. This detects missing entries, stale membership, old pointers, and retry defects. A rebuildable index is valuable, but rebuilding can be expensive; recovery objectives should name whether an endpoint can wait for it.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> Harbor Point adds an <code>issuer_id</code> index to every allocation-bucket shard. Does <code>GET /issuers/CA-MUNI/open-reservations</code> become a one-shard lookup?</p>
+<p><strong>Answer:</strong> No. The router still does not know which allocation buckets contain matching rows. It must fan out unless another directory or global index maps the issuer query to a bounded candidate set.</p>
+<p><strong>Check:</strong> An asynchronous index lists <code>R-88421</code> as open, but the base row says released at a later version. Which source decides the reservation's authoritative status?</p>
+<p><strong>Answer:</strong> The base row on its current owner. The index entry is stale derived state. The service must either validate the base row, wait for index catch-up, or disclose the stale-index contract.</p>
+<h2>Practice: Defend the Lookup Contract</h2>
+<p>Compliance wants interactive issuer searches, but a reservation approval must not depend on a stale alternate-key result. Propose one index design for the search endpoint. State whether it is pointer or covering, synchronous or asynchronous, what it may return while behind, and how a bucket move is handled.</p>
+<p>A strong answer may choose an asynchronous pointer index for interactive search: it routes to the issuer partition, includes an index watermark, and validates selected sensitive rows against the current base owner. It should state that approval reads stay on the authoritative bucket path, and that an <code>owner_epoch</code> mismatch triggers a fresh partition-map lookup. Another answer can choose synchronous maintenance only if it explains why the lookup's invariant justifies the extra coordination.</p>
 <h2>Connections</h2>
 <ul>
-<li><a href="014.html">Rebalancing Partitions Under Live Traffic</a> explains why index payloads need owner versions or fresh routing when base rows move.</li>
-<li><a href="002.html">Consistency Contracts and API Semantics</a> explains why a fast index answer still needs a stated freshness contract.</li>
-<li><a href="016.html">Clocks, Leases, and Safe Reads</a> continues the same pattern from a different angle: optimized reads are safe only when the system can prove the serving state is current enough.</li>
+<li><a href="014.html">Rebalancing Partitions Under Live Traffic</a> explains why index pointers require owner epochs and fresh routing after a base-row move.</li>
+<li><a href="016.html">Clocks, Leases, and Safe Reads</a> asks the next version of the same question: what evidence earns a fast read from a changing authority?</li>
 </ul>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://cloud.google.com/spanner/docs/secondary-indexes">Secondary indexes in Cloud Spanner</a><ul>
-<li>Focus: See how a distributed SQL system exposes secondary indexes, backfill behavior, and the cost of maintaining alternate access paths.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html">Using Global Secondary Indexes in DynamoDB</a><ul>
-<li>Focus: Compare a production system where alternate-key lookups are explicit, eventually consistent by default, and paid for through extra write and storage cost.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://vitess.io/docs/20.0/reference/features/vindexes/#lookup-vindexes">Lookup Vindexes in Vitess</a><ul>
-<li>Focus: Study a concrete sharded-database mechanism where a separate lookup table maps alternate keys to the correct shard.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/indexes">Indexes | CockroachDB Docs</a><ul>
-<li>Focus: Review how covering indexes, stored columns, and distributed execution affect the read-versus-write trade-off.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html">Amazon DynamoDB: Global Secondary Indexes</a> — Focus: Compare alternate keys, projections, asynchronous propagation, capacity effects, and index-key changes.</li>
+<li>[DOC] <a href="https://cloud.google.com/spanner/docs/secondary-indexes">Google Cloud Spanner: Secondary Indexes</a> — Focus: Contrast an index maintained inside a distributed transaction with an asynchronously derived access path.</li>
+<li>[DOC] <a href="https://vitess.io/docs/20.0/reference/features/vindexes/#lookup-vindexes">Vitess: Lookup Vindexes</a> — Focus: Inspect an alternate-key-to-shard mapping as an explicit distributed lookup structure.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A local index does not become global just because the table is sharded; the router still needs a separately partitioned access path when the query key differs from the authority key.</li>
-<li>A global secondary index is maintained distributed state, so every relevant base-row change can create cross-shard index mutations, retries, and freshness questions.</li>
-<li>Async indexes can be excellent for read latency, but only when their staleness contract is explicit and visible.</li>
-<li>Hotspot control, divergence repair, and rebuild strategy determine whether the index is safe to trust in production.</li>
-</ol>
+<ul>
+<li>A global secondary index is a separately partitioned access path, not a local index copied across shards.</li>
+<li>Each relevant base-row transition produces index membership work, so retries, versions, and deletes must be designed as carefully as inserts.</li>
+<li>Synchronous alignment buys stronger index semantics; asynchronous derivation buys a faster write path but requires an explicit freshness contract.</li>
+<li>Index hotspots, stale pointers, and divergence need their own routing, metrics, reconciliation, and recovery plan.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -215,7 +261,7 @@ fetch or validate base rows from current bucket owners
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,144 +81,265 @@
 <section class="stack-block lesson-content-shell">
   <h1>Partitioning Strategies and Shard Keys</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A shard key is a workload argument encoded in data layout: it decides which operations stay local, which invariants remain cheap, and where real traffic will concentrate.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>choose a shard key by starting from an invariant, traffic shape, and request path;</p>
+</li>
+<li>
+<p>compare range, hash, compound-key, and directory-based placement under named constraints;</p>
+</li>
+<li>
+<p>identify the read models and signals required by a key that keeps a decisive write local.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A shard key is a promise about which work one authority can decide locally, plus a bet about where traffic will gather.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Harbor Point has accepted the lesson from sharding: the reservation system needs multiple authority domains. The next question is sharper. Which key should decide those domains?</p>
-<p>The tempting answer is "pick the field we query most." For Harbor Point, that might be <code>desk_id</code>, because traders often view their own reservations, or <code>issuer_id</code>, because risk teams inspect exposure by issuer. But the strongest path is not a dashboard. It is the decision that one scarce allocation bucket can move from <code>held</code> to <code>confirmed</code> exactly once. If two desks race for the same bucket, the system wants one shard to decide that invariant, not a distributed workflow by accident.</p>
-<p>That is the non-obvious role of a shard key. It is not just a spreading function. It says which facts belong under the same owner. A key that makes convenient reads local can make decisive writes cross-shard. A key that keeps the invariant local may force search, reporting, and history screens into derived indexes or projections.</p>
-<p>For Harbor Point, the strongest candidate is an allocation-centric key such as <code>allocation_bucket_id</code>, derived from the issuer, instrument, settlement window, and reservation bucket. That does not make every query perfect. It makes the most important consistency boundary explicit.</p>
-<h2>Logical Partitions Before Physical Shards</h2>
-<p>Harbor Point separates three concepts that teams often blur together:</p>
-<ul>
-<li>A <strong>shard key</strong> is the business value used to choose an authority boundary.</li>
-<li>A <strong>logical partition</strong> is a stable slice of the keyspace, such as bucket <code>173</code> out of <code>4096</code>.</li>
-<li>A <strong>physical shard</strong> is the replica group currently serving one or more logical partitions.</li>
-</ul>
-<p>That distinction lets the data model stay stable while placement changes. Harbor Point does not want application code to say "send this issuer to machine 7." It wants application code to compute a stable logical partition, then let the partition map decide which physical shard owns that partition today.</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocation_partition</span><span class="p">(</span><span class="n">issuer_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">instrument_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">window</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-    <span class="n">key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">issuer_id</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">instrument_id</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2">&quot;</span>
-    <span class="k">return</span> <span class="n">murmur3</span><span class="p">(</span><span class="n">key</span><span class="p">)</span> <span class="o">%</span> <span class="mi">4096</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">route_confirmation</span><span class="p">(</span><span class="n">command</span><span class="p">):</span>
-    <span class="n">partition</span> <span class="o">=</span> <span class="n">allocation_partition</span><span class="p">(</span>
-        <span class="n">command</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">,</span>
-        <span class="n">command</span><span class="o">.</span><span class="n">instrument_id</span><span class="p">,</span>
-        <span class="n">command</span><span class="o">.</span><span class="n">settlement_window</span><span class="p">,</span>
-    <span class="p">)</span>
-    <span class="k">return</span> <span class="n">partition_map</span><span class="o">.</span><span class="n">owner_for</span><span class="p">(</span><span class="n">partition</span><span class="p">)</span>
-</code></pre></div>
-
-<p>With <code>4096</code> logical partitions on <code>12</code> physical shard groups, Harbor Point can later move partition <code>173</code> from shard <code>B</code> to shard <code>F</code> without redefining the application key. That is why mature sharded systems usually keep more logical partitions than machines. The key defines ownership; placement is allowed to evolve.</p>
-<p>This also keeps the next lesson possible. Rebalancing can move logical partitions under live traffic only if those partitions already exist as stable units of ownership.</p>
-<h2>Choosing the Boundary</h2>
-<p>Harbor Point evaluates candidate keys by asking: "Which state must be decided together on the strongest path?"</p>
+<p>Harbor Point must confirm the last available allocation in bucket <code>B-173</code> exactly once. Two desks can request that confirmation at the same time. The product also wants quick desk histories and issuer-wide risk reports.</p>
+<p>The tempting key is <code>desk_id</code>. Traders often open a desk page, so putting each desk on one shard seems useful. It works while a desk only changes its own records. It breaks when desk North and desk South both try to confirm the last allocation in <code>B-173</code>. If the two commands go to different desk shards, neither shard can decide the scarce bucket alone.</p>
+<p>The key decision is not “Which field appears most often in a query?” It is:</p>
+<blockquote>
+<p>Which facts must one authority decide together before it acknowledges this operation?</p>
+</blockquote>
+<p>For this scenario, that unit is the allocation bucket. Harbor Point uses <code>allocation_bucket_id</code> as its authority key. A bucket may be derived from issuer, instrument, settlement window, and a capacity slice, but it has one stable identity once a hold is created.</p>
+<p>This does not make every query local. It makes the no-double-confirm decision local. Desk history and issuer exposure become separate read problems, with explicit indexes or projections rather than accidental cross-shard writes.</p>
+<h2>Separate Authority, Partition, and Placement</h2>
+<p>The word “shard” often hides three different things. Keep them separate.</p>
 <table>
 <thead>
 <tr>
-<th>Candidate key</th>
-<th>What becomes local</th>
-<th>What breaks first</th>
+<th>Layer</th>
+<th>Harbor Point example</th>
+<th>What it answers</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>desk_id</code></td>
-<td>Trader dashboards and desk-scoped history</td>
-<td>Two desks competing for the same allocation cross shards</td>
+<td>Authority key</td>
+<td><code>allocation_bucket_id=B-173</code></td>
+<td>Which state must be decided together?</td>
 </tr>
 <tr>
-<td><code>issuer_id</code></td>
-<td>Issuer exposure checks and issuer-scoped reports</td>
-<td>A hot issuer can overload one shard during volatile markets</td>
+<td>Logical partition</td>
+<td><code>hash(B-173) -&gt; 173</code></td>
+<td>Which stable slice of the keyspace owns that key?</td>
 </tr>
 <tr>
-<td><code>allocation_bucket_id</code></td>
-<td>Hold, release, extend, and confirm for one scarce allocation bucket</td>
-<td>Desk history and issuer-wide reports need derived views</td>
+<td>Physical shard group</td>
+<td>partition <code>173</code> currently maps to group <code>B</code></td>
+<td>Which replica group serves that slice today?</td>
 </tr>
 </tbody>
 </table>
-<p>The last option is usually the safest for the decisive write path. If bucket <code>B-173</code> is the unit that can be reserved exactly once, then the rows that enforce that invariant should live with the owner of <code>B-173</code>. The confirmation path can stay single-shard:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">confirm_allocation</span><span class="p">(</span><span class="n">command</span><span class="p">):</span>
+<p>The numbers in this lesson are illustrative. A system might use 256, 4,096, or a dynamically split range layout. The important design property is that application code names a stable authority key, while a versioned partition map is free to place the resulting partition on different replica groups.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">route_confirmation</span><span class="p">(</span><span class="n">command</span><span class="p">):</span>
+    <span class="n">authority_key</span> <span class="o">=</span> <span class="n">command</span><span class="o">.</span><span class="n">allocation_bucket_id</span>
+    <span class="n">partition</span> <span class="o">=</span> <span class="n">stable_partition</span><span class="p">(</span><span class="n">authority_key</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">partition_map</span><span class="o">.</span><span class="n">owner_for</span><span class="p">(</span><span class="n">partition</span><span class="p">)</span>
+</code></pre></div>
+
+<p>The function is a teaching model. Real systems may use ranges, hashes, lookup tables, or a combination. But the router must receive the key before the authoritative operation begins. A lookup performed after an arbitrary shard accepts the command is already too late for a one-owner decision.</p>
+<p>This distinction also prepares the next lesson. Rebalancing can move a logical partition from one physical shard group to another without redefining the business fact that <code>B-173</code> has one owner.</p>
+<h2>Start with the Strongest Write, Not the Nicest Read</h2>
+<p>Compare two routing paths for the same scarce bucket.</p>
+<div class="codehilite"><pre><span></span><code>Candidate: desk_id
+
+desk North confirms B-173 -&gt; desk shard N
+desk South confirms B-173 -&gt; desk shard S
+
+Result: one bucket decision crosses two authorities.
+</code></pre></div>
+
+<div class="codehilite"><pre><span></span><code>Candidate: allocation_bucket_id
+
+desk North confirms B-173 -&gt; bucket partition 173 -&gt; shard B
+desk South confirms B-173 -&gt; bucket partition 173 -&gt; shard B
+
+Result: both commands reach the same authority before it chooses a winner.
+</code></pre></div>
+
+<p>The second route does not guarantee that the confirmation succeeds. It gives one shard the chance to enforce the right condition in its local transaction.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">confirm</span><span class="p">(</span><span class="n">command</span><span class="p">):</span>
     <span class="n">shard</span> <span class="o">=</span> <span class="n">route_confirmation</span><span class="p">(</span><span class="n">command</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">shard</span><span class="o">.</span><span class="n">transaction</span><span class="p">(</span>
-        <span class="n">assert_bucket_state</span><span class="p">(</span>
-            <span class="n">bucket_id</span><span class="o">=</span><span class="n">command</span><span class="o">.</span><span class="n">bucket_id</span><span class="p">,</span>
-            <span class="n">status</span><span class="o">=</span><span class="s2">&quot;held&quot;</span><span class="p">,</span>
-            <span class="n">hold_id</span><span class="o">=</span><span class="n">command</span><span class="o">.</span><span class="n">hold_id</span><span class="p">,</span>
-        <span class="p">),</span>
+        <span class="n">assert_hold</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">bucket_id</span><span class="p">,</span> <span class="n">command</span><span class="o">.</span><span class="n">hold_id</span><span class="p">,</span> <span class="n">status</span><span class="o">=</span><span class="s2">&quot;held&quot;</span><span class="p">),</span>
+        <span class="n">assert_bucket_available</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">bucket_id</span><span class="p">),</span>
         <span class="n">mark_bucket_confirmed</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">bucket_id</span><span class="p">),</span>
-        <span class="n">append_audit_event</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">hold_id</span><span class="p">,</span> <span class="s2">&quot;confirmed&quot;</span><span class="p">),</span>
+        <span class="n">record_command</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">idempotency_key</span><span class="p">),</span>
     <span class="p">)</span>
 </code></pre></div>
 
-<p>That local transaction is the payoff. Harbor Point still replicates the shard for durability and failover, but it does not need cross-shard coordination merely to decide whether one allocation bucket is available.</p>
-<p>The cost is that not every read is local. A dashboard that asks "show every reservation for desk 12" may need a desk-index projection. A risk report that asks "show issuer-wide exposure" may need an issuer-index projection. Those read models are not failures. They are the price of keeping the decisive write invariant cheap.</p>
-<h2>Strategy Trade-offs</h2>
-<p>Different partitioning strategies emphasize different risks.</p>
-<div class="codehilite"><pre><span></span><code>Strategy                 Helps with                         Hurts with
------------------------  ---------------------------------  -----------------------------------
-hash by stable id         even spread, simple ownership      range scans and locality
-range by business field   locality, ordered scans            hot ranges and monotonic writes
-directory lookup          custom placement, tenant control   metadata complexity and routing bugs
-compound key              matching a domain invariant        schema/API discipline
+<p>This pseudocode is a teaching model, not a database recipe. It assumes the shard transaction can make these checks atomic for one bucket. Its point is visible locality: the availability check, state change, and idempotency record share one authority boundary.</p>
+<p>Now consider a desk page. It asks for every reservation handled by desk North. The authority-key layout does not make that query local. Harbor Point can maintain a desk-index projection:</p>
+<div class="codehilite"><pre><span></span><code>authoritative bucket B-173 confirms a hold
+        -&gt; publish a desk-history event
+        -&gt; desk projection adds the reservation for North
+        -&gt; desk page reads the projection with its stated freshness
 </code></pre></div>
 
-<p>Hashing <code>allocation_bucket_id</code> spreads writes across many partitions, which is useful when no single issuer dominates. It also destroys natural range locality. If the risk team wants all buckets for <code>CA-MUNI</code> in one scan, the system may need an issuer projection or a scatter-gather query with a clear latency budget.</p>
-<p>Range partitioning by <code>issuer_id</code> keeps issuer reports local, but it can create a hot shard exactly when the market focuses on one issuer. Splitting by <code>issuer_id + instrument_id</code> may help, but the design still has to ask whether the key has enough cardinality and whether the hot path carries the key at request time.</p>
-<p>A directory strategy can place specific tenants, issuers, or buckets wherever the control plane chooses. That is flexible, especially for large customers or uneven workloads, but it turns routing metadata into a larger operational surface. The directory must be cached, versioned, monitored, and kept consistent during rebalancing.</p>
-<p>No strategy wins universally. The shard key should be chosen with the system's strongest operations, hottest traffic, and most painful migrations in view.</p>
-<h2>Evaluating a Shard Key</h2>
-<p>A practical shard-key review for Harbor Point asks five questions:</p>
+<p>That projection is a trade-off, not a defect. The confirmation endpoint reads the authoritative bucket. The desk page may read a delayed derived view if its product contract permits it. It must not reuse that view to decide whether the scarce bucket is available.</p>
+<p>So far, the shard key has done one precise job: it has kept the decisive write local. The cost is that other access patterns need their own read path and freshness promise.</p>
+<h2>Score Candidate Keys with Workload Evidence</h2>
+<p>An invariant is necessary, but it is not enough. A key can keep the right decision local and still create one overloaded partition. Harbor Point scores each candidate with the same evidence.</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Why it matters</th>
+<th>Evidence to inspect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Does every decisive command carry the key?</td>
+<td>A router cannot target an owner from missing information</td>
+<td>Request shapes and command logs</td>
+</tr>
+<tr>
+<td>Does the key contain the invariant?</td>
+<td>Otherwise a local transaction becomes cross-shard coordination</td>
+<td>State-transition diagram and invariants</td>
+</tr>
+<tr>
+<td>Is there enough cardinality?</td>
+<td>Too few possible values limit useful distribution</td>
+<td>Distinct-key count and expected growth</td>
+</tr>
+<tr>
+<td>Is traffic concentrated on a few values?</td>
+<td>High cardinality does not prevent hot values</td>
+<td>Top-key write share and per-partition latency</td>
+</tr>
+<tr>
+<td>Is the key stable?</td>
+<td>Changing it may mean moving ownership</td>
+<td>Product lifecycle and update history</td>
+</tr>
+<tr>
+<td>Which reads lose locality?</td>
+<td>Every expensive read needs an honest serving plan</td>
+<td>Query traces and latency budgets</td>
+</tr>
+</tbody>
+</table>
+<p>Cardinality means how many distinct key values are available. It helps a system spread work, but it does not prove that work is spread. A million possible issuer IDs still produce a hotspot if most new commands target one issuer. Likewise, a high-cardinality timestamp can create a hot range when every new write lands at the same end of the keyspace.</p>
+<p>The measurements are more useful than a key-name debate. Observe the busiest logical partitions, the share of writes held by the hottest one, targeted versus scatter/gather reads, and cross-shard attempts for the decisive command. Then decide whether the key matches the traffic that exists rather than the traffic the team hopes will exist.</p>
+<h2>Compare Placement Strategies</h2>
+<p>The authority key and the placement strategy solve related but separate problems. Harbor Point can choose different placement styles for different data shapes.</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Good fit</th>
+<th>Main cost or boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Range by business value</td>
+<td>Ordered scans and locality, such as an issuer region</td>
+<td>Hot ranges, especially for monotonic or popular values</td>
+</tr>
+<tr>
+<td>Hash of a stable key</td>
+<td>Evenly spread independent operations</td>
+<td>Loses range locality; range reads may fan out</td>
+</tr>
+<tr>
+<td>Compound key</td>
+<td>One field establishes ownership and another improves spread or query targeting</td>
+<td>Every write and query must carry and interpret the same key order</td>
+</tr>
+<tr>
+<td>Directory lookup</td>
+<td>Explicit tenant or workload placement</td>
+<td>Metadata becomes a versioned, monitored routing dependency</td>
+</tr>
+</tbody>
+</table>
+<p>Range placement is useful when nearby values are read together. It is risky when new values arrive in order, such as an increasing timestamp, because writes can collect at one edge. A hash of a stable key often spreads independent writes more evenly, but an issuer-wide scan may then need many partitions.</p>
+<p>A compound key can make a useful compromise. For example, <code>(issuer_id, allocation_bucket_id)</code> can retain issuer context while distinguishing individual buckets. It is not automatically better: the first components, key order, and actual command path determine whether it helps placement or recreates an issuer hotspot.</p>
+<p>A directory can explicitly map a tenant or bucket to an owner. This is attractive when a few customers require special placement or when a controller needs to move work independently of the data key. Its cost is operational: the mapping needs an epoch or version, cache behavior, observability, and stale-route rejection. In this track, the directory's live handoff belongs to the rebalancing lesson; here, the design question is whether the extra routing surface buys a needed placement choice.</p>
+<p>These are situated preferences. A reporting-first product might select issuer ranges and accept a coordinated confirmation workflow. Harbor Point selects the bucket boundary because an incorrect confirmation is more costly than maintaining derived report views.</p>
+<h2>Failure Boundaries and Signals</h2>
+<p>Shard-key design cannot make every invariant local. A transfer between <code>B-173</code> and <code>B-881</code> still spans two owners. That operation needs a distributed transaction, an escrow scheme, a saga, compensation, or a redesigned business rule. The key merely tells the team where that boundary begins.</p>
+<p>Changing a shard key is also not a harmless schema edit. It can require moving records, rebuilding indexes, updating request contracts, and validating that old and new routes do not both decide the same item. Treat a mutable field such as desk ownership, priority, or region as projection data unless the product is prepared to manage those ownership moves.</p>
+<p>Harbor Point watches signals that expose the chosen key's boundary:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Write rate and queue time by logical partition</td>
+<td>A hot authority boundary, not just a busy cluster</td>
+</tr>
+<tr>
+<td>Largest-key share of writes</td>
+<td>Whether a few values defeat the expected distribution</td>
+</tr>
+<tr>
+<td>Targeted versus scatter/gather read rate</td>
+<td>Whether request shapes support the chosen key</td>
+</tr>
+<tr>
+<td>Cross-shard confirmation attempt count</td>
+<td>An invariant that escaped its intended owner</td>
+</tr>
+<tr>
+<td>Projection lag and stale-read age</td>
+<td>The user cost of read locality sacrificed for write correctness</td>
+</tr>
+<tr>
+<td>Partition-map version misses</td>
+<td>Routers or clients using stale placement data</td>
+</tr>
+</tbody>
+</table>
+<p>No single cluster-average throughput graph answers these questions. The design is healthy only if the invariant remains local, the hot partitions stay within their budget, and the derived reads state their freshness honestly.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A desk dashboard is the most frequent query, but the last-unit confirmation must never be decided by two shards. Which field should define the primary authority key?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The allocation bucket identifier. It routes competing confirmations to one owner before the decision. The dashboard can use a derived desk index; query frequency alone does not justify splitting the decisive invariant.</p>
+<p><strong>Check:</strong> A key has millions of distinct values. Does that prove it will avoid hotspots?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. A few values may receive most of the traffic, and monotonic values can concentrate new writes in one range. Inspect frequency and per-partition load as well as cardinality.</p>
+<h2>Practice: Review a New Shard Key</h2>
+<p>A delivery service wants to shard package data by <code>city_id</code> because dispatch maps are city-local. However, the service must prevent two couriers from accepting the same package. The package can be offered to couriers in different cities near a border.</p>
+<p>Choose an authority key and a serving plan. State:</p>
 <ol>
-<li>Is the key present at the start of every authoritative write?</li>
-<li>Does the key keep the strongest invariant inside one shard?</li>
-<li>Does the key have enough cardinality to spread real production traffic?</li>
-<li>Is the key stable, or would normal business edits move ownership?</li>
-<li>What read models, indexes, or projections are required because of this choice?</li>
+<li>the invariant that must remain local;</li>
+<li>the key that routes the acceptance command;</li>
+<li>the city-facing read model and its allowed freshness;</li>
+<li>one hotspot risk and signal;</li>
+<li>whether a cross-city handoff belongs in the local transaction or an explicit workflow.</li>
 </ol>
-<p>The answers should become metrics after launch. Average cluster QPS is not enough. Harbor Point watches per-shard write rate, hottest logical partition concentration, cross-shard transaction count, scatter-gather read count, routing-cache misses, and partition-size skew. Those metrics show whether the chosen key still matches the workload.</p>
-<p>The lesson is not that <code>allocation_bucket_id</code> is magic. It is that the primary shard key should encode a deliberate claim: "This is the smallest state we need to decide together." Everything that does not fit that claim should be handled explicitly instead of smuggled into the strongest path.</p>
-<h2>Failure Modes</h2>
-<p><strong>Choosing the friendliest read query as the primary key.</strong> This often makes dashboards pleasant while pushing critical writes across shards. Start with the strongest invariant, then build projections for convenience reads.</p>
-<p><strong>Using mutable business fields as shard keys.</strong> Region, desk ownership, priority tier, or routing label may be meaningful, but if the value changes, ownership changes. Use stable identifiers for primary ownership and expose mutable fields through indexes or derived views.</p>
-<p><strong>Assuming hashing eliminates hotspots.</strong> Hashing smooths load only when the input key has enough cardinality and traffic is not dominated by a tiny set of keys. Monitor hot logical partitions, not just physical shard averages.</p>
-<p><strong>Baking physical placement into the data model.</strong> If records know they live on <code>shard_7</code>, rebalancing becomes a schema problem. Keep logical partitions stable and map them to physical shards through versioned metadata.</p>
-<p><strong>Letting derived views pretend to be authoritative.</strong> Desk and issuer projections are useful, but the owner of the allocation bucket should remain the source of truth for hold, release, extend, and confirm decisions.</p>
+<p>A strong answer identifies <code>package_id</code> or a stable offer/allocation identifier as the acceptance authority, not <code>city_id</code> alone. It may maintain city dispatch projections with a stated lag budget. It should watch hot-package or hot-zone concentration, not only total city traffic. A package that changes service city is an ownership change or workflow boundary; it should not silently create two authorities that can accept it.</p>
 <h2>Connections</h2>
 <ul>
-<li>The previous lesson defined sharding as splitting authority; this lesson chooses the key that defines those authority boundaries.</li>
-<li>The next lesson uses logical partitions as the unit that can be moved during live rebalancing.</li>
-<li>Bigtable, DynamoDB, Spanner, Vitess, and similar systems expose the same key-design pressure under different names: row keys, partition keys, primary keys, keyspaces, tablets, chunks, or ranges.</li>
+<li><a href="012.html">Sharding and Authority Boundaries</a> establishes why an authoritative command needs one owner; this lesson chooses the key that makes that ownership concrete.</li>
+<li><a href="014.html">Rebalancing Partitions Under Live Traffic</a> uses the stable logical partitions introduced here to move placement without changing the authority key.</li>
+<li><a href="015.html">Secondary Indexes Across Shards</a> develops the read-side cost of this choice: convenient lookup paths can cross authority boundaries and need explicit freshness semantics.</li>
 </ul>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Revisit the partitioning and secondary-index chapters with attention to how access patterns and invariants drive primary-key choice.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/pub27898/">Bigtable: A Distributed Storage System for Structured Data</a><ul>
-<li>Focus: Pay attention to row-key design and tablet hotspots; the same locality-versus-distribution trade-off appears in modern shard-key decisions.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html">Amazon DynamoDB: Best practices for choosing a partition key</a><ul>
-<li>Focus: Use it as a concrete checklist for cardinality, hot partitions, and request concentration.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://cloud.google.com/spanner/docs/schema-design">Cloud Spanner schema design best practices</a><ul>
-<li>Focus: Look at primary-key ordering and hotspot guidance to see how key layout affects both transaction locality and write concentration.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/">MongoDB: Choose a Shard Key</a> — Focus: Compare cardinality, frequency, monotonicity, and query routing before judging a candidate key.</li>
+<li>[DOC] <a href="https://cloud.google.com/spanner/docs/schema-design">Cloud Spanner: Schema Design Best Practices</a> — Focus: Inspect how primary-key order, monotonic values, and logical hashing affect hotspots and locality.</li>
+<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html">Amazon DynamoDB: Partition Key Design</a> — Focus: Relate uniform activity and access patterns to a concrete partition-key design review.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Connect partitioning, skew, secondary indexes, and application-level routing to the chosen invariant.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A shard key decides which work stays local, not merely how rows are distributed.</li>
-<li>The primary shard key should usually match the smallest invariant boundary that must be decided together.</li>
-<li>Hash, range, directory, and compound-key strategies all trade locality, spread, routing complexity, and hotspot risk differently.</li>
-<li>Many logical partitions on fewer physical shards make future rebalancing possible without redefining the data model.</li>
-</ol>
+<ul>
+<li>A shard key should first identify the smallest state one authority must decide together, then be tested against real traffic and query evidence.</li>
+<li>Cardinality, value frequency, and monotonicity are separate properties; none alone proves that load will be balanced.</li>
+<li>Range, hash, compound, and directory strategies trade locality, distribution, and routing complexity under different constraints.</li>
+<li>Derived views can make convenience reads useful without becoming the authority for a decisive write.</li>
+<li>Stable authority keys and versioned placement make later rebalancing possible, but do not remove cross-shard workflow boundaries.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -243,7 +368,7 @@ compound key              matching a domain invariant        schema/API discipli
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

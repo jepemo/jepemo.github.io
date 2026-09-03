@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -71,7 +75,7 @@
     <span class="meta-chip">30 min</span>
     <span class="meta-chip">advanced</span>
     
-    <span class="meta-chip">CAPSTONE</span>
+    <span class="meta-chip">FINAL CAPSTONE</span>
     
   </div>
 </section>
@@ -79,174 +83,256 @@
 <section class="stack-block lesson-content-shell">
   <h1>Replicated Data Service Capstone</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A production consistency design works when it narrows expensive coordination to the business decisions that must be final, then serves everything else from replayable logs and bounded-stale projections with explicit lag budgets.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>design a replicated data service whose write, read, recovery, and operational paths support named business guarantees;</p>
+</li>
+<li>
+<p>defend the design with a guarantee matrix, two traces, and observable readiness evidence;</p>
+</li>
+<li>
+<p>identify the unsupported promise when a failure or product request exceeds the proposed architecture.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A replicated data service is ready to defend when every client-visible result can be traced to one authority, one stated freshness or recovery boundary, and evidence that the promise still holds under failure.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Harbor Point is ready to ship the replicated reservation service only if it can explain one difficult moment. Two desks, one in Madrid and one in New York, try to reserve exposure for issuer <code>MUNI-77</code> during market open. At the same time, compliance search is catching up from a CDC stream, a remote replica is a few seconds behind, and one client times out while waiting for a confirmation response.</p>
-<p>The useful question is not "should the database be strongly consistent or eventually consistent?" That phrasing is too blunt. The real question is where Harbor Point is willing to pay for coordination. If every read, dashboard, and search query waits on the same strict path as the exposure update, latency and availability suffer everywhere. If the exposure update does not coordinate tightly enough, two desks can both be told "confirmed" and the business invariant is already broken.</p>
-<p>The design becomes defensible once Harbor Point names its invariants first and assigns a mechanism to each one. Issuer exposure and live reservations are decided by one shard leader. Confirmation uses a durable reservation token so retries and failover do not replay the business action blindly. Search, dashboards, and compliance views are derived from committed logs and allowed to be stale only within declared budgets. The trade-off is intentional: the system pays coordination cost where ambiguity is unacceptable and exposes lag everywhere else.</p>
-<h2>Architecture Contract</h2>
-<p>Harbor Point writes the contract before it chooses the topology:</p>
+<p>Harbor Point can add replicas in Madrid and New York, yet still break its reservation promise if two paths disagree about who decides the last available exposure for <code>MUNI-77</code>. The difficult part is keeping every client-visible promise aligned with the path that can actually support it.</p>
+<h2>The Scenario</h2>
+<p>Harbor Point is launching a reservation service for municipal-bond exposure. Desks in Madrid and New York submit reservations. Each issuer has a limited amount of exposure, and an accepted reservation must not over-allocate it. Compliance needs to search reservations across issuers. Risk wants dashboards near each desk. The service must survive loss of one region, and support must resolve a request that timed out without guessing whether it succeeded.</p>
+<p>The tempting design is simple: give both regions a writable replica, copy data between them, and call the service “strongly consistent.” That model works for a record that can be independently edited and reconciled later. It breaks at the last available euro of an issuer's exposure. If Madrid and New York each confirm the final reservation from separate copies, a later merge cannot make both earlier confirmations true.</p>
+<p>This capstone does not ask for a particular database product or a consensus implementation. It asks for a coherent contract. Use the mechanisms from the track only when they support an observable promise. The design below is a worked exemplar with illustrative numbers; your final challenge asks you to produce and defend the same kind of dossier.</p>
+<h2>Constraints</h2>
+<p>Assume these constraints for the worked exemplar:</p>
+<ul>
+<li>An issuer may have many reservations, but its remaining exposure may never fall below zero.</li>
+<li>A confirmation shown to a desk is final for that issuer, unless the request itself is reported as uncertain.</li>
+<li>A client that receives confirmation should be able to read its reservation immediately, even if it is routed to a nearby region.</li>
+<li>Compliance search may be behind the authoritative state for up to five seconds, but its response must make that freshness visible.</li>
+<li>The remote recovery copy may lose at most five seconds of acknowledged local work after loss of the home region. The recovery time objective is ten minutes.</li>
+<li>A delayed, partitioned, or returning former owner must not resume accepting writes after a new owner is active.</li>
+</ul>
+<p>The last two targets are assumptions for this exercise, not properties supplied by a replica count. They become real only when the acknowledgement rule, remote durable progress, promotion runbook, and restore drills support them.</p>
+<h2>Design Goal</h2>
+<p>Deliver an <strong>architecture dossier</strong> that answers five questions for each important operation:</p>
+<ol>
+<li>What business state decides the operation?</li>
+<li>Who is the authority for that state now?</li>
+<li>What does success, a read result, or a timeout mean to the client?</li>
+<li>Which weaker path is allowed, and what happens when it cannot prove its promise?</li>
+<li>Which trace, signal, or test could show that the answer is false?</li>
+</ol>
+<p>This is stronger than an architecture diagram alone. A diagram can show replicas. The dossier must say which replica may decide, which replica may only observe, and what a client can infer from the response.</p>
+<h2>Proposed Model</h2>
+<p>Harbor Point shards the authoritative reservation state by <code>issuer_id</code>. For the exercise, issuer <code>MUNI-77</code> maps to shard <code>184</code>, whose current home region is New York. A leader owns the issuer decision at one configuration generation. A same-region follower participates in the normal durable acknowledgement rule. A Madrid replica receives the committed log asynchronously for recovery. CDC consumers build search, dashboard, and reporting views from committed changes.</p>
+<div class="codehilite"><pre><span></span><code>Madrid or New York gateway
+           |
+           v
+issuer_id -&gt; shard map -&gt; shard 184, generation 31
+           |
+           v
+New York leader: issuer exposure + reservations + token outcomes
+           |
+           +--&gt; required same-region durable follower
+           |
+           +--&gt; asynchronous Madrid recovery replica
+           |
+           +--&gt; committed outbox / log -&gt; search, dashboards, reports
+</code></pre></div>
+
+<p>The key is not that New York is special. It is that one current owner can serialize the <code>MUNI-77</code> exposure decision. A later rebalancing or regional promotion must publish a new generation and fence the old one before it serves writes. This consumes the previous lessons on sharding, membership, and safe ownership without reimplementing their consensus machinery.</p>
+<h3>Guarantee matrix</h3>
 <table>
 <thead>
 <tr>
-<th>User-facing action</th>
-<th>Required guarantee</th>
-<th>Chosen mechanism</th>
-<th>What Harbor Point pays</th>
+<th>Operation</th>
+<th>Authority and public promise</th>
+<th>Serving path and fallback</th>
+<th>Evidence</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>POST /reservations</code> for issuer <code>MUNI-77</code></td>
-<td>One issuer exposure decision at a time</td>
-<td>Route to the shard leader that owns <code>issuer_exposure</code> and live reservations</td>
-<td>Leader-routed write plus synchronous local follower acknowledgment</td>
+<td><code>POST /reservations</code></td>
+<td>Shard <code>184</code> leader atomically decides exposure, reservation, and idempotency token. <code>confirmed</code> means this commit met the configured local durability rule.</td>
+<td>Route by current shard generation. If the authority or durability rule cannot be proven, fail or return <code>uncertain</code>, not a weaker confirmation.</td>
+<td>Commit position, leader generation, durable-ack trace, and a checker for duplicate token or lost completed result.</td>
 </tr>
 <tr>
-<td><code>GET /reservation-tokens/{token}</code> after timeout</td>
-<td>Durable idempotent outcome</td>
-<td>Store token status in the same commit as the reservation</td>
-<td>Extra write state, but safe retry handling</td>
+<td><code>GET /reservation-tokens/K7</code></td>
+<td>The token record has one durable outcome. A timeout is not treated as a failed reservation.</td>
+<td>Read the authority, or a replica that has replayed the token's position; otherwise wait or route to the leader.</td>
+<td>Token outcome, replay position, and retry history.</td>
 </tr>
 <tr>
-<td><code>GET /issuers/{issuer_id}/open-reservations</code></td>
-<td>Read-your-write or bounded staleness</td>
-<td>Use observed commit tokens and follower freshness checks</td>
-<td>Occasional leader reads when followers lag</td>
+<td><code>GET /my-reservations</code> after success</td>
+<td>The caller sees at least its observed commit.</td>
+<td>A local follower serves only after its replay position reaches the caller's commit token. Otherwise route or wait within a stated budget.</td>
+<td>Required position minus follower replay position.</td>
 </tr>
 <tr>
-<td>Compliance search across issuers</td>
-<td>Freshness published, usually within seconds</td>
-<td>CDC-fed search and compliance index</td>
-<td>Derived-state infrastructure and lag monitoring</td>
+<td>Compliance search</td>
+<td>Base reservations are authority; the index is a discovery view with freshness at most five seconds.</td>
+<td>Return the index watermark. When late, label the response degraded or use an issuer-backed investigation path.</td>
+<td>Index lag, watermark age, and an alert on the five-second budget.</td>
 </tr>
 <tr>
-<td>Regional failover</td>
-<td>RPO at most <code>5s</code>, RTO under <code>10m</code></td>
-<td>Promote only the remote replica's durable replayed prefix</td>
-<td>Explicit write gating when remote lag exceeds budget</td>
+<td>Regional recovery</td>
+<td>Promotion exposes only the remote durable prefix; loss must fit the five-second RPO.</td>
+<td>Stop claiming readiness when remote lag, retained-log continuity, or restore proof exceeds the target. Fence the old generation before writes resume.</td>
+<td>Remote durable position, RPO lag, restore age, promotion record, and a regional-loss exercise.</td>
 </tr>
 </tbody>
 </table>
-<p>This table is the real design artifact. It prevents Harbor Point from pretending that every endpoint deserves the same consistency cost. It also prevents the opposite mistake: hiding irreversible financial decisions behind "eventual" language when the product promise requires a final answer.</p>
-<h2>Decisive Writes Stay Narrow</h2>
-<p>Harbor Point chooses <code>issuer_id</code> as the authority boundary for the strict path. Each issuer shard has one leader at a time, a same-region synchronous follower for normal durability, and a remote asynchronous follower for disaster recovery:</p>
-<div class="codehilite"><pre><span></span><code>regional API gateway
-       |
-       v
-shard map: MUNI-77 -&gt; shard 184 -&gt; home region New York
-       |
-       v
-shard 184 leader
-       |
-       +--&gt; sync follower in same region
-       |
-       +--&gt; async follower in remote region
-       |
-       +--&gt; WAL / outbox -&gt; CDC views
+<p>The matrix deliberately does not say “the system is linearizable.” That sentence is too coarse. It says which operation needs a final decision, which reads need a session guarantee, which data may lag, and which success response survives which failure domain. This is a design preference under Harbor Point's constraints. A product that requires every confirmation to survive regional loss would need remote durability in the acknowledgement rule, with the resulting latency and availability cost.</p>
+<h2>Walkthrough</h2>
+<p>The following trace uses invented times and positions. It is a teaching model, not an observed production incident.</p>
+<h3>Normal write and session read</h3>
+<p>At 09:00, <code>MUNI-77</code> has €1m of remaining exposure. Madrid submits <code>POST /reservations</code> for €1m with token <code>K7</code>. The current shard map says <code>MUNI-77 -&gt; 184 -&gt; New York, generation 31</code>.</p>
+<div class="codehilite"><pre><span></span><code>09:00:00  Madrid gateway  route K7 to shard 184, generation 31
+09:00:01  NY leader       checks exposure = €1m; no outcome exists for K7
+09:00:01  NY leader       commits exposure = €0, reservation R-91, token K7 -&gt; R-91
+09:00:02  local follower  durably confirms position 842
+09:00:02  gateway         returns confirmed(R-91, commit=842, generation=31)
+09:00:03  Madrid follower replay position = 836
+09:00:03  client          asks GET /my-reservations, required position 842
+09:00:03  gateway         routes to leader or waits; follower 836 does not answer as current
 </code></pre></div>
 
-<p>The confirmation path for reservation <code>R-88421</code> is deliberately small:</p>
-<ol>
-<li>The gateway resolves <code>issuer_id=MUNI-77</code> to shard <code>184</code>.</li>
-<li>The shard leader locks or otherwise serializes the <code>issuer_exposure</code> record.</li>
-<li>The leader checks remaining headroom and the request's <code>reservation_token</code>.</li>
-<li>In one durable commit, it inserts the reservation row, updates exposure, stores the token outcome, and emits an outbox event.</li>
-<li>The leader waits for the same-region follower required by the commit rule.</li>
-<li>The response includes a commit token such as <code>shard184@982441</code>.</li>
-</ol>
-<p>In code-shaped terms, the boundary is this:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">create_reservation</span><span class="p">(</span><span class="n">cmd</span><span class="p">):</span>
-    <span class="k">return</span> <span class="n">issuer_shard</span><span class="p">(</span><span class="n">cmd</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">)</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span>
-        <span class="n">token</span><span class="o">=</span><span class="n">cmd</span><span class="o">.</span><span class="n">reservation_token</span><span class="p">,</span>
-        <span class="n">check</span><span class="o">=</span><span class="k">lambda</span> <span class="n">state</span><span class="p">:</span> <span class="n">state</span><span class="o">.</span><span class="n">remaining_exposure</span> <span class="o">&gt;=</span> <span class="n">cmd</span><span class="o">.</span><span class="n">notional</span><span class="p">,</span>
-        <span class="n">writes</span><span class="o">=</span><span class="p">[</span>
-            <span class="p">(</span><span class="s2">&quot;issuer_exposure&quot;</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">issuer_id</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;reserve&quot;</span><span class="p">:</span> <span class="n">cmd</span><span class="o">.</span><span class="n">notional</span><span class="p">}),</span>
-            <span class="p">(</span><span class="s2">&quot;reservation&quot;</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;confirmed&quot;</span><span class="p">}),</span>
-            <span class="p">(</span><span class="s2">&quot;token&quot;</span><span class="p">,</span> <span class="n">cmd</span><span class="o">.</span><span class="n">reservation_token</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;reservation_id&quot;</span><span class="p">:</span> <span class="n">cmd</span><span class="o">.</span><span class="n">reservation_id</span><span class="p">}),</span>
-            <span class="p">(</span><span class="s2">&quot;outbox&quot;</span><span class="p">,</span> <span class="n">next_event</span><span class="p">(),</span> <span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;reservation-confirmed&quot;</span><span class="p">}),</span>
-        <span class="p">],</span>
-    <span class="p">)</span>
-</code></pre></div>
-
-<p>The mechanism matters more than the syntax. Harbor Point is not trying to make every region a concurrent writer for the same issuer. It is not putting compliance search, dashboards, or external analytics into the write quorum. The irreversible decision is made once, under the shard that owns the invariant, with a token record that survives timeout, retry, restore, and failover.</p>
-<p>The trade-off is visible. Cross-region desks sometimes pay a WAN hop to the issuer's home leader. Harbor Point accepts that cost because it is cheaper than reconciling over-allocated exposure after two users have already seen success.</p>
-<h2>Logs And Projections Serve The Rest</h2>
-<p>Once <code>R-88421</code> commits, Harbor Point stops treating every consumer as part of the write path. The committed log becomes the boundary between authoritative state and derived views:</p>
-<div class="codehilite"><pre><span></span><code>issuer shard commit
-       |
-       v
-WAL / outbox / CDC stream
-       |
-       +--&gt; issuer dashboard projection
-       +--&gt; compliance search index
-       +--&gt; risk reporting view
-       +--&gt; backup and replay pipeline
-</code></pre></div>
-
-<p>The issuer dashboard can read from a follower or projection if it can prove freshness relative to the caller's commit token. Compliance search can lag by a few seconds because investigators can see the freshness watermark and fall back to an authoritative shard-backed lookup during an incident. Risk reporting can be replayed from the committed log rather than patched by hand.</p>
-<p>This is how Harbor Point avoids over-coordination without becoming sloppy. Derived views are allowed to be weaker only because the decisive write path is stronger and because every derived path has a freshness contract. The log is not just plumbing. It is the proof trail that lets the team rebuild indexes, explain token outcomes, restore to a point in time, and run failure tests against client-visible history.</p>
-<p>The control plane follows the same rule. Shard ownership changes only through versioned metadata. Rebalancing copies, catches up, and cuts over before routers accept the new owner. Membership changes are committed before nodes vote or serve traffic. Failover promotes only the durable remote prefix and resolves ambiguous writes through token status. Routing, replication, and recovery all answer the same question: who is the authority for this shard at this generation?</p>
-<h2>Readiness Review</h2>
-<p>Harbor Point is ready only when the design can survive the uncomfortable cases.</p>
-<p>If a client times out after submitting <code>reservation_token=tok-77</code>, support must be able to ask the issuer shard whether that token committed. The answer cannot depend on a best-effort log search or a support engineer re-running the business action.</p>
-<p>If the remote replica for shard <code>184</code> falls more than five seconds behind, the service must stop advertising a five-second RPO for that shard. It can throttle writes, pause topology changes, or degrade the region's failover claim, but it cannot keep the risk hidden behind a green API health check.</p>
-<p>If compliance search is behind, the index must expose its watermark. A stale search result is acceptable only when the endpoint's contract admits staleness and the workflow has a stronger path for authoritative decisions.</p>
-<p>If a leader, member, or partition owner changes, every old route must be fenced by term, epoch, or generation. A returning node with stale data is not useful until it rejoins through the membership and catch-up workflow.</p>
-<p>Those checks turn a collection of mechanisms into a service contract. The design is not complete because it uses replication. It is complete when every important promise has an authority, a serving path, a lag budget, an operational fallback, and a test that can falsify it.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>"A confirmation timeout means the reservation probably failed, so retry the whole action."</strong> Timeouts create uncertainty, not rollback. Persist the reservation token with the authoritative commit and resolve retries against the stored outcome.</p>
-<p><strong>"Compliance search should be strongly consistent so nobody sees stale results."</strong> That spends global coordination on a derived lookup path. Keep search bounded-stale, publish the freshness watermark, and route final decisions through the issuer shard.</p>
-<p><strong>"The remote replica is only for disasters, so lag is just an operations metric."</strong> Remote lag is the distance between the advertised RPO and reality. Gate failover claims, planned rebalancing, and write admission on the replay budget.</p>
-<p><strong>"A projection can be patched directly during an incident."</strong> Direct edits create drift from the committed log. Emit a corrective event, rebuild the projection, or replay from the authoritative source so derived state remains explainable.</p>
-<p><strong>"Cross-region failover is just leader election."</strong> Promotion is safe only for the durable prefix that has actually reached the remote region, and old owners must be fenced by generation before traffic resumes.</p>
-<h2>Connections</h2>
+<p>The first reasonable but wrong response at the last line is, “the follower is healthy, so it can answer.” Health is a process signal. It does not show that the follower contains this caller's commit. The required position makes the missing state visible. Once the follower reaches <code>842</code>, it can serve this session read. Before then, the design pays a small latency cost for honesty.</p>
+<p>The trace also shows why the token belongs in the same authoritative decision. If the response at 09:00:02 is lost, the client does not submit a fresh business action. It asks about <code>K7</code> or repeats <code>K7</code>; the leader returns <code>R-91</code>. One token maps to one business outcome across timeout and retry.</p>
+<h3>Derived read and recovery boundary</h3>
+<p>The outbox for position <code>842</code> reaches compliance search at 09:00:05. Until then, a search response can omit <code>R-91</code>, but it must expose a watermark older than <code>842</code>. The omission is permitted by that row's bounded-freshness contract; it is not permitted as proof that the reservation failed.</p>
+<p>At 09:04, Madrid has durably replayed through position <code>850</code>. At 09:04:02, New York becomes unreachable. The runbook first prevents the old generation from serving, then promotes Madrid at generation <code>32</code> from its durable prefix. A reservation at <code>854</code> cannot appear after promotion because it never reached the promoted prefix.</p>
+<p>This has two possible interpretations:</p>
 <ul>
-<li><a href="022.html">Guarantee Matrix Design Review</a> provides the checklist this architecture must satisfy: authority, serving path, lag budget, fallback, and evidence.</li>
-<li><a href="023.html">Replication Failure Mode Check</a> stress-tests the same architecture by asking whether shard authority, read paths, and failover semantics agree.</li>
-<li><a href="021.html">Failure Testing Replication Claims</a> explains how Harbor Point should falsify the final design with partitions, delayed replication, timeouts, and history checking.</li>
+<li>If the public confirmation rule promised survival of every acknowledged write through regional loss, the design is wrong. The acknowledgement path must wait for remote durability or change the promise.</li>
+<li>If the service explicitly promised an RPO of five seconds and the lost writes fall inside a measured five-second window, the loss may match the stated recovery contract. It is still an event that needs token resolution, communication, and evidence.</li>
+</ul>
+<p>The meaningful boundary is not “replication happened.” It is the durable prefix that the promoted authority can actually prove.</p>
+<p><strong>So far:</strong> the write path protects the invariant, the session path prevents a stale follower from impersonating current state, the derived path names its lag, and the promotion path names its loss boundary. These are separate mechanisms serving one contract.</p>
+<h2>Failure Review</h2>
+<p>Use this review before calling the design ready.</p>
+<table>
+<thead>
+<tr>
+<th>Pressure</th>
+<th>What must remain true</th>
+<th>Failure that reveals an unsupported promise</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two desks submit the final available exposure.</td>
+<td>At most one receives <code>confirmed</code>; the other sees insufficient exposure or an honest uncertain result.</td>
+<td>Two regional owners independently confirm the final amount, then attempt to merge later.</td>
+</tr>
+<tr>
+<td>A response times out after the leader commits.</td>
+<td>Repeating the same token returns the existing outcome, not a second reservation.</td>
+<td>The retry creates <code>R-92</code> because token status was not durable with the decision.</td>
+</tr>
+<tr>
+<td>A follower lags after a completed write.</td>
+<td>A session-sensitive read waits, routes, or returns a contractually stale answer.</td>
+<td>A healthy follower returns an older state as if it were read-your-writes.</td>
+</tr>
+<tr>
+<td>CDC or the index falls behind.</td>
+<td>Search exposes watermark age and does not decide issuer exposure.</td>
+<td>A stale index is used to approve or reject a reservation.</td>
+</tr>
+<tr>
+<td>Home region is lost.</td>
+<td>New writes use one fenced generation; recovery loss is no larger than the declared RPO.</td>
+<td>A former leader accepts writes after promotion, or the measured remote lag exceeds the advertised RPO.</td>
+</tr>
+<tr>
+<td>A restore is required.</td>
+<td>The team can reconstruct authoritative state to the stated point and then rebuild derived views.</td>
+<td>A replica exists but no restore proof, retained log, or replay plan supports the recovery target.</td>
+</tr>
+</tbody>
+</table>
+<p>A fault exercise should record client invocation and completion, request token, shard generation, commit/replay positions, and topology events. A green cluster after the exercise is not sufficient evidence. The checker needs to reject a history with an impossible confirmation, duplicate token, forbidden session read, or recovery result outside the stated contract.</p>
+<h2>Trade-offs</h2>
+<p>Harbor Point gets one final exposure decision per issuer. It pays cross-region latency when a desk is far from that issuer's leader. It also pays for token state, follower progress checks, remote replication, log retention, monitoring, and rehearsed recovery.</p>
+<p>In return, compliance search and dashboards can avoid the decisive write path. They are scalable because they are derived, not because they somehow become authoritative. The cost is that their freshness must be measured and displayed, and their operators need a fallback for investigations.</p>
+<p>The design can still fail. A five-second RPO does not make the last five seconds impossible to lose in the specified disaster. A token does not make a downstream email exactly-once. A fenced promotion cannot repair a false shard map before it is detected. These are boundaries, not reasons to abandon the model. They tell the team which promise to narrow, which mechanism to strengthen, or which signal to gate before release.</p>
+<h2>Evidence and Readiness</h2>
+<p>Before launch, Harbor Point should have an answer for every cell in this compact dossier:</p>
+<table>
+<thead>
+<tr>
+<th>Readiness question</th>
+<th>Acceptable evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Does each irreversible action have one authority boundary?</td>
+<td>Guarantee matrix and shard-key review showing that the invariant is local to the chosen owner.</td>
+</tr>
+<tr>
+<td>Does acknowledgement mean what product and operations think it means?</td>
+<td>Write trace with the exact durable condition and a documented treatment of timeout.</td>
+</tr>
+<tr>
+<td>Can clients obtain the promised read after a write?</td>
+<td>Commit-token propagation test; follower replay metric; leader fallback behavior.</td>
+</tr>
+<tr>
+<td>Are derived surfaces honest about staleness?</td>
+<td>Watermark in the response, lag alert, and a tested stronger lookup path.</td>
+</tr>
+<tr>
+<td>Is the recovery promise real?</td>
+<td>Remote durable-progress history, retained-log or backup continuity, timed restore, and fenced-promotion drill.</td>
+</tr>
+<tr>
+<td>Can the team falsify the central claims?</td>
+<td>A recorded workload, fault schedule, checker, and retained failure artifacts.</td>
+</tr>
+</tbody>
+</table>
+<p>These are not generic production checkboxes. They correspond directly to the matrix. If a row has no evidence, it is an aspiration rather than a guarantee. If an alert has no contract threshold, it may be useful for debugging but cannot tell the team whether the service is meeting its promise.</p>
+<h2>Final Challenge</h2>
+<p>Create an architecture dossier for one service with an invariant that cannot be repaired after success. You may use Harbor Point, an online ticket service, inventory allocation, or another nearby domain. Keep the same level of specificity; do not solve the challenge with “use a strongly consistent database.”</p>
+<p>Your dossier must contain:</p>
+<ol>
+<li>a one-sentence user-visible invariant and the authority boundary that decides it;</li>
+<li>a guarantee matrix with at least four rows: decisive write, timeout/status lookup, session-sensitive read, and one derived or recovery path;</li>
+<li>a topology and routing sketch that shows the current owner, durability path, remote recovery copy, and derived consumers;</li>
+<li>a normal-operation trace that includes a write, returned commit token or equivalent evidence, and a safe immediate read;</li>
+<li>a failure trace involving either timeout plus retry, stale read, rebalancing, or regional promotion;</li>
+<li>two explicit trade-offs and the product constraints that justify them;</li>
+<li>a signal, test, or runbook step for every high-value promise; and</li>
+<li>one limitation the design does not solve.</li>
+</ol>
+<p><strong>Readiness rubric:</strong></p>
+<ul>
+<li><strong>Correctness:</strong> every irreversible decision has one authority at a time; retries and promotion cannot silently create a second effect.</li>
+<li><strong>Clarity:</strong> the write acknowledgement, each read guarantee, and the RPO/RTO language can be understood without product slogans.</li>
+<li><strong>Operability:</strong> lag, required read position, topology generation, and recovery progress have named evidence and a response when outside budget.</li>
+<li><strong>Trade-offs:</strong> weaker reads or recovery loss are explicit, bounded, and connected to the latency or availability they buy.</li>
+<li><strong>Scope:</strong> the dossier uses the track's mechanisms to support a contract; it does not wander into database-engine internals, full consensus proofs, or a vendor deployment guide.</li>
 </ul>
 <h2>Resources</h2>
 <ul>
-<li>
-<p>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a></p>
-<ul>
-<li>Focus: Revisit the chapters on transactions, replication, logs, and derived data as one connected design space rather than isolated topics.</li>
-</ul>
-</li>
-<li>
-<p>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a></p>
-<ul>
-<li>Focus: Compare Harbor Point's narrow local coordination choice with a system that pays for stronger cross-region ordering directly.</li>
-</ul>
-</li>
-<li>
-<p>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Raft)</a></p>
-<ul>
-<li>Focus: Pay attention to leader ownership, log replication, and why failover safety depends on a well-defined committed prefix.</li>
-</ul>
-</li>
-<li>
-<p>[DOC] <a href="https://kafka.apache.org/33/documentation/streams/core-concepts/">Apache Kafka Streams Core Concepts</a></p>
-<ul>
-<li>Focus: Study stream-table duality and replay-backed state reconstruction, which is exactly how derived views stay out of the reservation write quorum.</li>
-</ul>
-</li>
-<li>
-<p>[DOC] <a href="https://www.postgresql.org/docs/current/logicaldecoding-explanation.html">PostgreSQL Logical Decoding Concepts</a></p>
-<ul>
-<li>Focus: Use it to ground the outbox or WAL-capture portion of the design in a concrete production implementation.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://research.google/pubs/spanner-googles-globally-distributed-database/">Spanner: Google's Globally-Distributed Database</a> — Focus: Compare a globally ordered transaction design with the capstone's deliberately narrow authority boundary.</li>
+<li>[DOC] <a href="https://docs.cloud.google.com/spanner/docs/true-time-external-consistency">Spanner: TrueTime and external consistency</a> — Focus: Contrast an explicit strong-read contract with bounded stale reads and their different costs.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: Revisit leader ownership, committed log prefixes, and safe membership change as concepts consumed by this design.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/logicaldecoding-explanation.html">PostgreSQL logical decoding concepts</a> — Focus: See a concrete log-to-consumer interface, including replay, duplicate-delivery, and retention boundaries.</li>
+<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a> — Focus: Find examples of client histories and faults that make a claimed guarantee testable.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A consistency design is not one global mode; it maps user-visible invariants to specific coordination points, lag budgets, and recovery rules.</li>
-<li>Harbor Point keeps issuer exposure and confirmed reservations on one authoritative shard, then exports committed truth through logs and projections for everything else.</li>
-<li>Bounded-stale reads are safe only when the decisive write path remains authoritative and each projection has explicit replay and lag semantics.</li>
-<li>Failover, rebalancing, and retries are part of the consistency contract because a design is only real if it can explain ambiguous outcomes after something breaks.</li>
-</ol>
+<ul>
+<li>A capstone design begins with client-visible invariants, then selects authority, acknowledgements, reads, recovery, and evidence to preserve them.</li>
+<li>A healthy replica, a CDC projection, and a promoted node each answer different questions; none is authority by default.</li>
+<li>Every weaker path needs a named freshness or recovery boundary and a fallback when it cannot prove that boundary.</li>
+<li>The final proof of a replicated service is a falsifiable dossier: matrix, traces, signals, runbook, and fault test all describe the same contract.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -275,7 +361,7 @@ WAL / outbox / CDC stream
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

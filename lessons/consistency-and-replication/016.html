@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,110 +81,168 @@
 <section class="stack-block lesson-content-shell">
   <h1>Clocks, Leases, and Safe Reads</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Lease-based reads are only safe when the system can prove that no earlier leader could still believe it has authority, and that proof depends on bounded clock uncertainty rather than on optimism.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>explain why a newly elected leader is not automatically ready for a lease-based fast read;</p>
+</li>
+<li>
+<p>trace the conservative interval checks that avoid overlapping read authority;</p>
+</li>
+<li>
+<p>choose a safe fallback when time uncertainty or quorum communication erodes the lease margin.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A lease read is fast only because a system has a time-bounded proof that no other replica may still serve the same read as current.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Harbor Point's reservation service has a familiar pressure: traders want "remaining capacity" reads to feel local and instant, but the value is only useful if it is current. After shard <code>184</code> moves leadership from <code>ny-db-3</code> to <code>md-db-2</code>, the write side may be settled by consensus. The read side still has a sharper question: can Madrid answer from local memory immediately, or might the old New York leader still believe its read lease is valid for a few more milliseconds?</p>
-<p>That is where clock uncertainty stops being an infrastructure footnote and becomes part of the correctness contract. A lease is a promise that one replica may act as read authority until an expiration time. But no machine observes real time directly. Each machine has a local clock with bounded error, so "it is 09:17:01.200" really means "real time is somewhere inside this interval."</p>
-<p>If two leaders use raw wall-clock timestamps without respecting that interval, the old leader can keep serving reads after the new leader has started serving them too. That overlap is enough to break linearizable reads even if the election was otherwise correct. Harbor Point cares because shard <code>184</code> backs issuer reservation limits during market open. A stale read is not a cosmetic dashboard bug; it can make a desk act on capacity that has already been consumed.</p>
-<p>The useful correction is that fast reads are not automatically safer than writes. They are a privilege earned by proof. Lease-based reads let a leader answer from local state only while the system can conservatively prove that no earlier leader could still be the read authority.</p>
-<h2>Time Is An Interval</h2>
-<p>Harbor Point runs a bounded-time service beside its replication layer. Each replica can ask for the current time and receive an interval rather than a single scalar:</p>
+<p>At 09:17, Harbor Point moves shard <code>184</code> from New York to Madrid. The consensus group has chosen <code>md-db-2</code> as the new leader. A trader then asks for the remaining capacity of an issuer.</p>
+<p>The tempting answer is immediate: “Madrid is leader now, so read from Madrid's memory.” That works when no previous leader can still act. But the old leader, <code>ny-db-3</code>, may be alive, isolated, and looking at a clock that differs from Madrid's. If its old read lease appears valid to it, two replicas may both answer a question that promised one current value.</p>
+<p>The important distinction is small:</p>
+<div class="codehilite"><pre><span></span><code>elected leader
+    -&gt; may be allowed to order writes for a new term
+
+safe lease reader
+    -&gt; also has a current proof that earlier read authority cannot overlap
+</code></pre></div>
+
+<p>Consensus establishes the ordered authority history. A lease is an additional fast-path argument, not a substitute for consensus. When the argument is unavailable, the correct response is usually a slower linearizable read, not a hopeful local read.</p>
+<h2>The Small Situation: What Does “Now” Mean?</h2>
+<p>Humans say “the lease expires at 09:17:01.500” as if every machine sees the same instant. A distributed program cannot assume that. It receives time from a local clock, and the clock may be early or late relative to real time.</p>
+<p>For this lesson, use a simplified bounded-time model. A replica reads an interval:</p>
 <div class="codehilite"><pre><span></span><code>now = [earliest, latest]
 </code></pre></div>
 
-<p>When synchronization is healthy, the interval might be only a few milliseconds wide. During a time-service incident, a VM pause, or an overloaded host, the interval widens because the system is less certain about where real time actually is. Suppose <code>md-db-2</code> sees:</p>
-<div class="codehilite"><pre><span></span><code>09:17:01.120 &lt;= real time &lt;= 09:17:01.127
+<p>The interval means that real time is somewhere between those two values. It is a teaching model for systems that can bound their clock error; specific databases may use different clock, lease, or read protocols.</p>
+<p>Suppose <code>ny-db-3</code> holds a read lease until <code>T = 09:17:01.500</code>. At one moment it sees:</p>
+<div class="codehilite"><pre><span></span><code>ny-db-3 now = [09:17:01.480, 09:17:01.492]
 </code></pre></div>
 
-<p>That means it is unsafe to reason from the midpoint alone. The clock is not saying "real time is exactly <code>09:17:01.123</code>." It is saying real time could already be as late as <code>09:17:01.127</code>, or as early as <code>09:17:01.120</code>. Lease logic has to use the pessimistic edge of the interval for each decision.</p>
-<p>Before New York stalled, <code>ny-db-3</code> held a leader lease for shard <code>184</code> until real-time expiration <code>09:17:01.150</code>. Consensus can elect <code>md-db-2</code> as the new term-<code>42</code> writer, but lease-based reads are a different claim. They say not only "Madrid is the elected leader" but also "no previous leader could still legitimately answer this read as current." To make that statement safe, Harbor Point uses the uncertainty interval in two conservative ways:</p>
-<div class="codehilite"><pre><span></span><code>old leader may serve reads only while latest &lt; old_lease_expiry
-new leader may start lease reads only when earliest &gt; old_lease_expiry
+<p>The old leader may serve via this lease only if its pessimistic upper bound is still before <code>T</code>:</p>
+<div class="codehilite"><pre><span></span><code>latest &lt; T
 </code></pre></div>
 
-<p>The asymmetry is the point. The old leader stops early because its clock might be slow. The new leader starts late because its clock might be fast. Those two rules create a guard band with no overlap. There may be a brief period where neither replica may use the lease fast path, but a short gap is much safer than overlapping authority.</p>
-<p>The guard band is the price of keeping the read contract honest:</p>
-<div class="codehilite"><pre><span></span><code>real time ------------------------------&gt;
-
-old lease expiry at Texp = 09:17:01.150
-
-ny-db-3 can still prove lease validity only if:
-  TT.now().latest &lt; Texp
-
-md-db-2 can start lease reads only if:
-  TT.now().earliest &gt; Texp
-
-          safe for old      guard band       safe for new
-------------|------------------|-----------------------------&gt;
-         latest&lt;Texp        uncertainty gap        earliest&gt;Texp
+<p>Why use <code>latest</code>? Real time might already be <code>09:17:01.492</code>. If even that value is before the expiration, the old leader has not stepped beyond the interval it was granted. The midpoint is not enough evidence; it hides the possibility that the local clock is behind.</p>
+<p>The successor must be conservative in the opposite direction. It may enable a replacement lease only after:</p>
+<div class="codehilite"><pre><span></span><code>earliest &gt; T
 </code></pre></div>
 
-<p>This is why teams talk about clock uncertainty instead of clock skew alone. Skew is the physical reality; uncertainty is the modeled bound that the software uses to stay safe in spite of that reality.</p>
-<h2>How A Lease Makes Reads Local</h2>
-<p>Harbor Point's replication layer still uses consensus to decide who may append writes for term <code>42</code>. The lease does not replace consensus. It converts recent quorum agreement into a fast local read path.</p>
-<p>Every 100 milliseconds, <code>md-db-2</code> sends heartbeats to <code>md-db-4</code> and <code>ny-db-3</code> when reachable. A heartbeat acknowledgment from a quorum means two things at once: the quorum still recognizes term <code>42</code>, and those replicas will not grant a conflicting read lease before the current lease window closes. With that proof in hand, the leader can answer many "current remaining capacity" reads from local state without appending a no-op or round-tripping to a quorum for every request.</p>
-<p>In practice, Harbor Point does not treat the full configured lease duration as usable. It subtracts a safety margin for clock uncertainty and message delay. A simplified model looks like this:</p>
-<div class="codehilite"><pre><span></span><code>configured lease duration: 300 ms
-worst-case clock uncertainty: 8 ms
-network / processing reserve: 12 ms
-usable local-read window after quorum renewal: 280 ms
+<p>If Madrid's interval is <code>[09:17:01.494, 09:17:01.506]</code>, <code>earliest</code> has not passed the old expiry. Madrid waits or uses a quorum-confirmed read. When its interval becomes <code>[09:17:01.512, 09:17:01.524]</code>, the time condition is satisfied.</p>
+<p>This creates a deliberate gap. Near <code>T</code>, neither replica gets the local lease fast path:</p>
+<div class="codehilite"><pre><span></span><code>old holder: latest &lt; T         safe to use old lease
+              [uncertain gap] use another safe read path
+new holder: earliest &gt; T       eligible for new lease
 </code></pre></div>
 
-<p>The exact arithmetic varies by implementation, but the principle is stable: the lease window consumed by the application is shorter than the window granted by the protocol. That difference is not waste. It is the margin that prevents a leader from reading one step beyond what the rest of the cluster can safely justify.</p>
-<p>For shard <code>184</code>, the sequence after leadership changes is:</p>
-<div class="codehilite"><pre><span></span><code>09:17:01.091  md-db-2 becomes active leader for term 42
-09:17:01.130  quorum heartbeat acknowledgments arrive
-09:17:01.130  lease granted until 09:17:01.430
-09:17:01.138  uncertainty-adjusted safe window opens for local reads
-09:17:01.418  uncertainty-adjusted safe window closes
+<p>The gap is not a bug. It is the cost of replacing “their clocks probably agree” with a proof that does not allow two lease holders to overlap.</p>
+<h2>The Initial Model and Where It Breaks</h2>
+<p>An initial model says: “A leader may serve a local read until its wall clock passes the expiry, and a new leader may serve as soon as it is elected.” It is attractive because it is fast and uses familiar timestamps.</p>
+<p>It breaks when a partition separates the former leader from the quorum. The former leader may not hear about the new term. If it compares only its own raw wall clock, a slow clock can make an expired lease look valid. Meanwhile, a fast clock at the new leader can make the old lease look expired. The two local decisions overlap in real time.</p>
+<p>The stronger model has two parts:</p>
+<ol>
+<li>The lease-grant protocol must ensure that a current quorum will not grant conflicting authority in the same interval. That protocol is product-specific and normally ties leases to terms, membership, and quorum acknowledgements.</li>
+<li>A holder and successor must consume the time bound conservatively. The holder stops before the possible end; the successor starts after the possible end.</li>
+</ol>
+<p>The interval formulas alone do not create safety. They only preserve safety after the protocol has supplied a valid lease boundary. A database with no bounded-clock assumption should use a different proof, such as confirming leadership with a quorum for the read.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>Use this illustrative sequence. The times and margins are examples, not observed measurements.</p>
+<div class="codehilite"><pre><span></span><code>Lease for term 41 held by ny-db-3: expires at T = 01.500
+
+01.480  ny-db-3 sees [01.480, 01.492]
+        latest &lt; T, so its existing lease fast path is still valid.
+
+01.490  network partition isolates ny-db-3 from the quorum.
+
+01.496  quorum elects md-db-2 for term 42 and records its authority.
+        Election alone is not permission to reuse the old time window.
+
+01.498  md-db-2 sees [01.494, 01.506]
+        earliest &lt;= T, so it does not use a replacement lease yet.
+        It can wait or use a quorum-confirmed read.
+
+01.518  md-db-2 sees [01.512, 01.524]
+        earliest &gt; T. With the protocol&#39;s term and quorum proof in place,
+        it may enable its own lease fast path.
 </code></pre></div>
 
-<p>Between <code>09:17:01.138</code> and <code>09:17:01.418</code>, <code>md-db-2</code> can serve a linearizable read of "remaining reservation capacity" from local state because the lease proof says no competing leader can exist in that interval. Outside that window, the leader has options, but "pretend the lease is probably still good" is not one of them. It must renew the lease or switch to a slower read protocol that confirms leadership again.</p>
-<p>This is also why safe reads are not identical to "reads from the leader." A leader without a current proof is just a replica that was probably leader a moment ago. Production systems need a stronger statement than probability.</p>
-<h2>When The Fast Path Should Close</h2>
-<p>Suppose Harbor Point's time service degrades and the uncertainty interval widens from 8 milliseconds to 70 milliseconds after a synchronization alarm. Nothing about the replicated log has become corrupt. <code>md-db-2</code> may still be the legitimate writer. But the usable portion of each lease window shrinks sharply because the guard band around expiration gets larger. The system sees this in metrics before users see correctness problems:</p>
-<ul>
-<li><code>clock_uncertainty_ms</code> jumps above the normal envelope.</li>
-<li><code>lease_read_margin_ms</code> approaches zero.</li>
-<li><code>read_path_fallback_total</code> starts increasing because more requests take the quorum-confirmed path.</li>
-</ul>
-<p>The trade-off is direct: give up latency before giving up correctness. Harbor Point falls back to a ReadIndex-style path, where the leader confirms with a quorum that it is still current and then serves the read from local state at a verified log boundary. That adds a round trip, so p99 read latency may rise from 3 milliseconds to 18 milliseconds, but the semantics remain sound. For a market-facing reservation system, a few extra milliseconds are cheaper than one wrong capacity decision.</p>
-<p>This fallback logic also explains why lease-based reads and failover tuning cannot be reasoned about in isolation. If follower acknowledgments slow down because a replication link is saturated, the leader renews its lease later and the safe local-read window collapses more often. The system is still correct, but it spends more time on the expensive read path. That is the bridge to flow control: backpressure is not only a write-side concern when lease renewal depends on timely quorum communication.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Read latency spikes after a clock synchronization alert, even though write leadership never changed.</strong> The uncertainty interval widened, so the lease fast path lost most or all of its safe window. Reads are falling back to quorum confirmation. Alert on time uncertainty directly, not just on NTP daemon health, and treat the increased fallback rate as protective behavior while clock quality recovers.</p>
-<p><strong>A stale read appears right after failover, even though the election log shows a clean term transition.</strong> The read path relied on raw local wall-clock comparisons or skipped the uncertainty guard band, allowing the old and new leaders to believe the lease was valid at the same time. Store lease expiry in a form all replicas interpret conservatively, check <code>latest &lt; expiry</code> before serving old-leader lease reads, and require the successor to wait until <code>earliest &gt; expiry</code> before enabling its own lease fast path.</p>
-<p><strong>The leader frequently refuses lease reads during peak traffic, but time synchronization looks healthy.</strong> Lease renewal depends on timely quorum acknowledgments. Replication lag, congested heartbeat channels, or overloaded followers can reduce the usable read window even when clocks are accurate. Separate heartbeat and replication latency metrics, watch how much margin remains before lease expiry, and investigate follower overload before tuning the lease duration upward.</p>
+<p>Notice what each replica can decide. <code>ny-db-3</code> cannot learn from the partition that it was replaced. It can only obey the lease it already has and stop conservatively. <code>md-db-2</code> can learn a new term from the quorum, but it still waits out the possible remainder of the prior lease. The overlap disappears because the old node's safe interval ends before the new node's begins.</p>
+<p>What if Madrid needs a result at <code>01.498</code>? It does not need to invent a weaker answer. A common alternative is a quorum-confirmed linearizable read: the leader verifies that it is still current with the quorum, then serves state at a safe log position. The details vary by system—some call this a read-index path—but its purpose is stable: trade an extra coordination round for a proof that is not relying on the lease fast path.</p>
+<p>So far, the lease does not make a read correct by magic. It lets a system reuse a recent proof for a limited interval. When time or communication makes that reuse unclear, the system obtains fresh evidence.</p>
+<p>The scope is narrow. A valid leader lease can justify a read from the leader's committed local state; it does not make an arbitrary follower current. A follower still needs its own freshness evidence, such as a required log position, before it can answer a session-sensitive request.</p>
+<h2>Margin Is an Operational Signal</h2>
+<p>Lease safety is binary at the boundary, but its performance value fades before the boundary. Harbor Point can track the available margin:</p>
+<div class="codehilite"><pre><span></span><code>lease expiry                        01.800
+latest safe local-read instant      01.784
+remaining local-read margin           16 ms
+</code></pre></div>
+
+<p>Those numbers are illustrative. The exact margin comes from a product's lease duration, clock bound, renewal timing, and safety reserve. Its use is practical: a shrinking margin predicts that the fast path will close more often.</p>
+<p>Two causes can shrink it:</p>
+<table>
+<thead>
+<tr>
+<th>Observation</th>
+<th>Likely effect on the lease path</th>
+<th>First safe response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Clock uncertainty widens</td>
+<td>The guard interval grows.</td>
+<td>Stop lease reads sooner; use the confirmed path.</td>
+</tr>
+<tr>
+<td>Quorum acknowledgements arrive late</td>
+<td>Renewal occurs later or fails.</td>
+<td>Inspect follower and heartbeat latency; let reads fall back.</td>
+</tr>
+<tr>
+<td>A leader change is in progress</td>
+<td>The successor may be inside the old lease window.</td>
+<td>Wait out the boundary or confirm with a quorum.</td>
+</tr>
+</tbody>
+</table>
+<p>The trade-off is explicit. Longer leases can reduce coordination on ordinary reads, but they make handoff waits and the consequences of a poor clock bound more visible. Shorter leases reduce the duration of any old authority but require more frequent renewal. Neither setting repairs an unbounded clock or a broken lease-grant protocol.</p>
+<p>The boundary also explains an important operational choice: a rise in <code>read_fallback_total</code> after a time-quality or heartbeat alert can be protective behavior. It means the service chose a more expensive proof. Treat it as a reason to investigate clocks, pauses, network delay, or follower overload—not as permission to turn off safety checks to recover latency.</p>
+<h2>Where Lease Reads Do Not Apply</h2>
+<p>Do not infer that every “read from leader” implementation is a lease read, or that every lease is a leader read lease. A system may offer linearizable reads by quorum confirmation, route reads to a leaseholder, use timestamp ordering, or expose an explicitly stale replica read. The word <em>lease</em> names a particular time-bounded authority argument; it does not name a universal API guarantee.</p>
+<p>Likewise, a clock bound is an assumption to operate, not a number to declare once. If a host pause, time-service failure, virtualization problem, or monitoring signal makes the bound untrustworthy, the fast path must close until the system can re-establish its assumptions. The safe fallback preserves semantics but may not preserve the latency objective.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> The former leader sees <code>[01.489, 01.503]</code> and its old lease expires at <code>01.500</code>. May it serve a lease read?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. <code>latest</code> is <code>01.503</code>, already beyond the expiry. The former leader must stop using that lease even though <code>earliest</code> is still before the boundary.</p>
+<p><strong>Check:</strong> The new leader has been elected, but sees <code>[01.497, 01.509]</code> while the old expiry is <code>01.500</code>. What is safe?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It may not start a replacement lease because <code>earliest</code> has not passed <code>01.500</code>. It can wait or use a quorum-confirmed read path if the system provides one.</p>
+<h2>Practice: Review a Read Fast Path</h2>
+<p>Your service proposes a 400 ms leader-read lease. Write the smallest safety review for it.</p>
+<ol>
+<li>Name the term, membership, and quorum event that grants the lease.</li>
+<li>State the clock-bound assumption and the conservative stop/start checks.</li>
+<li>Describe what the old leader does after a partition.</li>
+<li>Name the fallback that preserves the read guarantee during the guard interval.</li>
+<li>Choose one signal for time quality and one for renewal health.</li>
+</ol>
+<p><strong>A good answer should mention:</strong> a proof beyond “this node is leader,” a guard interval with no overlapping lease authority, a defined fallback, and a response when the clock or communication assumption is no longer trustworthy.</p>
 <h2>Connections</h2>
 <ul>
-<li><a href="015.html">Secondary Indexes Across Shards</a> showed that optimized read paths still need explicit freshness contracts; leases apply the same discipline to leader-local reads.</li>
-<li><a href="017.html">Membership Changes and Replica Set Evolution</a> continues the authority story by separating suspicion, committed configuration, and safe participation in a replica set.</li>
-<li><a href="018.html">Replication Flow Control and Backpressure</a> explains why timely follower acknowledgments affect both write throughput and lease-read availability.</li>
+<li><a href="015.html">Secondary Indexes Across Shards</a> separates an optimized read path from the authoritative base row; leases similarly make a fast read path conditional on proof.</li>
+<li><a href="017.html">Membership Changes and Replica Set Evolution</a> shows why a lease also depends on the current term and committed replica configuration.</li>
+<li><a href="018.html">Replication Flow Control and Backpressure</a> explains why delayed follower communication can turn a read optimization into fallback traffic.</li>
 </ul>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a><ul>
-<li>Focus: Read the sections on TrueTime and external consistency to see how bounded uncertainty becomes an explicit API for correctness decisions.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://etcd.io/docs/v3.5/learning/api_guarantees/">etcd API guarantees</a><ul>
-<li>Focus: Compare Harbor Point's lease-read fast path with etcd's linearizable read guarantees and the cases where extra quorum confirmation is required.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/architecture/transaction-layer">CockroachDB architecture: transaction layer</a><ul>
-<li>Focus: Look for how hybrid logical clocks, uncertainty windows, and leaseholders interact in a production SQL system.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/pub33002/">Paxos Made Live: An Engineering Perspective</a><ul>
-<li>Focus: Pay attention to how a formally correct leader protocol still needs operational guardrails around time, failure detection, and stale authority.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://docs.cloud.google.com/spanner/docs/true-time-external-consistency">Spanner: TrueTime and external consistency</a> — Focus: Study an explicit bounded-time model and how timestamp ordering supports strong reads across regions.</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/learning/api_guarantees/">etcd API guarantees</a> — Focus: Compare serializable and linearizable reads, and notice that an API can expose different proofs for different read modes.</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: Review terms, quorum agreement, and leader authority as prerequisites that a lease optimization cannot replace.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ol>
-<li>A lease is a time-bounded proof, not a performance hint; local reads are safe only while the system can prove that no earlier leader still has authority.</li>
-<li>Clock uncertainty turns "now" into an interval, so old leaders must stop early and successors must start late around lease handoff.</li>
-<li>The correct degraded mode is slower reads, not unsafe reads: when uncertainty, heartbeat delay, or replication pressure erodes lease margin, the system should fall back to quorum-confirmed reads.</li>
+<li>Election and lease-read authority are related but different proofs; a new term does not erase the possible remainder of an old lease.</li>
+<li>With a bounded-time model, an old holder stops using its lease on the conservative upper bound and a successor starts only after the conservative lower bound passes expiry.</li>
+<li>Lease reads buy lower normal-path latency, but their honest degraded mode is a slower confirmed read when time or quorum evidence weakens.</li>
 </ol>
 </section>
 
@@ -210,7 +272,7 @@ usable local-read window after quorum renewal: 280 ms
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

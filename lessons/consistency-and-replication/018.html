@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,102 +81,226 @@
 <section class="stack-block lesson-content-shell">
   <h1>Replication Flow Control and Backpressure</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A replicated leader must pace writes to the rate at which its critical followers can durably absorb the log; otherwise backlog turns one slow replica into cluster-wide latency, unstable failover, or exhausted storage.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>distinguish send, durable, apply, and retention backlog in a replicated shard;</p>
+</li>
+<li>
+<p>trace how a leader should protect a quorum-critical follower while another replica recovers;</p>
+</li>
+<li>
+<p>choose when to cap catch-up traffic, send a snapshot, or slow foreground writes.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Backpressure keeps a replica problem bounded by deciding whose backlog may grow, how far it may grow, and when clients must slow down.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Harbor Point's Madrid leader, <code>md-db-2</code>, is carrying shard <code>184</code> through market open. At <code>09:30</code>, reservation writes spike, local follower <code>md-db-4</code> is still keeping up, and recovering replica <code>ny-db-3</code> is replaying a backlog across the Atlantic. The tempting response is simple: keep accepting writes and push harder so New York catches up while the burst is still in flight.</p>
-<p>That instinct is how leaders overload themselves. If <code>md-db-2</code> keeps appending new entries, buffering unsent log data for <code>ny-db-3</code>, and sharing the same replication workers for heartbeats and catch-up traffic, the lagging follower stops being a local problem. Sender queues expand. Retained WAL grows because old log segments cannot be discarded. Heartbeats to healthy followers compete with bulk traffic. Lease-read margin starts collapsing because quorum acknowledgments arrive too close to expiry.</p>
-<p>Replication backpressure is the mechanism that forces the leader to admit the uncomfortable truth early: the cluster can only move safely at the rate its critical replication path can absorb. Sometimes that means capping a recovering follower's in-flight bytes. Sometimes it means snapshotting a lagger instead of streaming an endless backlog. Sometimes it means slowing client writes before a quorum-critical follower falls so far behind that failover and safe reads become fragile.</p>
-<p>The misconception to remove is that lag hurts only the slow replica. In production, unmanaged lag changes the behavior of the whole shard. It turns a catch-up problem into write latency, read fallback, WAL pressure, and weaker recovery options.</p>
-<h2>Lag Has Stages</h2>
-<p>Harbor Point's shard <code>184</code> has three important roles in this incident. <code>md-db-2</code> is the active leader in term <code>42</code>, <code>md-db-4</code> is the local quorum follower, and <code>ny-db-3</code> is a recovering remote replica. At <code>09:30:00</code>, the shard receives about <code>18,000</code> reservation writes per second. Each write becomes a log entry on the leader, but that entry still moves through several distinct stages before the cluster can forget about it.</p>
-<p>For each follower, the leader cares about at least four positions:</p>
-<div class="codehilite"><pre><span></span><code>leader last index   -&gt; newest entry accepted locally
-sent index          -&gt; newest entry put on the wire to that follower
-durable index       -&gt; newest entry the follower has fsynced
-applied index       -&gt; newest entry visible in the follower&#39;s state machine
+<p>At market open, <code>md-db-2</code> leads Harbor Point's shard <code>184</code>. Its local follower, <code>md-db-4</code>, is almost current. Its remote follower, <code>ny-db-3</code>, is recovering over a congested link. Reservation writes suddenly rise.</p>
+<p>The easy response is to let the leader queue every new log entry for New York and send as much as the network accepts. For a moment, the API looks fast. The cost is hidden in leader memory, retained log segments, and crowded replication workers. Eventually, even healthy quorum heartbeats compete with bulk catch-up traffic.</p>
+<p>The better question is not “how do we make every follower equally fast?” It is “which path proves the service contract right now, and how do we keep an optional recovery path from consuming that proof?”</p>
+<p>For this shard, commits need the leader and a local quorum follower. The remote replica improves recovery and failback, but it is not on the normal commit path. Backpressure protects the majority path first, then gives the remote replica a bounded way to recover. If the majority path starts losing ground, backpressure must reach clients before invisible queues become a failover or storage crisis.</p>
+<h2>The Situation: One Word, Four Backlogs</h2>
+<p>“Replication lag” is too vague to operate. A log entry moves through several stages for each follower:</p>
+<div class="codehilite"><pre><span></span><code>leader last index
+  -&gt; sent to follower
+  -&gt; durably stored by follower
+  -&gt; applied by follower&#39;s state machine
 </code></pre></div>
 
-<p>Those positions answer different operational questions. If <code>sent index</code> trails far behind <code>leader last index</code>, the bottleneck is usually sender scheduling, TCP congestion, or an in-flight window that is already full. If <code>durable index</code> trails far behind <code>sent index</code>, the follower is receiving data but cannot flush it fast enough. If <code>applied index</code> lags while <code>durable index</code> is close, commit safety may still be fine even though follower reads are stale.</p>
-<p>A single "replication lag = 2.4 seconds" metric hides those differences and makes the wrong fix look plausible.</p>
-<p>At Harbor Point during the burst, the state might look like this:</p>
-<div class="codehilite"><pre><span></span><code>leader last index:   813620
-md-db-4 durable:     813612   (healthy quorum follower)
-ny-db-3 durable:     809940   (recovering over WAN)
-ny-db-3 applied:     809100   (replay still catching up)
-</code></pre></div>
-
-<p>The production danger is not only that New York is behind. It is that the leader must retain every log segment after <code>809940</code> until <code>ny-db-3</code> catches up or is re-seeded by snapshot. If the sender also keeps buffering new entries for New York without a cap, backlog grows in two places at once: leader memory and retained WAL on disk. Flow control begins with admitting that "slow replica" is not one condition. The system needs to know whether it is limited by network, follower disk, replay throughput, or retention window so it can apply pressure at the right boundary.</p>
-<p>The trade-off is straightforward: richer per-stage accounting costs more instrumentation and more state in the replication layer, but without it teams tune blind. In Harbor Point's case, a dashboard that separates <code>inflight_bytes</code>, <code>durable_lag_entries</code>, <code>apply_lag_entries</code>, and <code>retained_wal_bytes</code> is not observability decoration. It is the map that tells operators whether to pace writers, switch a follower to snapshot catch-up, or stop serving local follower reads.</p>
-<h2>Pacing The Replication Stream</h2>
-<p>The naive leader policy is "send every follower everything as fast as possible." Real systems use more selective controls because not every follower matters equally at every moment. Harbor Point does not want <code>ny-db-3</code> to compete with <code>md-db-4</code> for the same replication budget while New York is recovering. The local quorum follower is what keeps commits fast and lease renewals credible. The remote recovering follower matters for fault tolerance and failback, but it should not be allowed to crowd out the majority path.</p>
-<p>One practical design is a per-follower sliding window plus a separate priority lane for heartbeats and quorum-critical append traffic:</p>
-<div class="codehilite"><pre><span></span><code>client writes
-   -&gt; leader appends locally
-   -&gt; replicate to quorum followers on priority lane
-   -&gt; replicate to lagging followers within per-follower byte window
-   -&gt; if follower backlog exceeds catch-up threshold, stop incremental stream and snapshot
-</code></pre></div>
-
-<p>In Harbor Point's policy, <code>md-db-4</code> may have up to <code>4 MB</code> of in-flight log data because it is on the fast local path and usually acknowledges within a few milliseconds. <code>ny-db-3</code> may be capped at <code>512 KB</code> of in-flight data while recovering over the WAN. That smaller window is not punitive. It prevents the leader from accumulating gigabytes of unsent or unacknowledged data for a follower that is already known to be slow. If <code>ny-db-3</code> falls beyond the retained log window, the leader stops pretending incremental catch-up is efficient and sends a snapshot instead.</p>
-<p>The more important distinction is when backpressure crosses from "shape background traffic" to "slow foreground writes." If only <code>ny-db-3</code> is behind, Harbor Point may continue committing writes on <code>md-db-2</code> plus <code>md-db-4</code> while capping New York's catch-up stream. But if <code>md-db-4</code> starts acknowledging too slowly, the safety path changes. Now the shard is not merely losing recovery slack; it is losing the follower that makes quorum commits and the lease-read fast path practical. At that point the leader should reduce write admission, shrink batch sizes, or even reject new work rather than let majority lag drift indefinitely upward.</p>
-<p>A simplified controller looks like this:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">admission_decision</span><span class="p">(</span><span class="n">quorum_durable_lag_ms</span><span class="p">,</span> <span class="n">optional_backlog_mb</span><span class="p">,</span> <span class="n">retained_wal_gb</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">quorum_durable_lag_ms</span> <span class="o">&gt;</span> <span class="mi">40</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">&quot;throttle foreground writes&quot;</span>
-    <span class="k">if</span> <span class="n">retained_wal_gb</span> <span class="o">&gt;</span> <span class="mi">20</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">&quot;snapshot or detach lagging follower&quot;</span>
-    <span class="k">if</span> <span class="n">optional_backlog_mb</span> <span class="o">&gt;</span> <span class="mi">512</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">&quot;cap catch-up stream&quot;</span>
-    <span class="k">return</span> <span class="s2">&quot;normal&quot;</span>
-</code></pre></div>
-
-<p>The exact thresholds are workload-specific, but the mechanism matters more than the numbers. Backpressure is not one giant brake pedal. It is a policy layer that answers three different questions: which follower gets replication bandwidth first, how much backlog is allowed to build for each one, and at what point the leader must slow clients because the majority path itself is falling behind.</p>
-<h2>Backpressure As Safety Policy</h2>
-<p>The easiest mistake in Harbor Point's incident review would be to judge the controller only by peak write throughput. A looser controller often looks better for the first few minutes because it lets the API keep accepting work while hidden buffers expand. The bill arrives later. Retained WAL grows because lagging followers pin old segments. Snapshot size grows because the follower is now too far behind for incremental log shipping to be efficient. Lease-based reads from <a href="016.html">Clocks, Leases, and Safe Reads</a> fall back more often because quorum acknowledgments arrive with less margin. If <code>md-db-4</code> degrades next, the shard is suddenly operating with almost no safe runway.</p>
-<p>That is why production teams usually define backpressure around "how much safety debt are we willing to carry" rather than "how many writes per second can we squeeze through right now." Harbor Point might adopt rules such as:</p>
+<p>For <code>ny-db-3</code>, the leader might expose these illustrative positions during the burst:</p>
+<table>
+<thead>
+<tr>
+<th>Position or resource</th>
+<th style="text-align: right;">Value</th>
+<th>What it tells us</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Leader last index</td>
+<td style="text-align: right;">813,620</td>
+<td>Latest entry accepted locally.</td>
+</tr>
+<tr>
+<td>Sent index</td>
+<td style="text-align: right;">811,900</td>
+<td>Data waiting in the network or follower receive path.</td>
+</tr>
+<tr>
+<td>Durable index</td>
+<td style="text-align: right;">809,940</td>
+<td>Last entry the follower can recover after its own crash.</td>
+</tr>
+<tr>
+<td>Applied index</td>
+<td style="text-align: right;">809,100</td>
+<td>Last entry visible to follower-served reads.</td>
+</tr>
+<tr>
+<td>Retained log floor</td>
+<td style="text-align: right;">809,940</td>
+<td>Oldest point still needed for incremental catch-up.</td>
+</tr>
+</tbody>
+</table>
+<p>Each gap changes the diagnosis.</p>
 <ul>
-<li>keep quorum durable lag below <code>40 ms</code></li>
-<li>keep retained WAL due to one lagging follower below <code>20 GB</code></li>
-<li>switch to snapshot catch-up if a follower trails more than <code>250,000</code> entries</li>
-<li>shed or slow new writes before the quorum follower misses two renewal intervals in a row</li>
+<li>A large gap from leader to sent points to sender scheduling, congestion, or a full in-flight window.</li>
+<li>A large gap from sent to durable points to follower receive or flush capacity.</li>
+<li>A large gap from durable to applied can leave commit safety intact while making follower reads stale.</li>
+<li>A very old retained-log floor consumes disk on the leader because the lagging follower still needs history.</li>
 </ul>
-<p>Those rules force the system to surface pain earlier, but in a controlled place. Application latency goes up before disks fill. A lagging replica is snapshot-reseeded before it holds the whole shard hostage through retained-log pressure. Lease reads fall back before the time-based proof becomes unsafe. In other words, backpressure chooses a graceful failure mode instead of an accidental one.</p>
-<p>Flow control can keep replicas within a bounded distance while the live write stream is still the main source of truth. Once a replica has been offline long enough, or state has diverged beyond what the retained log can cheaply repair, the problem stops being "pace the stream" and becomes "recover to a known state." That is why snapshot and recovery semantics matter: ordinary replication control cannot compensate for a missing restore path.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>One recovering follower causes leader memory growth and exploding WAL retention even though quorum commits still succeed.</strong> The leader is letting a lagging replica accumulate unbounded in-flight data or pin unlimited log segments while trying to catch up incrementally. Add per-follower byte windows, monitor retained-log pressure directly, and switch the follower to snapshot catch-up or temporary detachment once the backlog crosses a bounded threshold.</p>
-<p><strong>Write latency and lease-read fallback spike together during peak load.</strong> The quorum follower's acknowledgments are being delayed by the same queues, workers, or links used for bulk catch-up traffic, so the system is losing both commit margin and read-lease margin at once. Prioritize heartbeats and quorum replication traffic over optional catch-up streams, and treat quorum durable lag as the signal for foreground throttling.</p>
-<p><strong>Increasing batch size or send window makes replication graphs look smoother, but incidents get worse when a follower slows down.</strong> Larger buffers hide the bottleneck temporarily while increasing the amount of memory, retained log, and recovery work that accumulates behind it. Tune window sizes from bandwidth-delay product and follower flush behavior, not from "largest burst we can buffer." Bigger queues are not the same as more capacity.</p>
+<p>The numbers are a teaching trace, not a measurement. Their job is to show why one “lag seconds” graph cannot decide whether to tune a network window, protect disk, stop serving follower reads, or prepare a snapshot.</p>
+<h2>The Initial Model: Send Everything Faster</h2>
+<p>The initial model is reasonable: if New York is behind, give it more sender buffers and larger batches. This works when the follower has a short, known delay and enough disk and network capacity to catch up. A larger batch can reduce per-message overhead.</p>
+<p>It breaks when the follower is slower than the incoming write stream. A leader that can append 18,000 entries per second but can deliver only 7,000 net entries per second to New York creates a growing deficit every second. More buffering changes where that deficit lives; it does not remove it.</p>
+<div class="codehilite"><pre><span></span><code>write stream:       +18,000 entries/s
+remote catch-up:     -7,000 entries/s
+unbounded deficit:  +11,000 entries/s
+</code></pre></div>
+
+<p>Without a bound, the system accumulates unsent bytes in memory and old log segments on disk. The remote follower may eventually need a snapshot, but now the snapshot is larger and the leader has spent scarce resources postponing that decision. Worse, a shared queue can delay <code>md-db-4</code> heartbeats and acknowledgements, turning an optional follower's problem into a quorum problem.</p>
+<p>The missing mechanism is <strong>flow control</strong>: the leader gives each follower a limited amount of data it may have in flight, replenishing that credit only as the follower acknowledges durable progress. <strong>Backpressure</strong> is the policy above that mechanism: it decides which credits shrink, which traffic has priority, and when write admission changes.</p>
+<h2>The Moving Parts and Their Priorities</h2>
+<p>Harbor Point separates replication work into three classes:</p>
+<p>| Class | Example | Priority | Why |
+| --- | --- | --- |
+| Control | term changes, heartbeats, acknowledgements | Highest | They establish current authority and quorum health. |
+| Quorum-critical data | appends to <code>md-db-4</code> | High | They determine normal commit latency and durable majority progress. |
+| Recovery data | bulk catch-up to <code>ny-db-3</code> | Bounded | It improves resilience but must not crowd out the first two classes. |</p>
+<p>This is a situated choice, not a rule that remote replicas never matter. A design whose acknowledgement contract includes the remote region must treat that replica as critical. The point is to classify a follower by the guarantee it currently supports, not by its geographic label.</p>
+<p>For the example, the leader starts with a 4 MB in-flight window for <code>md-db-4</code> and a 512 KB window for recovering <code>ny-db-3</code>. Credits are illustrative. They keep the leader from letting one slow receiver reserve unlimited memory and worker time. The leader also reserves scheduling capacity for heartbeats and quorum appends; a full recovery window may delay its own bulk entries, but it may not starve the control lane.</p>
+<h2>A Worked Control Loop</h2>
+<p>At 09:30:00, writes rise and New York falls behind. The leader evaluates this small policy every few seconds:</p>
+<div class="codehilite"><pre><span></span><code>If a quorum follower&#39;s durable lag or acknowledgement delay grows:
+    slow write admission and preserve control/quorum lanes.
+
+Else if an optional follower&#39;s retained-log cost is too high:
+    stop incremental catch-up and re-seed it with a snapshot.
+
+Else if an optional follower&#39;s window is full:
+    pause its new sends until it acknowledges more durable progress.
+
+Else:
+    continue normal replication.
+</code></pre></div>
+
+<p>Here is one trace with illustrative thresholds.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th style="text-align: right;"><code>md-db-4</code> durable lag</th>
+<th><code>ny-db-3</code> state</th>
+<th>Leader decision</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>09:30:00</td>
+<td style="text-align: right;">8 ms</td>
+<td>Window full; remote durable lag grows</td>
+<td>Cap New York at 512 KB.</td>
+<td>Majority path is healthy; do not add remote queue debt.</td>
+</tr>
+<tr>
+<td>09:31:30</td>
+<td style="text-align: right;">11 ms</td>
+<td>Retention due to New York reaches 18 GB</td>
+<td>Continue bounded catch-up.</td>
+<td>Still inside the 20 GB policy budget.</td>
+</tr>
+<tr>
+<td>09:32:10</td>
+<td style="text-align: right;">14 ms</td>
+<td>Retention reaches 20 GB; catch-up rate stays below write rate</td>
+<td>Stop incremental catch-up; schedule snapshot.</td>
+<td>More retained log will not close the deficit cheaply.</td>
+</tr>
+<tr>
+<td>09:33:00</td>
+<td style="text-align: right;">55 ms</td>
+<td>Snapshot work is isolated</td>
+<td>Throttle foreground writes.</td>
+<td>The quorum path, not the optional path, now lacks margin.</td>
+</tr>
+</tbody>
+</table>
+<p>The order matters. At 09:30, stopping all writes would throw away availability without protecting a guarantee that is actually at risk. At 09:33, continuing normally would let the quorum follower fall farther behind, which threatens commit latency and the timely authority evidence used by lease-read fast paths. The controller therefore moves the pain to the smallest safe boundary first: remote flow, then recovery mode, then client admission.</p>
+<p><strong>So far:</strong> flow control keeps recovery traffic finite; backpressure decides who yields when finite resources are contested. Snapshotting is not punishment for a slow follower. It replaces an ever-growing incremental repair job with a bounded recovery operation.</p>
+<h2>What the User Sees—and What the System Knows</h2>
+<p>The user may see increasing write latency, a retryable overload response, or a temporarily stale regional read. Those outcomes differ, and the system should not hide them behind a generic “database slow” alert.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Meaning</th>
+<th>First action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Quorum durable lag grows</td>
+<td>The normal acknowledgement path is losing margin.</td>
+<td>Protect control traffic; reduce write admission.</td>
+</tr>
+<tr>
+<td>Optional follower in-flight bytes stay full</td>
+<td>The receiver cannot absorb its assigned recovery rate.</td>
+<td>Hold its credit; inspect network and follower I/O.</td>
+</tr>
+<tr>
+<td>Retained log bytes grow toward a limit</td>
+<td>Incremental history is becoming expensive to keep.</td>
+<td>Prepare snapshot or detach/reseed under the membership policy.</td>
+</tr>
+<tr>
+<td>Applied lag grows while durable lag is small</td>
+<td>Follower reads may be stale, even if its log is durable.</td>
+<td>Remove it from freshness-sensitive reads or require a version check.</td>
+</tr>
+<tr>
+<td>Heartbeat delay rises with bulk traffic</td>
+<td>Queues are mixing control and recovery work.</td>
+<td>Reserve or isolate the control lane.</td>
+</tr>
+</tbody>
+</table>
+<p>This evidence also avoids a common wrong fix: increasing every buffer after a latency spike. Larger queues can smooth a short burst. They cannot manufacture follower flush bandwidth, disk space, or WAN capacity. When the sustained input rate exceeds the recovery rate, bigger queues lengthen the time before the system admits that it needs a different response.</p>
+<h2>Cost, Limits, and Signals</h2>
+<p>Backpressure improves safety and recovery posture by bounding debt. The trade-off is normal-path throughput and earlier visible overload. A snapshot costs transfer work and time before the follower becomes useful again. A detached follower reduces redundant copies until it catches up. These are design choices under a stated durability and availability contract, not automatic fixes.</p>
+<p>The boundary is the recovery story. If the leader loses retained history before the follower can receive it, a snapshot must come from a known committed state. If the snapshot source or validation path is missing, a per-follower window only delays an unrecoverable condition. Membership status matters too: do not casually remove a lagger that is still required by the committed quorum configuration. Use the reconfiguration procedure from the next lesson when the replica set itself must change.</p>
+<p>The key signals are not decorative capacity metrics. They answer operational decisions: which stage is slow, whether a follower is still eligible for a read, how much retention is being consumed, and whether the quorum path needs client-facing pressure now.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A follower's durable index nearly matches the leader, but its applied index is far behind. Is the first problem necessarily commit durability?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The follower may have durably stored the log while applying it slowly. This can make its reads stale, but it is different from a missing durable acknowledgement. Inspect the serve-read contract before treating it as a quorum-commit failure.</p>
+<p><strong>Check:</strong> An optional remote follower falls farther behind every second, while the quorum follower remains healthy. Should the leader immediately reject all writes?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not necessarily. First cap the optional stream and bound retained history; switch to snapshot recovery when incremental catch-up cannot win. Foreground throttling becomes necessary when the quorum path or a stated recovery guarantee is at risk.</p>
+<h2>Practice: Set a Bounded Policy</h2>
+<p>For a three-replica service, write a four-line backpressure policy. Name one quorum-critical follower, one optional recovering follower, a retained-log threshold, and the signal that begins write throttling.</p>
+<p><strong>A good answer should mention:</strong> separate priority for heartbeats and critical appends; a finite in-flight window for recovery; a snapshot or reseed decision when retained history crosses a limit; and a client-facing throttle tied to growing quorum durable lag, not merely any follower lag.</p>
 <h2>Connections</h2>
 <ul>
-<li><a href="016.html">Clocks, Leases, and Safe Reads</a> depends on timely quorum acknowledgments; a backpressure policy that protects quorum traffic also protects the read fast path.</li>
-<li><a href="017.html">Membership Changes and Replica Set Evolution</a> explains why a lagging node should not be treated as "removed" until the membership change is actually committed.</li>
-<li><a href="019.html">Backup, Snapshots, and Recovery Semantics</a> picks up the recovery side: retained logs and snapshots decide whether a far-behind replica can catch up cheaply or needs a different recovery path.</li>
+<li><a href="016.html">Clocks, Leases, and Safe Reads</a> shows why delayed quorum communication can close a lease-read fast path before any safety violation occurs.</li>
+<li><a href="017.html">Membership Changes and Replica Set Evolution</a> explains why a lagging member remains part of the quorum until a committed reconfiguration changes that fact.</li>
+<li><a href="019.html">Backup, Snapshots, and Recovery Semantics</a> provides the recovery boundary when incremental log catch-up is no longer economical or possible.</li>
 </ul>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Extended Version)</a><ul>
-<li>Focus: Read the sections on <code>nextIndex</code>, <code>matchIndex</code>, and snapshot installation to see how a leader bounds catch-up work for lagging followers.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.postgresql.org/docs/current/runtime-config-replication.html">PostgreSQL Documentation: Replication Configuration</a><ul>
-<li>Focus: Look at replication slots, WAL retention, sender limits, and how lagging standbys can push resource pressure back onto the primary.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/architecture/replication-layer">CockroachDB Architecture: Replication Layer</a><ul>
-<li>Focus: Compare Harbor Point's quorum-first policy with a production Raft-based system's handling of follower lag, snapshots, and replica recovery.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://etcd.io/docs/v3.5/tuning/">etcd Tuning</a><ul>
-<li>Focus: Connect heartbeat and election timing with the backpressure lesson's point that overloaded replication paths eventually shape failover and read behavior too.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a> — Focus: Inspect per-follower <code>nextIndex</code>, <code>matchIndex</code>, append progress, and snapshot installation as ingredients of catch-up control.</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/runtime-config-replication.html">PostgreSQL Replication Configuration</a> — Focus: Connect replication slots and sender configuration to retained-WAL pressure caused by lagging standbys.</li>
+<li>[DOC] <a href="https://etcd.io/docs/v3.5/tuning/">etcd Tuning</a> — Focus: Relate heartbeat and election timing to the importance of preserving timely quorum communication under load.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ol>
-<li>Replication lag is a staged pipeline, not a single scalar; sender backlog, durable lag, apply lag, and retained-log pressure need different responses.</li>
-<li>Backpressure should protect the majority path before it protects every replica equally: optional laggers can be capped or snapshotted, while quorum lag should slow foreground writes sooner.</li>
-<li>The real product is bounded safety debt. Slowing clients early is often cheaper than carrying hidden backlog until leases collapse, disks fill, or failover is no longer credible.</li>
+<li>Sender, durable, apply, and retention gaps are different backlogs and need different interventions.</li>
+<li>Protect control traffic and quorum-critical replication before spending unbounded resources on a recovering optional follower.</li>
+<li>Backpressure makes overload visible at a chosen boundary—follower credit, snapshot recovery, or client admission—instead of letting it surface later as disk exhaustion or fragile failover.</li>
 </ol>
 </section>
 
@@ -202,7 +330,7 @@ ny-db-3 applied:     809100   (replay still catching up)
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

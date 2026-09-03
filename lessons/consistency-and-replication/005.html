@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -76,122 +80,237 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Synchronous and Asynchronous Replication</h1>
-<blockquote>
-<p><strong>The core idea</strong>: Synchronous and asynchronous replication differ at the acknowledgment boundary: which local or remote durability milestone must happen before the primary can tell the client that a write committed.</p>
-</blockquote>
+<p>Harbor Point's reservation API has accepted <code>R-88421</code>. Its primary database has made the commit record durable locally. A standby in another zone is connected, but it has not confirmed that record yet. May the API return <code>201 Created</code> now?</p>
+<p>It is tempting to say yes: there is a primary, there is a replica, and replication is running. That model works when the product can tolerate losing a very recent confirmed reservation after a primary failure. It fails when “accepted” means that the reservation must survive losing that one machine.</p>
+<p>The useful question is narrower: <strong>which event must happen before this client receives success?</strong> That event is the acknowledgment boundary. Asynchronous replication puts it at local durability on the primary. Synchronous replication puts some remote milestone on the path too. The choice changes write latency, what can be lost on failover, and whether a slow replica can stop new writes.</p>
+<p>This lesson uses one leader and one standby. The same reasoning applies to other replication designs, but it does not by itself explain quorum or consensus commits; the next lesson takes up the quorum case.</p>
 <h2>Core Insight</h2>
-<p>Imagine Harbor Point approving reservation <code>R-88421</code> at market open. The primary database writes the commit record locally and is ready to return <code>201 Created</code>. A standby is receiving the same WAL stream, but the team now has to answer a business question hidden inside a storage setting: can the API say "accepted" before any other machine has durably stored that commit?</p>
-<p>Asynchronous replication says yes. The primary can acknowledge the client after local durability and let standbys catch up in the background. That keeps the write path short and available when replicas are slow, but it creates a window where an acknowledged reservation can disappear if the primary dies before a standby has flushed the WAL.</p>
-<p>Synchronous replication moves a remote milestone into the commit path. The primary waits for a standby to receive, flush, or sometimes apply the relevant log record before it answers the client. That shrinks the acknowledged-write loss window, but it spends latency and makes replica health part of write availability.</p>
-<p>The trade-off is not "fast versus safe" in the abstract. It is: what failure can this operation expose to the caller, and what latency or availability cost is the product willing to pay to avoid it?</p>
-<h2>The Acknowledgment Boundary</h2>
-<p>Lesson 004 separated three standby watermarks: received, flushed, and replayed. This lesson turns those watermarks into a policy.</p>
-<p>For Harbor Point, the primary's local path looks like this:</p>
-<div class="codehilite"><pre><span></span><code>client -&gt; primary generates WAL -&gt; primary fsyncs WAL -&gt; primary can recover locally
+<p>An acknowledgment is not merely a response-time choice. It tells the client which failure story is still allowed. Local-only acknowledgment allows a primary-only loss window. Waiting for a remote durable flush trades part of the write path for the claim that the record exists beyond that primary. Waiting for apply makes a stronger read-visibility claim and costs more still.</p>
+<h2>The Moving Parts</h2>
+<p>Lesson 004 separated the three positions a standby can report. Reuse them here, because “the replica has it” is too vague to be a contract.</p>
+<table>
+<thead>
+<tr>
+<th>Milestone</th>
+<th>What happened on the standby</th>
+<th>What it supports</th>
+<th>What it does not promise</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Receive</td>
+<td>The standby has received log bytes, perhaps only in memory.</td>
+<td>Evidence that transport reached another machine.</td>
+<td>Survival of a standby crash.</td>
+</tr>
+<tr>
+<td>Flush</td>
+<td>The standby has durably stored the log bytes.</td>
+<td>Recovery of that history after the primary fails.</td>
+<td>A read on the standby can see the change.</td>
+</tr>
+<tr>
+<td>Apply</td>
+<td>The standby has replayed the record into its queryable state.</td>
+<td>A standby query can observe the change.</td>
+<td>A short or cheap commit path.</td>
+</tr>
+</tbody>
+</table>
+<p>The primary has a local milestone too: it makes its own commit record durable. That protects against a process restart or clean recovery of that machine. It does not protect against losing the primary host, its storage, or the failure domain that contains both storage and process.</p>
+<p>For the reservation, call the commit position <code>8A/58</code>. The positions below are illustrative, not measurements from a particular database:</p>
+<div class="codehilite"><pre><span></span><code>primary durable through 8A/58
+standby received through 8A/58
+standby flushed  through 8A/40
+standby replayed  through 8A/22
 </code></pre></div>
 
-<p>After that point, replication mode decides whether the client gets success immediately or whether the primary must wait for a remote milestone.</p>
-<div class="codehilite"><pre><span></span><code>Asynchronous replication
-
-client
-  -&gt; primary fsync
-  -&gt; ACK to client
-  -&gt; ship WAL later
-  -&gt; standby flush
-  -&gt; standby replay
-
-Synchronous replication, remote flush
-
-client
-  -&gt; primary fsync
-  -&gt; ship WAL
-  -&gt; standby flush
-  -&gt; standby ACK to primary
-  -&gt; ACK to client
-  -&gt; standby replay later
+<p>Only the primary has a durable copy of <code>8A/58</code>. A connected standby is useful evidence about the pipeline, but it is not yet the evidence Harbor Point needs for a primary-loss durability promise.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>Both modes start the same way. The primary validates the reservation, changes its state, and makes an ordered commit record durable locally. The difference is when it replies to the caller.</p>
+<h3>Asynchronous replication</h3>
+<div class="codehilite"><pre><span></span><code>1. Client sends POST /reservations/R-88421/approve.
+2. Primary commits and flushes 8A/58 locally.
+3. Primary returns 201 Created to the client.
+4. Sender later transmits 8A/58 to the standby.
+5. Standby receives, flushes, and eventually applies 8A/58.
 </code></pre></div>
 
-<p>The word "synchronous" is not specific enough by itself. A database may wait for remote receipt, remote flush, or remote apply. These are different promises:</p>
-<div class="codehilite"><pre><span></span><code>Remote milestone   What it buys                          What it does not buy
------------------  -------------------------------------  ------------------------------
-receive            another node saw the bytes             durability after standby crash
-flush              another node stored durable WAL         immediate standby read freshness
-apply              standby queries can see the change      low write latency
+<p>The primary does not wait in steps 4–5. This keeps the normal write path short: it needs local storage, not a network round trip plus remote storage. It also lets the service continue accepting writes when the standby is slow or disconnected.</p>
+<p>That availability is purchased with a recovery window. Between steps 3 and 5, a successful response may describe a commit that exists durably on only the primary. If that primary fails permanently, promotion of the standby can start from an older durable prefix. The client may have a confirmation for a reservation the new primary cannot recover.</p>
+<p>This is not a bug in asynchronous replication. It is the allowed outcome of its acknowledgment rule. An operation can fit that rule when it is derived, replaceable, or explicitly allowed to have a recovery-point objective. A search-index update or analytics projection often fits. A confirmed reservation may not.</p>
+<h3>Synchronous replication with remote flush</h3>
+<div class="codehilite"><pre><span></span><code>1. Client sends POST /reservations/R-88421/approve.
+2. Primary commits and flushes 8A/58 locally.
+3. Primary sends 8A/58 to a selected standby.
+4. Standby writes and flushes 8A/58 durably.
+5. Standby acknowledges that flush to the primary.
+6. Primary returns 201 Created to the client.
+7. Standby applies 8A/58 later, when replay reaches it.
 </code></pre></div>
 
-<p>Harbor Point usually cares about remote flush for reservation approvals. The legal promise is not "every dashboard can query this immediately." The promise is "if we tell the trader the reservation was accepted, losing the primary alone should not erase it."</p>
-<h2>Failover Outcomes</h2>
-<p>The difference becomes concrete in a crash timeline.</p>
-<div class="codehilite"><pre><span></span><code>09:30:00.120  client submits reservation R-88421
-09:30:00.123  primary fsyncs commit locally
-09:30:00.124  primary returns success
-09:30:00.125  primary host dies
+<p>Now success means that the commit has durable copies on at least the primary and the selected standby. If the primary fails after step 6, a correctly selected and promoted standby has the log record it needs to recover <code>R-88421</code>. The standby might not have shown it to a dashboard at step 6, because apply is later, but the durable recovery evidence exists.</p>
+<p>The word <em>synchronous</em> hides an important choice. Some systems wait for remote receipt, some for remote durable logging, and some for remote apply. PostgreSQL exposes remote-write, flush, and apply wait points; their names describe different commitments. MySQL's semisynchronous mode similarly waits for configured replica acknowledgments after events have been written and flushed to a relay log, rather than waiting for application on every replica.</p>
+<table>
+<thead>
+<tr>
+<th>Client waits for</th>
+<th>Stronger statement the client may infer</th>
+<th>Remaining gap</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Primary local flush</td>
+<td>The primary can recover the commit if it survives.</td>
+<td>The primary alone may be lost.</td>
+</tr>
+<tr>
+<td>Standby receipt</td>
+<td>Another machine observed the bytes.</td>
+<td>Its crash may erase an in-memory record.</td>
+</tr>
+<tr>
+<td>Standby flush</td>
+<td>Another machine has durable recovery history.</td>
+<td>Its ordinary reads may still be stale.</td>
+</tr>
+<tr>
+<td>Standby apply</td>
+<td>That standby can read the changed state.</td>
+<td>Replay work and remote delay lengthen commit.</td>
+</tr>
+</tbody>
+</table>
+<p>The exact vendor setting, number of required standbys, storage guarantees, and promotion procedure matter. So the table is a teaching model, not a substitute for an engine's documentation or a failure test.</p>
+<h2>A Worked Failure Trace</h2>
+<p>Consider two possible histories for <code>R-88421</code>. The network link is healthy until it is not; no timeout can make missing evidence appear.</p>
+<h3>The asynchronous history</h3>
+<div class="codehilite"><pre><span></span><code>09:30:00.120  client sends the approval
+09:30:00.123  primary flushes 8A/58 locally
+09:30:00.124  primary returns 201 Created
+09:30:00.125  primary host and its storage fail
+09:30:00.126  standby is promoted with durable log only through 8A/40
 </code></pre></div>
 
-<p>In asynchronous mode, success at <code>09:30:00.124</code> may have outrun replication. If no standby flushed the commit before the crash, the promoted standby recovers to an older prefix of history. The client has a confirmation, but the new primary does not have the reservation.</p>
-<p>In synchronous mode with remote flush, the primary would not have returned success until a standby had durably stored the commit record. If the primary dies after success, promotion can recover from that durable remote WAL. The standby may still need to replay the record before reads show it, but the committed event is not lost.</p>
-<p>This distinction corrects a common confusion: failover durability and standby read freshness are related but separate. Waiting for remote flush can make an acknowledged write survive primary loss without guaranteeing that a hot-standby query can see the write at the exact moment the client receives success.</p>
-<p>That separation matters for Harbor Point's dashboards. A dashboard stale by two seconds may be acceptable. A confirmed reservation disappearing after failover may not be acceptable at all.</p>
-<h2>Policy Spectrum in Practice</h2>
-<p>Production systems rarely offer only a pure binary. They usually expose a spectrum of acknowledgment policies:</p>
-<div class="codehilite"><pre><span></span><code>Policy                         Client success waits for...
------------------------------  ----------------------------------------------
-async                          local primary durability
-semi-sync / remote receive      at least one standby receives the record
-sync remote flush               at least one standby durably stores the record
-sync remote apply               at least one standby replays the record
-quorum commit                   enough replicas accept the ordered entry
+<p>The client did everything reasonably: it received a normal success response. Yet the promoted database lacks <code>R-88421</code>. The missing interval is not “replication lag” in the vague sense. It is the interval that the acknowledgment policy deliberately exposed to the caller.</p>
+<p>The right remediation depends on the product contract. Harbor Point might reconstruct the reservation from an independent durable command log, reconcile it manually, or tell the client the outcome is uncertain. Retrying blindly can create a duplicate reservation. A request idempotency key helps make a retry safe, but it does not restore a record that no surviving replica has.</p>
+<h3>The remote-flush history</h3>
+<div class="codehilite"><pre><span></span><code>09:30:00.120  client sends the approval
+09:30:00.123  primary flushes 8A/58 locally
+09:30:00.126  standby flushes 8A/58 durably
+09:30:00.127  primary returns 201 Created
+09:30:00.128  primary host and its storage fail
+09:30:00.129  standby recovers and is promoted
 </code></pre></div>
 
-<p>Each policy changes which failures become visible.</p>
-<p>Asynchronous replication is good for high-throughput paths where a small recovery point objective is acceptable. Harbor Point might use it for derived search projections, analytics feeds, or dashboard caches.</p>
-<p>Remote flush is a stronger fit for reservation approvals. It adds a network hop and a standby disk flush to the commit path, but it makes the acceptance response mean something more durable than "one machine had it for a moment."</p>
-<p>Remote apply is useful when the application needs immediate reads from the standby after commit, but it is expensive. It waits for the standby to perform replay work, not merely store the history safely.</p>
-<p>Quorum commit, which the next lesson approaches through tunable consistency, changes the shape again. Instead of "one primary plus optional followers," the write is considered successful only after enough replicas participate. The same pressure remains: stronger durability or freshness comes from waiting for more of the replicated system.</p>
-<h2>Choosing the Mode for One Workload</h2>
-<p>Harbor Point can document its policy per operation:</p>
-<div class="codehilite"><pre><span></span><code>Operation                    Acknowledgment rule               Reason
----------------------------  --------------------------------  -------------------------
-reservation approval          primary fsync + one standby flush  avoid acknowledged loss
-dashboard projection update   primary fsync only                 stale or lost cache is ok
-audit event write             primary fsync + one standby flush  preserve confirmed record
-bulk analytics refresh        async                              throughput matters more
-</code></pre></div>
-
-<p>This table is more useful than a global slogan like "we use synchronous replication." It names which user promises deserve remote durability and which workloads can accept a recovery window.</p>
-<p>The choice also needs a degraded-mode rule. If the synchronous standby is unavailable, should Harbor Point block reservation approvals, fail over, switch to another standby, or temporarily accept asynchronous risk? That decision should be explicit before the incident. Otherwise an operator under pressure becomes the real consistency policy.</p>
-<p>The strongest answer is not always the right answer. Strict synchronous replication can turn a replica I/O hiccup into a write outage. Asynchronous replication can keep the product moving but accept data loss on failover. The engineering work is matching the mode to the cost of being wrong.</p>
-<h2>Failure Modes</h2>
-<p><strong>Treating small lag as proof of safety.</strong> A low replay-lag graph after the fact does not prove the lost transaction had reached a standby before the primary died. The commit policy defines the promise.</p>
-<p><strong>Assuming synchronous means fresh reads everywhere.</strong> If the system waits for remote flush but not remote apply, a standby can be failover-safe while still briefly stale for queries.</p>
-<p><strong>Letting replica health accidentally control writes.</strong> Strict synchronous settings make the selected standby part of the write availability path. That may be correct, but it should be intentional and monitored.</p>
-<p><strong>Hiding degraded-mode behavior.</strong> If the system silently falls back from synchronous to asynchronous after a timeout, the client contract changes. Operators and callers need to know when that happens.</p>
+<p>Here <code>201 Created</code> was delayed by the remote path, but a primary-only failure should not erase the confirmed log record. During promotion, the standby may replay durable records before accepting new writes. That is why an earlier dashboard result and a later promoted database can differ: dashboard visibility follows replay, while recovery can use flushed log.</p>
+<p>This is a boundary, not a universal safety proof. The standby must be in an independent enough failure domain to make the second copy meaningful. Both replicas can still fail together, a bad promotion can choose a stale node, and an unfenced old primary can create two writable histories after a network partition. Remote flush narrows one loss window; it does not solve authority or disaster recovery by itself.</p>
+<h2>What This Changes in a Service Contract</h2>
+<p>“This database uses synchronous replication” is not a usable API guarantee. A service needs to state which operations wait for what, and how it behaves when that wait cannot complete.</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>A reasonable acknowledgment rule</th>
+<th>Why</th>
+<th>User-visible degraded rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Approve a reservation</td>
+<td>Primary flush plus one independent standby flush.</td>
+<td>A confirmed approval should survive primary loss.</td>
+<td>Reject or queue the approval when the required standby is unavailable.</td>
+</tr>
+<tr>
+<td>Update a dashboard projection</td>
+<td>Primary flush only; replicate asynchronously.</td>
+<td>It is derived and can be rebuilt.</td>
+<td>Show freshness age; rebuild after failover if needed.</td>
+</tr>
+<tr>
+<td>Write an audit event tied to approval</td>
+<td>Match the approval's remote-flush rule.</td>
+<td>The evidence should not disappear while the approval survives.</td>
+<td>Do not silently weaken the rule.</td>
+</tr>
+<tr>
+<td>Read a standby immediately after approval</td>
+<td>Wait for apply, route using a commit token, or use the primary.</td>
+<td>Flush does not make the row query-visible.</td>
+<td>Return a bounded-staleness or retry response.</td>
+</tr>
+</tbody>
+</table>
+<p>These are preferences under stated costs, not universal rules. A service may choose availability over remote durability during a regional incident, but then the response contract must change visibly. A silent fallback from synchronous to asynchronous means identical <code>201</code> responses represent different failure outcomes.</p>
+<p>Timeouts are especially deceptive. If the primary waits for a standby and the client times out, the reservation may still commit and later become durable. The client has an ambiguous outcome, not evidence of failure. The service should expose an idempotency key or a status lookup so the caller can resolve the command without inventing a second one.</p>
+<h2>The Cost and the Signals</h2>
+<p>Remote waiting adds at least a network round trip plus work at the replica. Tail latency matters more than the average here: one overloaded standby, full disk, or distant link can become part of every synchronous commit. Strict settings can therefore turn a replica incident into a write outage. That is sometimes the intended protection; it must be chosen and tested as such.</p>
+<p>Watch signals that identify the boundary rather than a single generic “replication health” light.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Question it answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Commit wait time or synchronous-commit latency</td>
+<td>How much delay is the acknowledgment rule adding to the client path?</td>
+</tr>
+<tr>
+<td>Required standby count and connection state</td>
+<td>Can the system still satisfy the configured promise?</td>
+</tr>
+<tr>
+<td>Receive and flush positions</td>
+<td>Has a candidate standby received and durably stored the relevant prefix?</td>
+</tr>
+<tr>
+<td>Replay position</td>
+<td>Can a standby serve a freshness-sensitive read yet?</td>
+</tr>
+<tr>
+<td>Timeout and fallback events</td>
+<td>Did the system block, reject, or weaken the promised acknowledgment rule?</td>
+</tr>
+</tbody>
+</table>
+<p>A low replay-lag chart is not proof that a confirmed write would survive failover. Conversely, replay lag does not prove that remote durability is absent. Inspect the relevant position and the actual acknowledgment policy.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A primary returns success after its own flush. The standby receives the record but has not flushed it. What does the success response prove about a primary failure followed by a standby crash?</p>
+<p><strong>Answer:</strong> It proves only local primary durability. The standby's in-memory receipt may disappear in its own crash, so the response does not prove that a surviving durable copy exists elsewhere.</p>
+<p><strong>Check:</strong> Harbor Point waits for a standby to flush <code>8A/58</code>, then immediately reads a dashboard on that standby. The dashboard omits the reservation. Is the synchronous rule necessarily broken?</p>
+<p><strong>Answer:</strong> No. A remote-flush rule protects durable recovery history. The dashboard needs replay or another read-routing rule. Check the standby's replay position before calling this data loss.</p>
+<h2>Practice: Write the Degraded-Mode Rule</h2>
+<p>Harbor Point uses remote flush for reservation approvals. At 10:02, its only required standby loses its network link for six minutes. Write a two-part policy for the API:</p>
+<ol>
+<li>What response does a new approval receive while the remote-flush requirement cannot be met?</li>
+<li>How does a client safely resolve a request that timed out while the server was waiting?</li>
+</ol>
+<p>A strong answer names the trade-off. For example: reject new approvals with a retryable unavailable response rather than silently acknowledging them asynchronously; require an idempotency key; and provide a status endpoint that returns the recorded outcome for that key. A different policy may queue commands or explicitly enter a lower-durability mode, but it must tell both operators and clients that the old survival promise no longer applies.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="004.html">Log Shipping and Ordered Apply</a> explains the receive, flush, and replay positions that this lesson turns into acknowledgment boundaries.</li>
+<li><a href="006.html">Quorum Reads, Writes, and Tunable Consistency</a> generalizes the idea: a client may wait for enough replicas to create overlap, not only for one standby.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION">PostgreSQL Documentation: Synchronous Replication</a><ul>
-<li>Focus: Compare remote write, flush, and apply settings as concrete acknowledgment boundaries.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html">MySQL Reference Manual: Semisynchronous Replication</a><ul>
-<li>Focus: Study a production middle ground between fully asynchronous and stricter synchronous behavior.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Review leader-based replication, failover windows, and why acknowledgment policy defines the durability semantics.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.microsoft.com/en-us/research/publication/pacifica-replication-in-log-based-distributed-storage-systems/">PacificA: Replication in Log-Based Distributed Storage Systems</a><ul>
-<li>Focus: Read for how log replication systems reason about primary/secondary roles, durability, and failover.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION">PostgreSQL: Synchronous Replication</a> — Focus: Compare remote-write, flush, and apply wait points and their client-visible trade-offs.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html">MySQL: Semisynchronous Replication</a> — Focus: Inspect acknowledgement, timeout, relay-log flush, and asynchronous fallback behavior.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Relate leader-based replication, acknowledged-loss windows, and failover to product guarantees.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Replication mode is an acknowledgment contract: it says what local or remote milestone must happen before success reaches the client.</li>
-<li>Asynchronous replication keeps writes fast and available, but accepts a window where acknowledged writes can be lost if the primary fails.</li>
-<li>Synchronous replication improves failover durability by waiting for replicas, but that adds latency and can make replica health affect write availability.</li>
-<li>Remote flush protects durability; remote apply protects standby read freshness. They are related, but they are not the same guarantee.</li>
-</ol>
+<ul>
+<li>Replication mode is an acknowledgment contract: it states the local or remote milestone required before the client gets success.</li>
+<li>Asynchronous replication keeps the write path independent of replica health, but a recent acknowledged write can be missing after primary failover.</li>
+<li>Waiting for remote flush creates durable recovery evidence on another machine; waiting for remote apply additionally supports a fresh read there.</li>
+<li>Stronger acknowledgment rules add tail latency and can reduce write availability, so each important operation needs an explicit degraded-mode rule.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -220,7 +339,7 @@ bulk analytics refresh        async                              throughput matt
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

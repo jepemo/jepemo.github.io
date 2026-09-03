@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,140 +81,237 @@
 <section class="stack-block lesson-content-shell">
   <h1>Sharding and Authority Boundaries</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Sharding scales a data system by splitting authority across partitions, so every request must know which owner can decide the answer and every rebalance must move that ownership safely.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Distinguish replication, which copies an authority, from sharding, which splits authority.</p>
+</li>
+<li>
+<p>Design a strong write so its routing key identifies one owner before the decision begins.</p>
+</li>
+<li>
+<p>Explain why a rebalance is an ownership transfer rather than a background data copy.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Sharding scales decisive work by giving different key ranges different owners, so routing and rebalancing become part of the correctness contract.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Harbor Point's reservation service has already learned how to replicate one authority domain. It can keep copies, route fresh reads, and even use an ordered chain for a scarce allocation bucket. That helps with resilience and some read load, but it does not remove the deeper limit: one authority still decides every write for the whole dataset.</p>
-<p>Now the platform is growing. New desks, issuers, and reservation buckets are arriving faster than one primary path can absorb. Adding more replicas only makes more copies of the same decision point. Sharding changes the model: instead of one owner for all reservations, the system creates many owners, each responsible for a subset of keys.</p>
-<p>The non-obvious insight is that sharding is not "put rows on more machines." It is a change in who is allowed to decide. A write to bucket <code>B-173</code> must reach the shard that owns <code>B-173</code>; a transaction that spans <code>B-173</code> and <code>B-912</code> crosses an authority boundary; a rebalance is not just copying bytes, but changing which group is authoritative for some keys.</p>
-<p>That makes sharding both powerful and expensive. It can turn one overloaded write path into many parallel local decisions, but it also pushes routing, transaction boundaries, fan-out, and ownership migration into the application and control plane.</p>
-<h2>Replication Copies Authority; Sharding Splits It</h2>
-<p>Before sharding, Harbor Point has one logical authority domain:</p>
-<div class="codehilite"><pre><span></span><code>one reservation authority
+<p>At 09:30, desk North and desk South both try to confirm the final unit in allocation bucket <code>B-173</code>. The current service sends both commands to one replicated primary. It can choose one winner, but the queue behind that one authority is growing as more desks trade.</p>
+<p>Harbor Point can replicate the bucket and keep its history ordered. But all allocation writes still arrive at one authority. That authority becomes the limit even if it has many read replicas.</p>
+<p>The tempting solution is “add more databases.” That adds capacity only if different machines are allowed to decide different writes. Sharding makes that change. It divides the keyspace into authority domains, each with its own replicated owner.</p>
+<p>For a scarce allocation bucket, the important question is not “which server has the row?” It is “which owner may decide whether this bucket changes from held to confirmed?” That owner must be unambiguous before the decision starts.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>Two desks race to confirm the same allocation bucket, <code>B-173</code>. Harbor Point must promise that one authority decides the outcome and that a retry reaches the same authority while the bucket is moving between shards.</p>
+<div class="codehilite"><pre><span></span><code>POST /allocations/confirm
+  bucket_id=B-173
+  hold_id=H-8821
+  idempotency_key=K-44
 
-          writes
-            |
-            v
-       [primary]
-       /   |   \
- [replica][replica][replica]
+Promise:
+  exactly one current owner decides the bucket transition.
 </code></pre></div>
 
-<p>The replicas may serve reads, provide failover capacity, or participate in a stronger replication protocol. But for an authoritative write, the system still has to use the same ownership boundary. If that boundary is saturated, more replicas do not make the write decision parallel.</p>
-<p>After sharding, ownership is divided:</p>
-<div class="codehilite"><pre><span></span><code>reservation authority split by keyspace
-
-bucket 000-255  -&gt; shard A replica group
-bucket 256-511  -&gt; shard B replica group
-bucket 512-767  -&gt; shard C replica group
-bucket 768-999  -&gt; shard D replica group
+<p>That promise tells the API what information it needs. A command that arrives with only <code>customer_id</code> and a vague issuer description may require a lookup, fan-out, or cross-shard transaction before it can find the deciding owner. A command with <code>bucket_id</code> can route directly to one authority boundary.</p>
+<h2>The Naive Design</h2>
+<p>Start with one logical reservation authority:</p>
+<div class="codehilite"><pre><span></span><code>                    writes
+                      |
+                      v
+                [one primary]
+                 /    |    \
+              replica replica replica
 </code></pre></div>
 
-<p>Each shard is now an authority domain for the keys it owns. Shard <code>A</code> can accept writes for bucket <code>173</code> while shard <code>D</code> accepts writes for bucket <code>881</code>. The system has not eliminated consistency questions. It has made many of them local.</p>
-<p>This is the core payoff. Local decisions stay cheaper than global decisions. A reservation update that touches one bucket can be handled by the one shard that owns that bucket. A workflow that needs two buckets now needs coordination across two authorities, or it needs to be redesigned so the invariant does not cross that boundary.</p>
-<h2>Routing Is Part of the Contract</h2>
-<p>Once data is sharded, a request cannot simply "go to the database." It has to find the owner of the key before the database can make a correct decision.</p>
-<div class="codehilite"><pre><span></span><code>POST /reservations/B-173/release
-          |
-          v
-extract shard key: B-173
-          |
-          v
-route through partition map
-          |
-          v
-send to shard A, the owner of B-173
+<p>Replication improves availability, recovery, and read capacity. It does not make the primary's authoritative write decision parallel. Every confirm still queues behind one owner.</p>
+<p>Now divide buckets among several shard groups:</p>
+<div class="codehilite"><pre><span></span><code>B-000..B-255  -&gt; shard A replica group
+B-256..B-511  -&gt; shard B replica group
+B-512..B-767  -&gt; shard C replica group
+B-768..B-999  -&gt; shard D replica group
 </code></pre></div>
 
-<p>The partition map is now part of the correctness surface. If a router sends a write to an old owner during a rebalance, two groups may both believe they can decide the same key. If a read fans out to every shard because the API lacks the partition key, the system pays a cost that grows with shard count. If the application hides routing behind a helper library, that library becomes part of the data contract.</p>
-<p>Healthy sharded systems make ownership visible in API and schema shape. The key needed to route a strong operation should be available at the start of the request. For Harbor Point, a release or confirm command should carry the reservation bucket or inventory identifier that selects the owner. Search, reporting, and dashboards may use derived views, but the decisive write path should not begin with "ask every shard."</p>
-<div class="codehilite"><pre><span></span><code>Good strong-path shape:
-  confirm(bucket_id=B-173, reservation_id=R-88421)
-  -&gt; one owner can decide
+<p>This improves write capacity only because <code>B-173</code> and <code>B-881</code> can now be decided independently. Replication still exists inside each shard group; it protects the local authority. Sharding decides where local authority begins and ends.</p>
+<h2>Why It Breaks Without an Authority Key</h2>
+<p>The initial model says a router can send a request to any healthy shard and let the database find the record. That works for a broadcast report when delay is acceptable. It fails for a strong command.</p>
+<div class="codehilite"><pre><span></span><code>confirm(bucket_id=B-173)
+  -&gt; partition map says shard A owns B-173
+  -&gt; shard A runs one local transaction
 
-Risky strong-path shape:
-  confirm(customer_id=C-7, issuer=CA-MUNI, maybe_bucket=?)
-  -&gt; router may need lookup, fan-out, or cross-shard coordination
+confirm(customer_id=C-7, bucket unknown)
+  -&gt; router may query several shards
+  -&gt; two owners or a stale map can enter the decision path
 </code></pre></div>
 
-<p>The trade-off is design discipline. Sharding gives capacity only when the common strong operations can be routed to one owner. Otherwise, the system has many shards but still behaves like one distributed transaction engine on the hot path.</p>
-<h2>Authority Boundaries Shape Transactions</h2>
-<p>A shard boundary is also a transaction boundary unless the system pays for coordination above it.</p>
-<p>Inside one shard, Harbor Point can often use the local database or local replicated log to enforce invariants. For example, moving one reservation bucket from <code>held</code> to <code>released</code> can be a single-shard transaction if all rows needed for that invariant live on the same owner.</p>
-<div class="codehilite"><pre><span></span><code>single-shard invariant
+<p>The missing model is an <strong>authority boundary</strong>. A shard key is not merely a distribution function. It states which facts may be decided together without cross-shard coordination.</p>
+<p>For <code>B-173</code>, the bucket row, current hold, capacity count, and transition audit record should live under the same owner if the invariant is “confirm this bucket at most once.” A local transaction can then enforce the invariant.</p>
+<div class="codehilite"><pre><span></span><code>shard A owns B-173
 
-shard A owns B-173:
-  reservation row
-  hold row
-  bucket state
+assert bucket.status = held and hold_id = H-8821
+set bucket.status = confirmed
+append audit event confirmed
 
-release B-173 -&gt; local transaction
+all in one shard-local decision
 </code></pre></div>
 
-<p>Across shards, the same style of operation becomes a different problem:</p>
-<div class="codehilite"><pre><span></span><code>cross-shard invariant
-
-shard A owns B-173
-shard D owns B-881
-
-swap allocations B-173 &lt;-&gt; B-881
-  -&gt; needs distributed transaction, saga, escrow, or redesign
+<h2>A Better Boundary</h2>
+<p>Plain meaning:</p>
+<blockquote>
+<p>Put the state that must be decided together under one owner, then replicate that owner for durability and failover.</p>
+</blockquote>
+<p>In this scenario:</p>
+<blockquote>
+<p><code>bucket_id</code> selects the owner that decides holds, releases, and confirmations for <code>B-173</code>.</p>
+</blockquote>
+<p>Technical names:</p>
+<blockquote>
+<p>The stable value that selects an authority domain is the <strong>shard key</strong>. A router's mapping from that value or partition to a current owner is the <strong>partition map</strong>.</p>
+</blockquote>
+<p>Mature designs separate a logical partition from its physical placement. Harbor Point can derive a stable partition from the bucket key, then map it to a shard group:</p>
+<div class="codehilite"><pre><span></span><code>bucket B-173 -&gt; logical partition 173 -&gt; owner shard A, epoch 61
+bucket B-881 -&gt; logical partition 881 -&gt; owner shard D, epoch 19
 </code></pre></div>
 
-<p>This is why "we can shard later" is often too casual. If the domain model assumes many records can be updated together cheaply, sharding turns that assumption into coordination cost. The system either pays with distributed transactions, accepts weaker workflow semantics, or changes the data model so the strongest invariants fit inside one authority boundary.</p>
-<p>The goal of this lesson is not yet to pick the perfect shard key. The next lesson goes deeper there. The goal here is to see what the key is really doing: it decides where authority begins and ends.</p>
-<h2>Rebalancing Moves Ownership</h2>
-<p>Shards do not stay balanced forever. One issuer may become hot, one range may grow faster, or a new region may need more capacity. Rebalancing changes which shard owns some part of the keyspace.</p>
-<div class="codehilite"><pre><span></span><code>before:
-  buckets 000-255 -&gt; shard A
+<p>The application need not know the server name. It needs a stable key and a routing layer that can reject a stale epoch. This lets the system move partition 173 later without changing the meaning of <code>bucket_id</code>.</p>
+<h2>A Worked Ownership Transfer</h2>
+<p>Shard A is overloaded, so the control plane moves logical partition 173 to shard E. This trace uses simplified states to expose the authority handoff.</p>
+<div class="codehilite"><pre><span></span><code>start
+  map: partition 173 -&gt; A, epoch 61
+  A is authoritative; E has no copy
 
-after split:
-  buckets 000-127 -&gt; shard A
-  buckets 128-255 -&gt; shard E
+1. copy
+  copy a consistent base of partition 173 from A to E
+
+2. catch up
+  stream later changes from A to E while A remains the only writer
+
+3. fence
+  briefly drain or reject new writes for partition 173
+  verify E has applied A&#39;s final authoritative position
+
+4. switch
+  publish: partition 173 -&gt; E, epoch 62
+
+5. enforce
+  A rejects epoch-61 writes after the switch
+  E accepts epoch-62 writes and becomes the only authority
+
+6. clean up
+  retain A&#39;s old copy until recovery rules say it is safe to remove
 </code></pre></div>
 
-<p>That looks like a storage migration, but the correctness issue is ownership. During the move, writes may still arrive. Routers may have cached old maps. Replicas may be behind. The system must avoid a period where both <code>A</code> and <code>E</code> accept authoritative writes for bucket <code>173</code>, or where neither accepts them while clients believe the key is available.</p>
-<p>A safe rebalance usually needs a protocol with phases:</p>
-<div class="codehilite"><pre><span></span><code>1. copy data to the future owner
-2. keep the future owner caught up
-3. block or drain writes for the moving range briefly
-4. switch the partition map to the new owner and epoch
-5. reject stale requests that still target the old owner
-6. clean up the old copy after the new ownership is proven
-</code></pre></div>
-
-<p>The exact implementation varies, but the principle is stable: rebalancing is a live authority migration. If the team treats it as a background file copy, it will eventually create stale reads, duplicate writes, or confusing partial outages.</p>
-<h2>Failure Modes</h2>
-<p><strong>Adding replicas to a write-authority bottleneck.</strong> Replicas help availability and read scale, but they do not split the write decision if one primary or leader still owns the whole keyspace. The fix is to split authority, then replicate within each shard.</p>
-<p><strong>Hiding the shard key from strong APIs.</strong> If the router cannot identify the owner from the request, it may need lookups, fan-out, or cross-shard coordination. Shape decisive commands around the key that selects the authority boundary.</p>
-<p><strong>Letting business workflows casually cross shards.</strong> A workflow that touches many owners can still be correct, but it is no longer a local transaction. It needs a deliberate distributed transaction, saga, escrow model, or domain redesign.</p>
-<p><strong>Treating rebalance as bulk copy.</strong> Moving data without moving ownership safely can leave old and new owners accepting conflicting writes. Use epochs, routing-map updates, write drains, and stale-owner rejection to make the handoff explicit.</p>
+<p>The critical observation is step 4 plus step 5. Copying bytes alone does not change authority. Without an epoch and stale-owner rejection, a router with an old map could send a confirmation to A while a new router sends another to E. Two healthy shard groups would then be deciding the same bucket.</p>
+<p><strong>So far:</strong> a rebalance is not finished when E has the data. It is finished when exactly one epoch-authorized owner can make new decisions.</p>
+<h2>The Trade-off</h2>
+<p>Sharding improves parallel decision capacity and can keep common strong operations local. The trade-off is that the schema, APIs, router, and migration controller all become part of one distributed correctness surface.</p>
+<table>
+<thead>
+<tr>
+<th>Choice</th>
+<th>Helps</th>
+<th>Costs or boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bucket-oriented key</td>
+<td>Keeps one allocation invariant local</td>
+<td>Desk and issuer reports may need derived views</td>
+</tr>
+<tr>
+<td>Customer-oriented key</td>
+<td>Keeps customer history local</td>
+<td>A scarce bucket may require cross-shard coordination</td>
+</tr>
+<tr>
+<td>Missing shard key in a query</td>
+<td>Flexible query shape</td>
+<td>Router may scatter/gather across many shards</td>
+</tr>
+<tr>
+<td>Live rebalance</td>
+<td>Relieves hot shards and supports growth</td>
+<td>Requires epochs, catch-up, drains, and stale-route handling</td>
+</tr>
+</tbody>
+</table>
+<p>MongoDB's documentation makes the routing part concrete: queries containing the shard key can target a shard, while queries without it can broadcast to all shards. The product-specific conclusion is not “always use one key.” Choose the key that keeps the most costly invariant local, then deliberately build projections for the queries it makes expensive.</p>
+<h2>Operational Consequences</h2>
+<p>The router and partition map need the same care as a database write path. Useful signals include:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-shard write rate and queue time</td>
+<td>Hot authority domains and imbalance</td>
+</tr>
+<tr>
+<td>Targeted versus scatter/gather query rate</td>
+<td>Whether APIs carry useful routing keys</td>
+</tr>
+<tr>
+<td>Stale-epoch rejection rate</td>
+<td>Cached maps or clients still targeting an old owner</td>
+</tr>
+<tr>
+<td>Migration catch-up lag and drain time</td>
+<td>Whether a move can safely switch authority</td>
+</tr>
+<tr>
+<td>Cross-shard transaction or saga rate</td>
+<td>Invariants that do not fit the chosen boundary</td>
+</tr>
+</tbody>
+</table>
+<p>Sharding does not make a multi-bucket workflow atomic. A swap between <code>B-173</code> and <code>B-881</code> crosses two authorities. The system must use a distributed transaction, escrow, saga, compensation, or redesign its invariant. The right choice depends on whether partial progress is acceptable and what external effects must never be duplicated.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> Adding replicas is the same as sharding.</p>
+<p><strong>Why it is tempting:</strong> Both add machines.</p>
+<p><strong>Better model:</strong> Replicas copy one authority decision. Shards create several authority decisions for disjoint key ranges.</p>
+<p><strong>Confusion:</strong> A partition map is only a performance cache.</p>
+<p><strong>Why it is tempting:</strong> It looks like routing metadata.</p>
+<p><strong>Better model:</strong> For strong writes, the map identifies who may decide. A stale map must be rejected or refreshed, not silently followed.</p>
+<p><strong>Confusion:</strong> Rebalancing is complete after the data copy.</p>
+<p><strong>Why it is tempting:</strong> The future owner can read the copied records.</p>
+<p><strong>Better model:</strong> A live move needs a handoff of authority: catch-up, epoch switch, stale-route rejection, and a safe cleanup rule.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A confirm request needs one decision for <code>B-173</code>. Which request shape better protects the invariant: <code>confirm(bucket_id=B-173, hold_id=H-8821)</code> or <code>confirm(customer_id=C-7, issuer=CA-MUNI)</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The first shape. It exposes the key that selects the authority before the decision begins, so the router can target one shard. The second may need lookup or fan-out and risks turning a local invariant into cross-shard coordination.</p>
+<p><strong>Check:</strong> E has copied all data from A, but clients can still send epoch-61 writes to A after the new map names E. What is missing?</p>
+<p><strong>Answer:</strong> Stale-owner fencing. A must reject the old epoch and E must accept the new one, so copied data becomes a single-authority migration rather than two live writers.</p>
+<h2>Practice: Review a Shard Move</h2>
+<p>The system moves inventory partition 173 from shard A to shard E. At the same time, a client retries <code>confirm(bucket_id=B-173, idempotency_key=K-44)</code> after a timeout. Describe the routing and write contract that prevents duplicate confirmation.</p>
+<p>A good answer should mention:</p>
+<ul>
+<li>A partition map that resolves partition 173 to one owner and an epoch.</li>
+<li>Idempotent command identity so a retry recovers the recorded decision rather than creating another one.</li>
+<li>Catch-up and a fencing boundary before E becomes authoritative.</li>
+<li>Rejection or refresh of stale epoch requests at A after the switch.</li>
+<li>Signals for stale-route rejections, migration lag, and duplicate or conflicting confirmation attempts.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="011.html">Chain Replication and Ordered Failover</a> keeps one replica group's history ordered; sharding decides how many such authority domains exist.</li>
+<li><a href="013.html">Partitioning Strategies and Shard Keys</a> compares candidate keys and the workload arguments hidden in each one.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Read the partitioning chapters for the difference between replication, partitioning, routing, skew, and secondary indexes.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://vitess.io/docs/">Vitess Sharding Documentation</a><ul>
-<li>Focus: Study how a production sharding layer exposes keyspaces, routing, resharding, and control-plane responsibilities.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.mongodb.com/docs/manual/sharding/">MongoDB Sharding</a><ul>
-<li>Focus: Use the overview to connect shard keys, routers, chunks, balancing, and distributed query behavior.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://www.databass.dev/">Database Internals</a><ul>
-<li>Focus: Review partitioning and distributed storage internals as the physical side of authority boundaries.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://www.mongodb.com/docs/manual/sharding/">MongoDB Sharding</a> — Focus: Compare targeted operations, scatter/gather queries, shard keys, chunks, routers, and range migration with the authority model.</li>
+<li>[DOC] <a href="https://vitess.io/docs/">Vitess Documentation</a> — Focus: Explore the sharding, routing, and migration material as examples of a production control plane.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Connect partitioning, skew, replication, and query routing to the invariants your application must preserve.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Replication copies an authority domain; sharding creates multiple authority domains for different keys.</li>
-<li>A sharded request must route to the owner that can decide the answer, so routing metadata becomes part of correctness.</li>
-<li>Local shard transactions are cheaper than cross-shard workflows, so authority boundaries shape application semantics.</li>
-<li>Rebalancing is a live ownership migration, not merely a storage copy.</li>
-</ol>
+<ul>
+<li>Replication copies one authority domain; sharding splits authority by key or partition.</li>
+<li>Strong commands should carry the key that routes them to the owner able to decide the invariant.</li>
+<li>A partition map and its epochs are correctness data during live ownership changes, not merely performance metadata.</li>
+<li>Rebalancing succeeds only when one new owner is authoritative and stale routes cannot keep writing to the old owner.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -239,7 +340,7 @@ after split:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

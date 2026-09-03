@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,128 +81,224 @@
 <section class="stack-block lesson-content-shell">
   <h1>Read Repair, Anti-Entropy, and Merkle Divergence Checks</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Replicas do not converge because time passes; they converge because repair mechanisms detect disagreement, decide what should be copied or merged, and spend foreground or background capacity to make replicas agree again.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace how a foreground read can find and repair a stale replica.</p>
+</li>
+<li>
+<p>Explain why background anti-entropy is still required for cold data.</p>
+</li>
+<li>
+<p>Use a Merkle-tree comparison to locate a mismatched range without copying every key.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Replicas converge because repair mechanisms find disagreement and move resolved versions, not because time passing somehow makes copies agree.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine Harbor Point's leaderless store after the sloppy-quorum incident from the previous lesson. A watchlist update for <code>watchlist:trader-17</code> landed on fallback nodes while two home replicas were unreachable. The write was accepted, the user kept working, and the system now has repair debt.</p>
-<p>When the home replicas return, some keys are current, some are stale, and some temporary hints may fail or expire. A hot key might heal quickly because clients keep reading it. A cold key might stay wrong for weeks if no one looks at it and the system has no background comparison process.</p>
-<p>Read repair and anti-entropy are two answers to that problem. Read repair heals divergence that a foreground read happens to expose. Anti-entropy proactively compares replicas in the background, often using Merkle-style summaries so the system can find mismatched ranges without copying every object.</p>
-<p>The trade-off is where the system pays for healing. Read repair puts some work on the read path and favors hot data. Anti-entropy puts work into background disk, CPU, and network activity and covers cold data. Real replicated stores often need both because availability-first writes create disagreement faster than one repair path can clean it all up.</p>
-<h2>Read Repair: Healing When a Read Finds Drift</h2>
-<p>Suppose the home replicas for <code>watchlist:trader-17</code> should be <code>A</code>, <code>B</code>, and <code>C</code>. After the incident, they hold different versions:</p>
-<div class="codehilite"><pre><span></span><code>A -&gt; version 7
-B -&gt; version 7
-C -&gt; version 5
+<p>After Harbor Point used sloppy quorum during a zone outage, <code>watchlist:trader-17</code> reached fallback nodes. Hinted handoff returned most copies home. One replica is still stale, however, and an old dashboard preference has not been read at all since the outage.</p>
+<p>It is tempting to call both records “eventually consistent” and wait. But waiting does not compare versions, send data, or resolve a conflict. The system needs work that detects divergence and a rule for what version can be copied.</p>
+<p>Two repair paths divide that work. <strong>Read repair</strong> uses a foreground read that already found disagreement. <strong>Anti-entropy</strong> compares replica state in the background, so cold records do not wait forever for a user to visit them. They complement each other; neither is a generic replacement for the other.</p>
+<h2>The Situation</h2>
+<p>The home replicas for one hot watchlist should contain the same resolved version:</p>
+<div class="codehilite"><pre><span></span><code>A: v7
+B: v7
+C: v5
 </code></pre></div>
 
-<p>A client reads the watchlist at a consistency level that contacts multiple replicas. The coordinator receives both <code>v7</code> and <code>v5</code>, compares version metadata, returns the newest safe answer to the client, and sends the fresher value back to the stale replica.</p>
-<div class="codehilite"><pre><span></span><code>client read
-   |
-   v
-coordinator asks A, B, C
-   |
-   +--&gt; A returns v7
-   +--&gt; B returns v7
-   `--&gt; C returns v5
-   |
-   v
-return v7 to client
-repair C with v7
+<p>The value <code>v7</code> is known to supersede <code>v5</code> in this teaching trace. That assumption matters. If <code>v7</code> and another version were concurrent, the system would need a conflict policy before copying either one. Repair is not permission to erase an unknown user intent.</p>
+<p>Harbor Point also has a cold key:</p>
+<div class="codehilite"><pre><span></span><code>layout:trader-17:legacy-view
+
+A: v12
+B: v12
+C: v9
 </code></pre></div>
 
-<p>That is read repair. It is attractive because it uses real traffic to discover real disagreement. If a key is hot, the system gets many chances to notice stale replicas and heal them.</p>
-<p>The limitation is just as important: read repair only wakes up for keys that are read. If Harbor Point has a rarely opened watchlist, an old dashboard configuration, or a historical preference record, read repair may never touch it. The system can look healthy for active users while carrying stale cold data quietly.</p>
-<h2>Anti-Entropy: Healing Without Waiting for Users</h2>
-<p>Anti-entropy is the background answer. Instead of waiting for a client to read a key, replicas compare their state and repair differences proactively.</p>
-<p>A naive process could compare every key and value directly, but that would be too expensive at scale. Many Dynamo-style systems use Merkle trees or similar hash summaries. Each replica builds a tree of hashes over a key range:</p>
-<div class="codehilite"><pre><span></span><code>range watchlist:0000..9999
-├── 0000..4999 hash=a13
-│   ├── 0000..2499 hash=77c
-│   └── 2500..4999 hash=9be
-└── 5000..9999 hash=f42
-    ├── 5000..7499 hash=21d
-    └── 7500..9999 hash=ab8
+<p>No client has opened that layout for a month. The hot and cold keys need different ways to become visible to the repair system.</p>
+<h2>The Initial Model</h2>
+<p>The first reasonable idea is: “A quorum read already sees several replicas, so it will keep all replicas current.” It works for a key that is read often and whose read path compares versions.</p>
+<p>It fails for the cold layout. No read means no comparison. Even for the hot key, a read might return the newest resolved value without writing it back, depending on the system's policy. The client gets a correct answer, while the stale replica remains a future risk.</p>
+<p>The missing model is that detecting, deciding, and copying are distinct steps. A repaired cluster needs all three.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>Plain meaning:</p>
+<blockquote>
+<p>When a read discovers a replica is behind, return the resolved answer and ask that replica to catch up.</p>
+</blockquote>
+<p>In this scenario:</p>
+<blockquote>
+<p>A client reading the hot watchlist receives <code>v7</code> from <code>A</code> and <code>B</code>, and <code>v5</code> from <code>C</code>. The coordinator can identify <code>C</code> as stale and send it <code>v7</code>.</p>
+</blockquote>
+<p>Technical name:</p>
+<blockquote>
+<p>This foreground path is <strong>read repair</strong>. It heals disagreement revealed by useful client traffic.</p>
+</blockquote>
+<div class="codehilite"><pre><span></span><code>1. client -&gt; coordinator: GET watchlist:trader-17
+2. coordinator -&gt; A, B, C: read version and value
+
+   A returns v7
+   B returns v7
+   C returns v5
+
+3. coordinator compares version ancestry
+   v7 supersedes v5 in this example
+
+4. coordinator -&gt; client: return resolved v7
+5. coordinator -&gt; C: repair with v7
+6. C confirms the repair
 </code></pre></div>
 
-<p>Two replicas compare the root hash first. If it matches, that range likely agrees and no object-level comparison is needed. If it differs, they descend into child ranges until they find the smaller ranges or keys that disagree.</p>
-<div class="codehilite"><pre><span></span><code>compare root hash
-   |
-   +-- same: skip entire range
-   |
-   `-- different: compare child hashes
-          |
-          `-- repair mismatched ranges or keys
+<p>The client should not have to wait for every repair action if the service contract permits asynchronous repair. The system must still make the result explicit: it returned <code>v7</code> because version comparison established that <code>v5</code> was older, not because a majority vote makes arbitrary data true.</p>
+<p>If the repair write fails, the read can remain correct while <code>C</code> stays stale. That is why repair outcomes and retries belong in operational monitoring, rather than being hidden behind a successful client response.</p>
+<p>The service also chooses whether a read waits for the repair acknowledgement. Waiting gives stronger evidence that <code>C</code> caught up, but adds tail latency to the user request and can make a slow replica dominate a healthy read. Sending repair asynchronously protects the foreground path, but leaves a measured convergence window. The right choice depends on the endpoint's freshness contract; neither mode turns a failed repair into success by wording alone. The API should state that boundary.</p>
+<h2>A Worked Anti-Entropy Trace</h2>
+<p>Read repair does nothing for the cold layout until someone reads it. Anti-entropy creates a background comparison schedule instead. Comparing every value in every replica range would be expensive, so a common approach summarizes ranges with a Merkle tree: leaves hash individual key values and each parent hashes its children.</p>
+<p>The following hashes are illustrative.</p>
+<div class="codehilite"><pre><span></span><code>Replica A, range layout:0000..9999
+root=aa9
+├── 0000..4999 = 51c
+└── 5000..9999 = 7d2
+    ├── 5000..7499 = 2f1
+    └── 7500..9999 = 0c9
+
+Replica C, same range
+root=be4
+├── 0000..4999 = 51c
+└── 5000..9999 = 46e
+    ├── 5000..7499 = 2f1
+    └── 7500..9999 = 913
 </code></pre></div>
 
-<p>This is why Merkle-style anti-entropy is useful: it narrows the repair search. The system can detect that most of a replica is identical and spend bandwidth only on the parts that drifted.</p>
-<p>Anti-entropy is especially important for cold data, long-lived replicas, and recovery after outages. It turns "eventually consistent" from a hope into a scheduled repair process.</p>
-<h2>Worked Example: Hot Watchlist, Cold Preference</h2>
-<p>Harbor Point sees two divergent records after a zone incident:</p>
-<div class="codehilite"><pre><span></span><code>Record                         Traffic pattern       Repair risk
------------------------------  --------------------  -------------------------------
-watchlist:trader-17            read every minute      read repair likely catches drift
-layout:trader-17:legacy-view    read once per month    read repair may never fire
+<p>The comparison follows only the evidence of mismatch:</p>
+<div class="codehilite"><pre><span></span><code>1. Compare roots: aa9 != be4, so the whole range is not identical.
+2. Compare left children: 51c == 51c, so skip keys 0000..4999.
+3. Compare right children: 7d2 != 46e, so descend.
+4. Compare 5000..7499: 2f1 == 2f1, so skip it.
+5. Compare 7500..9999: 0c9 != 913, so exchange narrower summaries or keys.
+6. Find layout:trader-17:legacy-view and resolve v12 over v9.
+7. Copy the resolved v12 to C and record success or retry work.
 </code></pre></div>
 
-<p>For the hot watchlist, a normal user read can expose the mismatch and repair the stale home replica. The user may pay a little extra latency on that read because the coordinator compares versions and sends repair writes.</p>
-<p>For the cold layout preference, no one may read the record soon. Without anti-entropy, one replica can remain stale indefinitely. The problem may surface later during a restore, regional failover, audit export, or a rare user session that lands on the wrong replica.</p>
-<p>The repair plan should therefore name both paths:</p>
-<div class="codehilite"><pre><span></span><code>hot data:
-- use read repair when quorum reads reveal stale replicas
-- track extra read latency and repair write volume
+<p>The tree does not tell the replicas which user value is correct. It tells them where their state differs. Version ancestry or a conflict resolver must still decide what to synchronize. Dynamo's anti-entropy design uses Merkle trees to reduce the data and disk work needed to find inconsistent ranges.</p>
+<p>There is one more practical detail. The range can change while the replicas compare it. A repair pass therefore needs a stable comparison boundary: for example, a range generation, a snapshot position, or a repeated comparison after a changed root. Otherwise <code>A</code> might hash one view of the range while <code>C</code> is already repairing a newer view, and the pass could wrongly report that the work is complete.</p>
+<div class="codehilite"><pre><span></span><code>comparison start: root(A)=aa9, root(C)=be4, generation=104
+repair writes v12 to C
+recheck: root(A)=aa9, root(C)=aa9, generation=104 -&gt; range converged
 
-cold and broad data:
-- run anti-entropy scans over replica ranges
-- compare Merkle summaries
-- alert on repair backlog and oldest unrepaired range
+if generation changes during the pass:
+  record incomplete comparison
+  schedule the changed range again
 </code></pre></div>
 
-<p>The product benefit is convergence. The operational cost is extra work: foreground read latency for read repair, and background CPU, disk, and network pressure for anti-entropy.</p>
-<h2>Designing Repair as an SLO</h2>
-<p>Repair needs an objective, not just a feature flag. Harbor Point can decide that watchlist data should converge within minutes after a home replica returns, while archival preferences can converge within hours. Those goals shape repair frequency, bandwidth limits, and alert thresholds.</p>
-<p>Useful signals include:</p>
-<div class="codehilite"><pre><span></span><code>Signal                              What it tells you
-----------------------------------  ---------------------------------------------
-read repair rate                    how often foreground reads find divergence
-anti-entropy backlog                how much replica range comparison remains
-oldest unrepaired hint or range      whether convergence is falling behind
-bytes repaired per hour             cost of healing after failures
-repair-induced read latency          user-facing cost of foreground repair
-</code></pre></div>
-
-<p>There is a real trade-off here. Aggressive repair reduces divergence windows but competes with production traffic. Conservative repair protects foreground latency but lets replicas disagree longer. The right setting depends on the data's consistency contract and the cost of stale reads.</p>
-<p>This also prepares the next lesson. Repair can copy the newer version when one version clearly supersedes another. When replicas contain concurrent versions with different user intents, the system needs a conflict-resolution policy before it can know what "repair" should write.</p>
-<h2>Failure Modes</h2>
-<p><strong>Assuming eventual consistency means passive convergence.</strong> Time alone does not heal replicas. Some mechanism must observe divergence and apply a repair or merge policy.</p>
-<p><strong>Relying only on read repair.</strong> Hot keys heal quickly, but cold keys can remain stale indefinitely if no background anti-entropy process scans them.</p>
-<p><strong>Treating anti-entropy as free background work.</strong> Merkle building, range comparison, and repair writes consume CPU, disk, and network. Poorly tuned repair can hurt the same workloads it is trying to protect.</p>
-<p><strong>Repairing without a conflict policy.</strong> If two versions are concurrent rather than stale-versus-new, the system must resolve or surface the conflict before blindly copying one value everywhere.</p>
+<p>The exact implementation varies. The teaching point is stable: a Merkle comparison is evidence about a particular replica state, not a permanent certificate. Good background repair records what range and version it checked, retries incomplete work, and limits concurrency so several large scans do not consume the same disk and network budget as foreground traffic.</p>
+<p><strong>So far:</strong> read repair gives hot keys quick, opportunistic healing. Merkle-based anti-entropy gives cold data a deliberate route back to convergence.</p>
+<h2>What This Changes</h2>
+<p>Before this model, a team may say “the store repairs itself.” After it, the team can state two separate obligations:</p>
+<table>
+<thead>
+<tr>
+<th>Data pattern</th>
+<th>Detection path</th>
+<th>Repair consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot watchlist</td>
+<td>Quorum or multi-replica read</td>
+<td>Low-latency foreground detection; repair may add read or write work</td>
+</tr>
+<tr>
+<td>Cold preference</td>
+<td>Scheduled range comparison</td>
+<td>Background coverage even with no client traffic</td>
+</tr>
+<tr>
+<td>Concurrent updates</td>
+<td>Version ancestry detects no ancestor relation</td>
+<td>Conflict policy must resolve, preserve siblings, or request retry before copying</td>
+</tr>
+</tbody>
+</table>
+<p>The important decision is not merely enabling a feature. It is setting a convergence objective that matches the data's contract. A watchlist might need to converge minutes after a replica returns. An archival preference may tolerate hours. An audit export may require a complete, verified view rather than a best-effort background repair window.</p>
+<h2>The Trade-off, Limits, and Signals</h2>
+<p>Repair improves replica agreement. The trade-off is where it spends work. Read repair adds comparison and sometimes writes to a user-facing read path. Anti-entropy adds scheduled CPU, disk reads, hashes, network transfer, and repair traffic even when no user asks for the data.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read-repair discovery and failure rate</td>
+<td>How often foreground reads find drift and whether the write-back succeeds</td>
+</tr>
+<tr>
+<td>Anti-entropy backlog and scan age</td>
+<td>Whether cold ranges receive the promised coverage</td>
+</tr>
+<tr>
+<td>Oldest unresolved range or hint</td>
+<td>The longest current convergence delay</td>
+</tr>
+<tr>
+<td>Repair bytes and disk utilization</td>
+<td>The resource cost of making copies agree</td>
+</tr>
+<tr>
+<td>Conflict or sibling count</td>
+<td>Whether divergence is stale data or unresolved user intent</td>
+</tr>
+</tbody>
+</table>
+<p>Aggressive repair shortens divergence windows but can compete with client traffic. Conservative repair protects foreground latency but lets stale replicas survive longer. Neither mechanism protects a business invariant that cannot tolerate a temporary conflicting write in the first place; that invariant needs a stronger write contract or a domain-specific conflict policy.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> Eventual consistency means replicas converge without an active mechanism.</p>
+<p><strong>Why it is tempting:</strong> “Eventually” sounds like a time-based promise.</p>
+<p><strong>Better model:</strong> Time only provides an opportunity. A system must discover divergence, choose a resolved version, and transfer it.</p>
+<p><strong>Confusion:</strong> Read repair covers the entire dataset.</p>
+<p><strong>Why it is tempting:</strong> A successful hot-key read can visibly heal a replica.</p>
+<p><strong>Better model:</strong> Read repair follows reads. Cold data needs scheduled anti-entropy or another background reconciliation path.</p>
+<p><strong>Confusion:</strong> Matching a Merkle root proves a system has no data problem.</p>
+<p><strong>Why it is tempting:</strong> The compared range matches at that time.</p>
+<p><strong>Better model:</strong> It only establishes agreement for the compared representation and range. It does not validate a bad conflict policy, an omitted range, or a value that was consistently wrong everywhere.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A client read returns <code>v7</code> from two replicas and <code>v5</code> from one replica. The version metadata proves <code>v7</code> descends from <code>v5</code>. What is the correct repair action, and what uncertainty remains if the repair write times out?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Return resolved <code>v7</code> and attempt to copy it to the <code>v5</code> replica. If the repair write times out, the client can still have received the correct resolved value, but the system cannot assume the stale replica caught up; it must retry or let later repair find it again.</p>
+<p><strong>Check:</strong> Two Merkle roots differ, but the left child hashes match. What should the replicas avoid doing?</p>
+<p><strong>Answer:</strong> They should avoid transferring the entire range or rechecking all left-side keys. The matching child proves that subtree can be skipped for this comparison.</p>
+<h2>Practice: Design a Repair Objective</h2>
+<p>An analyst dashboard uses a replicated <code>daily-exposure</code> record. It is read every few minutes during trading hours, but an end-of-day compliance export must not omit an acknowledged correction. A zone recovery leaves one replica stale.</p>
+<p>Define the read-repair behavior, anti-entropy objective, and export behavior. Include one signal and one conflict boundary.</p>
+<p>A good answer should mention:</p>
+<ul>
+<li>A multi-replica read can return the resolved newest descendant and repair a stale responder for the hot dashboard key.</li>
+<li>A background anti-entropy target covers records that do not receive enough reads, with a maximum scan age or oldest-unrepaired-range objective.</li>
+<li>The export waits for, verifies, or explicitly fails on its required version rather than silently trusting a possibly stale replica.</li>
+<li>Repair chooses a version only when ancestry or the domain policy makes that choice valid; concurrent corrections need a resolver or review.</li>
+<li>A signal such as repair failure rate, anti-entropy backlog, or oldest unresolved range.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="007.html">Leaderless Replication, Sloppy Quorums, and Hinted Handoff</a> creates temporary placement and repair debt; this lesson explains how that debt is found and reduced.</li>
+<li><a href="009.html">Conflict Resolution and Convergence Policies</a> addresses the decision this lesson leaves open: what to do when divergent versions are concurrent rather than stale.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
-<li>Focus: Read for hinted handoff, read repair, Merkle trees, and anti-entropy as a combined convergence strategy.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.riak.com/riak/kv/latest/learn/concepts/active-anti-entropy/index.html">Riak KV Active Anti-Entropy</a><ul>
-<li>Focus: Study how a production Dynamo-family system describes background repair.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.riak.com/riak/kv/latest/learn/concepts/replication/index.html">Riak KV Replication Concepts</a><ul>
-<li>Focus: Connect replication, divergence, and repair behavior in one operational model.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Review leaderless replication, read repair, anti-entropy, and why convergence requires explicit mechanisms.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a> — Focus: Study hinted handoff, anti-entropy, Merkle trees, and the distinction between locating divergence and resolving it.</li>
+<li>[DOC] <a href="https://docs.riak.com/riak/kv/latest/learn/concepts/active-anti-entropy/index.html">Riak KV Active Anti-Entropy</a> — Focus: Connect background comparison to an operational repair process.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Compare read repair, anti-entropy, and conflict handling in leaderless replication.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Read repair is foreground healing: it fixes divergence that a client read happens to reveal.</li>
-<li>Anti-entropy is background healing: it compares replicas proactively so cold data does not stay stale forever.</li>
-<li>Merkle-style summaries make background repair practical by narrowing comparison to mismatched ranges.</li>
-<li>Repair has a cost and a policy boundary: it must be tuned against production load and paired with conflict resolution when versions are concurrent.</li>
-</ol>
+<ul>
+<li>Read repair heals a replica when foreground traffic exposes a resolved stale version.</li>
+<li>Anti-entropy covers cold data by comparing replicas in the background rather than waiting for a user read.</li>
+<li>Merkle trees reduce comparison work by locating mismatched ranges before replicas exchange individual keys.</li>
+<li>Repair is a convergence mechanism, not a conflict policy: it needs version evidence, operational objectives, and a clear boundary for concurrent updates.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -227,7 +327,7 @@ repair-induced read latency          user-facing cost of foreground repair
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

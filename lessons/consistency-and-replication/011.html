@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,115 +81,209 @@
 <section class="stack-block lesson-content-shell">
   <h1>Chain Replication and Ordered Failover</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Chain replication makes a replicated object behave like one ordered pipeline: writes enter at the head, become committed at the tail, and failover must preserve that prefix before clients can trust the new chain.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Trace when an update is merely in flight and when a chain has committed it.</p>
+</li>
+<li>
+<p>Explain why the tail is the ordinary safe read point in basic chain replication.</p>
+</li>
+<li>
+<p>Review a failover plan for its epoch, committed-prefix, and catch-up requirements.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Chain replication gives one object an ordered update path: the head accepts writes, the tail establishes the committed prefix, and failover must preserve that prefix before serving clients again.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Harbor Point has one reservation bucket that is too important to reconcile casually: the last available allocation for a thinly traded municipal bond. Two desks can race to reserve it, and a stale or double-accepted answer would create a real business break. The team could use quorums and repair, but for this object they want a simpler promise: if a write is acknowledged, every later committed read should reflect one agreed order.</p>
-<p>Chain replication makes that promise by turning the replica set into a fixed pipeline. A reservation update enters at the head, travels through each replica in order, and is not complete until the tail has applied it. Ordinary reads go to the tail because the tail is the node that has seen the full committed prefix. The chain may have in-flight writes, but the committed history has one clear end.</p>
-<p>The tempting misconception is that chain replication is just leader-follower replication with more followers. The head does look leader-like, but the defining property is the ordered path and the special meaning of the tail. A completed write is not "the head accepted it." A completed write is "the update reached the tail in the configured chain."</p>
-<p>That clarity has a cost. Writes pay the latency of the chain, the tail can become a read bottleneck, and node failures require careful reconfiguration. Chain replication trades some availability flexibility for a read and write contract that is easy to explain and hard to accidentally weaken.</p>
-<h2>The Ordered Pipeline</h2>
-<p>Suppose Harbor Point stores the allocation bucket on three replicas:</p>
+<p>Harbor Point has one scarce allocation bucket: the final unit of a thinly traded municipal bond. Two desks may try to reserve it at once. The system must not tell both desks that they own it, and a completed reservation must not disappear after a replica failure.</p>
+<p>The team could use a repair-oriented leaderless design. For this bucket, however, it wants a simpler promise: completed operations form one visible order. Chain replication earns that promise by arranging replicas in a line rather than treating them as interchangeable copies.</p>
 <div class="codehilite"><pre><span></span><code>chain epoch 42
 
-[HEAD A]  -&gt;  [B]  -&gt;  [TAIL C]
+[head A]  -&gt;  [middle B]  -&gt;  [tail C]
 </code></pre></div>
 
-<p>A trader submits <code>reserve(bucket=MUNI-CA-17, qty=1)</code>. The request does not go to whichever replica is nearby. It enters at the head:</p>
-<div class="codehilite"><pre><span></span><code>client
-  |
-  v
-[HEAD A] --reserve#881--&gt; [B] --reserve#881--&gt; [TAIL C]
-                                                    |
-                                                    v
-                                             commit / ack
+<p>An update enters at <code>A</code>, moves through <code>B</code>, and reaches <code>C</code>. The tail is not just the last machine in a diagram. It is the point that has received the committed prefix, so ordinary committed reads go there.</p>
+<h2>The Situation</h2>
+<p>The allocation service receives two commands in this order:</p>
+<div class="codehilite"><pre><span></span><code>reserve#881: reserve the last unit for desk North
+release#882: release that reservation
 </code></pre></div>
 
-<p>Each replica applies updates in the same sequence before forwarding them. If <code>reserve#881</code> is followed by <code>release#882</code>, every replica sees that order as the updates move down the chain. The tail applies <code>reserve#881</code> last, and that is the point where the write becomes part of the committed prefix.</p>
-<div class="codehilite"><pre><span></span><code>Update order at each replica:
-
-A: reserve#881, release#882, ...
-B: reserve#881, release#882, ...
-C: reserve#881, release#882, ...  &lt;- committed prefix visible here
+<p>Each replica applies and forwards updates in the chain's order. At a moment during normal operation, replicas can legitimately have different prefixes:</p>
+<div class="codehilite"><pre><span></span><code>A: reserve#881, release#882
+B: reserve#881
+C: reserve#881
 </code></pre></div>
 
-<p>This is why chain replication is attractive for objects where the business wants one simple story. The chain removes ordinary read-time ambiguity. Harbor Point does not need to ask whether a read quorum intersects the latest write quorum for this bucket. It asks whether the read came from the tail of the current chain.</p>
-<p>The mechanism also reveals the trade-off. The head can contain writes that the tail has not committed yet. The middle can be between the head and the tail. Those states are normal, but they are not all safe read points for the committed view. The design gets its clean semantics by giving each position in the chain a different meaning.</p>
-<h2>Reads From the Tail</h2>
-<p>After <code>reserve#881</code> reaches the tail, a read from <code>C</code> sees the committed reservation. A read from <code>A</code> might see more than the committed prefix because the head may have accepted a later update that has not reached the tail. A read from <code>B</code> has the same problem in milder form. It is somewhere inside the pipeline, not at the point where the committed prefix is defined.</p>
-<div class="codehilite"><pre><span></span><code>Time T:
+<p>Nothing is wrong yet. <code>release#882</code> is simply in flight. The system needs a rule that tells clients which prefix is safe to call committed. In basic chain replication, that rule is: the tail's prefix is committed.</p>
+<h2>The Initial Model</h2>
+<p>The first reasonable model is “the head is the leader, so success at the head means success for the object.” That is attractive because clients send writes to the head and the head may already have stored <code>release#882</code>.</p>
+<p>It works only for accepting and sequencing incoming work. It does not work as a completion rule. If <code>A</code> crashes before <code>release#882</code> reaches <code>C</code>, the tail cannot safely show that release as committed. A client told that the release had completed would have a promise the chain never earned.</p>
+<div class="codehilite"><pre><span></span><code>client -&gt; A: release#882
+A applies release#882
+A crashes before forwarding it to B and C
 
-A has applied: reserve#881, release#882
-B has applied: reserve#881
-C has applied: reserve#881
-
-committed prefix: reserve#881
-tail read: safe committed view
-head read: may expose in-flight work
+C still contains only reserve#881
 </code></pre></div>
 
-<p>That rule is the contrast with the previous lesson. In read-your-writes routing, Harbor Point checked whether a replica had replayed a session token. In chain replication, the architecture names the safe read point up front. If the client reads the tail of the current chain after its write has been acknowledged, it reads a node that contains the full committed prefix.</p>
-<p>This does not make the design free. Tail reads can concentrate load, so high-read systems may need batching, object placement across many chains, or extensions such as CRAQ that allow non-tail reads when they can prove the object version is clean. The base idea stays the same: a faster read path must preserve the committed-prefix contract instead of treating all replicas as interchangeable.</p>
-<h2>Ordered Failover</h2>
-<p>The hard part of chain replication is not the happy path. It is changing the chain without losing the meaning of "committed."</p>
-<p>If the middle node fails, the system might move from:</p>
-<div class="codehilite"><pre><span></span><code>epoch 42: A -&gt; B -&gt; C
+<p>The missing distinction is between <strong>accepted by the head</strong> and <strong>committed at the tail</strong>.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>Plain meaning:</p>
+<blockquote>
+<p>Move every update through one ordered path, then let the final replica define the history ordinary readers may trust.</p>
+</blockquote>
+<p>In this scenario:</p>
+<blockquote>
+<p>North's reservation enters at <code>A</code>, reaches <code>B</code>, then reaches <code>C</code>. Only after <code>C</code> applies it can the client learn that the chain committed it.</p>
+</blockquote>
+<p>Technical name:</p>
+<blockquote>
+<p>This is <strong>chain replication</strong>. The sequence stored at the tail is the chain's committed prefix.</p>
+</blockquote>
+<p>Here is one illustrative write trace. The sequence numbers are teaching values, not output from a specific product.</p>
+<div class="codehilite"><pre><span></span><code>Starting state
+  epoch=42, A=B=C at sequence 880
+
+1. client -&gt; A: reserve#881
+   A appends 881 and forwards it to B.
+
+2. A -&gt; B: reserve#881
+   B applies 881 after its existing prefix, then forwards it to C.
+
+3. B -&gt; C: reserve#881
+   C applies 881 after its existing prefix.
+
+4. C -&gt; client (often through the chain&#39;s acknowledgement path)
+   &quot;881 is committed in epoch 42.&quot;
 </code></pre></div>
 
-<p>to:</p>
-<div class="codehilite"><pre><span></span><code>epoch 43: A -&gt; C
+<p>The important invariant is not that every replica is equal at every instant. It is that replicas process one order and the tail has a prefix that is safe to expose as complete. <code>A</code> and <code>B</code> may already contain later work, but that work is not yet part of the ordinary committed view.</p>
+<h2>A Worked Read Trace</h2>
+<p>After step 4, a client asks whether North owns the unit. A tail read has a direct answer:</p>
+<div class="codehilite"><pre><span></span><code>client -&gt; C: GET allocation/MUNI-CA-17
+C has committed prefix through 881
+C returns: reserved_by=North, sequence=881
 </code></pre></div>
 
-<p>That change must be coordinated. The control plane has to stop clients from using the old epoch, determine which updates reached which replicas, preserve the committed prefix at the old tail, and resume only when the new chain has a safe ordering. Otherwise, Harbor Point could accidentally acknowledge an update in one topology and read from a new topology that has not preserved it.</p>
-<p>Different failures stress different parts of the invariant:</p>
-<div class="codehilite"><pre><span></span><code>Failed position   Main risk
----------------   ------------------------------------------------
-head              clients may be sending writes to a dead entry point
-middle            in-flight updates may be split across the pipeline
-tail              the committed read point has disappeared
+<p>Now suppose <code>release#882</code> has reached <code>A</code> but not <code>C</code>.</p>
+<div class="codehilite"><pre><span></span><code>A: 881, 882
+B: 881
+C: 881
 </code></pre></div>
 
-<p>A head failure is often the easiest to reason about: promote the next node as the new head after ensuring clients stop using the old one. A tail failure is more delicate because the tail is where completion was observed. The new tail must be known to contain the committed prefix before reads resume. A middle failure requires reconnecting the predecessor and successor without skipping or duplicating in-flight updates.</p>
-<p>The phrase "ordered failover" is doing real work here. Failover is not merely replacing capacity. It is installing a new chain epoch that preserves the prefix relation clients rely on.</p>
-<h2>Operational Trade-offs</h2>
-<p>Chain replication buys a strong and local mental model: writes have one path, reads have one safe point, and committed state is a prefix at the tail. That makes it attractive for per-object stores, metadata services, inventory buckets, and other places where a single ordered history matters more than accepting writes on any reachable node.</p>
-<p>It also concentrates operational pressure:</p>
+<p>Reading from <code>A</code> would expose an in-flight release. Reading from <code>C</code> returns the last committed state. This is why “read the closest replica” weakens the basic chain contract even when the close replica is usually up to date.</p>
+<p>Can the system ever read elsewhere? Yes, but only with an additional safety rule. CRAQ is one example of a read-mostly extension that lets non-tail replicas serve versions they can prove are clean. The base lesson remains: a faster read path must prove an equivalent committed version; proximity is not proof.</p>
+<p><strong>So far:</strong> the tail gives a small, inspectable answer to “what completed?” The head sequences work, but the tail earns client-visible commitment.</p>
+<h2>Ordered Failover Is a New Epoch</h2>
+<p>The hard case is not forwarding an update. It is changing the chain while updates are in flight.</p>
+<p>Assume <code>B</code> fails. The control plane wants to replace this chain:</p>
+<div class="codehilite"><pre><span></span><code>old epoch 42: A -&gt; B -&gt; C
+new epoch 43: A -&gt; C
+</code></pre></div>
+
+<p>Treating that as a load-balancer change is unsafe. Before clients use epoch 43, the system needs a controlled transition:</p>
+<div class="codehilite"><pre><span></span><code>1. Fence or stop requests that still name epoch 42.
+2. Identify C&#39;s committed prefix from the old chain.
+3. Reconcile any updates accepted upstream but not present at C.
+4. Ensure A and C agree on the starting prefix for epoch 43.
+5. Publish epoch 43 and route writes to its head and reads to its tail.
+</code></pre></div>
+
+<p>Step 3 matters because upstream replicas may have updates that the old tail never committed. The new epoch must not silently turn them into completed writes. A correct system can retry, abort, or resolve those in-flight operations according to its protocol, but it must preserve the boundary between the old committed prefix and uncommitted work.</p>
+<p>For example, suppose <code>H</code> accepted 507 and <code>M</code> may or may not have received it, while <code>T</code> reports a durable committed prefix through 506:</p>
+<div class="codehilite"><pre><span></span><code>old epoch 18 state
+  H: 506, 507 accepted
+  M: unknown after the failure
+  T: 506 committed
+
+safe starting fact for epoch 19
+  committed prefix = 506
+  update 507 = unresolved, not silently committed
+</code></pre></div>
+
+<p>The coordinator can inspect durable records and retry 507 with an idempotency key, or report an indeterminate result that the client resolves by querying the new epoch. What it cannot do is infer completion merely because <code>H</code> received the command. This small distinction prevents a reconfiguration from turning a timeout into a duplicate allocation.</p>
+<p>Tail failure is more delicate. The service cannot simply pick a convenient survivor as a new tail and resume reads. It must establish which survivor contains the old committed prefix, or recover that prefix from durable records, before publishing the new read point. Head failure has a different danger: clients may keep sending writes to a dead or obsolete entry point, so epoch fencing and retry logic matter first.</p>
+<h2>The Trade-off, Limits, and Signals</h2>
+<p>Chain replication improves the clarity of a single object's history. The trade-off is direct: each write pays for ordered hops through the chain, and each ordinary committed read depends on a special tail. That cost is worthwhile when a wrong order harms the product more than a little extra latency or a restricted failover path.</p>
+<p>The chain also makes delay easier to locate. If the head accepts work quickly but tail commitment grows slow, the problem is not an abstract “replication lag” number: one link, a disk flush, or the tail itself is holding the committed prefix back. That diagnosis is valuable, but it does not remove the cost. Longer chains and slow tails directly lengthen the interval in which an update is accepted but still in flight.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Head-to-tail replication delay</td>
+<td>How long accepted work remains in flight</td>
+</tr>
+<tr>
+<td>Tail commit latency</td>
+<td>The client-visible write cost</td>
+</tr>
+<tr>
+<td>Tail read load and saturation</td>
+<td>Whether the safe read point is becoming the bottleneck</td>
+</tr>
+<tr>
+<td>Epoch-change duration</td>
+<td>How long reconfiguration blocks or restricts service</td>
+</tr>
+<tr>
+<td>Prefix mismatch or replay count</td>
+<td>Whether failover is encountering unresolved in-flight work</td>
+</tr>
+</tbody>
+</table>
+<p>The mechanism does not make a multi-object workflow atomic. One chain can give an ordered history for one object or partition. A reservation that must coordinate two buckets still crosses authority boundaries. It also does not remove the need for durable storage, membership control, or an exact retry policy.</p>
+<p>Choose a chain when a local, ordered contract is worth the routing and reconfiguration discipline. A repair-friendly preference store may prefer leaderless availability. A scarce allocation bucket may prefer the tail-defined history.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> The head and tail have the same completion role.</p>
+<p><strong>Why it is tempting:</strong> The head receives the client request first.</p>
+<p><strong>Better model:</strong> The head accepts and sequences updates. The tail marks the prefix that basic committed reads may trust.</p>
+<p><strong>Confusion:</strong> Failover means sending traffic to any live replica.</p>
+<p><strong>Why it is tempting:</strong> Capacity routing often works that way.</p>
+<p><strong>Better model:</strong> Chain failover installs a new epoch. It must preserve the old committed prefix and handle in-flight updates before clients trust the new head or tail.</p>
+<p><strong>Confusion:</strong> Reading an internal replica is always safe if it is fast.</p>
+<p><strong>Why it is tempting:</strong> It often contains the newest messages.</p>
+<p><strong>Better model:</strong> It may contain work the tail has not committed. A non-tail read needs an explicit proof that its version is safe.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> <code>A</code> has applied updates 881 and 882, while tail <code>C</code> has applied only 881. What should an ordinary committed read return, and why?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It should return the state after 881 from <code>C</code>. Update 882 is still in flight because the tail has not applied it; returning it from <code>A</code> would expose uncommitted work.</p>
+<p><strong>Check:</strong> A reconfiguration wants to move from <code>A -&gt; B -&gt; C</code> to <code>A -&gt; C</code>. What makes the word “epoch” more than a label?</p>
+<p><strong>Answer:</strong> It fences the old configuration and defines the prefix from which the new chain may continue. Clients must not mix old and new routing as if both chains were simultaneously authoritative.</p>
+<h2>Practice: Review a Failover Plan</h2>
+<p>An inventory service runs <code>epoch 18: H -&gt; M -&gt; T</code>. The middle replica becomes unreachable while the head has accepted update 507 but the tail has committed only through 506. The team proposes to route new writes directly from <code>H</code> to <code>T</code> immediately and continue returning successes.</p>
+<p>Write the smallest safe plan. State what happens to update 507, when reads may resume, and which signal you would watch during the transition.</p>
+<p>A good answer should mention:</p>
 <ul>
-<li>Write latency includes the path through the chain.</li>
-<li>The tail can become a read hotspot.</li>
-<li>Reconfiguration is correctness-sensitive, not just traffic routing.</li>
-<li>Replacement replicas must catch up before they can safely join the chain.</li>
-<li>Monitoring must distinguish head acceptance, tail commit, and chain-epoch changes.</li>
+<li>Fencing epoch 18 before clients can mix its routes with epoch 19.</li>
+<li>Establishing the tail's committed prefix, 506, as the safe boundary.</li>
+<li>Treating 507 as in-flight: reconcile, retry, or return an outcome according to the protocol; do not silently call it committed.</li>
+<li>Catching up and agreeing on the new chain's starting prefix before it serves normal reads and writes.</li>
+<li>Monitoring epoch-transition time, tail commit lag, and in-flight replay or mismatch counts.</li>
 </ul>
-<p>The comparison with quorum systems is not that one is universally stronger. They package coordination differently. Quorums rely on intersecting read and write sets plus repair. Chain replication relies on one ordered propagation path plus a distinguished committed read point. Harbor Point should choose the shape that matches the object: repair-friendly preferences and counters may not need a chain, while a scarce allocation bucket benefits from the tail-defined prefix.</p>
-<p>The next topic, sharding, changes the unit of authority again. Chain replication says how one replicated object or partition can maintain an ordered history. Sharding asks how many such authority domains should exist and how requests find the right one.</p>
-<h2>Failure Modes</h2>
-<p><strong>Reading from an internal replica for lower latency.</strong> A middle replica may be close to the client and mostly up to date, but it is not the committed read point in basic chain replication. Reading there can expose in-flight writes or miss the latest committed prefix unless the system has an explicit protocol proving the version is safe.</p>
-<p><strong>Acknowledging at the head.</strong> If Harbor Point tells the client a reservation is complete when the head accepts it, the client has a stronger belief than the chain has earned. A crash before the update reaches the tail can leave the system unable to honor that acknowledgement.</p>
-<p><strong>Treating failover as simple rerouting.</strong> Moving clients from <code>A -&gt; B -&gt; C</code> to <code>A -&gt; C</code> without an epoch and catch-up protocol can break the ordering guarantee. The new chain must preserve committed history, not merely have live nodes.</p>
-<p><strong>Forgetting that tail load is part of the design.</strong> The tail is special, so read scaling needs a deliberate plan: partition objects across chains, add safe read extensions, or accept the tail as the bottleneck for the objects that need this guarantee.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="010.html">Replication Lag and Read-Your-Writes</a> models why a replica that has not applied a required position cannot safely satisfy a fresh read; a chain makes the tail the default committed point.</li>
+<li><a href="012.html">Sharding and Authority Boundaries</a> changes the scale of this mechanism: each shard can have its own replicated authority, but cross-shard work needs a separate design.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://www.usenix.org/conference/osdi-04/chain-replication-supporting-high-throughput-and-availability">Chain Replication for Supporting High Throughput and Availability</a><ul>
-<li>Focus: Read for the head-to-tail update path, tail reads, and reconfiguration model.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://www.usenix.org/conference/usenix-09/object-storage-craq-high-throughput-chain-replication-read-mostly-workloads">Object Storage on CRAQ: High-Throughput Chain Replication for Read-Mostly Workloads</a><ul>
-<li>Focus: Study how chain replication can be extended for read-heavy workloads without discarding version safety.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Use the replication and consistency chapters to compare ordered pipelines with quorums and leader-based replication.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.usenix.org/conference/osdi-04/chain-replication-supporting-high-throughput-and-availability">Chain Replication for Supporting High Throughput and Availability</a> — Focus: Study head-to-tail update propagation, tail reads, and failure handling as one protocol.</li>
+<li>[PAPER] <a href="https://www.usenix.org/conference/usenix-09/object-storage-craq-high-throughput-chain-replication-read-mostly-workloads">Object Storage on CRAQ</a> — Focus: Compare its safe non-tail-read extension with the base tail-read rule.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Compare an ordered replication path with leaderless quorum and leader-based replication choices.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>Chain replication makes a committed write mean that the update reached the tail through one ordered path.</li>
-<li>The tail is the safe read point because it defines the full committed prefix of the chain.</li>
-<li>Failover must install a new chain epoch that preserves committed history before clients rely on it.</li>
-<li>The design trades flexible availability and arbitrary replica reads for a simpler, stronger per-object replication contract.</li>
-</ol>
+<ul>
+<li>The head accepts and orders updates; the tail defines the prefix ordinary clients may treat as committed.</li>
+<li>Internal replicas can legitimately contain in-flight work, so proximity alone does not make them safe read points.</li>
+<li>A chain failover is an epoch transition that must preserve the old committed prefix and explicitly handle in-flight updates.</li>
+<li>Chain replication buys a clear per-object history at the cost of write hops, a special tail, and correctness-sensitive reconfiguration.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -214,7 +312,7 @@ tail              the committed read point has disappeared
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

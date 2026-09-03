@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,13 +81,179 @@
 <section class="stack-block lesson-content-shell">
   <h1>Partition-Time Guarantees: CAP and PACELC</h1>
 <blockquote>
-<p><strong>The core idea</strong>: CAP names the choice a replicated service must make during a network partition, while PACELC reminds us that even healthy networks still force a latency-versus-consistency trade-off.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Explain why CAP applies to one operation during a network partition, not to a whole product as a permanent label.</p>
+</li>
+<li>
+<p>Trace the choice between accepting a local request and preserving one authoritative answer when replicas cannot communicate.</p>
+</li>
+<li>
+<p>Use PACELC to state the normal-case latency cost of a stronger replicated-data guarantee.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A replicated service earns a strong answer by coordinating before it replies; when communication breaks, it must sometimes refuse the answer instead.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a ticketing service with one remaining seat for a popular show. The service has replicas in Madrid and Virginia so buyers near each region get fast responses. Under normal conditions, the replicas coordinate before promising the seat to anyone. Then the transatlantic link fails while both regions are still receiving checkout traffic.</p>
-<p>At that moment, "the database is distributed" stops being an implementation detail and becomes a product decision. If both regions keep accepting purchases independently, the service may sell the same seat twice. If one region refuses or delays checkout until coordination is restored, some real buyers get an error or wait even though a local server is still alive.</p>
-<p>CAP is the name for that partition-time pressure. It is not a permanent personality label for a database, and it is not really "pick any two" in the casual sense. In a real distributed system, partitions can happen whether the team likes them or not. The practical question is what the service promises when replicas cannot reliably communicate.</p>
-<p>PACELC adds the part CAP leaves out. If there is a partition, the service chooses between availability and consistency. Else, when the network is healthy, it still chooses between lower latency and stronger consistency. That second choice is where many everyday architecture decisions actually live.</p>
+<p>One concert ticket remains. The service has a healthy replica in Madrid and another in Virginia, and both can receive a checkout request. Its most important promise is simple:</p>
+<div class="codehilite"><pre><span></span><code>one seat -&gt; at most one successful purchase
+</code></pre></div>
+
+<p>It is tempting to say: “Both servers are running, so both should keep serving customers.” That works while the replicas can exchange the information needed to decide who gets the final seat.</p>
+<p>Now the link between Madrid and Virginia stops carrying messages. It may be broken or only very slow; the replicas cannot tell which.</p>
+<p>The real question is: <strong>what may this checkout endpoint promise while it cannot learn what the other side has decided?</strong> CAP names that pressure. PACELC adds the normal-case latency question.</p>
+<h2>The Small Situation</h2>
+<p>Before the link fails, each replica has the same state:</p>
+<div class="codehilite"><pre><span></span><code>Madrid:   seat 42 = available, version 17
+Virginia: seat 42 = available, version 17
+</code></pre></div>
+
+<p>Lucía reaches Madrid and Jordan reaches Virginia. The link fails just before either replica learns about the other request.</p>
+<div class="codehilite"><pre><span></span><code>Lucía -&gt; Madrid:   buy seat 42
+
+Madrid       X  partition / indistinguishable delay  X       Virginia
+
+Jordan -&gt; Virginia: buy seat 42
+</code></pre></div>
+
+<p>Neither replica can infer that the other request did not happen. A timeout is missing information, not proof that the other side is idle.</p>
+<h2>The Initial Model Breaks</h2>
+<p>The initial model says: “If a local replica is alive, let it accept the local checkout.” That can work for a wishlist or cached display, where a later conflict is cheap to repair. It fails for this invariant. If both replicas say “purchase confirmed,” the service has already made two incompatible promises; reconciliation cannot make both true.</p>
+<p>Separate two questions:</p>
+<ol>
+<li>Can this replica return a response without waiting for the other side?</li>
+<li>Can this replica still prove that its response preserves the single-seat promise?</li>
+</ol>
+<p>During a partition, an endpoint may not be able to answer both with “yes.”</p>
+<h2>CAP in This Scenario</h2>
+<p>The familiar letters become clearer when they stay attached to this one operation.</p>
+<ul>
+<li><strong>Consistency, in the CAP result,</strong> is a single-copy or atomic story: completed reads and writes behave as though the service had one copy that respects real-time order. It is not ACID's umbrella term.</li>
+<li><strong>Availability, in the formal result,</strong> means a request received by a non-failing replica eventually receives a response. A checkout path that must refuse because it cannot establish authority gives up this property for that request.</li>
+<li><strong>Partition tolerance</strong> means the service keeps facing a model where messages between replicas may be lost or delayed. It is not a switch that a multi-site system can simply turn off.</li>
+</ul>
+<p>The CAP theorem says a replicated read/write service cannot guarantee both atomic consistency and availability while it tolerates a partition.</p>
+<h2>A Worked Partition Trace</h2>
+<p>Here are two possible checkout designs. The state values are a teaching model, not production measurements.</p>
+<h3>Design A: accept both local requests</h3>
+<div class="codehilite"><pre><span></span><code>Starting state
+  Madrid:   available @17
+  Virginia: available @17
+
+1. The link fails.
+2. Madrid accepts Lucía&#39;s request and writes sold-to-Lucía @18.
+3. Virginia cannot see @18. It accepts Jordan&#39;s request and writes sold-to-Jordan @18.
+4. The link heals. Repair finds two incompatible sales.
+</code></pre></div>
+
+<p>Both replicas answered, but checkout no longer has one single-copy answer. The system now needs compensation after making incompatible promises.</p>
+<h3>Design B: require current authority before confirmation</h3>
+<div class="codehilite"><pre><span></span><code>Starting state
+  Madrid:   available @17
+  Virginia: available @17
+
+1. The link fails.
+2. Madrid cannot reach the quorum or current authority needed to confirm a sale.
+3. Madrid returns “try again later” rather than “confirmed.”
+4. Virginia may confirm only if its own authority rule remains provable; otherwise it also refuses.
+</code></pre></div>
+
+<p>This protects the seat invariant but costs availability: a customer can receive an error while a nearby server is alive. The exact mechanism comes later; the contract is already clear: do not say “confirmed” without the evidence that earns it.</p>
+<p><strong>So far:</strong> CAP makes a hidden product choice visible. For checkout, accepting every local request and preserving one final answer are incompatible while replicas are separated.</p>
+<h2>PACELC: The Cost Before the Partition</h2>
+<p>Partitions are not the only time coordination matters. Suppose the link is healthy again.</p>
+<ul>
+<li>A Madrid checkout can return after one local durable write. It is fast, but Virginia learns about it later.</li>
+<li>The same checkout can wait for a remote acknowledgment or quorum. That gives stronger cross-replica evidence but adds network delay.</li>
+</ul>
+<p>For illustration, a local durable write may take 8 ms and a remote acknowledgment may add 70 ms. That may be worth it for a scarce allocation but wasteful for a “like” that can converge later.</p>
+<p>PACELC is a design framework, not a replacement formalization of the CAP proof:</p>
+<div class="codehilite"><pre><span></span><code>If there is a Partition: choose Availability or Consistency.
+Else: choose Latency or Consistency.
+</code></pre></div>
+
+<p>So “we are CP” is only a partial answer: normal-case latency and freshness choices still remain.</p>
+<h2>Turn the Letters into Endpoint Contracts</h2>
+<p>One product can make different choices for different promises:</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Must never happen</th>
+<th>Partition-time behavior</th>
+<th>Normal-case behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Confirm final-seat purchase</td>
+<td>Two customers both receive confirmation</td>
+<td>Refuse if authority is unclear</td>
+<td>Wait for the required acknowledgment</td>
+</tr>
+<tr>
+<td>Show inventory estimate</td>
+<td>A customer sees a count that is a few seconds old</td>
+<td>Serve a labelled stale value</td>
+<td>Prefer a nearby replica with a freshness budget</td>
+</tr>
+<tr>
+<td>Save a wishlist item</td>
+<td>Two temporary versions exist</td>
+<td>Accept locally and reconcile</td>
+<td>Replicate asynchronously</td>
+</tr>
+<tr>
+<td>Start a refund workflow</td>
+<td>Two irreversible refunds start from one request</td>
+<td>Require durable authority</td>
+<td>Wait for a recorded workflow decision</td>
+</tr>
+</tbody>
+</table>
+<p>The table records the harm to avoid, the failure response, and the normal-case latency cost.</p>
+<h2>What CAP Does Not Decide</h2>
+<p>CAP does not choose a shard key, define transaction isolation, guarantee durability, or resolve every conflict. A design still needs a timeout policy, authority rule, and client contract. The next lesson makes those API contracts explicit.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> During a partition, Madrid confirms Lucía's purchase from version 17. Virginia cannot see that write and confirms Jordan's purchase from its own version 17. Which promise failed?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The final-seat operation lost its single-copy consistency. Both replicas were responsive, but their responses created two incompatible confirmed sales. Repair may resolve the records later; it cannot undo the fact that the service made both promises.</p>
+<p><strong>Check:</strong> A dashboard can display inventory that is up to two seconds old, but it must show the writer's newly confirmed purchase when the writer refreshes. Is “eventual consistency” alone a sufficient API contract?</p>
+<p><strong>Answer:</strong> No. “Eventually” does not promise read-your-writes. The writer needs a commit token, a caught-up replica, or a fallback to an authoritative read path.</p>
+<h2>Practice: Write the Promise Before Choosing the Database</h2>
+<p>An event-registration service has two endpoints:</p>
+<div class="codehilite"><pre><span></span><code>POST /registrations
+GET  /event-page
+</code></pre></div>
+
+<p>There are two seats left. The event page may be slightly stale; a successful registration must never exceed capacity.</p>
+<p>For each endpoint, state the invariant or allowed staleness, partition-time response, normal-case latency choice, and evidence needed before replying.</p>
+<p>A good answer should mention:</p>
+<ul>
+<li>Capacity authority and a retryable failure for <code>POST /registrations</code> when authority cannot be established.</li>
+<li>Bounded staleness for <code>GET /event-page</code>; its count is not proof that registration succeeded.</li>
+<li>A client-visible confirmation token or freshness timestamp.</li>
+</ul>
+<h2>Connections</h2>
+<ul>
+<li><a href="002.html">Consistency Contracts and API Semantics</a> names the client-visible histories an API may promise after this lesson establishes the partition-time choice.</li>
+<li>Later lessons show mechanisms that can earn these promises: ordered apply, synchronous acknowledgment, quorums, repair, and safe reads.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>[PAPER] <a href="https://www.cs.princeton.edu/courses/archive/spr22/cos418/papers/cap.pdf">Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services</a> — Focus: Read the formal definitions of atomic consistency, availability, and partition tolerance before applying the slogan to a product.</li>
+<li>[ARTICLE/PAPER] <a href="https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf">Consistency Tradeoffs in Modern Distributed Database System Design: CAP Is Only Part of the Story</a> — Focus: Use PACELC to separate partition-time availability/consistency choices from normal-case latency/consistency choices.</li>
+<li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a> — Focus: Compare the single-copy real-time model with weaker client-visible guarantees.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Connect the formal models to replication, leader, quorum, and application-contract decisions.</li>
+</ul>
+<h2>Key Takeaways</h2>
+<ul>
+<li>CAP applies to a replicated operation under a partition; it is not a personality label for an entire product.</li>
+<li>When two replicas cannot communicate, a final-seat checkout must choose between accepting every local request and preserving one authoritative confirmation.</li>
+<li>PACELC adds the everyday question: how much latency should a healthy system spend to make a stronger replicated-data promise?</li>
+<li>The useful output is an endpoint contract that names the invariant, failure response, normal-case cost, and evidence behind success.</li>
+</ul>
 <h2>Partition as a Product Decision</h2>
 <p>The ticketing service has an invariant:</p>
 <div class="codehilite"><pre><span></span><code>one physical seat must map to at most one successful purchase
@@ -200,7 +370,7 @@ refund initiation      require durable coordination    wait for workflow record
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

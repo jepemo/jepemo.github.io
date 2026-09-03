@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -76,111 +80,227 @@
 
 <section class="stack-block lesson-content-shell">
   <h1>Replication Lag and Read-Your-Writes</h1>
-<blockquote>
-<p><strong>The core idea</strong>: A read replica is a real copy of the database, but it serves only the committed history it has already replayed, so read scaling is safe only when the application makes freshness explicit: accept staleness, wait for catch-up, or route the session to a node that has already applied the write.</p>
-</blockquote>
+<p>A trader releases reservation <code>R-88421</code>. Harbor Point's primary commits the release and returns success. The trader immediately refreshes the exposure page, but the page still says <code>9.9M</code> rather than the lower exposure that the release should produce.</p>
+<p>The write did not half-work. The page was sent to a read replica that had not replayed the release yet. This is easy to miss because the replica is healthy, connected, and fast. It is simply serving an earlier prefix of history.</p>
+<p>The reasonable first model is that a replica is “the same database, only cheaper for reads.” That model works for a dashboard whose contract allows a short delay. It fails for the next read in the same user workflow. Read-your-writes means the session must not observe an older state than its own completed write.</p>
+<p>The solution is not to avoid replicas. It is to make freshness part of routing: carry evidence of the write, compare it with the state a replica has made visible, then wait, route elsewhere, or state that staleness is allowed.</p>
 <h2>Core Insight</h2>
-<p>Harbor Point has just moved a risk dashboard onto <code>desk_issuer_exposure_mv</code>, an incrementally maintained projection table. The query is cheaper now, but the desk finds a new failure mode. A trader releases reservation <code>R-88421</code> for issuer <code>CA-MUNI</code>, the primary commits the release, and the next page refresh still shows the old <code>9.9M</code> exposure. The projection logic is correct. The read path is not.</p>
-<p>The missing mental model is that a read replica is not "the same database, but cheaper." It is a database that has replayed some prefix of the primary's durable history. If the release committed at log position <code>0/16B4A98</code> and the replica has only replayed through <code>0/16B42C0</code>, that replica can answer quickly and still be wrong for this session. Replica lag is therefore not just an operations graph. It changes the meaning of a successful read.</p>
-<p>That is why read-your-writes is not a generic feel-good property. It is a session contract. After Harbor Point writes a reservation change, the next read in that same workflow must observe a node whose replay position is at least as new as the write that just committed. If the system cannot prove that, it should not pretend the replica is fresh enough. It should wait, fall back to the primary, or tell the caller that bounded staleness is the actual contract.</p>
-<p>Once that clicks, read routing stops looking like a load balancer tweak and starts looking like part of the storage design. The trade-off is direct: replicas reduce primary load and improve read capacity, but only if the application says which reads may be stale and which reads need proof that a particular write is visible.</p>
-<h2>Freshness Is a Contract</h2>
-<p>Harbor Point wants the obvious performance win: send more reads to replicas so the primary can spend its budget on writes, lock management, WAL generation, and projection maintenance. That is reasonable. The mistake is collapsing all reads into one category. A regional dashboard that refreshes every few seconds can usually tolerate bounded staleness. A trader who just reduced exposure and immediately checks whether the release took effect usually cannot.</p>
-<p>Without an explicit freshness contract, teams create two bad outcomes at once. They keep the primary overloaded because nobody trusts replica answers during incidents, and they still serve stale state in user flows that assumed read-your-writes. Support then gets a class of tickets that sound like "the write half-worked" even though the write committed correctly and only the read path was behind.</p>
-<p>The production goal is therefore not "use read replicas aggressively." It is "assign the right freshness rule to each workflow, then make routing prove that rule." For Harbor Point, that means separating stale-tolerant dashboards from session-sensitive position checks, attaching a commit token to writes, and monitoring whether replicas can satisfy those tokens without silently falling behind.</p>
-<div class="codehilite"><pre><span></span><code>Workflow                         Freshness contract
--------------------------------  -------------------------------------------
-risk approval check              primary_only / newest authoritative state
-trader checks own release        read-your-writes for this session
-regional exposure dashboard      bounded staleness is acceptable
-historical analytics export      stale snapshot may be intentional
+<p>A replica can receive and durably store a transaction before it applies that transaction to the tables a query sees. For a read-your-writes request, the relevant question is therefore not “is the replica connected?” or even “is average lag small?” It is:</p>
+<blockquote>
+<p>Has this node made the specific committed write my session depends on visible to reads?</p>
+</blockquote>
+<p>Represent the required write with a <strong>commit token</strong>. Depending on the database and topology, that token can be a log position, a GTID set, a hybrid timestamp, or another monotonic commit marker. The router may use a replica only when its visible position is at least the session token in a comparison that is valid for the current authority epoch.</p>
+<p>This is a session guarantee, not a claim that every client sees the same global order. It protects one session from going backward after its own success response.</p>
+<h2>The Moving Parts</h2>
+<p>At 10:04, the primary commits the reservation release at illustrative position <code>8A/58</code>. Two replicas report different progress:</p>
+<div class="codehilite"><pre><span></span><code>commit token returned to trader: 8A/58
+
+replica east: received=8A/58, flushed=8A/58, replayed=8A/40
+replica west: received=8A/70, flushed=8A/70, replayed=8A/60
 </code></pre></div>
 
-<p>This table is not just product labeling. It tells the router which evidence it must obtain before choosing a read node. A stale-tolerant dashboard can use a healthy replica that is slightly behind. A session-sensitive page needs a replica that has already replayed the user's commit, or it needs another behavior.</p>
-<h2>Replicas Serve a Prefix of History</h2>
-<p>When Harbor Point commits the release of reservation <code>R-88421</code>, the primary does not instantly make every replica equivalent. The primary first makes the write durable locally, then replication ships the relevant log records, then the replica receives them, flushes them, and finally replays them into visible table state. Until the replay step finishes, a query on the replica can still see the pre-release exposure row even though the commit is already durable on the primary.</p>
-<p>That sequence is why lag needs a position-based mental model. A replica can be "connected" and still not be current enough for a given session. In PostgreSQL terms, the important distinction is between what has been sent, written, flushed, and replayed. In MySQL terms, the gap might be expressed through GTID execution state. In both cases, the user-visible question is the same: has this node applied the specific transaction my session depends on?</p>
-<p>Harbor Point's path looks like this:</p>
-<div class="codehilite"><pre><span></span><code>trader releases reservation R-88421
-        |
-        v
-primary commits release at LSN 0/16B4A98
-        |
-        v
-replica receives WAL and flushes it
-        |
-        v
-replica replays through 0/16B4A98
-        |
-        v
-reads from that replica can now show the lower exposure
+<p>The numbers are a teaching trace, not output from a particular engine. Still, they let us make a precise routing decision.</p>
+<table>
+<thead>
+<tr>
+<th>Node</th>
+<th>Has the release durably?</th>
+<th>Can a normal query see the release?</th>
+<th>Suitable for token <code>8A/58</code>?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Primary</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Replica east</td>
+<td>Yes</td>
+<td>No; replay ends at <code>8A/40</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td>Replica west</td>
+<td>Yes</td>
+<td>Yes; replay ends at <code>8A/60</code></td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<p>Lesson 004 introduced received, flushed, and replayed positions. Here the key distinction is that <strong>replay</strong> determines ordinary read visibility. A transport-health metric might show that east has already received the bytes, but it cannot prove that the trader's query will see them.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>Harbor Point gives the write and its immediate read a shared piece of evidence.</p>
+<div class="codehilite"><pre><span></span><code>1. Trader sends POST /reservations/R-88421/release with idempotency key K.
+2. Primary commits the release and returns 200 plus commit_token=8A/58.
+3. Client stores that token for the session or sends it with its next GET.
+4. Router inspects each candidate replica&#39;s replay position.
+5. Router chooses a replica only if its replay position has reached 8A/58.
+6. If none has reached it, the router waits briefly, falls back to the primary,
+   or returns the explicitly stated freshness outcome.
 </code></pre></div>
 
-<p>This also explains why "replica lag in seconds" is often the wrong dashboard for session routing. A node can report low transport delay yet still be missing one large transaction or be stalled in apply because of I/O pressure, replay serialization, or a conflict on the standby. For read-your-writes, Harbor Point cares less about an average lag number than about whether the replica has crossed the exact commit position the session requires.</p>
-<p>Treating replicas as historical prefixes instead of interchangeable copies keeps the price visible. It also gives the application a clean mechanism: compare the state a session needs with the state a replica has already applied.</p>
-<h2>Read-Your-Writes With Commit Tokens</h2>
-<p>Suppose Harbor Point's API processes <code>POST /reservations/R-88421/release</code> and the primary commits the change at <code>LSN=0/16B4A98</code>. If the API only returns <code>200 OK</code>, the next read has no proof of what freshness it requires. A better contract is to return or record a commit token for the session: an LSN, GTID, hybrid timestamp, or another monotonic position that identifies the newest state the client must be able to observe.</p>
-<p>The router can then treat read-your-writes as a simple comparison problem rather than a guess:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">choose_read_node</span><span class="p">(</span><span class="n">session_token</span><span class="p">,</span> <span class="n">endpoint_policy</span><span class="p">,</span> <span class="n">replicas</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">endpoint_policy</span> <span class="o">==</span> <span class="s2">&quot;primary_only&quot;</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">&quot;primary&quot;</span>
+<p>In plain language: the successful write tells the session what it must be able to see next. The replay position tells the router whether a replica has caught up enough. The technical name for that session property is <strong>read-your-writes consistency</strong>.</p>
+<p>The router's choice is a comparison, not a guess from elapsed time:</p>
+<div class="codehilite"><pre><span></span><code>required session token: 8A/58
 
-    <span class="n">fresh_enough</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">replicas</span> <span class="k">if</span> <span class="n">r</span><span class="o">.</span><span class="n">replay_position</span> <span class="o">&gt;=</span> <span class="n">session_token</span><span class="p">]</span>
-    <span class="k">if</span> <span class="n">fresh_enough</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">least_loaded</span><span class="p">(</span><span class="n">fresh_enough</span><span class="p">)</span>
-
-    <span class="k">if</span> <span class="n">endpoint_policy</span> <span class="o">==</span> <span class="s2">&quot;wait_then_replica&quot;</span><span class="p">:</span>
-        <span class="n">waited</span> <span class="o">=</span> <span class="n">wait_for_any_replica</span><span class="p">(</span><span class="n">session_token</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">40</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">waited</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">waited</span>
-
-    <span class="k">return</span> <span class="s2">&quot;primary&quot;</span>
+east replay position:  8A/40  -&gt; reject for this session
+west replay position:  8A/60  -&gt; eligible
 </code></pre></div>
 
-<p>That pseudocode captures three common production strategies. The simplest is primary stickiness: after a write, keep the session on the primary for a short interval. It is easy to implement and often good enough inside one region with tightly bounded lag. It is also imprecise, because time-based stickiness guesses that replicas will have caught up by then. A token-based strategy is better because it proves freshness instead of assuming it from the clock.</p>
-<p>The second strategy is wait-for-replica. Harbor Point can try to keep the read on a nearby replica, but only after that replica's replay position reaches the session token. This preserves more read offload than blanket primary stickiness, at the cost of occasional wait latency and more routing logic. The third strategy is explicit bounded staleness: for endpoints that do not require read-your-writes, the router skips the token check and serves from a replica that is merely "fresh enough" by a weaker SLA.</p>
-<p>One more production detail matters during failover. A node-local position such as an LSN may not be comparable across leadership changes unless the system also carries a timeline, term, or another epoch identifier. That is why products with multi-node failover often prefer GTIDs, globally comparable commit timestamps, or per-epoch tokens. Read-your-writes works only when the token means the same thing to the router after topology changes as it did before them.</p>
-<h2>Routing Policies and Their Costs</h2>
-<p>Harbor Point's workflows do not all need the same consistency surface. The risk-control path that decides whether a new reservation can be approved should read from the primary or another node that can prove an equally strong view of the latest committed state. A trader refreshing the position they just edited usually needs session consistency, which can be implemented by token-aware replica routing with a short wait budget and primary fallback. A regional oversight dashboard may be perfectly acceptable on a bounded-staleness replica if its contract is "usually within two seconds of primary."</p>
-<p>Writing those categories down is what turns replica routing into an operable system:</p>
+<p>For a single, stable primary and its physical replicas, an ordered log position can make this comparison direct. Systems with failover need a token format or accompanying epoch that remains meaningful across leadership changes. A bare node-local sequence from an old primary may not be comparable to a new leader's sequence. This is an implementation boundary, not a reason to drop the guarantee.</p>
+<h2>A Worked Session Trace</h2>
+<p>First see the failed route. The product has a fast load balancer that chooses the closest healthy replica.</p>
+<div class="codehilite"><pre><span></span><code>10:04:00.010  POST release R-88421 -&gt; primary
+10:04:00.016  primary commits release at 8A/58
+10:04:00.017  client receives 200 OK
+10:04:00.020  GET exposure/CA-MUNI -&gt; replica east
+10:04:00.021  east has replayed only through 8A/40
+10:04:00.022  east returns exposure=9.9M
+</code></pre></div>
+
+<p>The incorrect inference is “the release failed.” The evidence says otherwise: the primary committed it, while east is behind in replay. A generic lag graph could be low, but it still cannot answer whether <code>8A/58</code> is visible on east.</p>
+<p>Now use a token-aware path:</p>
+<div class="codehilite"><pre><span></span><code>10:04:00.017  client receives 200, commit_token=8A/58
+10:04:00.020  GET exposure/CA-MUNI carries token 8A/58
+10:04:00.020  router sees east replay=8A/40 and west replay=8A/60
+10:04:00.021  router sends request to west
+10:04:00.022  west returns the lower exposure
+</code></pre></div>
+
+<p>The router did not make west globally freshest. It made a smaller, sufficient claim: west has applied at least the history required by this session. The distinction matters because “freshest node” can be costly or undefined during normal replication, while a supplied token has a concrete comparison.</p>
+<p>If neither replica had reached <code>8A/58</code>, Harbor Point would have a policy choice:</p>
+<div class="codehilite"><pre><span></span><code>wait up to 40 ms for an eligible replica  -&gt; preserve read offload if it catches up
+otherwise route to primary                -&gt; preserve read-your-writes at primary cost
+otherwise return a retry/freshness status -&gt; preserve honesty, but add a client step
+</code></pre></div>
+
+<p>The 40 ms is an illustrative budget. The product should choose it from the user-visible latency budget and observed replay distribution, not copy it as a universal setting.</p>
+<h2>Freshness Classes Are Product Contracts</h2>
+<p>Not every endpoint needs the same route. Treating them all as primary reads wastes replica capacity; treating them all as replica reads makes session bugs inevitable.</p>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Required freshness</th>
+<th>Route rule</th>
+<th>What the caller must be told</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Approve a new reservation</td>
+<td>Current authoritative state</td>
+<td>Primary or a path with an equivalent authority guarantee</td>
+<td>A stale replica is not acceptable for this decision.</td>
+</tr>
+<tr>
+<td>Trader checks their own release</td>
+<td>Read-your-writes</td>
+<td>Token-aware replica, brief wait, then primary fallback</td>
+<td>The response includes the session's committed outcome.</td>
+</tr>
+<tr>
+<td>Regional exposure dashboard</td>
+<td>Bounded staleness</td>
+<td>Replica within a stated replay-age limit</td>
+<td>The page shows its freshness age.</td>
+</tr>
+<tr>
+<td>Historical export</td>
+<td>Intentional snapshot</td>
+<td>Read from a named snapshot</td>
+<td>It is not a live position view.</td>
+</tr>
+</tbody>
+</table>
+<p>This classification is a preference under product constraints. A risk admission check may need stronger authority than read-your-writes, because seeing <em>your</em> write does not prevent another session from changing a limit. A dashboard may tolerate stale data but should never be reused for a decision that assumes current state.</p>
+<p>The trade-off is direct. Token-aware routing, waiting, and primary fallback improve the session promise, but add routing state, occasional latency, and primary load when replicas cannot catch up. Bounded-stale reads gain cheap capacity and locality, but must expose the allowed delay rather than masquerading as current data.</p>
+<h2>The Failover Token Boundary</h2>
+<p>Assume the trader holds token <code>8A/58</code>, then the old primary fails before the next read. A router must not merely compare that token to whichever number a newly promoted node reports. First it needs evidence that the new authority includes the committed history the token represented.</p>
+<div class="codehilite"><pre><span></span><code>before failure
+  old primary: commit token 8A/58
+  replica west: replayed through 8A/60
+
+promotion
+  west recovers its durable history and becomes leader in epoch 19
+  router records that epoch 19 contains the old prefix through 8A/60
+
+next session read
+  token 8A/58 is recognized as included in epoch 19
+  router may read from the new leader or an eligible replica of epoch 19
+</code></pre></div>
+
+<p>If the service cannot establish that inclusion, it must treat the token as unresolved and use a safe command-status or authority path. A protocol can encode this with a globally meaningful transaction ID, a timeline plus log position, or an epoch-to-prefix mapping. The exact format is product-specific. The requirement is not: “use an LSN everywhere.” It is: “after authority changes, retain a truthful way to decide whether the session's write is visible.”</p>
+<p>This check belongs in a failover drill. Record a completed write, force a leadership change, then ask the session to read through every route the router might use. The expected result is not merely that the new leader is alive. It is that the session either observes its recorded write or receives a clear unresolved-outcome response. A fast stale answer reveals a broken token or epoch mapping.</p>
+<h2>Failure Boundaries and Signals</h2>
+<p>Read-your-writes does not solve every replication problem.</p>
 <ul>
-<li><code>primary_only</code>: approval checks, risk limits, and any workflow where a stale answer can trigger a wrong business action</li>
-<li><code>session_consistent</code>: trader self-service pages and APIs that must satisfy read-your-writes without paying primary cost for every read forever</li>
-<li><code>bounded_stale</code>: dashboards, analytics, and exploratory screens where the product explicitly accepts lag in exchange for lower latency and more read scale</li>
+<li>It does not make a derived projection correct. The projection must first be updated correctly at the source; the token then proves whether the selected read node has replayed that update.</li>
+<li>It does not make two different keys or shards atomic. A session can observe its own committed write and still need a separate transaction or workflow to protect a cross-key invariant.</li>
+<li>It does not turn a timeout into a failed command. If a client timed out after sending a write, it must resolve the idempotency key or command status before adopting a token for a supposedly completed result.</li>
+<li>It does not automatically survive failover. The system must define how tokens relate to a new leader, its timeline or epoch, and promotable replicas.</li>
 </ul>
-<p>Once Harbor Point adopts those classes, the right metrics become obvious. The team should watch replay position distance, wait-on-replica latency, fallback-to-primary rate, the percentage of traffic in each freshness class, and token mismatches after failover. Those metrics show whether the design is really saving primary load or merely hiding that session-sensitive reads already route back to the leader most of the time.</p>
-<p>This classification also prepares the ground for later lessons on sharding and secondary indexes. A global secondary index is another read-optimization structure whose visibility can trail the source-of-truth writes. The technical surface changes, but the discipline stays the same: do not claim a lookup is current unless the system can prove the supporting structure has caught up far enough.</p>
-<h2>Failure Modes</h2>
-<p><strong>Trusting generic lag graphs for session freshness.</strong> Replica lag graphs may measure transport delay or sampled wall-clock lag instead of the replica's actual replay position relative to the transaction that just committed. A replica can receive WAL quickly and still not have replayed the specific write the session cares about. Route read-your-writes by commit token, not by a generic "replica lag &lt; N ms" threshold.</p>
-<p><strong>Solving every stale read with primary stickiness.</strong> Sticky-primary reads can hide stale results, but blanket stickiness turns many harmless follow-up reads into primary traffic. During the 09:30 burst, this can erase the scaling benefit of replicas. Apply read-your-writes only to endpoints whose user contract requires it, and use token-aware wait-for-replica where a short wait can preserve read offload.</p>
-<p><strong>Using tokens that fail during topology changes.</strong> After failover, some tokens may become ambiguous if they were tied only to the old primary's local position format. Use tokens that survive topology changes, such as GTID sets or timeline-aware commit positions, and test those comparisons in failover drills.</p>
-<p><strong>Treating derived-state correctness and read freshness as the same promise.</strong> Incremental maintenance can keep <code>desk_issuer_exposure_mv</code> correct on the primary while replica routing still makes the dashboard look stale. Harbor Point needs both promises: the projection must be updated correctly, and the chosen read node must have replayed far enough to show the update.</p>
+<p>Use signals that identify the exact failed inference.</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Question it answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Replica replay position versus session token</td>
+<td>Can this node serve this session's next read?</td>
+</tr>
+<tr>
+<td>Wait-for-token latency and timeout rate</td>
+<td>Is token-aware routing preserving replica use within budget?</td>
+</tr>
+<tr>
+<td>Fallback-to-primary rate by endpoint</td>
+<td>Which workflow is losing its intended read offload?</td>
+</tr>
+<tr>
+<td>Replay conflicts, I/O pressure, and apply queue</td>
+<td>Why is a replica not becoming eligible?</td>
+</tr>
+<tr>
+<td>Token failures after an epoch change</td>
+<td>Does the read contract remain interpretable during failover?</td>
+</tr>
+</tbody>
+</table>
+<p>Do not rely on one sampled “lag seconds” chart as the routing authority. Database metrics can be sampled or delayed, and different products measure transport, flush, and apply at different points. The session token and the replica's comparable visible progress are the evidence for the individual request.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A replica has received and flushed the trader's release but has not replayed it. Can it serve a read-your-writes dashboard request for that release?</p>
+<p><strong>Answer:</strong> No. Durable receipt supports recovery evidence, not ordinary query visibility. The router needs replay or another mechanism that proves the query sees the token's state.</p>
+<p><strong>Check:</strong> A primary returns <code>200</code> for a release, but the client loses the response and times out. Should the client invent a token and route a later read by it?</p>
+<p><strong>Answer:</strong> No. The command outcome is ambiguous. The client should use the idempotency key or a status lookup to discover whether a commit occurred and obtain the authoritative token or result.</p>
+<h2>Practice: Choose the Fallback</h2>
+<p>For the trader's post-release page, every replica is behind token <code>8A/58</code>. The primary is healthy, but the product wants to protect it from unnecessary reads. Choose a policy that includes a maximum replica-wait budget, a fallback, and one metric that would tell the team the policy is no longer buying useful read scale.</p>
+<p>A strong answer might wait briefly for a nearby replica, then route to the primary to preserve read-your-writes. It should state that the wait budget is a product decision and observe fallback-to-primary rate plus wait latency. If fallback becomes common, the team should investigate replay capacity or reduce the traffic assigned to this freshness class instead of silently serving stale results.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="009.html">Conflict Resolution and Convergence Policies</a> explains why observing one session's write does not decide the semantic winner of concurrent writes.</li>
+<li><a href="011.html">Chain Replication and Ordered Failover</a> supplies a contrasting topology where the tail, rather than arbitrary replica routing, establishes the ordinary committed read point.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW">PostgreSQL Monitoring Statistics</a><ul>
-<li>Focus: Interpret replication positions such as sent, written, flushed, and replayed LSNs when diagnosing why a replica still serves stale reads.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.0/en/replication-gtids-concepts.html">MySQL Replication with GTIDs</a><ul>
-<li>Focus: See how GTIDs provide a portable commit token for routing or waiting on session-sensitive reads.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.mongodb.com/docs/manual/core/read-isolation-consistency-recency/#causal-consistency">MongoDB Causal Consistency</a><ul>
-<li>Focus: Study a production API that exposes read-your-writes and monotonic reads as session guarantees rather than assuming every replica is equally current.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/follower-reads">CockroachDB Follower Reads</a><ul>
-<li>Focus: Compare explicit bounded-staleness reads with session-consistent or primary-only paths.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW">PostgreSQL: Monitoring Replication Statistics</a> — Focus: Distinguish sender and standby progress signals before using them for a client-visible routing claim.</li>
+<li>[DOC] <a href="https://www.mongodb.com/docs/manual/core/read-isolation-consistency-recency/#causal-consistency">MongoDB: Causal Consistency</a> — Focus: Compare read-your-writes with related session guarantees in a database API.</li>
+<li>[DOC] <a href="https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html">MySQL: Replication with GTIDs</a> — Focus: Examine a portable transaction identity that can support session-aware routing or waiting.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A replica serves a position in history, not "the database in general"; freshness depends on how far replay has advanced.</li>
-<li>Read-your-writes is enforced with proof, not optimism; commit tokens let the router compare what a session needs against what a replica has applied.</li>
-<li>Read scale improves when freshness classes are explicit, because primary-only, session-consistent, and bounded-stale reads have different costs.</li>
-<li>Failover and derived read structures must preserve the same rule: do not claim freshness unless the system can prove the required commit is visible.</li>
-</ol>
+<ul>
+<li>A replica serves a replayed prefix of history; received or flushed data is not necessarily visible to a normal query.</li>
+<li>Read-your-writes needs request-specific evidence: a commit token and a replica whose visible position has reached it.</li>
+<li>Token-aware wait and primary fallback preserve the session contract while bounded-stale endpoints retain inexpensive replica reads.</li>
+<li>Tokens, routing, and metrics must remain meaningful across timeout, replay delay, derived projections, and failover boundaries.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -209,7 +329,7 @@ reads from that replica can now show the lower exposure
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

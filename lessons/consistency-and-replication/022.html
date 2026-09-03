@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -79,138 +83,136 @@
 <section class="stack-block lesson-content-shell">
   <h1>Guarantee Matrix Design Review</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A production scale-out plan starts by deciding which operations must stay under one owner, then chooses replication, shard keys, lag budgets, and rebalancing rules that preserve that contract under load and failure.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>turn a service endpoint into a row that names its invariant, authority, read or write path, recovery boundary, and evidence;</p>
+</li>
+<li>
+<p>find a contradiction between an advertised guarantee and the path that actually serves it;</p>
+</li>
+<li>
+<p>defend a deliberately weaker path when its freshness, fallback, and failure behavior are explicit.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A guarantee matrix makes a replicated service reviewable by requiring every client-visible operation to name who decides, what a client may see, what happens under failure, and how the team will prove it.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Harbor Point has enough individual mechanisms to build something dangerous if it connects them casually. It has issuer sharding, leader leases, global secondary indexes, async replicas, WAL archives, backpressure, membership changes, observability, and adversarial failure tests. Each mechanism can be correct in isolation while the service contract remains confused.</p>
-<p>The design review starts with a concrete pressure: Madrid and New York desks both want fast reservation workflows, support wants global lookup, compliance wants search within seconds, and risk systems need issuer exposure to stay authoritative. The wrong move is to answer with a database slogan such as "strong consistency everywhere" or "active-active writes." Those slogans hide the real question: which operation is allowed to be stale, which operation must be final, and which component is the authority when the system is under stress?</p>
-<p>A guarantee matrix is the artifact that makes those choices inspectable. It maps each endpoint or workflow to its authoritative state, required consistency, allowed lag, serving path, failure behavior, and validation evidence. The matrix is not paperwork. It is how Harbor Point prevents an optimized read path, a rebalancing plan, or a regional failover runbook from quietly changing the promise made to traders and compliance.</p>
-<p>The trade-off becomes visible once the matrix exists. Harbor Point pays coordination cost on the narrow path that protects issuer exposure and confirmed reservations. It deliberately allows bounded staleness for dashboards and derived search. It accepts non-zero remote RPO in exchange for lower normal-path latency, but only while the system can measure and enforce that recovery budget.</p>
-<h2>The Matrix Comes Before The Diagram</h2>
-<p>Harbor Point begins by listing the operations that matter most and refusing to treat them as one generic "database read/write" surface.</p>
+<h3>What You Can Now See</h3>
+<p>Harbor Point is preparing a reservation service for desks in Madrid and New York. The service has shard leaders, followers, a remote replica, a search index, backups, and fault tests. That sounds reassuring, but it is not yet a contract.</p>
+<p>The simple model is: “choose a highly consistent database, then place replicas wherever latency is good.” It works for a small system with one kind of request. It breaks as soon as the same service has a final reservation, a retry after a timeout, a dashboard, a cross-issuer search, and a regional-recovery promise. Those operations do not need the same answer, and a slogan cannot tell a caller which one it received.</p>
+<p>The stronger model is a <strong>guarantee matrix</strong>. It starts with operations people can observe, rather than with a topology diagram. Each row joins seven decisions that must agree:</p>
+<ol>
+<li>the business invariant or question;</li>
+<li>the current authority for that decision;</li>
+<li>the acknowledgement or read guarantee;</li>
+<li>the normal serving path and an allowed freshness budget;</li>
+<li>the fallback when that path cannot prove the guarantee;</li>
+<li>the recovery boundary; and</li>
+<li>the signal or test that makes the row falsifiable.</li>
+</ol>
+<h2>The Concepts Together</h2>
+<p>For issuer <code>MUNI-77</code>, every accepted reservation consumes the same remaining exposure. That is the narrow invariant. A reservation can be final only if one current authority orders the exposure update and the reservation together. A local gateway may receive the HTTP request, but receipt is not authority.</p>
+<p>Other surfaces can be weaker. A search index can be useful before it is current. A dashboard can be fast before it is authoritative. The mistake is not using those paths; the mistake is silently treating their answers as proof of a just-completed reservation.</p>
 <table>
 <thead>
 <tr>
-<th>Workflow</th>
-<th>Authority</th>
-<th>Required guarantee</th>
-<th>Allowed lag</th>
-<th>Serving path</th>
+<th>Operation</th>
+<th>Authority and contract</th>
+<th>Normal path</th>
+<th>When it cannot prove the contract</th>
+<th>Evidence</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>POST /reservations</code> for issuer <code>MUNI-77</code></td>
-<td>Issuer shard leader</td>
-<td>Linearizable per issuer shard</td>
-<td>None after success</td>
-<td>Route to the shard leader that owns <code>issuer_exposure</code> and live reservations</td>
+<td><code>POST /reservations</code></td>
+<td>The issuer-shard leader orders <code>issuer_exposure</code> and the reservation together. A success is one accepted decision.</td>
+<td>Route by <code>issuer_id</code> to the current leader; wait for the configured durable acknowledgement.</td>
+<td>Fail or return an uncertain result that the caller resolves with the same token.</td>
+<td>Commit position, leader generation, and a history checker that rejects duplicate tokens or lost acknowledged writes.</td>
 </tr>
 <tr>
-<td><code>GET /reservation-tokens/{token}</code> after a timeout</td>
-<td>Same issuer shard</td>
-<td>Idempotent token status</td>
-<td>None for the token record</td>
-<td>Leader or follower that has replayed the token's commit index</td>
+<td><code>GET /reservation-tokens/K7</code></td>
+<td>The same durable token record maps one token to one outcome.</td>
+<td>Read the authoritative shard, or a replica known to have replayed the relevant position.</td>
+<td>Wait or route to the leader; never create another reservation just because the first call timed out.</td>
+<td>Token record, replay position, and retry trace.</td>
 </tr>
 <tr>
-<td><code>GET /issuers/{issuer_id}/open-reservations</code></td>
-<td>Base shard plus index</td>
-<td>Bounded-stale with session fallback</td>
-<td>Usually under <code>2s</code></td>
-<td>Regional follower or global secondary index, then validate when needed</td>
+<td><code>GET /my-reservations</code> after success</td>
+<td>The caller must see at least its observed commit.</td>
+<td>A nearby follower may serve only after it reaches the caller's commit position.</td>
+<td>Route to the leader or say that the answer is not yet available.</td>
+<td>Caller-required position minus follower replay position.</td>
 </tr>
 <tr>
-<td>Compliance search across issuers</td>
-<td>CDC-derived search view</td>
-<td>Eventually consistent, freshness published</td>
-<td>Usually under <code>5s</code></td>
-<td>CDC-fed search/index service with lag watermark</td>
+<td>Compliance search</td>
+<td>Base reservations remain authoritative; search is a derived discovery view with a published freshness budget.</td>
+<td>Query the index with its watermark.</td>
+<td>Mark degraded freshness or use an issuer-backed investigation path.</td>
+<td>Index lag and an alert on the published budget.</td>
 </tr>
 <tr>
-<td>Regional failover readiness</td>
-<td>Remote replica and WAL archive</td>
-<td>RPO no worse than <code>5s</code>, RTO under <code>10m</code></td>
-<td>Explicit recovery window</td>
-<td>Promote only durable replayed prefix and reconcile tokens</td>
+<td>Regional recovery</td>
+<td>The promoted site can expose only its durable recovered prefix. The stated RPO bounds the permitted loss window.</td>
+<td>Remote asynchronous replica plus tested backup and log-recovery path.</td>
+<td>Do not claim readiness when lag, log continuity, or restore evidence is outside the stated budget.</td>
+<td>Durable replay position, backup/restore proof, and promotion exercise.</td>
 </tr>
 </tbody>
 </table>
-<p>That table forces useful disagreements early. If product wants compliance search to be fully linearizable, the team can say what it would cost: synchronous fan-out or a very different indexing architecture. If operations wants to advertise five-second RPO, the team can point to remote replay lag and WAL archive continuity as release-blocking signals. If a dashboard reads from a follower, the UI and API contract must admit when the result is stale or route through a stronger path.</p>
-<p>The matrix also separates correctness from convenience. Sharding by issuer makes the exposure invariant local. A global secondary index makes issuer and compliance lookup cheaper. CDC makes derived surfaces scalable. Those are different paths with different promises, and the matrix keeps them from being mistaken for one another.</p>
-<h2>Turn Guarantees Into Architecture</h2>
-<p>Once Harbor Point has the matrix, the topology choices become much less arbitrary. The decisive write path is organized around issuer authority:</p>
-<div class="codehilite"><pre><span></span><code>reservation request
-       |
-       v
-gateway resolves issuer_id -&gt; shard_id -&gt; home region -&gt; leader
-       |
-       v
-leader updates issuer_exposure + reservation row atomically
-       |
-       +--&gt; same-region sync follower for normal durability
-       |
-       +--&gt; remote async follower for disaster recovery
-       |
-       +--&gt; CDC stream for search, compliance, and dashboards
-</code></pre></div>
-
-<p>The shard key is doing real work here. If Harbor Point shards by trader office, client account, or route through a random active-active write surface, the issuer exposure check can no longer be decided in one place. The system would have to reconcile financial limits after multiple desks may already have seen "confirmed." That is not a tolerable merge. The matrix marks the reservation write as linearizable per issuer shard, so the architecture keeps that state under one leader.</p>
-<p>The same matrix allows weaker paths without shame. Compliance search does not need to block every reservation commit on a global query service. It can read from a CDC-fed index as long as the freshness watermark is visible and investigators know when to fall back to the authoritative shard. A trader's session-sensitive read can use a local follower only if that follower has replayed the caller's observed commit token. Otherwise the gateway routes to the leader. The system is not "eventually consistent" or "strongly consistent" as a whole. Each path has a named promise.</p>
-<p>Failure handling also becomes part of the architecture rather than a separate operations appendix. If the remote replica falls more than five seconds behind, Harbor Point can no longer honestly claim a five-second RPO for that shard. If WAL archive continuity breaks, point-in-time recovery is no longer trustworthy. If a removed member returns with an old configuration epoch, it must be fenced before it can serve traffic. These are not optional alerts; they are the evidence that the matrix is still true.</p>
-<h2>Review Checks</h2>
-<p>The design review asks a small set of hard questions for every row in the matrix.</p>
-<div class="codehilite"><pre><span></span><code>1. What state is authoritative for this operation?
-2. Which replica or derived view is allowed to serve it?
-3. What lag, if any, is part of the public contract?
-4. What happens when the serving path cannot prove the guarantee?
-5. Which metric, test, or runbook shows that the guarantee still holds?
-</code></pre></div>
-
-<p>For <code>POST /reservations</code>, the answer is strict. The authority is the issuer shard leader, the success response means the exposure update and reservation row committed together, and the fallback when the guarantee cannot be proven is to fail or retry with a token, not to accept a weaker write.</p>
-<p>For compliance search, the answer is different. The authority is still the base reservation data, but the normal serving path is derived. The guarantee is freshness within a published lag budget, not immediate linearizability. If CDC lag exceeds the budget, the search surface should report degraded freshness or direct investigators to a stronger shard-backed lookup.</p>
-<p>For regional failover, the answer is operational. Promotion can only use the remote replica's durable replayed prefix, not whatever the old region might have accepted during the outage window. Ambiguous writes are resolved by reservation token status. If the team cannot answer token status after promotion, the runbook does not actually satisfy the storage contract.</p>
-<p>This is where the failure-testing discipline matters. Every high-value row needs an adversarial test: partitions around leader changes, delayed CDC, stale follower reads, lagging remote replicas, and retries after timeouts. A matrix without tests is just a clearer promise. A matrix with tests becomes an acceptance criterion.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>A team says "the database is strongly consistent" without naming the endpoint.</strong> The phrase hides too much. The reservation write, token lookup, follower dashboard, and CDC search surface have different guarantees. Split the claim into matrix rows and require each row to name authority, serving path, lag budget, and fallback behavior.</p>
-<p><strong>A dashboard starts depending on a follower read as if it were authoritative.</strong> The follower path may be correct for bounded-stale operational views, but the caller is treating it like a leader-backed read. Carry observed commit tokens through session-sensitive flows, expose freshness watermarks, and route to the leader when the follower cannot prove the required version.</p>
-<p><strong>Regional failover is declared ready while remote replay lag is outside the RPO budget.</strong> The system may still be accepting local writes, but the advertised recovery promise is already false. Gate failover readiness and planned topology changes on replay lag, WAL archive continuity, and restore rehearsal evidence.</p>
-<p><strong>The architecture diagram shows ownership, but the runbook changes ownership through a different path.</strong> Rebalancing, promotion, and membership changes all need a versioned authority update. Require partition-map or configuration generations in routed requests, and make cutover or promotion publish a new generation before traffic resumes.</p>
-<h2>Connections</h2>
+<h2>Common Confusions</h2>
+<h3>“Every row should be linearizable.”</h3>
+<p>That would simplify the wording, but it may impose unnecessary latency and coordination on search and reporting. The better rule is narrower: make the final business decision strong enough for its invariant, then name exactly what weaker paths may return.</p>
+<h3>“A healthy follower can serve a session-sensitive read.”</h3>
+<p>Health says that the follower process is up. It does not prove that it has replayed commit <code>842</code> from this caller. If the follower is at <code>836</code>, the missing state is visible: it lacks six positions. The gateway needs a required position from the caller, then it can wait, route to the leader, or return a response that honestly permits staleness.</p>
+<h3>“An RPO is a backup-team detail.”</h3>
+<p>An RPO changes what a completed local write means after a regional loss. If remote replication is asynchronous, a local acknowledgement may survive a node failure but still be absent from the remote recovered prefix. That may be acceptable under an explicit five-second RPO; it is not compatible with a promise that every success survives losing the whole home region. The boundary becomes operational when remote replay lag, archive continuity, or restore rehearsal leaves the budget.</p>
+<h2>Synthesis Example</h2>
+<p>At 09:00, the New York leader for <code>MUNI-77</code> has 1 million euros of remaining exposure. Madrid sends <code>POST /reservations</code> with token <code>K7</code> for the last 1 million euros. The leader commits the exposure update and token record at position <code>842</code>, and returns success. The Madrid follower is still at <code>836</code>; the search index watermark is also before <code>842</code>.</p>
+<p>The matrix tells each actor what to do:</p>
+<ol>
+<li>The write succeeds only through the issuer leader, so a second desk cannot independently confirm the same last capacity.</li>
+<li>If the client refreshes immediately, the local follower cannot yet serve a read-your-writes response. The gateway waits for <code>842</code> or routes to the leader. It does not interpret a healthy follower as current.</li>
+<li>Compliance search may still omit <code>K7</code>. That is not evidence that the reservation vanished because this row promised bounded freshness, not immediate authority. The response must show the index watermark or use the stronger lookup path.</li>
+<li>If the client saw a timeout instead of success, it repeats <code>K7</code> or asks for its status. The token converts an ambiguous network outcome into one resolvable business outcome.</li>
+<li>If New York later fails, promotion starts from Madrid's durable recovered prefix and publishes a new shard generation before accepting writes. A reservation beyond that prefix is either within the declared RPO or a broken recovery promise; the matrix prevents calling both outcomes “successful failover.”</li>
+</ol>
+<p>This is the useful review move: follow one business action across write, read, retry, derived data, and recovery. The topology is not judged by its number of replicas. It is judged by whether every observed result still matches its row.</p>
+<h2>Retrieval Check</h2>
+<p><strong>Check:</strong> A team says, “Compliance search is linearizable because the base table is strongly replicated.” The index has a 12-second ingestion delay, while the public search contract says results appear within five seconds. Which matrix columns contradict each other?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The serving path and freshness budget contradict the claimed guarantee. A strongly protected base record does not automatically make a derived index current. The team must improve the index path, increase the published budget, or provide a stronger fallback; relabeling the base table does not repair the row.</p>
+<p><strong>Check:</strong> The remote replica is 18 seconds behind, but the service advertises a five-second RPO. Can the on-call team call a failover drill successful because promotion works?</p>
+<p><strong>Answer:</strong> No. Promotion may be mechanically possible, yet the recovery row is already outside its stated loss budget. The signal says the promise is false until the lag returns within budget or the advertised RPO changes.</p>
+<h2>Transfer Challenge</h2>
+<p>A ticket platform sells the last ten seats for a concert. It proposes local writes in two regions, an asynchronous replica, a seat map served from a cache, and a global search index. Create four matrix rows: purchase, order-status retry, seat-map read after purchase, and search.</p>
+<p><strong>A good answer should mention:</strong></p>
 <ul>
-<li><a href="021.html">Failure Testing Replication Claims</a> supplies the validation method: every important guarantee row should map to a workload, fault model, and checker.</li>
-<li><a href="023.html">Replication Failure Mode Check</a> applies the matrix to a concrete geo-distributed architecture and asks whether shard authority, read paths, and failover semantics agree.</li>
-<li><a href="020.html">Observability for Replicated Data Systems</a> explains why lag, replay position, WAL continuity, and restore proof need to be measured directly instead of inferred from API health.</li>
+<li>the concert inventory or performance as the authority boundary for the purchase, not the buyer's nearest region;</li>
+<li>an idempotency key and a durable status record for an ambiguous payment or order request;</li>
+<li>a required commit position, leader fallback, or explicit stale label for the seat map immediately after purchase;</li>
+<li>a visible freshness budget for search; and</li>
+<li>a recovery promise, fencing step, and operational evidence before claiming that a regional loss preserves paid orders.</li>
 </ul>
+<h2>What Comes Next</h2>
+<p>The next review lesson attacks this matrix with partitions, timeouts, stale reads, membership changes, backlog, restore, and regional loss. First make each row coherent. Then ask whether it still holds when several mechanisms are under pressure at once.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Revisit partitioning, replication, transactions, and derived data as one design space instead of separate implementation topics.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://research.google/pubs/pub39966/">Spanner: Google's Globally-Distributed Database</a><ul>
-<li>Focus: Compare Harbor Point's local-quorum design with a system that pays for stronger cross-region ordering directly.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://www.cockroachlabs.com/docs/stable/multiregion-overview">CockroachDB Multi-Region Overview</a><ul>
-<li>Focus: Study how production systems expose locality, survival goals, and stale-read trade-offs as explicit schema and topology choices.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a><ul>
-<li>Focus: Read failure reports as examples of guarantees that were claimed informally but broken under specific workloads and faults.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html">Amazon DynamoDB: Best practices for designing and using partition keys effectively</a><ul>
-<li>Focus: Use it as a concrete checklist for cardinality, request concentration, and hot-partition risk when evaluating candidate shard keys.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html">DynamoDB read consistency</a> — Focus: Compare table, index, and multi-Region consistency contracts instead of assigning one label to a whole service.</li>
+<li>[DOC] <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html">DynamoDB global secondary indexes</a> — Focus: See why an efficient alternate query path is a separate data surface with its own synchronization behavior.</li>
+<li>[DOC] <a href="https://docs.cloud.google.com/spanner/docs/true-time-external-consistency">Spanner: TrueTime and external consistency</a> — Focus: Contrast strong and stale read contracts in a geo-distributed system.</li>
+<li>[PAPER] <a href="https://research.google/pubs/spanner-googles-globally-distributed-database/">Spanner: Google's Globally-Distributed Database</a> — Focus: Study the design trade-offs behind global transaction ordering.</li>
+<li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a> — Focus: Connect a matrix row to a workload and fault history that can reject its promise.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A guarantee matrix starts with user-visible operations and authoritative state, not with a preferred replication slogan.</li>
-<li>Harbor Point keeps issuer exposure and confirmed reservations on one shard leader, then uses follower reads, indexes, and CDC only where their weaker guarantees are explicit.</li>
-<li>Lag budgets, token status, WAL continuity, and configuration generations turn replication choices into an operating contract the team can test and enforce.</li>
-</ol>
+<ul>
+<li>A guarantee matrix begins with client-visible operations and business invariants, not a preferred database label.</li>
+<li>Authority, acknowledgement, serving path, freshness, fallback, recovery, and evidence must agree within every row.</li>
+<li>A weak path is a valid design choice only when its boundary is visible and callers have an honest fallback.</li>
+<li>The next step is not adding more components; it is testing whether the matrix remains true during compound failure.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -239,7 +241,7 @@ leader updates issuer_exposure + reservation row atomically
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,136 +81,318 @@
 <section class="stack-block lesson-content-shell">
   <h1>Conflict Resolution and Convergence Policies</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Conflict resolution is the rule that decides which user intent survives when replicas accept concurrent writes, so it must be designed from domain invariants rather than treated as storage cleanup.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>distinguish a stale replica from two concurrent versions by inspecting causal history;</p>
+</li>
+<li>
+<p>choose among deterministic selection, merge, rejection, and compensation from a business invariant;</p>
+</li>
+<li>
+<p>design an API and an operational signal that make information loss visible.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Making replicas agree is a mechanical goal; deciding which user intent survives is a domain decision.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine Harbor Point's leaderless store after a regional network flap. A trader in Lisbon extends reservation hold <code>H-8821</code> for issuer <code>MUNI-77</code> because the client is still negotiating. One second later, the Baltimore approval workflow confirms that same hold as reservation <code>R-88421</code> after risk and payment checks pass. Both writes start from version <code>18</code> because neither side has seen the other's update yet.</p>
-<p>When replicas repair, they do not have a simple old value and new value. They have two children of the same parent:</p>
-<div class="codehilite"><pre><span></span><code>v18  status=active, expires_at=09:35
-|- v19-lis  status=active, expires_at=09:40
-`- v19-iad  status=confirmed, reservation_id=R-88421
+<p>Harbor Point stores reservation holds in a leaderless replicated database. During a regional network break, two workflows update hold <code>H-8821</code> from the same version:</p>
+<div class="codehilite"><pre><span></span><code>parent v18: status=active, expires_at=09:35
+
+Lisbon trader:
+  v19-lis: status=active, expires_at=09:40
+
+Baltimore approval workflow:
+  v19-iad: status=confirmed, reservation_id=R-88421
 </code></pre></div>
 
-<p>That is a conflict. The system accepted two writes that did not causally supersede each other. Copying one version to every replica will make the cluster converge, but convergence alone does not mean the business outcome is correct.</p>
-<p>The trade-off is that easy policies are often semantically dangerous. Last-writer-wins is simple and fast, but it can erase a confirmed reservation because one clock timestamp happened to be later. Domain-specific resolution protects invariants, but it takes more metadata, tests, client behavior, and operational visibility.</p>
-<h2>Detect Concurrency Before Resolving It</h2>
-<p>A replica can disagree with another replica for two very different reasons. One value may be stale, or two values may be concurrent.</p>
-<div class="codehilite"><pre><span></span><code>stale case:
+<p>Each write is reasonable from the writer's local view. Neither writer has seen the other write. When the network heals, the database has two children of <code>v18</code>.</p>
+<p>The tempting model is: “repair should copy the newest value everywhere.” That model works when one replica is merely behind. It breaks here because neither child is newer in the causal sense. A wall-clock timestamp can select one child, but it cannot show that the selected writer observed the other child's intent.</p>
+<p>Harbor Point needs two different decisions:</p>
+<ol>
+<li><strong>Detect the relationship:</strong> Is one version an ancestor of the other, or are they concurrent?</li>
+<li><strong>Apply a policy:</strong> If they are concurrent, may the system choose, merge, reject, or compensate?</li>
+</ol>
+<p>The first decision belongs to replication metadata. The second belongs to the invariant and to the information available when the branches meet.</p>
+<h2>First Decide Whether There Is a Conflict</h2>
+<p>Replica disagreement does not always mean concurrent user intent.</p>
+<div class="codehilite"><pre><span></span><code>stale replica
 v18 -&gt; v19
 
-concurrent case:
-v18 -&gt; v19-a
-v18 -&gt; v19-b
+concurrent branches
+v18 -&gt; v19-lis
+    `-&gt; v19-iad
 </code></pre></div>
 
-<p>In the stale case, the newer descendant can replace the older value. In the concurrent case, neither branch saw the other. The resolver must apply a conflict policy.</p>
-<p>Harbor Point therefore stores version ancestry for each entity. The exact representation could be a revision tree, vector-clock-style metadata, origin-plus-counter pairs, or another causal marker. The important capability is comparison:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">classify</span><span class="p">(</span><span class="n">local</span><span class="p">,</span> <span class="n">incoming</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">incoming</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">local</span><span class="o">.</span><span class="n">version</span><span class="p">):</span>
-        <span class="k">return</span> <span class="s2">&quot;incoming_supersedes_local&quot;</span>
-    <span class="k">if</span> <span class="n">local</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">incoming</span><span class="o">.</span><span class="n">version</span><span class="p">):</span>
-        <span class="k">return</span> <span class="s2">&quot;incoming_is_stale&quot;</span>
-    <span class="k">return</span> <span class="s2">&quot;concurrent_conflict&quot;</span>
-</code></pre></div>
-
-<p>Wall-clock timestamps are not enough for this classification. A timestamp can tell you which write was stamped later by some node. It cannot prove that one writer observed the other's value before writing. Even a well-synchronized clock is not causality.</p>
-<p>This matters because the wrong classification applies the wrong policy. Treating a concurrent write as merely stale can erase real user intent. Treating a stale retry as a conflict can force unnecessary manual review. Good convergence starts with honest metadata.</p>
-<h2>Match Policy to the Invariant</h2>
-<p>Harbor Point uses more than one conflict policy because not all fields mean the same thing.</p>
-<div class="codehilite"><pre><span></span><code>Data shape                         Possible policy             Why
----------------------------------  --------------------------  -------------------------
-trader dashboard layout            last-writer-wins            replaceable preference
-set of desks that viewed a hold     set union                   additive membership
-reservation hold lifecycle          domain resolver / reject    state machine invariant
-audit notes                         preserve siblings           human review may matter
-</code></pre></div>
-
-<p>Last-writer-wins is acceptable for the dashboard layout because losing an older layout preference is annoying, not financially dangerous. It is a poor default for reservation state. If <code>confirmed</code> can be overwritten by <code>active</code> merely because a later timestamp wins, the database has converged to a false business truth.</p>
-<p>For the hold lifecycle, Harbor Point encodes a domain rule:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">resolve_hold</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">):</span>
+<p>In the stale case, <code>v19</code> descends from <code>v18</code>. Replacing <code>v18</code> with <code>v19</code> does not discard a separate decision. In the concurrent case, neither child descends from the other. Choosing either child discards information unless the policy explicitly says that information is replaceable.</p>
+<p>A version vector, revision tree, or another causal marker can support this comparison. This lesson uses a simplified ancestry interface:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compare</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">):</span>
     <span class="k">if</span> <span class="n">left</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">right</span><span class="o">.</span><span class="n">version</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">left</span>
+        <span class="k">return</span> <span class="s2">&quot;left_supersedes_right&quot;</span>
     <span class="k">if</span> <span class="n">right</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">descends_from</span><span class="p">(</span><span class="n">left</span><span class="o">.</span><span class="n">version</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">right</span>
+        <span class="k">return</span> <span class="s2">&quot;right_supersedes_left&quot;</span>
+    <span class="k">return</span> <span class="s2">&quot;concurrent&quot;</span>
+</code></pre></div>
 
-    <span class="n">states</span> <span class="o">=</span> <span class="p">{</span><span class="n">left</span><span class="o">.</span><span class="n">status</span><span class="p">,</span> <span class="n">right</span><span class="o">.</span><span class="n">status</span><span class="p">}</span>
-
-    <span class="k">if</span> <span class="s2">&quot;confirmed&quot;</span> <span class="ow">in</span> <span class="n">states</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">choose_confirmed_branch</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">)</span>
+<p>The code is a teaching model, not a complete version-vector implementation. Its important claim is smaller: a system needs evidence of observed history if it wants to distinguish succession from concurrency.</p>
+<p>Suppose Baltimore's clock reads <code>09:34:22.900</code> and Lisbon's reads <code>09:34:23.100</code>. Lisbon has the later timestamp. That does not prove the trader saw the confirmation. Clock order answers “which timestamp sorts later?” Causal order answers “did this write include knowledge of the other write?” Those are different questions.</p>
+<p>This correction matters. If Harbor Point treats <code>v19-iad</code> as stale because its timestamp is smaller, it can erase a confirmed reservation. If it treats a delayed copy of <code>v19-iad</code> as concurrent, it can create needless retries and review work.</p>
+<h2>State the Invariant Before Choosing a Winner</h2>
+<p>Harbor Point writes the rule for the hold lifecycle before it writes resolver code:</p>
+<blockquote>
+<p>Once a hold is confirmed, ordinary hold updates must not return it to <code>active</code> or <code>released</code>. A confirmation also creates an externally visible reservation record.</p>
+</blockquote>
+<p>This is a scenario assumption, not a universal reservation rule. Under this rule, <code>confirmed</code> is an absorbing lifecycle state. The later-expiry branch still records real trader intent, but that intent cannot reverse confirmation.</p>
+<p>Other Harbor Point data has different meaning:</p>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Invariant or product tolerance</th>
+<th>Candidate policy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dashboard layout</td>
+<td>An older preference may be lost</td>
+<td>Deterministic last-writer-wins</td>
+</tr>
+<tr>
+<td>Desks that viewed a hold</td>
+<td>Membership only grows for this audit field</td>
+<td>Add-only set union</td>
+</tr>
+<tr>
+<td>Reservation lifecycle</td>
+<td>Confirmation must not be reversed</td>
+<td>Domain resolver or reject</td>
+</tr>
+<tr>
+<td>Free-form audit notes</td>
+<td>Every note may matter</td>
+<td>Preserve siblings for review</td>
+</tr>
+</tbody>
+</table>
+<p>The set-union row is safe only because this particular field is add-only. If users can remove a desk, plain union can resurrect a removed member. Merge safety comes from the data's rules, not from the word “merge.” A downstream CRDT track develops the algebra needed to make broader merge claims.</p>
+<h2>Build a Conflict Ledger</h2>
+<p>Before implementing a resolver, Harbor Point reviews each policy against the same questions. This is the worked design artifact for <code>H-8821</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Information used</th>
+<th>Result for <code>H-8821</code></th>
+<th>Information lost or deferred</th>
+<th>Safe under this invariant?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Last-writer-wins (LWW)</td>
+<td>A deterministic timestamp and tie-breaker</td>
+<td><code>active</code> may win because Lisbon's stamp sorts later</td>
+<td>Confirmation and its side effect can be hidden</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Field merge</td>
+<td>Both JSON documents</td>
+<td>Could create <code>status=confirmed</code> with an expiry copied from the active branch</td>
+<td>The merged object may never have existed or passed validation</td>
+<td>Not without a domain rule</td>
+</tr>
+<tr>
+<td>Domain resolver</td>
+<td>Causal branches plus lifecycle rule</td>
+<td>Preserve <code>confirmed</code>; record the extension as superseded intent</td>
+<td>Requires code, metadata, and tests</td>
+<td>Yes, under the stated assumption</td>
+</tr>
+<tr>
+<td>Reject or preserve siblings</td>
+<td>Both branches</td>
+<td>Return a conflict or enqueue review</td>
+<td>Resolution work moves to a caller or operator</td>
+<td>Yes, but slower</td>
+</tr>
+<tr>
+<td>Compensate</td>
+<td>Branches plus evidence of external effects</td>
+<td>Keep the valid state and undo or offset an invalid side effect</td>
+<td>Compensation can fail and is not instant rollback</td>
+<td>Only with an owned workflow</td>
+</tr>
+</tbody>
+</table>
+<p>LWW is deterministic: replicas given the same candidates and tie-breaker can choose the same value. Determinism gives convergence. It does not give semantic correctness.</p>
+<p>A generic field merge is also suspicious. Combining <code>status=confirmed</code> from one branch with <code>expires_at=09:40</code> from the other produces a document that no workflow wrote. If validation and side effects depend on whole-state transitions, a field-wise merge can invent an impossible state.</p>
+<p>The domain resolver uses more information:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">resolve_hold</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">):</span>
+    <span class="n">relation</span> <span class="o">=</span> <span class="n">compare</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">relation</span> <span class="o">==</span> <span class="s2">&quot;left_supersedes_right&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">Resolved</span><span class="p">(</span><span class="n">left</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">relation</span> <span class="o">==</span> <span class="s2">&quot;right_supersedes_left&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">Resolved</span><span class="p">(</span><span class="n">right</span><span class="p">)</span>
 
     <span class="k">if</span> <span class="n">left</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="n">right</span><span class="o">.</span><span class="n">status</span> <span class="o">==</span> <span class="s2">&quot;active&quot;</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">branch_with_later_expiry</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">resolve_active_extensions</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">)</span>
 
-    <span class="k">return</span> <span class="n">ConflictRequiresRetry</span><span class="p">([</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">])</span>
+    <span class="n">confirmed</span> <span class="o">=</span> <span class="n">branch_with_status</span><span class="p">(</span><span class="s2">&quot;confirmed&quot;</span><span class="p">,</span> <span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">confirmed</span> <span class="ow">and</span> <span class="n">confirmation_evidence_is_valid</span><span class="p">(</span><span class="n">confirmed</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">Resolved</span><span class="p">(</span>
+            <span class="n">value</span><span class="o">=</span><span class="n">confirmed</span><span class="p">,</span>
+            <span class="n">superseded_intent</span><span class="o">=</span><span class="n">other_branch</span><span class="p">(</span><span class="n">confirmed</span><span class="p">,</span> <span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">),</span>
+        <span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">NeedsReview</span><span class="p">([</span><span class="n">left</span><span class="p">,</span> <span class="n">right</span><span class="p">])</span>
 </code></pre></div>
 
-<p>The policy is not arbitrary. <code>confirmed</code> is an absorbing state because a downstream workflow has already allocated the reservation and produced audit records. Two concurrent active extensions can be merged by keeping the later expiry only if both branches refer to the same hold and the business allows monotonic extension. A conflict between <code>released</code> and <code>active</code> should not be guessed; it should be retried or reviewed.</p>
-<p>The invariant drives the policy. The storage system can provide version ancestry and sibling branches, but the domain decides which outcome is safe.</p>
-<h2>Worked Example: Three Outcomes</h2>
-<p>When replicas converge after conflict, the resolver has three broad options.</p>
-<div class="codehilite"><pre><span></span><code>Outcome             Example                          Trade-off
-------------------  -------------------------------  ------------------------------------
-choose one branch    dashboard layout LWW             fast, but may lose intent
-merge branches       set of involved desks            preserves compatible facts
-surface conflict     hold lifecycle mismatch          safer, but pushes work upward
+<p>This pseudocode deliberately refuses to say “confirmed always wins.” It first checks the causal relation. For concurrent branches, it also requires the evidence that Harbor Point's confirmation rule depends on. If that evidence is missing or contradictory, the resolver preserves the branches and asks the owning workflow to decide.</p>
+<h2>Trace One Resolution from Detection to Repair</h2>
+<p>Now follow the complete path. The values and times are illustrative.</p>
+<div class="codehilite"><pre><span></span><code>09:34:20  Lisbon reads parent v18.
+09:34:20  Baltimore reads parent v18.
+09:34:22  Baltimore writes v19-iad: confirmed.
+09:34:23  Lisbon writes v19-lis: active until 09:40.
+09:34:30  The network path recovers.
+09:34:31  Anti-entropy finds different leaf versions.
+09:34:31  Causal comparison says: concurrent.
+09:34:32  Lifecycle resolver validates confirmation evidence.
+09:34:32  Resolver emits v20: confirmed, based on both branches.
+09:34:33  Repair copies v20 to the replica set.
+09:34:34  Metric records one domain-resolved conflict and one
+          superseded extension intent.
 </code></pre></div>
 
-<p>Choosing one branch is attractive when values are replaceable. It keeps APIs simple and latency low. The risk is silent loss when the data was not actually replaceable.</p>
-<p>Merging branches is attractive when the data type is naturally composable. Sets, counters, and append-only histories can often merge safely if the merge operation preserves the invariant. This is the world where CRDT-style thinking helps.</p>
-<p>Surfacing the conflict is appropriate when the system lacks enough information to merge safely. That may mean rejecting a conditional write, asking the client to refetch, putting an item into a review queue, or running a compensating workflow.</p>
-<p>For Harbor Point's confirmed reservation conflict, surfacing or domain resolution is better than pretending the latest timestamp knows business law. The system should preserve evidence, protect the confirmed state, and make any ambiguous branch visible to the workflow that owns the invariant.</p>
-<h2>API and Operations Impact</h2>
-<p>Conflict resolution is not hidden database plumbing. It changes the API contract.</p>
-<p>Harbor Point exposes different write styles:</p>
-<div class="codehilite"><pre><span></span><code>API style                    Use case                         Conflict behavior
----------------------------  -------------------------------  --------------------------
-blind overwrite              replaceable preferences           LWW permitted
-conditional write             lifecycle state changes           requires expected version
-merge-aware command           additive or monotonic updates     resolver tested by domain
-manual/retry path             unsafe lifecycle conflicts        conflict surfaced
-</code></pre></div>
-
-<p>A conditional lifecycle write might require <code>If-Match: v18</code>. If the system has advanced to a concurrent branch, the API rejects the write and forces the caller to refetch. That is not a nuisance; it is how the API avoids pretending that every concurrent decision can be silently merged.</p>
-<p>Operations need evidence too. A replicated store should track:</p>
+<p>The result version must descend from both branches. Otherwise a later repair pass can rediscover the same sibling and repeat the conflict.</p>
+<p>Notice what each layer contributed:</p>
 <ul>
-<li>conflicts detected by entity type</li>
-<li>conflicts auto-resolved by each policy</li>
-<li>conflicts rejected to clients</li>
-<li>conflicts sent to review or compensation</li>
-<li>timestamp tiebreakers used during clock-skew alarms</li>
+<li>Anti-entropy found divergent data. It did not decide the business result.</li>
+<li>Causal metadata proved that the branches were concurrent. It did not rank their value.</li>
+<li>The lifecycle policy protected confirmation under a stated invariant.</li>
+<li>The new version recorded that both branches were considered.</li>
+<li>Metrics retained evidence that an accepted write did not become the visible lifecycle state.</li>
 </ul>
-<p>Aggressive auto-resolution reduces retries and keeps latency low, but it can hide semantic loss. Conservative rejection protects invariants, but it pushes complexity into clients and operational queues. The right boundary depends on the cost of losing user intent versus the cost of asking for human or workflow help.</p>
-<h2>Failure Modes</h2>
-<p><strong>Treating last-writer-wins as harmless convergence.</strong> LWW makes replicas agree, but it may agree on the wrong business result. Use it only for data that is genuinely replaceable.</p>
-<p><strong>Merging fields instead of preserving invariants.</strong> A field-level merge can create an impossible entity state. Test conflict policies against real state-machine transitions and side effects.</p>
-<p><strong>Using timestamps as causality.</strong> Timestamp order is not the same as happened-before order. Keep ancestry metadata when concurrent writes matter.</p>
-<p><strong>Hiding conflicts from APIs and operators.</strong> If clients, metrics, and runbooks cannot tell whether a write was overwritten, merged, or rejected, the system will be hard to trust during failures.</p>
+<p>So far, we have not proved that every Harbor Point conflict is safely mergeable. We have shown a narrower result: this conflict has enough causal and domain evidence for one declared policy. That is the level at which a resolver should earn trust.</p>
+<h2>Make the Policy Part of the API</h2>
+<p>Conflict handling changes what a successful write means. It should not remain hidden inside storage repair.</p>
+<table>
+<thead>
+<tr>
+<th>API style</th>
+<th>Suitable use</th>
+<th>Client-visible behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Blind overwrite</td>
+<td>Replaceable preference</td>
+<td>Accept that an older preference may disappear under LWW</td>
+</tr>
+<tr>
+<td>Conditional command</td>
+<td>Lifecycle transition</td>
+<td>Require an expected version; return conflict if the observed version has changed</td>
+</tr>
+<tr>
+<td>Merge-aware command</td>
+<td>Add-only or otherwise proven mergeable data</td>
+<td>Return the merged version or its identity</td>
+</tr>
+<tr>
+<td>Review-required command</td>
+<td>Ambiguous, high-cost conflict</td>
+<td>Return or enqueue a durable conflict reference</td>
+</tr>
+</tbody>
+</table>
+<p>A condition such as <code>If-Match: v18</code> prevents a caller from overwriting a newer version that the receiving authority already knows. It does <strong>not</strong> by itself prevent two isolated replicas from both accepting a write against <code>v18</code>. Preventing that concurrent acceptance requires a write path with stronger authority or coordination. This is the boundary between optimistic conflict handling and invariants that must be protected before acknowledgment.</p>
+<p>Harbor Point should therefore ask one question for every invariant:</p>
+<blockquote>
+<p>May two sides temporarily accept conflicting states, provided a later resolver handles them?</p>
+</blockquote>
+<p>If the answer is no—for example, because both sides could allocate the same scarce asset—the service must coordinate or reject writes during the partition. A clever resolver cannot undo every external effect after the fact.</p>
+<h2>Trade-offs, Failure Boundaries, and Signals</h2>
+<p>Automatic resolution improves availability and reduces client retries. It costs causal metadata, deterministic policy code, cross-version testing, and visibility for discarded intent.</p>
+<p>Preserving or rejecting conflicts protects ambiguous intent. It costs latency, client complexity, queue growth, and possibly human work. Compensation helps after a side effect escaped, but compensation is another fallible distributed workflow. It is not a time machine.</p>
+<p>Useful signals connect the mechanism to the user promise:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Question it answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Concurrent branches by entity type</td>
+<td>Where are users making decisions from disconnected state?</td>
+</tr>
+<tr>
+<td>Outcomes by policy and resolver version</td>
+<td>Which rules choose, merge, reject, or compensate?</td>
+</tr>
+<tr>
+<td>Age of oldest unresolved conflict</td>
+<td>Is deferred work becoming a correctness or support risk?</td>
+</tr>
+<tr>
+<td>Superseded-intent count</td>
+<td>How often does convergence hide an accepted action?</td>
+</tr>
+<tr>
+<td>Compensation failures and age</td>
+<td>Did an external effect remain inconsistent after resolution?</td>
+</tr>
+</tbody>
+</table>
+<p>The boundary signal is not simply “all replicas now match.” Agreement shows convergence. To evaluate the policy, Harbor Point also needs to know which branches existed, which rule ran, what the rule produced, and whether any promised side effect remains unresolved.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> Two replicas return different values. Version metadata shows that <code>v22</code> descends from <code>v21</code>. Should the system invoke the concurrent-conflict policy?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. This is stale-versus-descendant disagreement. Repair may replace <code>v21</code> with <code>v22</code>. A conflict policy is needed only when neither version causally supersedes the other.</p>
+<p><strong>Check:</strong> Two concurrent profile-layout writes are safe under deterministic LWW. Does that make LWW safe for a reservation confirmation?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The layout policy accepts lost preference information. The reservation invariant does not accept losing confirmation or hiding its side effect. The same convergence mechanism can be suitable for one data type and unsafe for another.</p>
+<h2>Practice: Review a Conflict Policy</h2>
+<p>A replicated inventory service accepts two concurrent updates for the last camera:</p>
+<div class="codehilite"><pre><span></span><code>branch A: allocate camera to order O-71; payment captured
+branch B: allocate camera to order O-84; payment captured
+</code></pre></div>
+
+<p>Design the smallest honest policy. State:</p>
+<ol>
+<li>whether the service may choose, merge, reject, or compensate;</li>
+<li>which evidence the resolver needs;</li>
+<li>what the API reports;</li>
+<li>one operational signal;</li>
+<li>whether the write contract should change to prevent recurrence.</li>
+</ol>
+<p>A strong answer should reject field merge and should not claim that LWW repairs the double allocation. If both payments already happened, the workflow must choose an allocation by a declared business rule, compensate the losing order, and expose both outcomes. The resolver needs causal branches plus payment and allocation identities. The API needs a durable command-status result rather than a silent overwrite. Compensation age or failure rate is a useful signal. Because one physical item cannot satisfy two accepted allocations, the stronger long-term design is to coordinate allocation before acknowledging success, even if that reduces write availability during a partition.</p>
+<h2>Connections</h2>
+<ul>
+<li><a href="008.html">Read Repair, Anti-Entropy, and Merkle Divergence Checks</a> explains how replicas discover and transfer differences; this lesson supplies the decision those mechanisms cannot make for concurrent branches.</li>
+<li><a href="010.html">Replication Lag and Read-Your-Writes</a> separates conflict semantics from a session's need to observe its own completed write.</li>
+<li><code>crdts-and-coordination-avoidance</code> continues from the merge boundary by developing data types and invariants that can converge without ad hoc resolution.</li>
+</ul>
 <h2>Resources</h2>
 <ul>
-<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a><ul>
-<li>Focus: Read for vector clocks, sibling versions, and application-assisted conflict resolution.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.couchdb.org/en/stable/replication/conflicts.html">Apache CouchDB Documentation: Conflicts</a><ul>
-<li>Focus: Study revision trees and how conflicts are surfaced instead of hidden behind timestamp order.</li>
-</ul>
-</li>
-<li>[PAPER] <a href="https://hal.inria.fr/inria-00609399/document">A Comprehensive Study of Convergent and Commutative Replicated Data Types</a><ul>
-<li>Focus: Use this for merge policies that are mathematically safe rather than ad hoc.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Revisit replication conflicts, causal metadata, and why last-writer-wins can be data loss with a cleaner dashboard.</li>
-</ul>
-</li>
+<li>[PAPER] <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">Dynamo: Amazon's Highly Available Key-value Store</a> — Focus: Study vector clocks, sibling versions, and application-assisted reconciliation.</li>
+<li>[DOC] <a href="https://docs.couchdb.org/en/stable/replication/conflicts.html">Apache CouchDB Documentation: Replication and Conflicts</a> — Focus: Inspect revision trees, deterministic winners, and explicit access to conflicting leaves.</li>
+<li>[PAPER] <a href="https://inria.hal.science/inria-00609399">A Comprehensive Study of Convergent and Commutative Replicated Data Types</a> — Focus: See the stronger conditions required for deterministic, mathematically grounded merges.</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Compare causality tracking, LWW, conflict preservation, and application-level resolution.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A conflict is a concurrency fact: two writes were accepted without either causally superseding the other.</li>
-<li>Conflict policy is domain logic. Choosing, merging, or rejecting versions decides which user intent survives.</li>
-<li>Convergence is not enough; replicas can converge to an invalid business state if the resolver ignores invariants.</li>
-<li>APIs and operations must expose conflict behavior through conditional writes, merge-aware commands, metrics, and review paths.</li>
-</ol>
+<ul>
+<li>Causal ancestry distinguishes a delayed copy from two concurrent decisions; wall-clock order does not establish that relationship.</li>
+<li>A deterministic winner makes replicas converge, but only a domain invariant can justify the information that the winner discards.</li>
+<li>Choose, merge, reject, and compensate are different policies with different evidence, API behavior, and failure boundaries.</li>
+<li>A resolved version should include both conflicting branches in its ancestry and should leave operational evidence of discarded or deferred intent.</li>
+<li>If an invariant cannot tolerate concurrent acceptance, protect it on the write path; post-hoc resolution is too late.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -235,7 +421,7 @@ manual/retry path             unsafe lifecycle conflicts        conflict surface
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

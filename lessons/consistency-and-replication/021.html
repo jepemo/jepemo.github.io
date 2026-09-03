@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,80 +81,179 @@
 <section class="stack-block lesson-content-shell">
   <h1>Failure Testing Replication Claims</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A Jepsen-style test is not "chaos plus load." It is a controlled adversarial experiment that combines a concurrent workload, deliberate faults, and a history checker so a team can prove whether the database's consistency claims still hold when the system is under stress.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>turn a replicated-service promise into operations, faults, and a checker;</p>
+</li>
+<li>
+<p>distinguish an acknowledged result, a definite failure, and an uncertain timeout in a test history;</p>
+</li>
+<li>
+<p>diagnose what a failure-test anomaly says about fencing, retries, or a stated guarantee.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A failure test earns confidence only when a checker can reject the client-visible histories that the promised contract forbids.</p>
 </blockquote>
+<p>At 10:02, Harbor Point's reservation API returns <code>201 Created</code> for request token <code>K7</code>. A few seconds later, the current leader is partitioned away from the other replicas and a new leader takes over. The cluster recovers. Its dashboard is green.</p>
+<p>That is reassuring, but it does not answer the important question: after the <code>201</code>, can a strong status read find exactly one reservation for <code>K7</code>? A smooth election proves that some recovery path worked. It does not prove that the acknowledgement, retry path, and reads all obeyed the API contract.</p>
+<p>This distinction is the point of Jepsen-style failure testing. The test is not “add chaos while generating load.” It records what clients invoked and observed, injects a fault that threatens a named promise, and checks whether the resulting history could have happened in a system with that promise. Faults provide pressure; the history and checker provide the evidence.</p>
 <h2>Core Insight</h2>
-<p>Harbor Point can now watch the <code>bond_reservations</code> cluster as a sequence of engine states: WAL sync, archive continuity, replay progress, and restore readiness. That observability is necessary, but it still leaves one uncomfortable production question unanswered. If the API returns <code>201 Created</code> for reservation <code>R-88421</code> during a failover, can the team prove that the reservation exists exactly once afterward, or are they merely hoping the replication layer behaved?</p>
-<p>A Jepsen-style test turns that question into an experiment. Harbor Point runs many concurrent reservation, cancellation, and read operations with unique request tokens, injects faults such as partitions, process kills, and clock jumps, and then reconstructs the full client-visible history. Instead of asking only "did the cluster stay up?", the team asks "could these observed results have happened in a system that really satisfies linearizable reads, at-most-once token application, and durable quorum commits?"</p>
-<p>That is the mental shift. Failure testing at this level is about histories, not dashboards. A clean failover demo can still hide lost acknowledged writes, stale reads that violate a "strong read" promise, or duplicate application of the same client token. The database may look healthy at the node level and still be wrong at the contract level. Jepsen-style validation matters because it forces Harbor Point to define the contract precisely enough that a checker can reject impossible histories.</p>
-<h2>Why Ordinary Drills Are Not Enough</h2>
-<p>Harbor Point is preparing the reservation system for a wider rollout in which traders in Madrid and New York will hit the same logical cluster, replicas will serve some reads, and automated failover will move authority when a node or link fails. The business risk is not only downtime. A more dangerous outcome is silent divergence: one trader sees a reservation confirmed, risk accounting misses it for thirty seconds, or the same request token gets applied twice after a timeout and retry. Those are correctness failures, not performance regressions.</p>
-<p>Traditional staging tests rarely catch that class of bug. A load test shows throughput. A failover drill shows whether the service comes back. A chaos experiment might show that alerts fire. None of those automatically prove that the observed sequence of successes, failures, timeouts, and reads is compatible with the guarantees the database advertises. If Harbor Point claims linearizable confirmations for reservations, then the test harness has to verify linearizability. If the team claims idempotent retries, the checker has to prove that one client token never became two committed reservations.</p>
-<p>Once the team starts working this way, architectural discussions get sharper. "We think leader leases are safe" becomes "under a 400 ms clock jump and a network partition, does the old leader still acknowledge writes that later vanish?" "Retries are fine" becomes "can we detect whether a timeout hid a committed write before the client replays the token?" The value of Jepsen-style validation is not that it breaks systems for entertainment. It converts vague confidence into falsifiable evidence before the next release or topology change reaches production.</p>
-<h2>Start From the Claim, Not the Fault</h2>
-<p>Harbor Point does not need a generic "database torture test." It needs evidence about a few concrete promises. For the reservation API, the high-value claims are specific: if <code>POST /reservations</code> succeeds, that reservation should survive leader failover; a request token retried after a timeout should apply at most once; and a strong read issued after success should never return a state older than the acknowledged write. Those are not infrastructure metrics. They are observable contracts between the storage system and the business.</p>
-<p>That means the first design step in a Jepsen-style test is choosing operations and invariants that match the contract. Harbor Point's workload might include <code>reserve</code>, <code>release</code>, <code>get_reservation</code>, and <code>issuer_exposure</code>. The checker then asks questions such as: did any acknowledged reservation disappear without a matching release, did exposure ever exceed the configured issuer limit, and did one client token produce two distinct reservation rows? If the system claims linearizable semantics for the strong-read path, the history must be explainable as if each operation happened at one single instant between invocation and completion.</p>
-<p>This is where many teams go wrong. They jump directly to partitions and node kills because those are easy to imagine, but they have not said what failure means. A partition is only interesting relative to a claim. If Harbor Point promises only eventual convergence for an analytics view, then stale reads during a partition may be acceptable. If the trading confirmation path promises linearizable success, the same stale read is a release blocker. The workload and checker therefore come before the nemesis.</p>
-<p>The trade-off is scoping. A narrow checker is easier to trust and maintain, but it may miss classes of anomalies outside the modeled operations. A checker that tries to prove every property of the entire SQL surface is usually too ambitious to finish. Good Jepsen-style work chooses the smallest set of operations that still covers the business-critical invariants.</p>
-<h2>The Harness Is a Pipeline</h2>
-<p>Once Harbor Point knows what it wants to prove, it can build the experiment. Many clients issue reservation operations concurrently, each with a unique token and enough metadata to reconstruct what the client thought happened. A separate nemesis component perturbs the cluster: it severs links between nodes, pauses a leader process, kills and restarts a replica, adds clock skew to nodes that rely on leases, or injects packet delay during elections. The goal is not random destruction. The goal is to expose the exact timing windows where a bad implementation lies about commit status or serves reads from the wrong authority.</p>
-<p>The experiment only works if it preserves the client-visible history. Every operation should be recorded as an <code>invoke</code>, then later as <code>ok</code>, <code>fail</code>, or <code>info</code> if the client timed out and could not tell what happened. That distinction matters. A timeout is not proof of failure; it is proof of uncertainty. Harbor Point needs request tokens precisely so the checker can look back later and determine whether a timed-out <code>reserve</code> actually committed before the connection broke.</p>
-<p>For this lesson's recurring scenario, the flow looks like this:</p>
-<div class="codehilite"><pre><span></span><code>clients issue reserve/release/read operations
-                |
-                v
-        Harbor Point cluster
-                ^
-                |
-nemesis injects partitions, pauses, kills, clock skew
-                |
-                v
-     event history + follow-up observations
-                |
-                v
- checker asks whether the history fits the claimed model
+<p>The trade-off is deliberate: a precise workload and checker cost more to design than a generic failover drill, but they can reject a history that violates a business promise instead of merely showing that processes restarted.</p>
+<h3>Start With a Promise a Client Can Observe</h3>
+<p>Harbor Point first writes a small contract for its reservation endpoint:</p>
+<div class="codehilite"><pre><span></span><code>POST /reservations  with idempotency key K7 returns 201
+    -&gt; one reservation for K7 exists durably
+    -&gt; a later strong GET /reservation-tokens/K7 finds that reservation
+    -&gt; retrying K7 never creates a second reservation
 </code></pre></div>
 
-<p>That pipeline explains why Jepsen-style validation is more demanding than ordinary chaos engineering. Chaos tooling often stops at "the service degraded and then recovered." A correctness harness keeps going until it can classify the outcome. Did the old leader acknowledge an uncommitted reservation during a lease violation? Did a read observe a state impossible under a single global order? Did the retry path create a duplicate because the system could not reconcile a timeout with the durable record? The trade-off is complexity: the harness needs good client instrumentation, realistic faults, and a checker the team understands well enough to trust.</p>
-<h2>Turn Anomalies Into Design Decisions</h2>
-<p>Suppose Harbor Point runs a test where three nodes host the reservation range. The nemesis partitions the current leader away from the other two nodes, then adds a clock jump on the isolated leader. During the split, trader clients keep sending <code>reserve</code> requests. Some receive success from the isolated leader. Others retry through a different node once failover completes. When the partition heals, the checker finds an impossible history: reservation <code>R-88421</code> was acknowledged to a client, but no later linearizable read can find it, while a second request with the same token produced a different row on the new leader.</p>
-<p>That result is valuable because it points to a concrete engineering decision. Harbor Point might need stronger fencing on old leaders, a safer lease implementation, or a retry protocol that first resolves token status before reissuing work. The bug is no longer "failover seems flaky." It is "under partition plus clock skew, the cluster can acknowledge a reservation that did not survive quorum and can later apply the same token twice." That is specific enough to drive a fix, a regression test, and a go/no-go call for deployment.</p>
-<p>The same logic prevents overreaction. Not every anomaly is a database bug. Sometimes the checker reveals that the product contract was vague. If the API returns a timeout without a durable request identifier, then neither the database nor the client can distinguish "did not commit" from "committed but reply lost." Jepsen-style testing often forces improvements above the engine layer: clearer idempotency keys, explicit strong-read endpoints, or better observability around uncertain outcomes.</p>
-<p>This is also the bridge into the design-review lessons that follow. A replication plan is not ready because the diagram looks plausible. It is ready when the team can name its core invariants, build adversarial tests for them, and use the outcomes to accept or reject the architecture.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>The test run shows lots of timeouts, but the checker does not report any anomalies.</strong> A timeout-heavy run can still hide correctness problems if the harness cannot resolve what happened after uncertainty. Without request tokens, read-after-timeout probes, or enough state captured in the history, the checker may only learn that clients were confused. Make uncertain outcomes first-class data. Persist client tokens, record invocation and completion times, and add follow-up reads that can determine whether timed-out operations committed.</p>
-<p><strong>The harness finds anomalies that the database team dismisses as "not production-realistic."</strong> Some fault combinations are unrealistic, but many impossible traces reveal hidden assumptions about clocks, leases, or retry semantics. Teams often reject the test before mapping it back to the claim they made. Compare the nemesis to real operational risks. If Harbor Point depends on time-based leader leases, clock skew belongs in scope. If the system advertises automatic failover, partitions and delayed packets during elections are in scope. Reject only faults that are truly outside the design envelope.</p>
-<p><strong>A test passes once, and the team treats the result as permanent proof.</strong> Concurrency bugs are statistical and configuration-sensitive. A passing run may simply have missed the dangerous interleaving, and a minor version upgrade or timeout change can reopen the same class of bug. Run the suite repeatedly, vary the schedule and load, and keep it in the release process for topology or configuration changes. Jepsen-style validation is a regression asset, not a one-time ceremony.</p>
+<p>The exact durability boundary matters. If the product says <code>201</code> means only that one process accepted a request, the promise is weak. If it says <code>201</code> means the reservation survived a failover, the test may insist that a successful response remains discoverable after that failover. The harness must test the promise actually offered, rather than silently upgrading or weakening it.</p>
+<p>The same discipline applies to reads. A dashboard allowed to lag may legitimately miss a fresh reservation. A <strong>strong</strong> token-status endpoint cannot. Giving the two paths different names prevents the checker from calling an intended stale read a bug, or worse, accepting a stale read on the path users rely on for confirmation.</p>
+<p>The resulting operations should be small enough to model:</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Client result that matters</th>
+<th>Invariant to check</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>reserve(K)</code></td>
+<td><code>ok</code> with reservation ID</td>
+<td>An acknowledged reservation is not later absent without a matching release.</td>
+</tr>
+<tr>
+<td><code>status(K)</code> on the strong path</td>
+<td>the ID or absence</td>
+<td>After <code>reserve(K)</code> returns <code>ok</code>, it returns that same ID.</td>
+</tr>
+<tr>
+<td>retry <code>reserve(K)</code></td>
+<td>same ID or an explicit already-created result</td>
+<td>One token has at most one business effect.</td>
+</tr>
+<tr>
+<td><code>release(K)</code></td>
+<td>completion</td>
+<td>A later absence is valid only when the history includes a valid release.</td>
+</tr>
+</tbody>
+</table>
+<p>These are not performance assertions. “p95 stayed below 40 ms” may be useful context, but it cannot establish that an acknowledged action was not lost. A checker needs a rule about the state transition visible to a client.</p>
+<h2>Record Uncertainty Instead of Erasing It</h2>
+<p>Each client operation enters the history with an invocation and later receives one of three useful outcomes:</p>
+<ul>
+<li><code>ok</code>: the client received a successful response.</li>
+<li><code>fail</code>: the client received a definite rejection, such as validation failure or a fenced-leader error before the request was accepted.</li>
+<li><code>info</code>: the client timed out or lost its connection and cannot tell whether the operation took effect.</li>
+</ul>
+<p><code>info</code> is neither success nor proof of failure. Treating every timeout as a failure can hide a committed reservation. Treating every timeout as success can invent one. The safe test design keeps the uncertainty, then uses the idempotency key to resolve it later.</p>
+<p>For example, a harness can issue <code>status(K7)</code> after the topology settles. If it finds one reservation, the earlier timeout may have hidden a commit. If it finds none, the client may safely make a new attempt with the <em>same</em> key. If it finds two IDs, the test has caught a duplicate effect. Generating a fresh key after every timeout would make that last anomaly much harder to see and would not match a safe production retry protocol.</p>
+<p>This is also why client instrumentation belongs in the test, not just server logs. Server logs explain a suspected cause after a failure. The client-visible history establishes what the service promised and what it delivered. A correct system can have noisy logs; it cannot make an <code>ok</code> mean two incompatible things.</p>
+<h2>Work One Adversarial History</h2>
+<p>Consider three replicas, <code>A</code>, <code>B</code>, and <code>C</code>. <code>A</code> is initially the leader. The test uses two clients and distinct tokens, while the fault injector can partition, pause, and restart nodes.</p>
+<div class="codehilite"><pre><span></span><code>10:00:00  client 1  invoke  reserve(K7)  -&gt; A
+10:00:01  client 1  info    timeout waiting for response
+10:00:01  nemesis   partition A away from B and C
+10:00:03  B and C   elect a new leader
+10:00:04  client 1  invoke  reserve(K7)  -&gt; new leader
+10:00:04  client 1  ok      reservation R-91
+10:00:05  client 2  invoke  status(K7) on strong path
+10:00:05  client 2  ok      R-91
+</code></pre></div>
+
+<p>This trace can be acceptable. The first request was uncertain. The retry used the same token, and the final status sees one reservation. The checker does not need to decide whether the first request reached <code>A</code>; it only needs to see that the observable outcome has one valid effect for <code>K7</code>.</p>
+<p>Now change the final observations:</p>
+<div class="codehilite"><pre><span></span><code>10:00:04  retry reserve(K7) returns R-91
+10:00:05  strong status(K7) returns R-77 and R-91
+</code></pre></div>
+
+<p>No healthy-looking dashboard repairs this history. There are two business effects for one key. The likely engineering question is whether the old leader accepted an operation without durable authority, whether a request-record table was not committed with the reservation, or whether the retry handler did not resolve an existing token before creating a row. The checker reports the violation; logs, commit positions, and leader epochs help locate the cause.</p>
+<p>There is another, stricter case. Suppose the first <code>reserve(K7)</code> returned <code>ok</code> before the partition, and, after recovery, the strong status path says no reservation exists. If the documented <code>ok</code> is a failover-surviving confirmation, this is an acknowledged-write-loss anomaly. If the system only promised a weaker acknowledgement, the test has instead exposed a contract mismatch: the API response is being read as stronger than its implementation.</p>
+<p>The important reasoning move is to separate these cases. A timeout creates uncertainty that must be resolved. A success response creates an obligation according to the published acknowledgement contract.</p>
+<h2>Choose Faults That Threaten the Contract</h2>
+<p>A fault is useful when it attacks a mechanism the guarantee relies on. The goal is not an impressive collection of destructive actions.</p>
+<table>
+<thead>
+<tr>
+<th>Fault schedule</th>
+<th>Promise under pressure</th>
+<th>Evidence the checker needs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Partition leader from a quorum during writes</td>
+<td>Old authority must not acknowledge unsafe work.</td>
+<td><code>ok</code> writes remain visible after recovery; no duplicate token.</td>
+</tr>
+<tr>
+<td>Pause or kill a leader during an acknowledgement</td>
+<td>Recovery must preserve the stated commit boundary.</td>
+<td>The post-failover history is compatible with every completed result.</td>
+</tr>
+<tr>
+<td>Delay replica application while issuing strong reads</td>
+<td>A strong path must not serve an older state.</td>
+<td>A read after a completed write sees the required version.</td>
+</tr>
+<tr>
+<td>Change a node clock when leases determine authority</td>
+<td>Lease and fencing assumptions survive the fault model.</td>
+<td>No obsolete leader produces accepted results.</td>
+</tr>
+</tbody>
+</table>
+<p>Clock manipulation is not mandatory just because a tool can do it. It belongs in scope when leadership or safe reads depend on time-based leases. Similarly, a stale analytics view is not a failure unless that particular view promised freshness or strength it did not deliver. Name the fault model and its boundary in the test plan, so a result cannot be dismissed vaguely as “unrealistic” after it fails.</p>
+<p>The fault injector is often called a <em>nemesis</em>, but it should be boringly deliberate. Schedule the partition near the acknowledgement window; vary timing and concurrent load across runs; retain the seed or schedule that reproduces an anomaly. Randomness can explore more interleavings, yet reproducibility is what turns an alarming trace into a regression test.</p>
+<h2>What the Checker Can and Cannot Conclude</h2>
+<p>For a small token-based API, a checker can verify local rules directly: no token maps to two reservation IDs, a completed strong read follows the required completed write, and a release explains a later absence. For a richer concurrent object, the question may be whether all completed operations fit one allowed sequential ordering. Linearizability is the familiar strong form: each operation appears to take effect at one point between its invocation and response, while non-overlapping operations retain their real-time order.</p>
+<p>That does not make one passing run a proof of correctness. It means the run found no forbidden history within its workload, duration, topology, and faults. Nondeterministic tests may miss a rare timing window. A model can also omit a business rule. Keep the checker narrow enough to understand, run it repeatedly around releases and configuration changes, and grow it when a real incident reveals a missing invariant.</p>
+<p>The cost is real: capturing histories, building a trustworthy model, and operating faults takes time. The benefit is equally concrete. Instead of “failover looked fine,” Harbor Point can say: “under this documented partition schedule, our checker found no acknowledged-write loss, duplicate idempotency token, or forbidden strong read.” That claim is bounded, falsifiable, and useful in a design review.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A fault run causes 200 client timeouts. The test calls every timeout a failure, then reports no duplicate reservations. Why is that conclusion weak?</p>
+<p><strong>Answer:</strong> Some timed-out calls may have committed. Without recording them as uncertain and resolving their token status, a duplicate created by a retry can be hidden. The history lacks the evidence needed to check at-most-once application.</p>
+<p><strong>Check:</strong> A partition-and-failover test completes, every node is healthy, and no checker ran. What did the team establish?</p>
+<p><strong>Answer:</strong> It established that this run recovered operationally. It did not establish that successes survived, strong reads were valid, or retries were idempotent. Those require observable invariants and a history checker.</p>
+<h2>Practice: Design the Smallest Useful Test</h2>
+<p>Write a one-page test plan for one endpoint in your system, or use <code>reserve(K)</code>.</p>
+<ol>
+<li>State one success-response promise in a sentence that a client can observe.</li>
+<li>Name the operation, idempotency or correlation key, and the result the harness records.</li>
+<li>Pick one fault that threatens the mechanism behind that promise.</li>
+<li>Write the checker rule and how it treats <code>ok</code>, <code>fail</code>, and <code>info</code>.</li>
+<li>Name the extra evidence you will keep for diagnosis: request IDs, leader epoch, commit position, topology events, or logs.</li>
+</ol>
+<p><strong>Self-review:</strong> If your checker can pass when an <code>ok</code> write disappears, your promise and rule do not match. If it cannot say what a timeout means or how a retry reuses identity, add a resolution step before adding more faults.</p>
 <h2>Connections</h2>
 <ul>
-<li><a href="020.html">Observability for Replicated Data Systems</a> exposes the internal boundaries; this lesson tests whether those boundaries preserve the client-visible contract under stress.</li>
-<li><a href="022.html">Guarantee Matrix Design Review</a> depends on this discipline: every promised guarantee should map to a workload, a fault model, and a checker before the architecture is accepted.</li>
-<li><a href="016.html">Clocks, Leases, and Safe Reads</a> is one of the concrete claims that failure testing should attack when time-based authority is part of the read path.</li>
+<li><a href="020.html">Observability for Replicated Data Systems</a> maps internal signals to operational promises; this lesson checks whether those promises survive adversarial schedules.</li>
+<li><a href="022.html">Guarantee Matrix Design Review</a> turns each important promise into an architecture, fallback, measurement, and test obligation.</li>
+<li><a href="016.html">Clocks, Leases, and Safe Reads</a> explains why a clock fault becomes relevant when authority depends on lease time.</li>
 </ul>
 <h2>Resources</h2>
 <ul>
 <li>[DOC] <a href="https://jepsen.io/analyses">Jepsen Analyses</a><ul>
-<li>Focus: Read real consistency failures and see how workload design, nemesis choices, and history analysis expose bugs that ordinary load tests miss.</li>
+<li>Focus: See how generated concurrent histories, real clusters, and injected failures expose replica divergence, stale reads, and lost data.</li>
 </ul>
 </li>
 <li>[PAPER] <a href="https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a><ul>
-<li>Focus: The formal model behind single-copy behavior and why "acknowledged" must correspond to one valid global history.</li>
+<li>Focus: Learn the history-based correctness model behind the strong-read and acknowledged-write examples.</li>
 </ul>
 </li>
 <li>[PAPER] <a href="https://www.vldb.org/pvldb/vol13/p268-anand.pdf">Elle: Inferring Isolation Anomalies from Experimental Observations</a><ul>
-<li>Focus: How modern checkers infer transactional anomalies from histories instead of relying only on hand-written assertions.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a><ul>
-<li>Focus: Review the chapters on replication, transactions, and fault tolerance, then map those guarantees into the kinds of invariants Harbor Point is trying to test.</li>
+<li>Focus: Study a checker that infers transactional anomalies from observed histories.</li>
 </ul>
 </li>
 </ul>
 <h2>Key Takeaways</h2>
 <ol>
-<li>A Jepsen-style test starts with a claim, not with random breakage; the workload and checker must match the promise the service makes.</li>
-<li>Client-visible history is the ground truth for correctness because partitions, crashes, and timeouts matter only when they produce histories the claimed model should forbid.</li>
-<li>Useful anomalies change engineering decisions: they lead to tighter lease rules, safer retry contracts, better fencing, or a rejected release.</li>
+<li>Begin with a client-visible promise, then choose operations, faults, and a checker that can falsify that promise.</li>
+<li>A timeout is uncertainty, not a result; stable tokens and follow-up status checks make retries testable.</li>
+<li>A passing failure test is bounded evidence, while a rejected history points directly to a contract, fencing, retry, or durability decision.</li>
 </ol>
 </section>
 
@@ -180,7 +283,7 @@ nemesis injects partitions, pauses, kills, clock skew
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 07:04 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
