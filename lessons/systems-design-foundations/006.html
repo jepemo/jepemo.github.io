@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,222 +81,269 @@
 <section class="stack-block lesson-content-shell">
   <h1>Writing and Reviewing Architecture Proposals</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong> frame an architecture proposal as a reviewable argument, trace one happy path and one degraded path through the design, and review a proposal for assumptions, rollout risk, and operating cost.</p>
-<p><strong>Idea in one sentence.</strong> A strong architecture proposal turns private design intuition into shared evidence, so the team can challenge the reasoning before the system is expensive to change.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Turn a design intuition into a proposal with a clear decision, invariants, alternatives, and evidence.</p>
+</li>
+<li>
+<p>Trace both normal and degraded behavior through the proposed boundary.</p>
+</li>
+<li>
+<p>Review a proposal by testing its assumptions, rollout plan, operating signals, and accepted costs.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A useful architecture proposal makes a decision challengeable before implementation makes changing it expensive.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the whiteboard team is redesigning progress tracking. Today, a learner can complete a lesson on a laptop, open the same course on a phone, and briefly see stale progress. During traffic bursts, notification jobs sometimes slow the user-facing write path. Analytics consumers want richer events, but product engineers do not want reporting work to interfere with the moment a learner saves progress.</p>
-<p>Several designs sound plausible. The team could harden the current synchronous write path, add an event log and asynchronous projections, split notifications into a separate worker path, or redesign ownership around a single progress service. The hard part is not inventing one possible architecture. The hard part is making the reasoning visible enough that other engineers can test it.</p>
-<p>That is the job of an architecture proposal. It is not a performance, a vendor comparison, or a diagram with more boxes. It is a decision instrument. A good proposal explains the problem, the constraints, the options considered, the chosen mechanism, the failure behavior, the rollout path, and the cost the team is accepting.</p>
-<p>The common misconception is that proposal quality comes mostly from polish. Clear writing matters, but the deeper question is whether the document exposes the design's assumptions. If a reviewer cannot tell what must remain true, what can fail safely, why rejected alternatives lost, or how operators will know the rollout is healthy, the proposal is not yet reviewable.</p>
-<h2>Start With The Decision Frame</h2>
-<p>The first useful move is to frame the decision before naming tools. A weak opening says:</p>
-<div class="codehilite"><pre><span></span><code>We propose moving progress tracking to an event-driven architecture.
+<p>Lina completes lesson 006 on her laptop. A moment later, she opens the course on her phone and does not see the completion. Meanwhile, a launch campaign creates a burst of notifications and analytics work. Some progress saves now wait behind that downstream work.</p>
+<p>An engineer says, “We should make progress tracking event driven.” That might be a good direction, but it is not yet a proposal. It names a technology shape without saying what promise failed, what must remain true, how the new path behaves when consumers fail, or how the team will know that migration is safe.</p>
+<p>The naive model is that a proposal is a polished diagram plus a preferred tool. It works only when everyone already shares the problem, assumptions, and operational context. It breaks when a reviewer needs to ask: Can a learner lose accepted progress? How long may cross-device visibility lag? What happens when notifications are down? Can we roll back after half the readers move?</p>
+<p>The stronger model treats the proposal as a reviewable argument:</p>
+<div class="codehilite"><pre><span></span><code>pressure -&gt; promises and limits -&gt; alternatives -&gt; chosen boundary
+-&gt; normal and degraded traces -&gt; rollout evidence -&gt; accepted cost
 </code></pre></div>
 
-<p>That sentence names a shape, but it does not give the reader enough context to disagree productively. A stronger opening says:</p>
-<div class="codehilite"><pre><span></span><code>Learner progress can diverge across devices under retries and burst traffic.
-Notification and analytics work currently share the user-facing write path.
-We need accepted progress to be durable immediately, visible across devices
-within a few seconds, and isolated from downstream consumer slowdowns.
-This proposal does not redesign quiz scoring, billing, or course enrollment.
+<p>The document does not eliminate uncertainty. It puts uncertainty where a team can test it.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>Start with the decision frame, before naming a log, broker, or vendor.</p>
+<div class="codehilite"><pre><span></span><code>Observed pressure:
+  notification and analytics work share a path with learner progress saves.
+
+Product promises:
+  once a valid progress update is accepted, it must not disappear;
+  the save should not wait for notification or analytics work;
+  another device should show accepted progress within a stated window.
+
+Non-goals:
+  this decision does not redesign billing, quiz scoring, or course enrollment.
+
+Evidence needed:
+  trace time on the current write path; consumer lag; cross-device mismatch rate.
 </code></pre></div>
 
-<p>Now the reader has a decision frame. They can inspect the problem, the success criteria, the boundaries, and the non-goals. If they disagree, the disagreement has a useful target: maybe the convergence window should be shorter, maybe billing is actually affected, or maybe the real issue is missing idempotency rather than architecture shape.</p>
-<p>A proposal's opening should usually include:</p>
-<div class="codehilite"><pre><span></span><code>problem observed
--&gt; user or operational impact
--&gt; invariants that must hold
--&gt; constraints and non-goals
--&gt; evidence that the current design is stressed
+<p>An invariant is a rule the design must protect. Here, a useful invariant is: an accepted progress update remains durable even if a downstream worker is unavailable. The stated convergence window is a different kind of promise. It may permit a brief delay after acceptance, but it must be measurable.</p>
+<p><strong>Check:</strong> Why is “move progress tracking to an event-driven architecture” an unready opening?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It proposes a shape before the decision criteria. A reviewer cannot tell whether the current failure is durability, latency, duplicates, consumer coupling, or something simpler such as missing idempotency. The frame makes disagreement productive.</p>
+<h2>The Naive Design</h2>
+<p>The current path writes progress and waits for several kinds of work:</p>
+<div class="codehilite"><pre><span></span><code>client
+  -&gt; Progress API
+  -&gt; primary progress record
+  -&gt; notification work
+  -&gt; analytics work
+  -&gt; return success
 </code></pre></div>
 
-<p>An invariant is a rule the design must protect. In the progress scenario, one invariant might be: once the API accepts a valid progress update, that update must not disappear, even if notification workers are down. Another might be: analytics lag must not block the learner-facing save path.</p>
-<p>The trade-off is that strong framing exposes uncertainty early. That can feel slower than jumping to the diagram. But uncertainty found in the proposal is cheap. Uncertainty found during migration, after clients and workers depend on the new path, is expensive.</p>
-<h2>Show The Mechanism, Not Just The Components</h2>
-<p>After the frame, the proposal should show how the chosen design changes the movement of data, control, and failure. Component names are not enough. A diagram that says "API, event log, projector, notifier, analytics" may be accurate and still leave the hard questions hidden.</p>
-<p>For the whiteboard team, suppose the chosen design is:</p>
+<p>This is easy to understand while traffic is low and downstream work is quick. It breaks when a slow notification provider or analytics consumer adds waiting to a learner action that should be accepted independently. Adding retries can reduce transient failures, but it does not separate the responsibility for accepted progress from derived side effects.</p>
+<p>The design question is therefore narrower than “Should we adopt events?” It is: where should the authority to accept progress end, and which work may follow it asynchronously?</p>
+<h2>Design Alternatives</h2>
+<p>Compare options by the promises they keep and the costs they create.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Helps</th>
+<th>Loses or risks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Keep one synchronous path and tune retries</td>
+<td>fewer moving parts</td>
+<td>slow consumers can still threaten saves</td>
+</tr>
+<tr>
+<td>Durable acceptance, then asynchronous projections and consumers</td>
+<td>isolates accepted saves from derived work</td>
+<td>lag, duplicate delivery, backlog operations</td>
+</tr>
+<tr>
+<td>Full event-sourced platform now</td>
+<td>rich replay and audit history</td>
+<td>migration and operating complexity beyond the current evidence</td>
+</tr>
+</tbody>
+</table>
+<p>The second option is a reasonable current boundary if traces show downstream coupling is the active pressure. It is not automatically superior. If the trace shows that an idempotency bug in the primary write is causing the symptom, a new event path would be a costly distraction.</p>
+<p>This is the useful test from lesson 005: a familiar mechanism earns transfer only after local evidence identifies the pressure it addresses.</p>
+<h2>A Better Boundary</h2>
+<p>The proposal chooses durable acceptance before derived work:</p>
 <div class="codehilite"><pre><span></span><code>Client
   -&gt; Progress API
-  -&gt; durable progress event store
-  -&gt; learner progress projection
-  -&gt; notification worker
-  -&gt; analytics consumers
+  -&gt; durable accepted-progress record
+  -&gt; progress projection
+  -&gt; notification consumer
+  -&gt; analytics consumer
 </code></pre></div>
 
-<p>The mechanism is the decoupling of acceptance from derived work. The user-facing path validates a progress update and records it durably. Projection, notification, and analytics become consumers of accepted progress events. The design buys isolation: a slow notification worker should no longer make the learner wait to save progress.</p>
-<p>That mechanism should be written as a trace:</p>
-<div class="codehilite"><pre><span></span><code>Input:
-  learner completes lesson 006 on laptop
+<p>In plain English, the API first decides whether the update counts. It records that decision durably. Other components can learn from the accepted decision later.</p>
+<p>In this scenario, the technical pattern is an accepted event path with projections and consumers. The name matters less than the boundary: notification and analytics are no longer allowed to decide whether the learner's progress save succeeds.</p>
+<p>The proposal must also state ownership:</p>
+<div class="codehilite"><pre><span></span><code>authoritative:
+  accepted progress record and its idempotency rule
+
+derived:
+  cross-device projection, notifications, analytics
+
+operational owner:
+  the team responsible for backlog, replay, dead letters, and projection health
+</code></pre></div>
+
+<p>Without this, an asynchronous design merely moves ambiguity into a queue.</p>
+<h2>Worked Path: Accepted, Then Visible</h2>
+<p>Trace one update. This is a teaching model; the names and timing are illustrative.</p>
+<div class="codehilite"><pre><span></span><code>Starting state:
+  Lina has not completed lesson 006 on either device.
 
 Step 1:
-  client sends progress update with learner_id, lesson_id, attempt_id
+  The laptop sends {learner_id, lesson_id, attempt_id} to the Progress API.
 
 Step 2:
-  API validates ownership and idempotency key
+  The API validates that Lina owns the course and checks attempt_id so a retry
+  cannot create a second accepted completion.
 
 Step 3:
-  API appends accepted progress event to durable store
+  The API writes the accepted progress record durably.
 
 Step 4:
-  API returns success after durable acceptance
+  The API returns success to the laptop. The save promise is now kept.
 
 Step 5:
-  projection consumes event and updates cross-device progress view
+  A projection updates the cross-device view. The phone may be briefly stale
+  until this step completes within the stated convergence window.
 
 Step 6:
-  notification and analytics consumers process the same event later
+  Notification and analytics consumers process the same accepted record later.
 </code></pre></div>
 
-<p>The trace makes intermediate states visible. After step 4 but before step 5, the update is accepted but may not yet be reflected on every device. That is not automatically a bug if the proposal explicitly promises convergence within a few seconds. It is a bug if the product promise was immediate cross-device visibility.</p>
-<p><strong>Prediction check:</strong> If the notification worker is down at step 6, should the learner-facing progress save fail?</p>
-<p>No. In this proposal, notification work is derived work. The accepted progress event should remain durable, the learner should keep moving, and operators should see a notification backlog. If the save fails because the notifier is down, the implementation has violated the proposal's central mechanism.</p>
-<h2>Compare Options With Honest Losses</h2>
-<p>A proposal becomes credible when it shows that the team compared real alternatives. The point is not to fill a ritual section called "options considered." The point is to prove that the chosen design beat plausible choices under the stated constraints.</p>
-<p>For progress tracking, the proposal might compare:</p>
-<div class="codehilite"><pre><span></span><code>Option A: keep synchronous writes and improve retry logic
-  Wins:
-    simpler mental model, fewer moving parts
-  Loses:
-    downstream notification and analytics work still threaten the write path
-
-Option B: append accepted progress events and build async consumers
-  Wins:
-    durable acceptance, isolated downstream work, better audit trail
-  Loses:
-    lag, duplicate delivery handling, consumer backlog operations
-
-Option C: build a full event-sourced progress platform immediately
-  Wins:
-    strong history model, flexible replay, rich audit semantics
-  Loses:
-    more migration risk and operational complexity than the current pressure earns
-</code></pre></div>
-
-<p>This section should not pretend every option is equally good. It should state why the selected design is the best fit for the current pressure. In this scenario, option B may be the right middle move: it separates accepted progress from derived consumers without forcing the team into a full event-sourcing platform before it needs one.</p>
-<p>The useful review question is: "Did the chosen option lose in a way we can live with?" If option B introduces lag and duplicate delivery, the proposal must say how much lag is acceptable and how consumers will be idempotent. If the team cannot answer that, the alternative comparison is not finished.</p>
-<h2>Walk The Degraded Path</h2>
-<p>Most architecture mistakes hide in degraded behavior. The steady-state diagram looks calm; production is where dependencies stall, consumers retry, messages duplicate, and migrations pause halfway.</p>
-<p>A strong proposal includes at least one degraded path:</p>
+<p>The intermediate state after step 4 matters. Lina's completion is accepted even though the phone view and notification may not yet be updated. That is acceptable only because the proposal says which result is immediate and which result may lag.</p>
+<p>So far, the boundary preserves durable acceptance while making derived delay observable. It does not make every view instantly consistent, and it does not remove the need for idempotent consumers.</p>
+<h2>What This Changes</h2>
+<p>Before this model, a design review can get stuck on a question such as “Should we use a broker?” That question is too late and too narrow. It assumes the team already agrees on the pressure, the immediate promise, the permitted delay, and the facts that must survive a failure.</p>
+<p>After this model, the reviewer can inspect each claim separately. If the real pressure is a duplicate-write bug, the event path may not earn its cost. If the learner needs immediate cross-device visibility, the projection cannot be treated as ordinary derived work. If notification delivery is legally or commercially required, its outage policy needs a stronger promise than “eventually.” The proposal has not made the choices for the team. It has made the choices visible enough to challenge.</p>
+<p>This changes the decision from “adopt an architecture” to “accept this boundary under these observable conditions.” That is a smaller and safer claim. It also gives future operators a reason for every important signal: the signal exists because a stated promise or risk needs evidence.</p>
+<h2>The Degraded Path</h2>
+<p>Now test the argument when a dependency fails:</p>
 <div class="codehilite"><pre><span></span><code>Scenario:
-  notification worker is unavailable for 20 minutes
+  notification consumer is unavailable for 20 minutes.
 
 Expected behavior:
-  Progress API continues accepting valid updates.
-  Accepted events remain durable.
-  Progress projection continues if it does not depend on notifier.
-  Notification backlog grows.
-  Alert fires when backlog age exceeds threshold.
-  Worker resumes and drains idempotently.
+  the API continues to accept valid progress updates;
+  accepted records stay durable;
+  the progress projection continues if it is independent of notifications;
+  notification backlog age grows and an alert fires;
+  recovery drains work idempotently under a stated policy for late messages.
 
 User-visible result:
-  learner progress is saved and visible;
-  notifications may arrive late or be skipped according to policy.
-
-Operator signal:
-  backlog age, retry count, dead-letter count, consumer lag.
+  progress is saved; a notification may arrive late or be omitted if its value expires.
 </code></pre></div>
 
-<p>This path reveals whether the design's promises are coherent. If notification lag is acceptable, the product team should know. If some notifications become worthless after a time window, the proposal should say whether to send them late, drop them, or compact them. If duplicate events can create duplicate notifications, the proposal should require an idempotency rule.</p>
-<p>The same proposal should include a rollout path. A design that works only after every client, API, projection, and consumer moves at once is risky. A safer migration may look like this:</p>
-<div class="codehilite"><pre><span></span><code>1. write current path and new event path in parallel
-2. compare projection output against existing progress view
-3. enable read traffic for a small cohort
-4. expand cohort while watching lag and mismatch metrics
-5. cut over default reads
-6. keep rollback path until event path has survived peak traffic
+<p>This degraded trace reveals a trade-off that a diagram can hide. The design buys isolation for learner saves. It costs consumer lag, replay behavior, duplicate handling, and an operations commitment. If the team cannot say whether a twenty-minute-late notification should send, compact, or drop, the proposal has left a product decision undefined.</p>
+<h2>Operational Consequences and Rollout</h2>
+<p>The proposal needs signals tied to both the promise and the new risk:</p>
+<div class="codehilite"><pre><span></span><code>Outcome signals:
+  accepted-save latency; cross-device projection freshness; mismatch rate
+
+Safety signals:
+  consumer backlog age; retry and dead-letter counts; duplicate side effects
+
+Decision signals:
+  projection comparison mismatch; rollback trigger; percentage of traffic on new reads
 </code></pre></div>
 
-<p>The trade-off is extra engineering work. Dual writes, comparison jobs, and rollback plans are not free. But they convert one large bet into a sequence of measured steps. That is often the difference between an architecture proposal and an architecture gamble.</p>
-<h2>Review The Proposal Like A System</h2>
-<p>Reviewing an architecture proposal is not voting on whether the diagram looks reasonable. It is testing the argument. A reviewer should be able to reconstruct the design from problem to mechanism to failure behavior.</p>
-<p>Use this checklist:</p>
-<div class="codehilite"><pre><span></span><code>Problem:
-  Can I restate the pressure without naming the chosen technology?
-
-Invariants:
-  Can I name what must remain true under retries, lag, and partial failure?
-
-Mechanism:
-  Can I trace one accepted request through the design?
-
-Alternatives:
-  Do I understand why the rejected options lost?
-
-Degraded behavior:
-  Can I describe what happens when one dependency is slow or unavailable?
-
-Rollout:
-  Is there a measured migration and rollback path?
-
-Operations:
-  Do we know which metrics, alerts, and ownership boundaries are required?
+<p>Do not migrate every writer and reader at once. A bounded rollout can make the decision reversible:</p>
+<div class="codehilite"><pre><span></span><code>1. record the new accepted path alongside the current result;
+2. compare the projection with the existing progress view;
+3. enable new reads for a small cohort;
+4. expand only while freshness and mismatch guardrails remain healthy;
+5. retain a tested rollback path until the new path survives representative traffic.
 </code></pre></div>
 
-<p>Review comments should attach to one of those categories. "This seems complex" is a start, but it becomes useful when converted into a sharper claim: "The proposal accepts consumer lag, but does not define a maximum backlog age or a product policy for late notifications." That comment tests an operational gap rather than expressing a vague preference.</p>
-<p><strong>Quick check:</strong> A reviewer says, "Why not just use Kafka?" What is missing from that question?</p>
-<p>The question jumps to a tool before naming the design pressure. A better version is: "Which property do we need from the event path: durable ordering, replay, consumer isolation, throughput, or operational familiarity? Once that is clear, we can compare Kafka, a database-backed outbox, or another mechanism fairly."</p>
-<h2>Common Failure Modes</h2>
-<p><strong>The proposal is mostly a diagram.</strong> Diagrams are useful, but they compress reasoning. Add problem framing, invariants, alternatives, traces, degraded paths, and operating signals. The diagram should support the argument, not replace it.</p>
-<p><strong>The proposal hides the cost of the chosen design.</strong> Every mechanism buys something by spending something else. Async consumers buy isolation by spending consistency simplicity. Edge placement buys latency by spending invalidation complexity. A proposal that names only the benefit is not yet honest enough to review.</p>
-<p><strong>The review becomes a taste debate.</strong> This usually means the proposal lacks shared criteria. Bring the conversation back to user promises, invariants, failure behavior, rollout risk, and operational ownership.</p>
-<p><strong>The document freezes after approval.</strong> A proposal should become team memory, not a dead artifact. If the rollout teaches the team that an assumption was wrong, record the change in the proposal or in a follow-up architecture decision record.</p>
-<h2>Practice: Review A Proposal Fragment</h2>
-<p>Read this fragment:</p>
-<div class="codehilite"><pre><span></span><code>We will move progress tracking to an event-driven architecture.
-The API will publish progress events. A projection service will update the
-read model. Notification and analytics services will consume the events.
-This makes the system scalable and easier to extend.
+<p>This adds temporary complexity. Dual paths and comparison jobs cost engineering time. That cost is worthwhile when it discovers a false assumption before a full cutover. It becomes wasteful when the team keeps both paths without a decision metric or removal plan.</p>
+<h2>Design Review</h2>
+<p>A review should test the proposal's argument, not vote on its diagram. Ask questions in these categories:</p>
+<table>
+<thead>
+<tr>
+<th>Review lens</th>
+<th>Question</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pressure</td>
+<td>Can we restate the observed problem without naming the chosen technology?</td>
+</tr>
+<tr>
+<td>Invariant</td>
+<td>What remains true under retries, lag, and a consumer outage?</td>
+</tr>
+<tr>
+<td>Boundary</td>
+<td>Which component has authority to accept progress, and which work is derived?</td>
+</tr>
+<tr>
+<td>Alternative</td>
+<td>Why did the simpler and broader options lose under current evidence?</td>
+</tr>
+<tr>
+<td>Degraded path</td>
+<td>What does a learner see, and what does an operator see, when a consumer is down?</td>
+</tr>
+<tr>
+<td>Rollout</td>
+<td>Which comparison, guardrail, and rollback rule make migration safe enough?</td>
+</tr>
+</tbody>
+</table>
+<p>Convert taste into testable comments. “This seems complex” becomes “The proposal introduces consumer lag but never states its maximum acceptable age or who owns the dead-letter queue.” That is a comment the author can answer with a decision, evidence, or a changed boundary.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion: “Asynchronous means reliable.”</strong></p>
+<p>Why it is tempting: a queue separates callers from a slow consumer.</p>
+<p>Better model: it can isolate the accepted path, but it creates lag, duplicate delivery, backlog, and recovery obligations. Reliability comes from the whole rule set, not from the word <em>asynchronous</em>.</p>
+<p><strong>Confusion: “A rollout plan belongs after the architecture decision.”</strong></p>
+<p>Why it is tempting: rollout sounds like implementation detail.</p>
+<p>Better model: a design that cannot be measured, compared, and safely reversed may be too risky for the stated pressure. The migration path is evidence that the boundary can be introduced responsibly.</p>
+<h2>Practice: Repair a Proposal Fragment</h2>
+<p>Review this fragment:</p>
+<div class="codehilite"><pre><span></span><code>We will use an event-driven architecture for progress tracking.
+The API will publish events, and several services will consume them.
+This will make the platform scalable and extensible.
 </code></pre></div>
 
-<p>Before rereading the lesson, write the five most important review questions. A strong answer should include questions like:</p>
+<p>A good review should request:</p>
 <ul>
-<li>What exact user or operational pressure is forcing this change?</li>
-<li>What invariant protects accepted progress updates?</li>
-<li>What lag is acceptable between event acceptance and read-model visibility?</li>
-<li>What happens if a consumer is down, slow, or processes an event twice?</li>
-<li>Which alternatives were considered, and why did they lose?</li>
-<li>How will the rollout compare old and new progress views?</li>
-<li>Which metrics prove the design is healthy?</li>
+<li>the user and operational pressure that justifies the change;</li>
+<li>the invariant for an accepted progress update and the idempotency rule;</li>
+<li>the allowed projection lag and behavior when consumers are unavailable;</li>
+<li>alternatives with their concrete losses;</li>
+<li>rollout comparison signals, a rollback condition, and an operational owner.</li>
 </ul>
-<p>Now improve the fragment in one sentence:</p>
-<div class="codehilite"><pre><span></span><code>We will append accepted progress updates to a durable event path so the
-learner-facing save can succeed independently of notification and analytics
-work, while projections converge within a defined window and operators track
-consumer lag, duplicate handling, and rollout mismatches.
+<p>Then write one replacement sentence. A reasonable answer is:</p>
+<div class="codehilite"><pre><span></span><code>We will record a valid progress update durably before derived notification and
+analytics work, so learner saves survive consumer outages while projections
+converge within a stated window and operators watch backlog, duplicates, and
+old-versus-new view mismatches during rollout.
 </code></pre></div>
 
-<p>That sentence is not a full proposal, but it is reviewable. It names the mechanism, the user-facing promise, the accepted trade-off, and the operational evidence needed to trust the design.</p>
+<h2>Connections</h2>
+<p>Lesson 005 taught how to turn an external example into conditional evidence. This lesson records the local decision that evidence supports. Lesson 007 will reuse the same lenses—limit, assumption, mechanism, invariant, baseline, and failure signal—when the proposed technology is unfamiliar.</p>
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] Documenting Architecture Decisions<ul>
-<li>Link: <a href="https://adr.github.io/">https://adr.github.io/</a></li>
-<li>Focus: Use this to see how small, durable decision records preserve architectural reasoning after a proposal is approved.</li>
-</ul>
-</li>
-<li>[DOC] Google SRE Workbook<ul>
-<li>Link: <a href="https://sre.google/workbook/table-of-contents/">https://sre.google/workbook/table-of-contents/</a></li>
-<li>Focus: Read for rollout, reliability, observability, and operational review habits that proposals should surface early.</li>
-</ul>
-</li>
-<li>[ARTICLE] The C4 Model for Visualising Software Architecture<ul>
-<li>Link: <a href="https://c4model.com/">https://c4model.com/</a></li>
-<li>Focus: Use this to make architecture diagrams readable while keeping written reasoning as the source of the decision.</li>
-</ul>
-</li>
-<li>[ARTICLE] Martin Fowler: Event Sourcing<ul>
-<li>Link: <a href="https://martinfowler.com/eaaDev/EventSourcing.html">https://martinfowler.com/eaaDev/EventSourcing.html</a></li>
-<li>Focus: Read this when proposal alternatives involve event history, replay, projections, and their operational consequences.</li>
-</ul>
-</li>
+<li>[ARTICLE] <a href="https://adr.github.io/">Documenting Architecture Decisions</a> — Focus: decision context, alternatives, and consequences that remain useful after approval.</li>
+<li>[DOC] <a href="https://sre.google/workbook/table-of-contents/">Google SRE Workbook</a> — Focus: rollout, observability, and operational readiness that a proposal should expose.</li>
+<li>[ARTICLE] <a href="https://c4model.com/">The C4 Model</a> — Focus: readable architecture diagrams that support, rather than replace, the written argument.</li>
+<li>[ARTICLE] <a href="https://martinfowler.com/eaaDev/EventSourcing.html">Event Sourcing</a> — Focus: replay, projections, and the costs of event-history alternatives.</li>
 </ul>
 <h2>Key Takeaways</h2>
-<ol>
-<li>A proposal is a reviewable argument, not just a diagram or tool choice.</li>
-<li>The strongest proposals expose invariants, alternatives, failure paths, rollout plans, and operating signals.</li>
-<li>Good review comments test assumptions against concrete behavior under lag, retries, migration, and partial failure.</li>
-<li>Architecture proposals become valuable team memory when they record why a cost was accepted, not only what was built.</li>
-</ol>
+<ul>
+<li>A proposal begins with a pressure, promises, non-goals, and evidence—not a tool name.</li>
+<li>The chosen boundary must show who accepts the authoritative fact and which work may lag.</li>
+<li>A normal trace and a degraded trace expose different assumptions; both belong in a reviewable decision.</li>
+<li>Rollout metrics, guardrails, ownership, and rollback conditions are part of the architecture, not postscript operations.</li>
+</ul>
 </section>
 
 <section class="lesson-navigation-grid lesson-page-nav">
@@ -321,7 +372,7 @@ consumer lag, duplicate handling, and rollout mismatches.
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 14:20 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

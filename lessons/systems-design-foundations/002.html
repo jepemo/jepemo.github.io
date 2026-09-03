@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,165 +81,259 @@
 <section class="stack-block lesson-content-shell">
   <h1>Product Promises and Subsystem Guarantees</h1>
 <blockquote>
-<p><strong>By the end of this lesson, you will be able to...</strong> separate product requirements into promise classes, assign each class to an appropriate subsystem guarantee, and review a design for mismatched coordination cost.</p>
-<p><strong>Idea in one sentence.</strong> A product is easier to design when you stop treating it as one system and instead map each user promise to the lightest subsystem guarantee that can protect it.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>Classify product promises as authoritative, interactive, or derived work.</p>
+</li>
+<li>
+<p>Assign each promise a subsystem guarantee and name what that subsystem must refuse to own.</p>
+</li>
+<li>
+<p>Review a design for a guarantee that is too weak, too expensive, or attached to the wrong path.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A product becomes easier to design when each promise gets the lightest guarantee that can keep it true.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine a collaborative whiteboard product used by remote teams. Users create boards, invite collaborators, draw at the same time, see live cursors, reconnect after a flaky network drop, search for old boards, and receive notifications when someone mentions them. If the design conversation starts with "we need a database, WebSockets, Kafka, Redis, and search," the team may build a plausible stack without knowing which promises the stack is protecting.</p>
-<p>The better starting point is to split the product into promises. Some promises need one authoritative answer: a board exists, a user has access, an invitation was accepted, a saved object has an owner. Some promises need low latency but can tolerate temporary looseness: cursors should feel live, strokes should appear quickly, presence should update soon. Other promises are derived consequences: search should eventually find a board, notifications should be sent, analytics should record usage.</p>
-<p>Those promises should not all receive the same coordination style. If every live cursor update waits for global agreement, the product will feel slow. If board ownership is propagated loosely with no clear authority, the product may expose private content or lose access decisions. The design skill is to match each promise to a guarantee: authority where ambiguity is unacceptable, local or session-level coordination where responsiveness matters, and asynchronous processing where lag is acceptable.</p>
-<p>This is the project-level version of constraint-driven design. The previous lesson asked what the system must protect. This lesson asks a sharper follow-up: which subsystem owns each promise, what guarantee does it provide, and what cost or failure mode comes with that guarantee?</p>
-<h2>Classify Product Promises Before Drawing Components</h2>
-<p>Start by writing product promises in user language. Do not translate them to services yet. For the whiteboard, the list might look like this:</p>
-<div class="codehilite"><pre><span></span><code>P1. A board has a durable identity and owner.
-P2. Only authorized users can open or edit the board.
-P3. Drawing should feel live to collaborators in the same session.
-P4. A disconnected client should be able to recover recent work.
-P5. Search should find saved boards.
-P6. Notifications should be sent when someone is mentioned.
-P7. Analytics should record board activity.
+<p>Priya creates a shared project board. She invites Mateo. Both start drawing at the same time. Mateo sees Priya's cursor move, finds the board in search, and later receives a notification when Priya mentions him.</p>
+<p>It is tempting to call all of that “the whiteboard system.” But the product has made several different promises. Board ownership must have a clear answer. Live cursors should feel immediate. Search may be briefly behind. A notification can retry later without undoing a drawing operation.</p>
+<p>The first lesson taught us to name the pressure before choosing a component. This lesson takes the next step: assign each product promise to a subsystem guarantee. A guarantee says what a subsystem is responsible for making true, what delay it accepts, and what it must not quietly become responsible for.</p>
+<h2>The Promise We Need to Keep</h2>
+<p>Write promises in user language before drawing services. For the board, the team might agree on these:</p>
+<div class="codehilite"><pre><span></span><code>P1. A board has one durable identity and owner.
+P2. Only authorized people may open or edit the board.
+P3. Collaborators in one active board see drawing changes quickly.
+P4. A reconnecting collaborator can recover accepted recent work.
+P5. Search can find saved boards after a bounded delay.
+P6. Mentions create notifications without blocking drawing.
+P7. Analytics records activity without deciding product correctness.
 </code></pre></div>
 
-<p>Now classify each promise by the kind of guarantee it needs:</p>
-<div class="codehilite"><pre><span></span><code>Promise                     Class             Reason
---------------------------  ----------------  ---------------------------------------
-board identity + owner      authoritative     ambiguity breaks the product contract
-access control              authoritative     wrong answers leak or block content
-live strokes + cursors      interactive       latency dominates user experience
-reconnect recovery          mixed             recent state must be recoverable
-search indexing             derived           useful if fresh, tolerable if delayed
-notifications               derived/bursty    should happen, but not block drawing
-analytics                   derived           valuable, not user-path authority
-</code></pre></div>
-
-<p>An authoritative promise needs a clear source of truth. In plain language, there must be one place or protocol the system treats as the official answer. An interactive promise needs fast coordination within a narrow scope, often a board session or room. A derived promise is downstream work produced from authoritative or accepted events; it may lag without invalidating the core user action.</p>
-<p><strong>Quick check:</strong> If search is down for five minutes, should users still be able to draw on an already-open board?</p>
-<p>Usually yes. Search is a derived discovery path, not the authority for board existence or live collaboration. If search downtime prevents drawing, the architecture has probably coupled a downstream projection to the core interaction path.</p>
-<h2>Turn Promise Classes Into Subsystem Guarantees</h2>
-<p>Once the promises are classified, the architecture begins to take shape. You can now ask what guarantee each subsystem must offer, rather than asking which component sounds impressive.</p>
-<p>One reasonable whiteboard design might look like this:</p>
+<p>These promises differ in a useful way:</p>
+<table>
+<thead>
+<tr>
+<th>Promise class</th>
+<th>Plain meaning</th>
+<th>Typical guarantee</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Authoritative</td>
+<td>The product needs one answer it can defend.</td>
+<td>Commit or reject the change clearly.</td>
+<td>Board ownership and access grants.</td>
+</tr>
+<tr>
+<td>Interactive</td>
+<td>The user needs a fast local experience.</td>
+<td>Respond within a short latency target for the active session.</td>
+<td>Cursor and stroke fan-out.</td>
+</tr>
+<tr>
+<td>Derived</td>
+<td>The work follows from an accepted fact.</td>
+<td>Process later with a stated freshness, retry, or loss policy.</td>
+<td>Search indexing, notifications, analytics.</td>
+</tr>
+</tbody>
+</table>
+<p>This is a teaching model, not a universal taxonomy. Reconnect recovery is often mixed: the live session needs speed, while accepted edits need durable evidence. The point is to expose the tension instead of using one vague word such as “reliable.”</p>
+<h2>The Naive Design</h2>
+<p>A reasonable first design puts every step in one synchronous pipeline:</p>
 <div class="codehilite"><pre><span></span><code>client
-  -&gt; edge/auth gateway
-  -&gt; board metadata service
-       -&gt; authoritative metadata store
-  -&gt; board session service
-       -&gt; in-memory room state + live fanout
-       -&gt; accepted stroke/event log
-  -&gt; async workers
-       -&gt; search index
-       -&gt; notification sender
-       -&gt; analytics pipeline
-</code></pre></div>
-
-<p>The metadata service owns durable board identity, ownership, and access control. Its guarantee is not "fast live drawing." Its guarantee is a clear answer about who may do what. It should be careful about idempotent board creation, invitation acceptance, and permission changes.</p>
-<p>The session service owns low-latency collaboration within a board. Its guarantee is not eternal truth about every user in the product. Its guarantee is that active collaborators see responsive updates and that accepted drawing operations have enough order and recovery information to survive ordinary reconnects.</p>
-<p>The worker systems own derived consequences. Their guarantee is not immediate user-visible correctness. Their guarantee is eventual processing with visible lag, retries, and failure handling. If notification workers fall behind, the board should not stop accepting strokes. If analytics drops a non-critical event after exhausted retries, it should not corrupt ownership.</p>
-<p>So far, the design has separated three questions that are often confused:</p>
-<div class="codehilite"><pre><span></span><code>Who is allowed?       -&gt; authoritative metadata / access control
-What is happening now? -&gt; session service / live collaboration
-What should happen later? -&gt; async projections and side effects
-</code></pre></div>
-
-<p>That separation is the central mechanism of the lesson. Product promises become promise classes. Promise classes become subsystem guarantees. Subsystem guarantees determine coordination cost, failure behavior, and operational signals.</p>
-<p>One useful way to test the mapping is to ask what each subsystem must refuse. A guarantee is not only what a subsystem does; it is also what the subsystem deliberately refuses to own.</p>
-<div class="codehilite"><pre><span></span><code>Subsystem              Must accept                         Must refuse
----------------------  ----------------------------------  --------------------------------
-metadata service       board identity, ownership, ACLs     live cursor fanout
-session service        active room state, stroke order     permanent access authority
-event log              accepted collaboration events       direct user authorization
-search worker          searchable board projections        source-of-truth board existence
-notification worker    mention/share side effects          blocking core edit success
-analytics pipeline     usage facts and aggregates          product correctness decisions
-</code></pre></div>
-
-<p>This refusal list prevents a common drift. A session service often starts with a simple job: keep a room responsive. Then someone asks it to remember permanent membership because it already sees everyone online. Then another feature reads presence state as if it were access control. The system slowly turns temporary session knowledge into authority. The reverse can happen too: a metadata service that should answer ownership questions starts carrying live collaboration traffic and becomes too slow for interactive work.</p>
-<p>Clear subsystem guarantees keep those pressures separated. The metadata service can be slower and more careful because wrong permission answers are serious. The session service can be faster and more local because it is not the final authority on every durable fact. Workers can retry and lag because they do not define whether the board action happened. The architecture becomes easier to review because each component has a job, a boundary, and a known way to fail.</p>
-<p>It also becomes easier to change, because a new feature has to declare which promise class it belongs to before it borrows an existing path.</p>
-<h2>Walk Through One User Action</h2>
-<p>Trace a concrete action: Priya creates a board, invites Mateo, and both start drawing.</p>
-<div class="codehilite"><pre><span></span><code>1. Priya creates board &quot;Q3 Roadmap&quot;.
-2. Metadata service assigns board_id=84 and owner=Priya.
-3. Metadata store commits the board record.
-4. Priya invites Mateo.
-5. Metadata service records Mateo&#39;s access grant.
-6. Both clients join board session 84.
-7. Session service checks access, then admits both clients.
-8. Priya draws stroke S1.
-9. Session service assigns room sequence 501 and fans S1 to Mateo.
-10. Session service appends accepted stroke event for recovery.
-11. Async workers index the board title and send notification events later.
-</code></pre></div>
-
-<p>There are several intermediate states worth noticing. After step 3, the board exists even if notifications are down. After step 5, Mateo has access even if search has not indexed the board. After step 9, Mateo may see the stroke before every derived system has processed it. After step 10, reconnect recovery has something to replay.</p>
-<p>Now compare that with a naive design:</p>
-<div class="codehilite"><pre><span></span><code>all actions -&gt; one synchronous pipeline
-  -&gt; write metadata
+  -&gt; write board metadata
   -&gt; update live room
-  -&gt; update search
+  -&gt; index search
   -&gt; send notification
   -&gt; write analytics
   -&gt; return success
 </code></pre></div>
 
-<p>This feels simpler on a diagram but creates the wrong guarantee. A slow notification provider can delay live drawing. A search indexing failure can make board creation appear broken. Analytics ingestion can become part of the user contract by accident. The design has not separated authoritative, interactive, and derived promises.</p>
-<p><strong>Prediction check:</strong> If the notification provider is unavailable after Priya mentions Mateo, what should the product promise?</p>
-<p>A reasonable answer is: the mention event should be accepted or recorded if the board action itself succeeds; notification delivery may lag and should be retried or surfaced as a worker problem. The user should not lose the board edit merely because the notification side effect is unavailable.</p>
-<h2>Trade-offs And Failure Boundaries</h2>
-<p>Mixed guarantees make the product fit reality better, but they add boundary work. The team has to document what success means in each subsystem.</p>
-<p>For the metadata service, success means the authoritative change was committed or rejected clearly. Its main risks are duplicate creation, stale permissions, inconsistent ownership, and slow writes. Useful signals include write latency, conflict rate, permission check failures, and idempotency-key reuse.</p>
-<p>For the session service, success means active collaborators receive responsive updates and can recover from ordinary disconnections. Its risks are hot rooms, fanout overload, lost room state, inconsistent ordering, and retry storms. Useful signals include room p95/p99 fanout latency, connected clients per board, reconnect success, dropped events, and per-room backpressure.</p>
-<p>For worker systems, success means downstream work is processed within an acceptable freshness window. Their risks are queue lag, poison messages, duplicate side effects, and silent data loss. Useful signals include backlog age, retry counts, dead-letter rate, notification delivery latency, and search freshness.</p>
-<p>The trade-off is that this design is more explicit and more operationally honest, but it is not free. Separate guarantees mean more interfaces, more metrics, and more careful documentation. The benefit is that failures stay closer to the promise they threaten. Search lag hurts discovery. Notification lag hurts communication. Metadata ambiguity threatens the product contract. Those are different severities and should not be hidden behind one generic "the whiteboard is down" bucket.</p>
-<p>This is also where over-design can sneak in. A small prototype may not need all subsystems split into separate deployable services. It can still use the same promise map inside one modular codebase. The important point is not physical separation. It is guarantee separation. You can keep modules local today and still know which boundaries would deserve distribution later.</p>
-<h2>Practice: Review A Promise Map</h2>
-<p>Review this proposed mapping:</p>
-<div class="codehilite"><pre><span></span><code>Board metadata       -&gt; eventually consistent cache
-Live drawing         -&gt; strongly coordinated global database transaction
-Search indexing      -&gt; async worker
-Notifications        -&gt; synchronous call before draw succeeds
-Analytics            -&gt; async worker
+<p>This works while the product is small and all dependencies respond quickly. It is attractive because there is one visible path and one success result.</p>
+<p>It becomes insufficient when the promises conflict. A slow notification provider should not make a stroke appear to fail. A search indexing error should not remove board ownership. Conversely, a fast session process should not invent permanent access rights merely because it sees who is currently connected.</p>
+<p>The initial model treats every action as one unit of work. The stronger model separates the promises before it separates the deployment units.</p>
+<h2>Design Alternatives</h2>
+<p>There are several plausible ways to respond. Each one buys something and leaves a different risk.</p>
+<table>
+<thead>
+<tr>
+<th>Alternative</th>
+<th>What it buys</th>
+<th>What it risks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One strict path for every action</td>
+<td>A simple success rule and fewer moving parts.</td>
+<td>High latency and broad failure coupling; secondary work blocks the user.</td>
+</tr>
+<tr>
+<td>Loose replication for every action</td>
+<td>Fast local responses.</td>
+<td>Ambiguous ownership and unsafe permission decisions.</td>
+</tr>
+<tr>
+<td>Separate promise classes</td>
+<td>Each path pays for only the coordination it needs.</td>
+<td>More interfaces, metrics, and explicit failure policies.</td>
+</tr>
+</tbody>
+</table>
+<p>The third option is usually the better fit for this scenario, but only under its stated constraints. It assumes that search and notifications can lag, while access decisions and accepted board state cannot be ambiguous. If the product promise changed—for example, a legal compliance alert must be delivered immediately—the classification would need to change too.</p>
+<h2>A Better Boundary</h2>
+<p>Now turn the promise map into subsystem guarantees. A subsystem is not defined only by the data it stores. It is also defined by what it refuses to decide.</p>
+<div class="codehilite"><pre><span></span><code>client
+  -&gt; identity and access check
+  -&gt; board metadata authority
+  -&gt; board session service
+  -&gt; accepted edit record
+  -&gt; downstream workers
+       -&gt; search projection
+       -&gt; notification delivery
+       -&gt; analytics pipeline
 </code></pre></div>
 
-<p>Before checking the answer, identify two mismatches.</p>
-<p>One reasonable critique:</p>
+<table>
+<thead>
+<tr>
+<th>Subsystem</th>
+<th>Guarantee it provides</th>
+<th>Must refuse to own</th>
+<th>Signal to watch</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metadata authority</td>
+<td>Board identity, ownership, and permission changes are committed or rejected clearly.</td>
+<td>Live cursor fan-out and search freshness.</td>
+<td>write latency, conflicts, permission failures</td>
+</tr>
+<tr>
+<td>Board session service</td>
+<td>Active collaborators receive ordered room updates quickly enough for the interaction.</td>
+<td>Final authority for ownership and permanent membership.</td>
+<td>room latency, connected clients, dropped updates</td>
+</tr>
+<tr>
+<td>Accepted edit record</td>
+<td>Accepted edits can be recovered after an ordinary reconnect.</td>
+<td>Sending notifications or deciding access.</td>
+<td>append latency, recovery failures, storage errors</td>
+</tr>
+<tr>
+<td>Search projection</td>
+<td>Saved boards become discoverable within a freshness target.</td>
+<td>Proof that a board exists or that a user may access it.</td>
+<td>indexing lag, failed documents, freshness age</td>
+</tr>
+<tr>
+<td>Notification worker</td>
+<td>Accepted mention events are delivered or retried by policy.</td>
+<td>Blocking a completed board action.</td>
+<td>backlog age, retries, dead-letter rate</td>
+</tr>
+</tbody>
+</table>
+<p>“Authority” here means the official answer for a specific fact. It does not mean that one service controls the entire product. The session service can make a room responsive without becoming the final source of truth for access. The search index can be useful without deciding permissions.</p>
+<h2>Worked Example: Priya Invites Mateo</h2>
+<p>Follow one path through the design. This example uses illustrative identifiers and timings.</p>
+<div class="codehilite"><pre><span></span><code>Starting point:
+  Priya owns board 84. Mateo does not yet have access.
+
+Step 1:
+  Priya sends an invitation request for Mateo.
+
+Step 2:
+  The metadata authority checks Priya&#39;s ownership and records Mateo&#39;s grant.
+
+Step 3:
+  The metadata authority returns success after the grant is accepted.
+
+Step 4:
+  Priya and Mateo join board session 84. The session service checks the
+  authoritative access result before admitting them.
+
+Step 5:
+  Priya draws stroke S1. The session service assigns room sequence 501 and
+  fans the stroke out to active collaborators.
+
+Step 6:
+  The accepted edit is recorded for reconnect recovery.
+
+Step 7:
+  Workers later index the board and attempt the invitation notification.
+</code></pre></div>
+
+<p>After step 3, Mateo has access even if the notification worker is down. After step 5, Mateo may see the stroke before analytics has processed it. After step 7, search may still be behind. Those states are not automatically bugs. They are the stated costs of giving the user-facing actions a narrower dependency set.</p>
+<p><strong>Check:</strong> The notification provider fails after the invitation is accepted. Should the metadata authority undo Mateo's grant?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. The access grant is the authoritative promise in this path. Notification delivery is a derived promise with a retry or visibility policy. Undoing the grant would let a downstream side effect rewrite the product's source of truth.</p>
+<p>So far, we have separated three questions that often blur together: who may act, what is happening now, and what should happen later. The next lesson will ask how wide each of those decisions must travel through the system.</p>
+<h2>The Trade-off</h2>
+<p>Separate guarantees reduce unnecessary coupling. A notification provider can fail without changing whether Mateo has access. A search delay can affect discovery without deciding whether the board exists. That is the benefit.</p>
+<p>The cost is extra boundary work. Each path needs an owner, a failure policy, and a way to observe whether it is keeping its promise. For a small application with modest load, one modular application and a periodic worker may be the clearest implementation. Splitting it into network services before a pressure appears can add latency, retries, and deployment work without improving a user promise.</p>
+<h2>Operational Consequences</h2>
+<p>Separate guarantees make failures easier to classify, but they do not make failures disappear.</p>
+<p>If the metadata authority slows down, access changes and board creation may wait. That is serious because the affected promises are authoritative. If the session service slows down, collaborators may see delayed strokes while durable board ownership remains correct. If the notification worker slows down, operators should see a growing backlog while drawing continues.</p>
+<p>This separation also changes what the team measures. A generic “whiteboard availability” metric is not enough. The team needs signals that match the promise:</p>
 <ul>
-<li>Board metadata should not be owned by an eventually consistent cache. Metadata and access control are authoritative promises, so the cache may accelerate reads but should not become the source of truth.</li>
-<li>Live drawing probably should not require a global database transaction for every stroke. The interactive path needs low latency and room-level ordering more than global serialization.</li>
-<li>Notifications should usually not block drawing success. They are derived side effects and should normally be processed asynchronously with retries and visibility.</li>
+<li>permission decision latency and conflict rate for the metadata path;</li>
+<li>room fan-out latency and reconnect success for live collaboration;</li>
+<li>append failures and recovery gaps for accepted edits;</li>
+<li>freshness age and failed updates for search;</li>
+<li>queue age, retry count, and delivery delay for notifications.</li>
 </ul>
-<p>A better mapping would be:</p>
-<div class="codehilite"><pre><span></span><code>Board metadata       -&gt; authoritative metadata store + cached reads
-Live drawing         -&gt; board session service + accepted event log
-Search indexing      -&gt; async projection with freshness metric
-Notifications        -&gt; async worker with retry/dead-letter handling
-Analytics            -&gt; async pipeline with loss/quality policy
+<p>This operational work is worthwhile when the product genuinely has different classes of work. It is over-design when a small application gains separate services without a concrete pressure or owner.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion:</strong> “A fast cache can own permissions.”</p>
+<p><strong>Why it is tempting:</strong> cached answers feel available and convenient.</p>
+<p><strong>Better model:</strong> a cache may accelerate an authoritative decision, but it needs a clear freshness and invalidation policy. It does not become the authority by being fast.</p>
+<p><strong>Confusion:</strong> “Interactive means eventually consistent.”</p>
+<p><strong>Why it is tempting:</strong> live interfaces often need low latency.</p>
+<p><strong>Better model:</strong> interactive work still needs a stated guarantee. In this case, the session service orders updates within a board and records accepted edits for recovery.</p>
+<p><strong>Confusion:</strong> “Separate promises require separate microservices.”</p>
+<p><strong>Why it is tempting:</strong> diagrams often map every boundary to a network process.</p>
+<p><strong>Better model:</strong> guarantee separation can exist inside a modular monolith. Deployment separation should earn its network and operations cost.</p>
+<h2>Design Review</h2>
+<p>Review this mapping before reading the answer:</p>
+<div class="codehilite"><pre><span></span><code>Board ownership       -&gt; eventually consistent search index
+Live cursor updates   -&gt; global transaction for every cursor movement
+Notifications         -&gt; synchronous call before the stroke succeeds
+Analytics             -&gt; async worker
 </code></pre></div>
 
-<p>Close the lesson by applying the same review to a product you know. Pick five user promises. Mark each one as authoritative, interactive, or derived. Then write the subsystem guarantee and one metric that would reveal trouble.</p>
+<p><strong>Check:</strong> Which two mappings are most clearly wrong, and why?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Board ownership should not be decided by search because search is a derived view. Notifications should not usually block a stroke because they are a derived side effect. The global cursor transaction is also suspect: it gives a low-latency interaction a coordination cost that the stated promise may not need.</p>
+<h2>Practice: Write a Promise Map</h2>
+<p>Choose a shared document, marketplace, booking system, or another product with both user actions and background work. Write five promises. For each one, state:</p>
+<ul>
+<li>whether it is authoritative, interactive, derived, or mixed;</li>
+<li>the subsystem guarantee it needs;</li>
+<li>what the subsystem must refuse to own;</li>
+<li>one failure signal.</li>
+</ul>
+<p>A good answer does not begin with product names. It makes the product promise and failure boundary visible first. For example, a booking confirmation may require a clear authoritative result, a seat map may need fast reads with a freshness limit, and a confirmation email may retry later without changing whether the booking exists.</p>
+<h2>Connections</h2>
+<p>Lesson 001 framed pressure and invariants. The next lesson, <a href="003.html">Designing Hybrid Local and Distributed Systems</a>, chooses the narrowest sufficient coordination scope for each guarantee.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] Designing Data-Intensive Applications<ul>
-<li>Link: <a href="https://dataintensive.net/">https://dataintensive.net/</a></li>
-<li>Focus: Use the chapters on replication, transactions, and stream processing to compare guarantees instead of memorizing tools.</li>
-</ul>
-</li>
-<li>[BOOK] Building Secure and Reliable Systems<ul>
-<li>Link: <a href="https://sre.google/books/building-secure-reliable-systems/">https://sre.google/books/building-secure-reliable-systems/</a></li>
-<li>Focus: Read for how reliability and security promises become explicit system design requirements.</li>
-</ul>
-</li>
-<li>[COURSE] MIT 6.824 Distributed Systems<ul>
-<li>Link: <a href="https://pdos.csail.mit.edu/6.824/schedule.html">https://pdos.csail.mit.edu/6.824/schedule.html</a></li>
-<li>Focus: Treat each case study as an example of matching a system promise to a coordination mechanism.</li>
-</ul>
-</li>
+<li>[BOOK] <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a> — Focus: Compare replication, transactions, and stream processing by the product promises they protect.</li>
+<li>[BOOK] <a href="https://sre.google/books/">Building Secure and Reliable Systems</a> — Focus: Notice how security, reliability, and operational responsibility shape system boundaries.</li>
+<li>[COURSE] <a href="https://pdos.csail.mit.edu/6.824/schedule.html">MIT 6.5840 Distributed Systems</a> — Focus: Use the papers and labs as concrete examples of matching a coordination mechanism to a systems promise.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Product requirements become clearer when you classify them as authoritative, interactive, or derived promises.</li>
-<li>Subsystems should provide the lightest guarantee that protects the promise they own.</li>
-<li>A design is production-minded when each promise has a failure boundary and an operational signal.</li>
-<li>Physical service separation is optional early; guarantee separation is not.</li>
+<li>Product promises become design constraints only when the system names its authority, delay tolerance, and failure boundary.</li>
+<li>Authoritative, interactive, and derived work need different guarantees; a single uniform path is often either too weak or too expensive.</li>
+<li>A subsystem has a healthy boundary when it can state both what it owns and what it refuses to own.</li>
+<li>Service boundaries are optional early. Explicit guarantees and signals are not.</li>
 </ul>
 </section>
 
@@ -265,7 +363,7 @@ Analytics            -&gt; async pipeline with loss/quality policy
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 14:20 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
