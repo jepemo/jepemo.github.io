@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>API Gateway Patterns - @jepemo</title>
+    <title>Gateway Rate Limiting and Traffic Shaping - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>API Gateway Patterns</h1>
+<h1>Gateway Rate Limiting and Traffic Shaping</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,119 +79,215 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>API Gateway Patterns</h1>
+  <h1>Gateway Rate Limiting and Traffic Shaping</h1>
 <blockquote>
-<p><strong>The core idea</strong>: An API gateway is a public-edge trade-off: it can shield clients from internal topology and adapt responses, but it becomes dangerous when it starts owning domain behavior.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>investigate a surge by separating excess arrival rate, in-flight work, and request priority;</p>
+</li>
+<li>
+<p>choose a fairness key and limit that protect a named shared resource; and</p>
+</li>
+<li>
+<p>write a gateway response that helps clients back off instead of amplifying overload.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Gateway traffic control turns uncontrolled public demand into an explicit policy about who may enter, at what pace, and which work keeps capacity during stress.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose the learning platform has separate services for identity, catalog, enrollment, billing, progress, and recommendations. A learner opening the mobile dashboard does not care which internal service owns each piece. The client needs one coherent response, not a tour through the platform's internal topology.</p>
-<p>That is the pressure an API gateway answers. It gives external clients a disciplined public edge: one place to route requests, shape responses, normalize incoming traffic, and hide some internal service churn. The gateway is useful because internal boundaries are designed for ownership and operations, while public APIs are designed for consumers.</p>
-<p>The misconception to correct is that a gateway is simply a reverse proxy with a grander name. A gateway is a boundary translator. It turns external requests into appropriate internal calls and turns internal responses into a public contract that clients can use.</p>
-<p>The risk is the same centrality that makes it useful. Because every request passes through the gateway, teams are tempted to put business rules there. If the gateway starts deciding enrollment eligibility, billing policy, or catalog publishing rules, it becomes a new monolith at the front door.</p>
-<h2>One Public Edge Over Many Services</h2>
-<p>The basic gateway pattern gives external clients one coherent entry point while the platform behind it remains decomposed.</p>
-<div class="codehilite"><pre><span></span><code>web / mobile / partner clients
-            |
-            v
-        API gateway
-         /   |    \
- identity  catalog  enrollment  billing
+<p>Consider the opening minute for a popular certification course. Learners refresh seat availability. Some browsers retry checkout when responses slow down. A partner integration has a bug and requests the catalog many times per second. The traffic is not necessarily malicious, but it competes for the same enrollment, identity, and billing capacity.</p>
+<p>The tempting model is: let every valid request through and let the backend handle it. It works while the arrival rate is below what the services and dependencies can process. It fails when slow responses trigger more retries. A noisy caller then gets a larger share simply by sending more requests, while everyone else experiences timeouts.</p>
+<p>The stronger model is that the gateway is the first public-capacity boundary. It makes an explicit policy: which unit gets a fair share, which routes cost more, which requests may wait, and which requests should be rejected with useful guidance before overload fans into the platform.</p>
+<p>Rate limiting and traffic shaping are not punishments for clients. They are a truthful way to say that capacity is finite and that the platform will preserve its most important promises first.</p>
+<h2>The Production Symptom</h2>
+<p>At 09:00, the public catalog route jumps from 80 to 1,800 requests per second. Checkout latency rises. The enrollment service has more work in flight than it can finish. Billing receives retries for already-slow checkout calls.</p>
+<div class="codehilite"><pre><span></span><code>learner sees:       checkout spins, then retries
+gateway sees:       catalog burst and rising rejected or queued requests
+enrollment sees:    in-flight work rises and queue age grows
+billing sees:       repeated attempts for the same logical purchase
 </code></pre></div>
 
-<p>This matters because internal service boundaries are usually shaped by ownership, data authority, and operational needs. Those boundaries are not automatically the right public API shape. A mobile client should not need to know that a dashboard screen requires identity plus enrollment plus billing plus recommendations, nor should it break every time an internal ownership boundary changes.</p>
-<p>The gateway presents a stable public surface while the internal system can evolve behind it. One internal service may split into three, three may collapse into one module, or a new service may take over part of the workflow, while the public contract changes more deliberately.</p>
-<p>The trade-off is edge simplification versus another critical component in the request path. A gateway reduces client coupling, but it also becomes part of latency, availability, observability, and incident response for every request it handles.</p>
-<h2>Client Shaping and Edge Adaptation</h2>
-<p>A gateway earns its existence when it handles concerns that are genuinely about the edge:</p>
-<ul>
-<li>routing requests to internal services</li>
-<li>shaping or aggregating responses for client needs</li>
-<li>translating protocols or public API shape</li>
-<li>normalizing headers and request metadata</li>
-<li>applying baseline ingress policy</li>
-<li>tailoring backend-for-frontend surfaces</li>
-</ul>
-<p>For the learning platform, the mobile app may want a compact dashboard response, while the admin UI may need a richer multi-panel response. The gateway can compose the client-friendly shape without forcing clients to orchestrate internal service calls.</p>
-<div class="codehilite"><pre><span></span><code>mobile dashboard request
-    |
-    +--&gt; gateway composes:
-         profile + active enrollments + subscription summary
+<p>The first wrong conclusion is “the gateway is slow.” A gateway can be healthy while it passes too much work to a saturated backend. The useful question is: <strong>which demand is consuming which shared resource, and what decision should the platform make before it gets worse?</strong></p>
+<p>Start with a small policy map:</p>
+<table>
+<thead>
+<tr>
+<th>Request class</th>
+<th>Resource under pressure</th>
+<th>Desired outcome during stress</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Login and checkout</td>
+<td>Identity, enrollment, billing</td>
+<td>Preserve a bounded path for valid user actions</td>
+</tr>
+<tr>
+<td>Catalog browsing</td>
+<td>Search and catalog capacity</td>
+<td>Remain available at a controlled pace</td>
+</tr>
+<tr>
+<td>Partner catalog sync</td>
+<td>Shared catalog capacity</td>
+<td>Restrict one integration to its agreed share</td>
+</tr>
+<tr>
+<td>Bulk export</td>
+<td>Workers and database capacity</td>
+<td>Delay or reject before it harms interactive traffic</td>
+</tr>
+</tbody>
+</table>
+<p>This table is illustrative. A real policy should come from product promises, observed capacity, and customer agreements. It is more useful than a single global number because it names the work and the resource being protected.</p>
+<h2>The Failure Mechanism: Retries Create More Demand</h2>
+<p>Suppose the enrollment service can safely start 60 checkout operations at once. Without a concurrency boundary, 300 requests may enter during a short burst. As work waits, latency rises. Clients reach their deadlines and retry. The gateway now sees 450 arrivals, but many represent the same logical purchase.</p>
+<div class="codehilite"><pre><span></span><code>arrival burst
+  -&gt; more work enters enrollment
+  -&gt; queue and latency rise
+  -&gt; clients time out
+  -&gt; clients retry
+  -&gt; arrival rate rises again
 </code></pre></div>
 
-<p>That composition should stay about client ergonomics and edge adaptation. If the gateway asks enrollment for active courses and billing for subscription summary, that is shaping. If the gateway starts deciding whether a learner is eligible for a course, that is domain policy and belongs with enrollment.</p>
-<p>The trade-off is convenience versus hidden coupling. Aggregation can simplify clients dramatically, but every extra internal call adds latency, failure modes, and ownership questions.</p>
-<h2>Worked Gateway Request</h2>
-<p>Consider a mobile dashboard endpoint that returns the learner's name, active courses, subscription state, and a small recommendation panel. A naive design treats this as "one API call" and stops thinking. A production design treats it as one public request with several internal dependencies.</p>
-<div class="codehilite"><pre><span></span><code>GET /mobile/dashboard
-    |
-    v
-API gateway
-    |
-    +--&gt; identity: profile summary          required
-    +--&gt; enrollment: active courses         required
-    +--&gt; billing: subscription banner       optional
-    +--&gt; recommendations: next suggestion   optional
+<p>Rate limiting controls <strong>arrival pace</strong>. A token-style policy gives a caller or route a budget: requests are allowed while tokens remain; excess requests are rejected or delayed. The policy can allow a short burst while limiting the sustained rate.</p>
+<p>Concurrency limiting controls <strong>in-flight work</strong>. It prevents a service or route from starting more work than it can safely carry at once, even if the recent arrival rate looks acceptable.</p>
+<p>Traffic shaping controls <strong>priority and pacing</strong>. It can reserve room for checkout while slowing a bulk export or a nonessential sync. These mechanisms work together. One is not a substitute for the others.</p>
+<h2>Choose the Fairness Key Before the Number</h2>
+<p>A limit such as “100 requests per minute” is incomplete. It omits the question: 100 requests for whom, on which route, and against which resource?</p>
+<table>
+<thead>
+<tr>
+<th>Route or client class</th>
+<th>Plausible fairness key</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anonymous catalog browsing</td>
+<td>Source network or anonymous session</td>
+<td>A coarse key can reduce obvious burst pressure before login</td>
+</tr>
+<tr>
+<td>Learner checkout</td>
+<td>Authenticated learner or account</td>
+<td>One learner should not consume the purchase path through repeated retries</td>
+</tr>
+<tr>
+<td>Partner API</td>
+<td>API key or tenant</td>
+<td>One partner should not consume the shared integration budget</td>
+</tr>
+<tr>
+<td>Bulk export</td>
+<td>Tenant plus expensive route</td>
+<td>The operation has a high cost and may need a separate, tight budget</td>
+</tr>
+</tbody>
+</table>
+<p>A source-address key can be useful on anonymous routes. It can be unfair on a shared corporate network. A per-user key is better for an authenticated learner action, but it does not protect a shared downstream database from many different users arriving together. This is why a platform may need both a fairness limit and a route or dependency protection limit.</p>
+<p>The trade-off is precision versus operational complexity. More carefully chosen keys better match the fairness problem, but they require reliable identity context and documentation. A blunt global limit is easier to configure, yet can deny normal users while letting a costly route dominate capacity.</p>
+<h2>Investigation Path</h2>
+<p>When checkout slows, do not raise every limit first. Follow the evidence from demand to the protected resource.</p>
+<ol>
+<li><strong>Classify the traffic.</strong> Split volume by route, caller class, tenant or API key, and response outcome. A global total hides a noisy route.</li>
+<li><strong>Compare arrivals with in-flight work.</strong> A high arrival rate suggests an edge policy issue. Rising in-flight work or queue age suggests that admitted work exceeds backend capacity.</li>
+<li><strong>Look for retry amplification.</strong> Compare logical operation ids or retry headers with raw request count. A growing retry ratio means clients may be making the incident worse.</li>
+<li><strong>Check priority behavior.</strong> Did checkout retain capacity while exports and partner sync slowed? If not, the shaping policy does not match the product promise.</li>
+<li><strong>Contain, then repair.</strong> Tighten the smallest relevant limit, reduce unsafe retries, and give clients a clear backoff response. Do not indiscriminately block every route.</li>
+</ol>
+<p>Useful signals support those steps:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+<th>First response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allowed, delayed, and rejected requests by key and route</td>
+<td>Who consumes the edge budget</td>
+<td>Check whether the fairness key matches the noisy demand</td>
+</tr>
+<tr>
+<td>Retry rate and repeated operation ids</td>
+<td>Whether clients amplify load</td>
+<td>Return clear retry guidance and review retry safety</td>
+</tr>
+<tr>
+<td>In-flight requests and queue age</td>
+<td>Whether admitted work exceeds service capacity</td>
+<td>Apply or tighten concurrency limits</td>
+</tr>
+<tr>
+<td>Checkout success and latency by priority lane</td>
+<td>Whether critical work is actually protected</td>
+<td>Adjust reservations or shedding rules</td>
+</tr>
+<tr>
+<td>Dependency saturation</td>
+<td>Whether the bottleneck is below the gateway</td>
+<td>Reduce admission to a sustainable level and investigate the dependency</td>
+</tr>
+</tbody>
+</table>
+<h2>Mitigation and Prevention</h2>
+<p>During the course launch, an initial response might be:</p>
+<div class="codehilite"><pre><span></span><code>1. Preserve a bounded checkout lane for authenticated learners.
+2. Limit partner catalog sync by API key and catalog route.
+3. Delay or reject bulk export work before it enters the interactive path.
+4. Return a clear overload response with a retry-after hint where the contract supports it.
+5. Stop clients from retrying the same purchase blindly; reuse the logical operation and reconcile its state.
 </code></pre></div>
 
-<p>The gateway can own the response shape: field names, compact mobile payload, and whether optional panels are omitted when they are unavailable. It should also own edge-level mechanics such as request deadlines, correlation IDs, and the rule that recommendation failure should not take down the entire dashboard.</p>
-<p>It should not own the domain decision behind those fields. Enrollment decides which courses are active. Billing decides the subscription state. Recommendations decides what to suggest. The gateway decides how to assemble the client contract from those answers.</p>
-<p>This distinction becomes important during failure. If identity or enrollment is unavailable, the dashboard may need to fail with a clear retryable error because the core screen cannot be built. If recommendations is slow, the gateway might omit that panel, return a cached suggestion, or mark the panel as temporarily unavailable. Those choices are not afterthoughts; they are part of the gateway contract.</p>
-<p>The practical design question is not only "Can the gateway aggregate these services?" It is "Which fields are required, which can degrade, how long will the gateway wait, and who owns the meaning of each answer?"</p>
-<h2>Keep Domain Decisions Out of the Gateway</h2>
-<p>Because the gateway sees every request, it is an attractive place to add "just one more rule." Over time, those rules can turn it from an edge adapter into the hidden owner of multiple domains.</p>
-<div class="codehilite"><pre><span></span><code>healthy gateway:
-  route + adapt + enforce edge policy
-
-unhealthy gateway:
-  route + adapt + decide billing, enrollment, and catalog rules
-</code></pre></div>
-
-<p>The warning signs are easy to miss at first:</p>
-<ul>
-<li>downstream services become thin CRUD wrappers</li>
-<li>domain teams cannot change policy without gateway changes</li>
-<li>product workflows are stitched together at the edge</li>
-<li>incidents require reading gateway code to understand domain outcomes</li>
-</ul>
-<p>The right mental model is that a gateway manages entrance and translation. It may authenticate a request, route it, attach context, compose a response, or enforce coarse edge policy. It should not quietly become the owner of billing, enrollment, catalog, or learning-progress behavior.</p>
-<p>The trade-off is central convenience versus boundary erosion. A heavy gateway can feel efficient in the short term, but over time it weakens service ownership and creates a high-blast-radius bottleneck.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Issue</strong>: Adding a gateway that only forwards requests without solving a real edge problem.</p>
-<p><strong>Clarification / Fix</strong>: Use a gateway when it creates real value: stable public surface, client adaptation, edge policy, or shielding clients from internal topology churn.</p>
-<p><strong>Issue</strong>: Treating the gateway as the right place for all cross-service logic.</p>
-<p><strong>Clarification / Fix</strong>: Keep the gateway focused on edge concerns. Domain decisions belong in the services that own the capability and data.</p>
-<p><strong>Issue</strong>: Making the public API mirror internal service boundaries exactly.</p>
-<p><strong>Clarification / Fix</strong>: Public API design should follow consumer needs and edge semantics. Internal topology is an implementation detail unless the public contract intentionally exposes it.</p>
-<p><strong>Issue</strong>: Letting gateway aggregation hide unreliable internal fanout.</p>
-<p><strong>Clarification / Fix</strong>: Track latency, partial failure, timeouts, and fallbacks for composed responses. Aggregation is still distributed communication.</p>
-<p><strong>Issue</strong>: Treating a composed response like a local join.</p>
-<p><strong>Clarification / Fix</strong>: Give each internal call an ownership rule and a failure rule. Required calls, optional calls, cached fallbacks, and omitted panels should be explicit in the public contract.</p>
-<p>Before designing a gateway endpoint, sketch the endpoint as a dependency map. Label every downstream call as required or optional, then write the timeout and fallback behavior next to it. If you cannot label those paths, the gateway contract is not finished.</p>
+<p>The exact thresholds are not universal. The policy should be reviewed with the service owners who know capacity, operation cost, and user harm. A generic value copied from another platform is not evidence that this enrollment system can safely absorb the same load.</p>
+<p>Prevention makes the policy inspectable before the next incident. Document the fairness key, route class, sustained and burst behavior, action on exhaustion, client guidance, owner, and signal that triggers review. Test whether the gateway can still prioritize a checkout route when a controlled partner burst occurs. A policy that only exists in a proxy configuration is difficult for product, support, and client teams to follow.</p>
+<h2>The Trade-off and Boundary</h2>
+<p>Traffic controls improve fairness and protect dependencies. They cost some valid requests a delay or a rejection. They can also hide a deeper capacity problem if teams treat rate limiting as a permanent answer to an underprovisioned service.</p>
+<p>They are a good fit when a shared resource needs a predictable admission policy. They do not decide whether a request is authorized, whether a retry is semantically safe, or whether the downstream domain action succeeded. Authentication supplies a useful fairness identity; the domain owner still determines the business outcome.</p>
+<p>The boundary appears when a gateway policy and a service policy disagree. If the gateway admits more checkout work than enrollment can hold in flight, latency and queue age rise despite a calm edge. If the gateway rejects a route that still has safe capacity, the platform creates unnecessary user harm. Review both admission and backend signals together.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion: “Rate limiting is only for attackers.”</strong></p>
+<p>Why it is tempting: abusive traffic is an obvious example.</p>
+<p>Better model: legitimate retries, popular launches, and buggy integrations can consume shared capacity too. The policy protects fairness and reliability.</p>
+<p><strong>Confusion: “One global requests-per-minute limit is fair.”</strong></p>
+<p>Why it is tempting: one number is easy to explain.</p>
+<p>Better model: fairness depends on the caller, route cost, and protected resource. A single rule often protects the wrong thing.</p>
+<p><strong>Confusion: “A request allowed at the gateway is safe for the backend.”</strong></p>
+<p>Why it is tempting: passing the first control feels like success.</p>
+<p>Better model: rate, concurrency, queues, and dependency pressure are distinct. The platform needs layered controls.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> A partner API key produces most catalog traffic, while checkout latency rises. What is a focused first containment action?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Apply or tighten a limit for that partner key on the catalog route, while preserving the separate checkout lane. Then inspect whether catalog pressure is the actual shared bottleneck. A global block would harm unrelated learners without proving the cause.</p>
+<p><strong>Check:</strong> The edge request rate is stable, but enrollment’s in-flight count and queue age rise. Is a lower per-second rate limit necessarily the first fix?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Not necessarily. The evidence points to admitted work lasting too long or to a constrained dependency. Inspect service concurrency, queue behavior, and downstream saturation. An edge adjustment may help, but it should follow the resource evidence.</p>
+<h2>Practice</h2>
+<p>An online event platform has public schedule browsing, ticket checkout, and an organizer export API. A popular announcement causes browsing traffic to spike while organizers run exports.</p>
+<p>Write a three-lane policy. For each lane, name the fairness key, the traffic action during stress, and one signal to watch.</p>
+<p>A strong answer gives ticket checkout a protected interactive lane keyed by an authenticated account, browsing a coarse route-aware budget, and exports a separate tenant-plus-route budget that can be delayed or rejected first. It names signals such as checkout latency, allowed versus rejected requests, queue age, or export concurrency. It does not claim that a rate limit proves a ticket purchase succeeded.</p>
 <h2>Connections</h2>
-<p>The previous lesson covered service discovery: how internal callers find healthy instances behind logical service identities. A gateway can shield external clients from that topology, but the gateway itself still needs reliable internal routing and discovery.</p>
-<p>The next two lessons go deeper on specific edge responsibilities. Authentication and edge security deserve their own treatment, and rate limiting plus traffic shaping deserve another. This lesson keeps the gateway pattern broad: public boundary, client shaping, and discipline about what not to centralize.</p>
-<p>Backend-for-frontend is a related pattern. A BFF is a more specialized gateway surface tailored to one client class, such as mobile, web, or partner integrations.</p>
+<p>The preceding lesson established trusted caller context at the gateway. That identity can help choose a fairness key, but it does not make a rate limit an authorization decision.</p>
+<p>The next lesson moves some content and decisions closer to users through edge and CDN placement. Traffic control still matters there: a cache hit may reduce origin pressure, while a cache miss or write request still needs an explicit admission policy.</p>
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] <a href="https://microservices.io/patterns/apigateway.html">API Gateway Pattern</a><ul>
-<li>Focus: Review the gateway as a client-facing boundary in microservice architectures.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://samnewman.io/patterns/architectural/bff/">Backend for Frontend</a><ul>
-<li>Focus: See how different client classes can justify different edge surfaces.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://samnewman.io/books/building_microservices_2nd_edition/">Building Microservices, 2nd Edition</a><ul>
-<li>Focus: Connect gateways to service decomposition, edge concerns, and ownership boundaries.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/rate_limit_filter">Envoy Rate Limit Filter</a> — Focus: inspect how an edge proxy expresses policy and actions for over-limit traffic.</li>
+<li>[DOC] <a href="https://docs.nginx.com/nginx/admin-guide/security-controls/controlling-access-proxied-http/">NGINX Rate Limiting</a> — Focus: compare request-rate control with delay and rejection behavior.</li>
+<li>[DOC] <a href="https://sre.google/sre-book/handling-overload/">Google SRE Book: Handling Overload</a> — Focus: connect admission, retries, and overload containment.</li>
+<li>[BOOK] <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!, 2nd Edition</a> — Focus: relate edge throttling to wider stability patterns.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A gateway is a public-edge boundary that shields clients from internal topology and adapts API shape to consumer needs.</li>
-<li>Gateway aggregation can simplify clients, but it still introduces latency, partial failure, and operability concerns.</li>
-<li>Composed gateway responses need explicit required fields, optional fields, deadlines, and fallback behavior.</li>
-<li>Domain rules should stay with the services that own the capability; a gateway that owns too much business logic becomes a new bottleneck.</li>
+<li>Rate limiting controls arrival pace; concurrency limits in-flight work; traffic shaping preserves the right work under stress.</li>
+<li>A fair policy starts with the protected resource and an explicit caller or route key, not an arbitrary global number.</li>
+<li>Investigate demand, retries, queue age, and dependency saturation before changing limits.</li>
+<li>Clear backoff behavior and layered controls protect capacity without turning overload into a mystery.</li>
 </ul>
 </section>
 
@@ -195,14 +295,14 @@ unhealthy gateway:
   
   <a class="nav-card" href="010.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Service Discovery and Dynamic Topology</strong>
+    <strong>Gateway Authentication and Edge Security</strong>
   </a>
   
 
   
   <a class="nav-card" href="012.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Gateway Authentication and Edge Security</strong>
+    <strong>Edge Computing, CDNs, and Geographic Locality</strong>
   </a>
   
 </section>
@@ -217,7 +317,7 @@ unhealthy gateway:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 13:02 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

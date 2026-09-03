@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cluster Scheduling and Workload Placement - @jepemo</title>
+    <title>Service Discovery and Dynamic Topology - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>Cluster Scheduling and Workload Placement</h1>
+<h1>Service Discovery and Dynamic Topology</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,95 +79,284 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Cluster Scheduling and Workload Placement</h1>
+  <h1>Service Discovery and Dynamic Topology</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Scheduling is not "find any machine with spare CPU"; it is the platform decision that turns workload intent into safe placement under resource, locality, failure-domain, and rollout constraints.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>trace how a caller reaches a healthy service instance while instances are replaced;</p>
+</li>
+<li>
+<p>distinguish service identity, membership, readiness, and load balancing; and</p>
+</li>
+<li>
+<p>diagnose whether a failed call came from stale topology knowledge or from the selected service.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Service discovery lets callers use one stable service name while the platform continually changes which concrete instances are safe to receive traffic.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose the learning platform runs API replicas, video workers, background email jobs, and a small search indexer on the same cluster. The previous lesson helped choose runtime shapes: some work may be long-running services, some may be workers, and some may stay serverless. Once work does run inside the cluster, the platform still has to answer a deceptively hard question: where should each unit run?</p>
-<p>A naive answer is "wherever there is spare CPU." That can look fine in a dashboard while hiding a fragile placement. All video workers might land in one zone. API replicas might compete with memory-heavy jobs. A search indexer might be placed far from the storage it needs. A rollout might drain too much capacity from the same node pool.</p>
-<p>Kubernetes and other orchestrators use declarative control to maintain desired state. This lesson focuses on a narrower mechanism inside that control loop: placement. Once the platform knows a workload should exist, it still has to decide where it can run without violating resource needs, resilience goals, affinity rules, or operational policy.</p>
-<p>That makes scheduling a platform design topic, not just an implementation detail. Placement decides whether the cluster can absorb node failure, whether noisy workloads hurt latency-sensitive ones, and whether rollouts preserve enough healthy capacity while change is underway. The scheduler is translating workload intent into a concrete location under constraints.</p>
-<p>The trade-off is expressiveness versus explainability. Rich placement rules let teams encode real constraints, but they also make "why is this workload pending?" or "why did all replicas move there?" harder to answer.</p>
-<h2>Placement as Constraint Solving</h2>
-<p>A scheduler usually makes placement in two broad phases: filter impossible nodes, then score acceptable nodes. Filtering removes nodes that cannot legally run the workload. Scoring ranks the remaining options according to preferences such as spread, locality, utilization, or policy.</p>
-<div class="codehilite"><pre><span></span><code>workload needs:
-  2 CPU, 8 GB memory, zone spread, no colocated replicas
+<p>Consider a course platform during a rollout. Billing needs to ask enrollment-service whether it can grant a learner access. At 10:00, there are three enrollment instances. At 10:02, one is draining, another has stopped unexpectedly, and a new instance has started but is not ready yet.</p>
+<p>The first model is understandable: put the addresses of the three instances in billing’s configuration and choose one. It works while the process list stays still. It fails as soon as a deployment, autoscaler, or node failure changes that list. Billing has learned a temporary coordinate, not a durable dependency.</p>
+<p>The stronger model is that billing depends on a <strong>logical service identity</strong> and a discovery mechanism keeps a changing set of eligible endpoints beneath that identity. A concrete address can be present, alive, ready, draining, or absent. Those are different states. The point is not merely to find an IP address. The point is to route a new request only to an instance that currently belongs in the service’s usable set.</p>
+<p>This lesson uses a simplified rollout trace. Its addresses, times, and health results are illustrative. The state transitions, however, are the reason discovery exists in dynamic infrastructure.</p>
+<h2>The Small Situation</h2>
+<p>Keep four actors in view:</p>
+<table>
+<thead>
+<tr>
+<th>Actor</th>
+<th>What it knows or does</th>
+<th>What it must not assume</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Billing</td>
+<td>Needs an enrollment decision for the current request</td>
+<td>One particular enrollment address will remain valid</td>
+</tr>
+<tr>
+<td>Discovery source</td>
+<td>Records the current members and their eligibility</td>
+<td>Every running process can receive traffic</td>
+</tr>
+<tr>
+<td>Router or client</td>
+<td>Selects one eligible endpoint</td>
+<td>Its cached view is permanently fresh</td>
+</tr>
+<tr>
+<td>Enrollment instance</td>
+<td>Starts, becomes ready, drains, or fails</td>
+<td>Being alive is the same as being ready</td>
+</tr>
+</tbody>
+</table>
+<p>At the start, the logical name resolves to three ready instances:</p>
+<div class="codehilite"><pre><span></span><code>logical name: enrollment-service
 
-scheduler:
-  filter ineligible nodes
-  score remaining nodes
-  bind workload to a chosen node
+e1  10.0.14.8:8080   ready
+e2  10.0.14.9:8080   ready
+e3  10.0.15.2:8080   ready
 </code></pre></div>
 
-<p>A node may be filtered out because it lacks memory, has the wrong hardware, sits in a disallowed zone, carries a taint the workload cannot tolerate, or violates anti-affinity rules. A node may remain eligible but score poorly because it would pack replicas too tightly, cross a locality boundary, or reduce failure-domain spread.</p>
-<p>For the learning platform, video transcode workers may need high memory and should not crowd API replicas. API replicas should spread across zones because a single-zone failure should not remove the public surface. Search indexers may prefer nodes near local storage or a particular cache layer. Background email jobs can often tolerate lower priority because a small delay is less visible than API latency.</p>
-<p>The key idea is that placement quality is part of reliability. A cluster can have enough aggregate resources and still make bad placement decisions if the constraints do not represent the real workload.</p>
-<h2>Worked Placement Decision</h2>
-<p>Trace one new enrollment API replica entering the cluster during a rollout. The workload asks for 1 CPU, 1 GB of memory, access to the standard service network, and spread across zones so one zone failure does not remove too much public capacity. The scheduler first removes nodes that cannot legally run it: nodes without enough allocatable memory, nodes marked for batch jobs only, nodes in zones that would violate the spread rule, and nodes with taints the API pod does not tolerate.</p>
-<p>The remaining nodes are not all equally good. One node may be legal but already packed with latency-sensitive services. Another may be in a zone that currently has fewer enrollment replicas. A third may be close to a cache layer but in a node pool that should be reserved for video workers. The scheduler scores the eligible nodes and binds the pod to one choice.</p>
-<div class="codehilite"><pre><span></span><code>candidate nodes:
-  node-a: enough memory, same zone as two replicas      -&gt; legal, poor spread
-  node-b: enough memory, different zone, light load     -&gt; legal, better score
-  node-c: tainted for video workers only                -&gt; filtered out
-  node-d: not enough memory after existing reservations -&gt; filtered out
-
-chosen: node-b
+<p>Billing does not need to know which node runs e2. It needs a usable enrollment service. The stable name expresses that dependency. The endpoint set is an implementation detail that must be updated as the runtime changes.</p>
+<p>Plain meaning: discovery keeps a current enough answer to “where may I send this request?”</p>
+<p>In this scenario: the answer for enrollment-service is a short list of instances that have joined and passed the rule for receiving new traffic.</p>
+<p>Technical name: that mapping from logical service identity to a changing endpoint set is <strong>service discovery</strong>.</p>
+<h2>Why a List of Addresses Is Not Enough</h2>
+<p>It might seem that discovery only needs a registry:</p>
+<div class="codehilite"><pre><span></span><code>enrollment-service -&gt; [e1, e2, e3]
 </code></pre></div>
 
-<p>This is why a pending pod should be read as evidence, not as a mystery. If no node passes the filter phase, adding more scoring preferences will not help. If many nodes pass but placement looks poor, the issue may be the scoring preferences or the absence of a constraint the workload actually needs. Debugging scheduling starts by separating "cannot run anywhere" from "can run, but not where we wish it would."</p>
-<h2>Health, Disruption, and Rollout Headroom</h2>
-<p>Scheduling also interacts with lifecycle. A workload that is technically placed may not be ready. A rollout may create temporary extra replicas. A node drain may evict work and force replacement. A disruption budget may prevent too many replicas from disappearing at once. The scheduler is not only placing steady-state work; it is helping the platform move safely through change.</p>
-<div class="codehilite"><pre><span></span><code>node drain
-  -&gt; evict some replicas
-  -&gt; respect disruption budget
-  -&gt; schedule replacements elsewhere
-  -&gt; wait for readiness before removing more capacity
+<p>That list is incomplete. An instance can still have a network address after it has started shutting down. It can be running while its application has not connected to its dependencies. It can disappear without sending a clean goodbye. Sending new work to any such instance makes the system look unpredictable during ordinary rollout activity.</p>
+<p>The discovery view therefore needs a lifecycle, not a one-time lookup:</p>
+<div class="codehilite"><pre><span></span><code>instance starts
+  -&gt; registers or becomes visible
+  -&gt; proves readiness
+  -&gt; enters the routing set
+  -&gt; drains before planned removal
+  -&gt; deregisters or expires
 </code></pre></div>
 
-<p>This is where scheduling connects back to declarative operations without repeating the whole Kubernetes lesson. Desired state says what should exist. Placement and disruption policy decide how that state can move through the cluster safely as reality changes.</p>
-<p>The trade-off is utilization versus slack. Packing workloads tightly can improve cost efficiency, but resilience and safe rollout often need spare capacity, spreading rules, and room for replacements during failure. A fully packed cluster may be cheap at rest and expensive during the first node failure.</p>
-<p>The important word is <strong>temporary</strong>. Rollouts, node drains, autoscaler lag, and failure recovery all create moments when the cluster needs more room than steady state suggests. A service that normally needs three replicas may briefly need four while a new version warms up. A node drain may require replacement pods before old pods disappear. A disruption budget may intentionally slow the movement so availability is preserved. Scheduling policy that ignores these transition states will look efficient until the first routine maintenance event becomes an availability incident.</p>
-<h2>Reading Pending and Misplaced Work</h2>
-<p>Good scheduling practice includes being able to explain why a workload did or did not land somewhere. When a workload remains pending, the answer should be inspectable: not enough memory, no tolerated taint, impossible zone spread, missing GPU, blocked disruption budget, or an affinity rule that conflicts with reality.</p>
-<p>When work lands but behaves badly, the question changes. Are latency-sensitive services sharing nodes with noisy workers? Did replicas concentrate in one failure domain? Are high-priority workloads able to preempt lower-priority work during pressure? Did rollout settings require more temporary capacity than the cluster actually had?</p>
-<p>This is why simple placement rules are often better than clever ones. The scheduler can only optimize the constraints it is given, and humans still need to debug the result. If the placement policy cannot be explained during an incident, it is part of the incident.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Issue</strong>: Treating all replicas as interchangeable.</p>
-<p><strong>Clarification / Fix</strong>: Model failure domains. Replicas that serve the same user-facing path should avoid sharing the same single point of failure when possible. Zone spread and anti-affinity rules exist because "three replicas" is not the same as "three independent replicas."</p>
-<p><strong>Issue</strong>: Optimizing only for utilization.</p>
-<p><strong>Clarification / Fix</strong>: Leave enough headroom for rollout, node loss, and burst. A fully packed cluster is cheap until it cannot recover or replace work safely.</p>
-<p><strong>Issue</strong>: Encoding placement rules nobody can debug.</p>
-<p><strong>Clarification / Fix</strong>: Keep constraints visible and intentional. Prefer a few meaningful rules over a maze of affinity settings that obscure operational behavior. Track the reason workloads are pending, not only whether they eventually run.</p>
-<p>Before changing placement policy, close the lesson and reconstruct one workload's placement from memory. Name its hard resource needs, failure-domain rule, locality preference, disruption budget, and acceptable trade-off between packing and slack. If you cannot explain why a pod should land on one class of nodes and avoid another, the scheduler cannot infer that intent for you.</p>
+<p><strong>Membership</strong> answers, “Which instances claim to be part of this service?”</p>
+<p><strong>Readiness</strong> answers, “Which members may receive a new request now?”
+<strong>Load balancing</strong> answers, “Which eligible member receives this particular request?”</p>
+<p>Some platforms combine these functions behind one service address. The distinction still matters when diagnosing an incident. A missing service name points to discovery or membership. A request sent to a draining instance points to eligibility or stale routing information. An overloaded but ready instance may point to the balancing policy or capacity, not discovery itself.</p>
+<h2>The Mechanism Step by Step</h2>
+<p>Now trace the rollout. Assume billing has a discovery view that refreshes periodically or receives updates. The exact update mechanism—DNS, a registry watch, or a platform proxy—is outside this small teaching model. What matters is how the routing set changes.</p>
+<h3>Starting state</h3>
+<p>At 10:00, all three instances are ready:</p>
+<table>
+<thead>
+<tr>
+<th>Instance</th>
+<th>Process state</th>
+<th>Eligible for new traffic?</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>e1</td>
+<td>running</td>
+<td>yes</td>
+<td>Ready and serving</td>
+</tr>
+<tr>
+<td>e2</td>
+<td>running</td>
+<td>yes</td>
+<td>Ready and serving</td>
+</tr>
+<tr>
+<td>e3</td>
+<td>running</td>
+<td>yes</td>
+<td>Ready and serving</td>
+</tr>
+</tbody>
+</table>
+<p>The routing set is [e1, e2, e3]. A client-side resolver or an infrastructure router may choose one member. That selection happens after discovery provides the eligible set.</p>
+<h3>Step 1: a replacement starts</h3>
+<p>At 10:01, the platform starts e4 on a new node. The process is alive, but its application is still loading configuration and connecting to its database.</p>
+<div class="codehilite"><pre><span></span><code>e4  10.0.16.4:8080   running, not ready
+</code></pre></div>
+
+<p>The tempting mistake is to add e4 to traffic as soon as a process exists. That creates a race: billing can reach the address before e4 can safely answer. A readiness check is the evidence that corrects the model. Until readiness succeeds, discovery records that e4 exists but the routing set remains [e1, e2, e3].</p>
+<h3>Step 2: an old instance drains</h3>
+<p>At 10:02, the platform asks e1 to stop. It should not vanish from every record instantly. It may have in-flight requests that need time to finish. But it should stop receiving <strong>new</strong> requests.</p>
+<div class="codehilite"><pre><span></span><code>e1: draining
+routing set: [e2, e3]
+</code></pre></div>
+
+<p>Draining is a separate state from failure. A failed instance cannot serve work. A draining instance may finish existing work, but the router should not select it for a new enrollment request. If it remains eligible until the process finally exits, new requests can land on an instance just as it closes connections.</p>
+<h3>Step 3: the replacement becomes ready</h3>
+<p>At 10:03, e4 passes readiness. Now the discovery source can add it to the usable set:</p>
+<div class="codehilite"><pre><span></span><code>e2: ready
+e3: ready
+e4: ready
+
+routing set: [e2, e3, e4]
+</code></pre></div>
+
+<p>Billing still asks for enrollment-service. It does not edit its configuration or learn e4’s address. This is the practical benefit: topology changes under a stable dependency.</p>
+<h3>Step 4: an instance disappears without notice</h3>
+<p>At 10:04, the node running e3 fails. There may be no clean deregistration. A healthy discovery system therefore needs a way to remove members whose membership or health information is no longer credible. That may be an expiry lease, a missed health check, or a platform controller updating the endpoint set.</p>
+<p>Until the view updates, some callers may still select e3. That is not proof that discovery is pointless; it is the normal consequence of information that propagates over time. The system needs a bounded stale period and a call policy that handles the occasional failed attempt. The prior lesson supplied that policy: deadline, safe retry posture, evidence, and a truthful fallback.</p>
+<h2>A Worked Request Trace</h2>
+<p>Follow one billing request at 10:04. The numbers are illustrative.</p>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>Event</th>
+<th>Discovery or routing state</th>
+<th>What billing can conclude</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>10:04:00.000</td>
+<td>Billing requests enrollment-service.</td>
+<td>Cached eligible set is [e2, e3, e4].</td>
+<td>The service name resolved; the view may still contain e3.</td>
+</tr>
+<tr>
+<td>10:04:00.002</td>
+<td>Router selects e3.</td>
+<td>e3 is stale because its node just failed.</td>
+<td>The chosen endpoint may not answer.</td>
+</tr>
+<tr>
+<td>10:04:00.120</td>
+<td>Connection attempt fails.</td>
+<td>A transport failure is observed.</td>
+<td>Billing has not learned whether enrollment performed the command.</td>
+</tr>
+<tr>
+<td>10:04:00.150</td>
+<td>Health or membership update removes e3.</td>
+<td>New set is [e2, e4].</td>
+<td>Future selections should avoid e3.</td>
+</tr>
+<tr>
+<td>10:04:00.170</td>
+<td>Billing follows the operation’s safe retry rule.</td>
+<td>Router selects e4.</td>
+<td>The retry must reuse the logical operation, not invent a second enrollment.</td>
+</tr>
+</tbody>
+</table>
+<p>The trace separates two questions that are often mixed together. Discovery answers whether e3 should still be considered. The remote-call policy answers what billing does after the failed attempt. Discovery reduces the duration of bad routing; it does not prove that the first attempt did nothing.</p>
+<p>So far, we have built the mechanism from visible states. A service name stays stable. Membership records possible endpoints. Readiness and drain state form the eligible set. A client or router selects one endpoint. Health updates and expiry remove endpoints that are no longer safe. The remaining uncertainty is handled at the call boundary, not denied by the discovery layer.</p>
+<h2>Where Topology Knowledge Lives</h2>
+<p>The same mechanism can be placed in different layers.</p>
+<div class="codehilite"><pre><span></span><code>client-side discovery:
+billing -&gt; resolver or registry -&gt; chooses e2/e3/e4 -&gt; calls chosen instance
+
+server-side discovery:
+billing -&gt; stable service address -&gt; router or proxy chooses e2/e3/e4
+</code></pre></div>
+
+<p>With client-side discovery, billing or a shared client library knows how to resolve and select instances. This can offer direct control over caching and selection. It also requires all callers to implement that logic consistently.</p>
+<p>With server-side discovery, billing calls a stable virtual address. A platform router, proxy, or load balancer resolves the backend set. This keeps application code simpler and can centralize traffic policy. The router then becomes an important component to observe and operate.</p>
+<p>The trade-off is local control versus shared consistency. Client-side discovery can suit a platform that deliberately gives services sophisticated client libraries. Server-side discovery can suit a platform that wants uniform routing behavior. Neither choice removes the need for correct readiness, drain, and expiry signals.</p>
+<h2>Where It Breaks</h2>
+<p>Discovery makes topology manageable. It does not make topology instantaneous or eliminate every failed request.</p>
+<p><strong>Stale views.</strong> A cache or update stream can retain e3 briefly after failure. This improves availability by avoiding a registry lookup for every request, but costs freshness. Watch endpoint age, update lag, and connection failures to recently removed instances.</p>
+<p><strong>Flapping health.</strong> If a readiness rule changes rapidly between ready and not ready, the routing set churns. Removing an instance on every short blip may concentrate traffic on the remaining members. Watch readiness transitions and the size of the eligible set, not only aggregate error rate.</p>
+<p><strong>Too-permissive readiness.</strong> A process can answer a shallow probe while it cannot perform the workload that callers need. In this example, a readiness rule that ignores a required enrollment dependency can send billing traffic to an instance that accepts connections but fails every command. The signal is a gap between readiness success and real request success.</p>
+<p><strong>Confusing discovery with balancing.</strong> Discovery can offer three healthy members while a poor balancing rule overloads one. Compare the eligible set with per-instance request rate and latency before blaming the registry.</p>
+<p><strong>Assuming a successful connection proves the workflow succeeded.</strong> Discovery only got the request to a candidate endpoint. The enrollment owner and the operation identifiers establish whether access was granted.</p>
+<h2>Cost, Limits, and Signals</h2>
+<p>This mechanism buys deployment flexibility. Instances can be replaced, scaled, and moved without editing every caller’s configuration. It costs a runtime control path: membership data, readiness evidence, caches, health checks, and observability must stay credible.</p>
+<p>It is a good fit when endpoints change more often than application releases, which is common for orchestrated workloads. It becomes risky when the routing set changes faster than the system can observe it, or when readiness hides the real ability to serve. It does not solve capacity, semantic retries, or authorization between services.</p>
+<p>Use these signals to decide where the boundary is:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it reveals</th>
+<th>First question</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Eligible endpoint count</td>
+<td>Whether the service still has enough ready capacity</td>
+<td>Did a rollout, health failure, or readiness rule remove members?</td>
+</tr>
+<tr>
+<td>Endpoint update lag</td>
+<td>How long callers can use old topology</td>
+<td>Are cache or watch updates behind the source of truth?</td>
+</tr>
+<tr>
+<td>Requests to draining endpoints</td>
+<td>Whether routing respects lifecycle state</td>
+<td>When was the endpoint removed from the eligible set?</td>
+</tr>
+<tr>
+<td>Per-instance latency and errors</td>
+<td>Whether balancing or an unhealthy instance is the problem</td>
+<td>Are failures concentrated on one selected endpoint?</td>
+</tr>
+<tr>
+<td>Readiness transitions</td>
+<td>Whether health is flapping</td>
+<td>Is the probe measuring the ability to serve this workload?</td>
+</tr>
+</tbody>
+</table>
+<h2>Trace It Yourself</h2>
+<p><strong>Check:</strong> e4 is running but has not passed readiness. Billing’s resolver can see its address. Should a new enrollment request be routed to e4?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. Registration or visibility says that an instance exists. Readiness is the evidence that it may receive new work. Keep e4 out of the eligible routing set until that condition is true.</p>
+<p><strong>Check:</strong> A router selected e3, then the connection failed. Does that prove enrollment did not grant the learner access?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. It proves that the caller did not complete a conversation with that endpoint. Use the operation identifier and enrollment’s authoritative state to settle the result. Discovery should remove e3 for later requests; the call policy decides whether and how the logical operation is retried.</p>
+<h2>Practice</h2>
+<p>An image-processing service runs four instances. During a deployment, one old instance is draining, one new instance is running but not ready, and two old instances are ready. A client cache still lists all four.</p>
+<p>Draw the eligible routing set now. Then name one signal that would tell you whether the cache is stale and one rule that prevents a new upload from being sent to the draining instance.</p>
+<p>A strong answer uses only the two ready old instances in the set. It names endpoint update lag, requests sent to draining instances, or a cache age metric as evidence of staleness. It also says that the router must remove a member from new-request selection when that member enters drain state, even if the process remains alive to finish in-flight work.</p>
 <h2>Connections</h2>
-<p>Runtime choice from the previous lesson describes the contract a workload needs: long-lived service, bursty function, edge logic, or sandboxed module. Scheduling begins once the platform has to place long-running work into shared capacity.</p>
-<p>This lesson also prepares the migration lesson next. Extracted services only gain autonomy if the platform can place, roll out, observe, and recover them independently. A microservice boundary is weak if every service still competes for the same unmanaged pool of capacity.</p>
+<p>The preceding lesson gave remote calls a deadline, safe retry posture, identity, evidence, and fallback. Discovery supplies the changing destination set beneath that call policy; it cannot determine whether a retry would repeat a business operation.</p>
+<p>The next lesson introduces Kubernetes as a desired-state and reconciliation system. Kubernetes creates and replaces workloads deliberately. Its Service and EndpointSlice abstractions are one concrete way to keep that planned churn from leaking into callers.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/">Kubernetes Scheduling, Preemption, and Eviction</a><ul>
-<li>Focus: Review how Kubernetes places pods and what constraints affect scheduling.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/">Kubernetes Pod Topology Spread Constraints</a><ul>
-<li>Focus: Connect placement policy to failure-domain spread and resilience.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/">Kubernetes Disruptions</a><ul>
-<li>Focus: Study how planned disruption and availability constraints interact during operations.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/">Kubernetes Taints and Tolerations</a><ul>
-<li>Focus: Use it for understanding how nodes can repel workloads unless those workloads explicitly tolerate the placement.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Services</a> — Focus: inspect a platform-managed stable service identity for dynamic workloads.</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/">Kubernetes EndpointSlices</a> — Focus: see how an eligible endpoint set is represented and updated.</li>
+<li>[DOC] <a href="https://developer.hashicorp.com/consul/docs/discover/service-discovery">Consul Service Discovery</a> — Focus: compare a registry-based model of service membership and health.</li>
+<li>[BOOK] <a href="https://samnewman.io/books/building_microservices_2nd_edition/">Building Microservices, 2nd Edition</a> — Focus: connect discovery choices to service communication and operational ownership.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Scheduling turns workload intent into placement under resource, locality, and failure-domain constraints.</li>
-<li>Placement quality affects reliability, rollout safety, and cost, not just cluster neatness.</li>
-<li>Debugging placement means separating hard filters from softer scoring preferences.</li>
-<li>The core trade-off is efficient packing versus enough slack and spread to survive change.</li>
+<li>A logical service name is stable; the endpoint set behind it is not.</li>
+<li>Membership, readiness, draining, and expiry determine which instances are eligible for new traffic.</li>
+<li>Discovery provides a usable endpoint set, while load balancing selects one endpoint and call policy handles ambiguous outcomes.</li>
+<li>Dynamic topology is expected during deployments and failures, so its state transitions need explicit signals and ownership.</li>
 </ul>
 </section>
 
@@ -171,14 +364,14 @@ chosen: node-b
   
   <a class="nav-card" href="005.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Serverless, Edge, and Evolving Abstractions</strong>
+    <strong>Service-to-Service Network Policy</strong>
   </a>
   
 
   
   <a class="nav-card" href="007.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Microservices Migration and Operating Model</strong>
+    <strong>Kubernetes and Declarative Cloud Operations</strong>
   </a>
   
 </section>
@@ -193,7 +386,7 @@ chosen: node-b
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 13:02 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

@@ -3,11 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Service Decomposition and Boundary Design - @jepemo</title>
+    <title>Cluster Scheduling and Workload Placement - @jepemo</title>
     <link rel="shortcut icon" href="../../favicon.ico" />
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -52,7 +56,7 @@
 
     <main class="lesson-page">
       
-<h1>Service Decomposition and Boundary Design</h1>
+<h1>Cluster Scheduling and Workload Placement</h1>
 
 <section class="stack-block lesson-context">
   <p class="breadcrumb">
@@ -75,109 +79,215 @@
 </section>
 
 <section class="stack-block lesson-content-shell">
-  <h1>Service Decomposition and Boundary Design</h1>
+  <h1>Cluster Scheduling and Workload Placement</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Service decomposition is a cohesion trade-off: a boundary is strong when behavior, language, authority, and change pressure belong together strongly enough to justify distributed coordination.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>trace why a workload can or cannot be placed on a cluster node;</p>
+</li>
+<li>
+<p>separate hard placement constraints from softer placement preferences; and</p>
+</li>
+<li>
+<p>explain why rollout and failure recovery need capacity beyond a steady-state count.</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Scheduling turns a workload’s declared needs into one concrete location by rejecting impossible nodes and choosing among the safe ones, while balancing resource use against spread, locality, and room to recover.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Suppose the learning platform team is deciding whether to split identity, catalog, enrollment, billing, notifications, and live classes into services. Those names sound plausible, but names are not boundaries. The real question is whether each candidate groups behavior that can be owned, changed, secured, and operated as a coherent capability.</p>
-<p>Enrollment is a useful example. It is not merely an <code>enrollments</code> table or a set of CRUD endpoints. It includes eligibility rules, seat allocation, waitlists, cancellation policy, enrollment history, and sometimes payment or certificate prerequisites. Those behaviors use the same domain language and change under the same product pressure: what does it mean for a learner to take a place in a course?</p>
-<p>The misconception to correct is that decomposition is mainly a size problem. A tiny service can still be weak if it has no real authority. A larger service can be healthy if it owns one coherent policy area and lets other services depend on it through clear contracts. The goal is not more pieces. The goal is boundaries that reduce coordination rather than multiply it.</p>
-<p>This lesson is different from the migration lesson before it. Migration asks how to extract a plausible boundary safely. Decomposition asks how to decide whether the boundary is plausible at all. The design work is to test cohesion, authority, and workflow friction before turning a diagram into network calls.</p>
-<h2>Capability Cohesion</h2>
-<p>A strong service boundary clusters behavior that changes for the same reason. If eligibility, seat allocation, waitlists, cancellation, and enrollment history are always discussed by the same product owners, use the same vocabulary, and change together, they probably belong inside one enrollment capability.</p>
-<div class="codehilite"><pre><span></span><code>cohesive capability:
-  enrollment
-    -&gt; eligibility rules
-    -&gt; seat allocation
-    -&gt; waitlists
-    -&gt; cancellation policy
-    -&gt; enrollment history
-
-fragmented capability:
-  eligibility service
-  seat service
-  waitlist service
-  cancellation service
-  each needs the others for ordinary decisions
+<p>The platform is rolling out a fourth enrollment API replica. Three replicas already serve traffic, but one availability zone holds two of them. The new replica needs one CPU and one GiB of memory. The team expects it to land in another zone.</p>
+<p>The tempting model is: <strong>the scheduler finds any machine with spare CPU.</strong> It works when all nodes are identical, the cluster is lightly loaded, and replica independence does not matter.</p>
+<p>It fails during a node loss or rollout. The cluster may have enough total CPU but no single eligible node with enough requested memory. A node may have capacity but be reserved for batch work. A legal placement may put the new replica beside two existing replicas in the same failure domain. The cluster can look full of machines and still have no safe home for this specific workload.</p>
+<p>The stronger model is that scheduling is a constraint decision inside the reconciliation loop. Controllers decide that another pod should exist. Scheduling decides where it may run. The result depends on declared resources, node eligibility, spread rules, and preferences. A pending pod is not a mysterious failure; it is evidence that the requested placement cannot yet be justified.</p>
+<h2>The Small Situation</h2>
+<p>Keep these actors in view:</p>
+<div class="codehilite"><pre><span></span><code>Deployment:       asks for 4 available enrollment replicas
+Scheduler:        chooses a node for a newly created pod
+Nodes:            offer different remaining capacity, labels, and failure domains
+Service:          sends traffic only after the placed pod becomes ready
 </code></pre></div>
 
-<p>The fragmented version may look cleaner on a diagram, but it can make every ordinary enrollment decision a distributed workflow. A boundary that forces constant collaboration between services is usually too thin. It has separated code that still behaves like one policy area.</p>
-<p>The trade-off is granularity versus cohesion. Smaller services can create focused ownership, but only when the split follows a real change pressure. If the split separates rules that always move together, the system pays coordination cost without gaining autonomy.</p>
-<h2>Authority and Data Ownership</h2>
-<p>A boundary becomes weak very quickly when one service owns the rules but several other services can mutate the state those rules depend on. If enrollment owns seat allocation, then enrollment should usually be authoritative for seat state and enrollment records. Other services may read through APIs, events, or replicated views, but they should not all write critical enrollment state directly.</p>
-<div class="codehilite"><pre><span></span><code>strong boundary:
-  enrollment service
-    owns enrollment rules
-    owns enrollment records
-    owns seat allocation state
-    publishes facts to others
+<p>For this lesson, use a small teaching cluster. The values are illustrative, not a capacity recommendation.</p>
+<div class="codehilite"><pre><span></span><code>new enrollment pod requests: 1 CPU, 1 GiB memory
+placement goal:              spread replicas across zones when possible
 
-weak boundary:
-  enrollment owns rules
-  catalog, billing, and gateway also write enrollment rows
+node-a (zone-a): 0.5 CPU, 3 GiB remaining; already has 2 enrollment replicas
+node-b (zone-b): 2 CPU,   4 GiB remaining; has no enrollment replica
+node-c (zone-c): 4 CPU,   8 GiB remaining; reserved for batch workers
+node-d (zone-c): 2 CPU,   2 GiB remaining; has 1 enrollment replica
 </code></pre></div>
 
-<p>The issue is not that services may never share data. The issue is authority. Who is allowed to decide? Who can change the state that decision depends on? Who must explain an incident when the invariant breaks? If those answers point to different teams, the boundary is mostly cosmetic.</p>
-<p>This also shapes integration. A service can expose read APIs, publish events, or feed read models without giving up ownership of critical writes. Reads can be flexible. Authority should be explicit.</p>
-<p>The trade-off is short-term integration convenience versus long-term correctness. Shared writes can unblock a release, but they make later consistency, ownership, and incident response much harder to reason about.</p>
-<h2>Workflow Pressure Test</h2>
-<p>Static diagrams are too forgiving. The best way to test a decomposition is to walk through real workflows and count the coordination it creates. Consider a learner buying a course:</p>
-<div class="codehilite"><pre><span></span><code>learner buys course
-  -&gt; identity confirms account
-  -&gt; catalog confirms course is sellable
-  -&gt; billing authorizes payment
-  -&gt; enrollment grants seat
-  -&gt; notifications send receipt
+<p>A resource <strong>request</strong> tells the scheduler what capacity to reserve for placement. It is not the same as a live measurement of current CPU use. A runtime <strong>limit</strong> may control how much a running workload can consume, but it does not create capacity that the scheduler could not reserve. The cluster needs an honest workload request before it can make an honest placement decision.</p>
+<h2>The Initial Model Breaks Under Shared Capacity</h2>
+<p>If the team only checks total cluster CPU, it may conclude that the new replica should fit. But scheduling asks more precise questions:</p>
+<div class="codehilite"><pre><span></span><code>Can this pod fit on one node with its requested resources?
+May it run on that node according to placement policy?
+Would this location violate a required spread or separation rule?
+Among the nodes that remain, which one best meets the stated preferences?
 </code></pre></div>
 
-<p>Some cross-service interaction is normal because capabilities differ. But if enrollment has to synchronously ask five tiny services before it can decide anything, the design may have fractured one capability into fragments. If several teams argue about who owns the seat count, the boundary is not clear. If support cannot explain a failed purchase because every service holds one tiny piece of the truth, the decomposition is too expensive.</p>
-<p>Useful warning signs include:</p>
+<p>The distinction matters because the first three questions are hard constraints. A node that fails one is not a “less good” candidate. It is ineligible. Preferences only matter after eligibility.</p>
+<table>
+<thead>
+<tr>
+<th>Constraint or preference</th>
+<th>What it expresses</th>
+<th>If it fails</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Requested CPU and memory</td>
+<td>The pod needs reserved capacity on one node.</td>
+<td>Node cannot host the pod.</td>
+</tr>
+<tr>
+<td>Node reservation or taint</td>
+<td>Some nodes should repel this workload unless it explicitly belongs there.</td>
+<td>Node cannot host the pod without the relevant policy.</td>
+</tr>
+<tr>
+<td>Required zone or anti-affinity rule</td>
+<td>A placement must avoid a named failure or co-location condition.</td>
+<td>Node cannot host the pod.</td>
+</tr>
+<tr>
+<td>Spread preference or lower utilization</td>
+<td>Prefer a safer or less loaded eligible location.</td>
+<td>Node may host the pod but ranks lower.</td>
+</tr>
+<tr>
+<td>Locality preference</td>
+<td>Prefer a resource or network path that improves this workload.</td>
+<td>Node may host the pod but ranks lower.</td>
+</tr>
+</tbody>
+</table>
+<p>This is why “more affinity rules” is not automatically a better answer. Rules encode real operational intent. Every hard rule also removes possible recovery locations. The team should add one only when it protects a failure, locality, isolation, or policy boundary that is worth the reduced flexibility.</p>
+<h2>The Placement Mechanism Step by Step</h2>
+<p>The exact scheduler implementation varies by platform. The teaching mechanism is stable: filter impossible nodes, then score the eligible ones, then bind the pod to the chosen node.</p>
+<div class="codehilite"><pre><span></span><code>new pod created
+  -&gt; inspect requests and placement rules
+  -&gt; filter nodes that cannot accept it
+  -&gt; score the eligible nodes
+  -&gt; bind to one node
+  -&gt; wait for workload readiness
+</code></pre></div>
+
+<p>Apply it to the enrollment pod.</p>
+<h3>Step 1: Filter</h3>
+<table>
+<thead>
+<tr>
+<th>Node</th>
+<th>Evidence</th>
+<th>Filter result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>node-a</code></td>
+<td>Only 0.5 CPU remains; the request is 1 CPU.</td>
+<td>Excluded: insufficient requested CPU.</td>
+</tr>
+<tr>
+<td><code>node-b</code></td>
+<td>Has 2 CPU and 4 GiB remaining; no conflicting reservation.</td>
+<td>Eligible.</td>
+</tr>
+<tr>
+<td><code>node-c</code></td>
+<td>Has capacity, but is reserved for batch workers and enrollment has no matching allowance.</td>
+<td>Excluded: placement policy.</td>
+</tr>
+<tr>
+<td><code>node-d</code></td>
+<td>Has requested capacity and no hard conflict.</td>
+<td>Eligible.</td>
+</tr>
+</tbody>
+</table>
+<p>At this point, only <code>node-b</code> and <code>node-d</code> can run the pod. A better scoring rule cannot make <code>node-a</code> or <code>node-c</code> legal. This is the first diagnostic fork: <strong>pending because no node is eligible</strong> needs a capacity or policy correction, not a new preference.</p>
+<h3>Step 2: Score</h3>
+<p>The workload wants to avoid concentrating replicas in one zone. <code>node-d</code> is in zone-c, which already has one enrollment replica. <code>node-b</code> is in zone-b, which currently has none. If the spread policy is a preference rather than an absolute requirement, both remain eligible, but <code>node-b</code> receives the better score.</p>
+<div class="codehilite"><pre><span></span><code>eligible candidates:
+  node-b -&gt; improves zone spread, light remaining load
+  node-d -&gt; legal, but concentrates another replica in zone-c
+
+chosen node: node-b
+</code></pre></div>
+
+<h3>Step 3: Bind and observe</h3>
+<p>Binding does not mean serving capacity. The scheduler has selected a home. The node still starts the pod, the workload must pass readiness, and the Service only then sends traffic to it.</p>
+<div class="codehilite"><pre><span></span><code>chosen node -&gt; pod starts -&gt; readiness passes -&gt; endpoint becomes usable
+</code></pre></div>
+
+<p>So far, we have separated three states that are easy to blur: a requested replica exists, a pod has a placement, and the placed pod is ready to serve. The previous lesson covered the reconciliation and readiness loop. This lesson explains the location decision inside that loop.</p>
+<h2>Where Placement Fails During Change</h2>
+<p>Steady state can be misleading. The platform may normally run three replicas, but a rolling update or node drain often needs temporary extra capacity before old work is removed.</p>
+<div class="codehilite"><pre><span></span><code>steady state:     3 ready replicas
+rollout begins:   create 1 new replica before removing 1 old replica
+node drain:       schedule replacements before capacity disappears
+</code></pre></div>
+
+<p>Suppose the cluster has exactly enough requested capacity for three replicas. The fourth rollout replica cannot be placed. The deployment may pause with three old replicas still serving. Nothing is wrong with the controller; the cluster lacks <strong>headroom</strong> for the requested transition.</p>
+<p>Headroom is capacity that is intentionally not consumed in the normal picture. It supports replacement, warm-up, burst, and safe movement. It can be provided through spare node capacity, autoscaling that arrives soon enough, a rollout policy that uses smaller steps, or a deliberate reduction in another lower-priority workload. The right choice depends on service importance, cost, and recovery objectives.</p>
+<p>Disruption policy matters too. During planned maintenance, a platform should not remove every replica just because all nodes need work. A disruption budget can limit voluntary loss while replacements become ready. It does not create capacity or make an impossible placement possible; it protects availability by slowing the transition.</p>
+<p>The trade-off is utilization versus recovery slack. Tighter packing can reduce cost in steady state. Slack and spread make the platform more likely to survive a zone problem, node drain, or rollout without reducing user-facing capacity. A fully packed cluster is efficient only until it needs to change.</p>
+<h2>Signals to Inspect</h2>
+<p>When a pod is pending, investigate from declared intent to observed evidence:</p>
+<ol>
+<li><strong>Read the pod’s requests and placement rules.</strong> Which resources, selectors, reservations, and spread conditions did the team ask for?</li>
+<li><strong>Read scheduling status and events.</strong> Did every node fail a hard filter? Which filter was decisive?</li>
+<li><strong>Inspect eligible-node reality.</strong> Is capacity actually unavailable, are labels/reservations correct, or did a required rule remove every candidate?</li>
+<li><strong>Check transition pressure.</strong> Is a rollout, drain, or temporary surge consuming the slack that steady-state dashboards hide?</li>
+<li><strong>Change the right layer.</strong> Add or free suitable capacity, correct an unrealistic request or rule, adjust policy deliberately, or reduce transition pressure. Do not weaken a resilience rule only to make a pending alert disappear.</li>
+</ol>
+<p>If the pod is placed but latency is poor, the question changes. Look for noisy neighbors, replica concentration, missing locality preference, or a workload request that does not represent the resources it truly needs. A scheduler can only protect the model it receives.</p>
+<h2>Common Confusions</h2>
+<p><strong>Confusion: “Three replicas means three independent copies.”</strong></p>
+<p>Why it is tempting: the replica count is visible.</p>
+<p>Better model: replicas on the same node or zone can share a failure. Spread and anti-affinity make the count closer to independent serving capacity.</p>
+<p><strong>Confusion: “Pending means the scheduler is broken.”</strong></p>
+<p>Why it is tempting: the desired pod exists but does not run.</p>
+<p>Better model: pending often names a specific unsatisfied constraint. Events and status reveal whether capacity, policy, or topology made every node ineligible.</p>
+<p><strong>Confusion: “Fully used capacity is efficient capacity.”</strong></p>
+<p>Why it is tempting: high utilization looks economical.</p>
+<p>Better model: a cluster also needs room to replace, roll out, drain, and recover important workloads. Required headroom is part of the availability design.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check:</strong> <code>node-a</code> has 0.5 CPU available, while the new enrollment pod requests 1 CPU. <code>node-a</code> would otherwise improve zone spread. Should scoring choose it?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. Requested capacity is a hard filter. <code>node-a</code> is ineligible before scoring starts. The team must change available capacity or a justified request; a spread preference cannot override an impossible reservation.</p>
+<p><strong>Check:</strong> A rollout needs one extra replica, but no eligible node has capacity. Would lowering a disruption budget fix the placement?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. A disruption budget controls how quickly voluntary disruption may remove existing replicas. It does not create a node that can host the new one. The relevant issue is headroom, capacity, or rollout shape.</p>
+<h2>Trace It Yourself</h2>
+<p>An API needs two replicas across two zones. A new rollout pod requests 2 CPU and 2 GiB. <code>node-x</code> in zone-a has the resources but already hosts the other API replica. <code>node-y</code> in zone-b lacks 0.5 CPU. <code>node-z</code> in zone-c has capacity but is reserved for GPU batch work.</p>
+<p>Trace the filter result. Then decide whether the best first change is to loosen spread, add/free suitable capacity, change a reservation, or change the rollout. State the evidence you would inspect before changing policy.</p>
+<p>A good answer should mention:</p>
 <ul>
-<li>one basic business action requires a long chain of synchronous calls</li>
-<li>several services claim partial ownership of the same concept</li>
-<li>multiple services need direct writes to the same core state</li>
-<li>callers know too much about another service's internal workflow</li>
-<li>incidents require many teams because no boundary owns the outcome</li>
+<li><code>node-y</code> is ineligible because it lacks requested capacity;</li>
+<li><code>node-z</code> is ineligible unless the API legitimately belongs on the batch-reserved node;</li>
+<li><code>node-x</code> may be eligible only if its co-location does not violate a hard separation rule, but it weakens the stated failure-domain goal;</li>
+<li>additional suitable capacity or a safe rollout adjustment is usually preferable to discarding a necessary resilience rule; and</li>
+<li>scheduling events plus the declared requests, reservations, and spread policy establish which conclusion is valid.</li>
 </ul>
-<p>The trade-off is independence versus interaction debt. More boundaries promise more independent change, but every boundary is also a contract, failure point, and operational responsibility.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Issue</strong>: Splitting by table, endpoint, or technical layer.</p>
-<p><strong>Clarification / Fix</strong>: Start from workflows, language, and policy ownership. Data design should reinforce a capability boundary, not define it by itself.</p>
-<p><strong>Issue</strong>: Mistaking small services for strong services.</p>
-<p><strong>Clarification / Fix</strong>: Optimize for cohesive authority and independent evolution. A tiny service that must call its neighbors for every decision is usually not autonomous.</p>
-<p><strong>Issue</strong>: Letting several services share write authority over core state.</p>
-<p><strong>Clarification / Fix</strong>: Be flexible about reads and projections, but strict about the source of truth. If one service owns the policy, it should usually own the critical writes.</p>
-<p><strong>Issue</strong>: Reviewing only the static architecture diagram.</p>
-<p><strong>Clarification / Fix</strong>: Walk real user and operational workflows. A boundary is convincing only if ordinary behavior can cross it without excessive coordination or ambiguous ownership.</p>
 <h2>Connections</h2>
-<p>The first lesson in this track explained why a microservice boundary must earn its distributed cost. This lesson gives the design tests for where that boundary should go: cohesion, authority, and workflow pressure.</p>
-<p>The migration lesson before this one assumed billing was already plausible and focused on how to extract it safely. This lesson moves one step earlier and asks whether billing, enrollment, catalog, or another capability is coherent enough to deserve service ownership.</p>
-<p>The next lesson builds on this one by asking how strong boundaries communicate. Once capabilities are separated, request-response, commands, and events become choices about timing, coupling, and failure semantics.</p>
+<p>The previous lesson explained how a controller keeps declared workload state converging. Scheduling gives each new or replacement pod a concrete home. The next lesson moves outside the cluster: an API gateway hides these internal placement decisions from clients while defining a stable public boundary.</p>
 <h2>Resources</h2>
 <ul>
-<li>[BOOK] <a href="https://domainlanguage.com/ddd/">Domain-Driven Design</a><ul>
-<li>Focus: Review bounded contexts as a foundation for boundary design.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://martinfowler.com/books/monolithToMicroservices.html">Monolith to Microservices</a><ul>
-<li>Focus: Connect extraction strategy to ownership and data boundaries.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://martinfowler.com/bliki/MicroservicePremium.html">Microservice Premium</a><ul>
-<li>Focus: See why weak boundaries make distributed systems more expensive than teams expect.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://martinfowler.com/bliki/BoundedContext.html">Bounded Context</a><ul>
-<li>Focus: Use bounded context as a lens for language, model, and ownership boundaries.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/">Kubernetes Scheduling, Preemption, and Eviction</a> — Focus: scheduling vocabulary and the conditions that make a pod pending.</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/">Kubernetes Pod Topology Spread Constraints</a> — Focus: translate failure-domain goals into placement rules.</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/">Kubernetes Disruptions</a> — Focus: planned disruption, availability, and transition safety.</li>
+<li>[DOC] <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/">Kubernetes Taints and Tolerations</a> — Focus: nodes that repel workloads unless policy says they belong.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Strong service boundaries follow cohesive capability, not table shape, endpoint count, or service size.</li>
-<li>Authority matters: the team that owns a policy usually needs authority over the state that enforces it.</li>
-<li>Workflow pressure reveals bad decomposition faster than static diagrams; excessive coordination is a design signal.</li>
+<li>Scheduling filters impossible placements before it scores safe alternatives.</li>
+<li>Resource requests, node policy, and failure-domain rules express what a workload needs; the scheduler cannot infer unstated intent.</li>
+<li>A placement is not ready serving capacity until the workload starts and passes readiness.</li>
+<li>Headroom and spread trade some steady-state utilization for safer rollout, maintenance, and failure recovery.</li>
 </ul>
 </section>
 
@@ -185,14 +295,14 @@ weak boundary:
   
   <a class="nav-card" href="007.html">
     <span class="page-kicker">PREVIOUS</span>
-    <strong>Microservices Migration and Operating Model</strong>
+    <strong>Kubernetes and Declarative Cloud Operations</strong>
   </a>
   
 
   
   <a class="nav-card" href="009.html">
     <span class="page-kicker">NEXT</span>
-    <strong>Inter-Service Communication Patterns</strong>
+    <strong>API Gateway Patterns</strong>
   </a>
   
 </section>
@@ -207,7 +317,7 @@ weak boundary:
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-03 13:02 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
