@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,76 +81,105 @@
 <section class="stack-block lesson-content-shell">
   <h1>Backend Error Handling and Failure Semantics</h1>
 <blockquote>
-<p><strong>The core idea</strong>: backend error handling preserves failure meaning across the request lifecycle, then translates that meaning into a safe client contract and useful operator evidence.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>classify a backend failure before choosing its HTTP representation</p>
+</li>
+<li>
+<p>preserve one failure’s meaning for both the client and the operator without leaking internals</p>
+</li>
+<li>
+<p>decide when a retry is safe, unsafe, or impossible to classify after an uncertain write</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> Good error handling keeps the failure’s meaning intact long enough for each boundary to produce the right client action, retry signal, and diagnostic evidence.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the review endpoint from the previous lessons: a learner sends <code>POST /courses/42/reviews</code> with an auth token, a rating, and a short comment. The happy path is easy to narrate. The backend authenticates the learner, validates the body, checks enrollment, writes the review, and returns a response.</p>
-<p>The real design pressure appears when the same request fails. The JSON body may be malformed. The token may be missing. The learner may be signed in but not enrolled in the course. A review may already exist. The database may time out while writing. All of those failures interrupt one endpoint, but they do not mean the same thing.</p>
-<p>That is the key shift: an error is not just an exception plus a status code. It is a named exit from the lifecycle. Good error handling keeps the exit meaningful long enough for the right boundary to translate it. Inside the backend, the system should distinguish input problems, policy denials, domain rejections, state conflicts, and dependency failures. At the HTTP edge, those meanings become stable public responses. In logs, metrics, and traces, they stay rich enough for diagnosis.</p>
-<p>The common mistake is to treat <code>500 Internal Server Error</code> as the safest default for everything unclear. Used too broadly, it hides client-correctable mistakes, makes retry behavior vague, and tells operators little about where the lifecycle broke. A mature backend does not expose every internal detail, but it also does not erase failure meaning.</p>
-<h2>Failure Classes Before Status Codes</h2>
-<p>The first useful question is not "which HTTP status should this return?" The first useful question is "what kind of failure is this?" Status codes are a boundary language. Failure classes are system meaning.</p>
-<p>For the review endpoint, a practical classification might look like this:</p>
+<h3>One Request, Several Kinds of Failure</h3>
+<p>Alice submits a review:</p>
+<div class="codehilite"><pre><span></span><code>POST /courses/42/reviews
+Authorization: Bearer &lt;token&gt;
+{&quot;rating&quot;: 5, &quot;comment&quot;: &quot;Clear and practical.&quot;}
+</code></pre></div>
+
+<p>The successful path is familiar from lessons 009–011. The request is parsed, authenticated, validated, authorized, mapped, committed, and serialized. Now change one fact at a time:</p>
+<ul>
+<li>the body is malformed;</li>
+<li>the token is missing;</li>
+<li>Alice is authenticated but not enrolled;</li>
+<li>Alice already has a review;</li>
+<li>the database times out during the write;</li>
+<li>the server commits, but the client connection closes before the response arrives.</li>
+</ul>
+<p>All six cases stop the same endpoint. They do not mean the same thing, and the client should not react to them in the same way. A malformed body asks the client to correct input. A missing token asks the user to sign in. A timeout may justify a bounded retry. An uncertain write may require a status lookup instead of another create request.</p>
+<p>The tempting model is <code>exception -&gt; 500 -&gt; log</code>. It is easy to implement, but it destroys the distinction needed by user interfaces, automated clients, support staff, and incident response. The stronger model treats each failure as a named exit from the lifecycle. First classify what the system knows. Then translate that meaning at the boundary that owns the next audience.</p>
+<h2>The Failure Taxonomy</h2>
+<p>Start with meaning, not status codes. The following table is a teaching model for the review endpoint; a real API may choose a different mapping if it documents the choice consistently.</p>
 <table>
 <thead>
 <tr>
-<th>Failure in <code>POST /courses/42/reviews</code></th>
-<th>Meaning</th>
-<th>Typical public shape</th>
+<th>Stage and failure</th>
+<th>Internal meaning</th>
+<th>Likely client action</th>
+<th>Operator signal</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Body is not valid JSON or rating is outside range</td>
-<td>The client sent unusable input</td>
-<td><code>400 Bad Request</code> with field detail</td>
+<td>JSON cannot be parsed or rating is 6</td>
+<td>input cannot become an accepted request</td>
+<td>fix fields; do not retry unchanged</td>
+<td>validation counter and field location</td>
 </tr>
 <tr>
-<td>Token is absent or invalid</td>
-<td>The caller is not authenticated</td>
-<td><code>401 Unauthorized</code></td>
+<td>token missing or invalid</td>
+<td>no caller identity established</td>
+<td>authenticate, then retry</td>
+<td>auth-failure counter, route, request id</td>
 </tr>
 <tr>
-<td>Learner is authenticated but not enrolled</td>
-<td>The caller may not perform this action</td>
-<td><code>403 Forbidden</code></td>
+<td>Alice not enrolled or reviews closed</td>
+<td>business policy rejects this action</td>
+<td>show denial; do not retry unchanged</td>
+<td>policy code, course, caller-safe identifier</td>
 </tr>
 <tr>
-<td>Review already exists for this learner and course</td>
-<td>Current state conflicts with the requested change</td>
-<td><code>409 Conflict</code></td>
+<td>review already exists</td>
+<td>current state conflicts with requested change</td>
+<td>show existing state or stop retrying</td>
+<td>conflict count and uniqueness cause</td>
 </tr>
 <tr>
-<td>Database times out</td>
-<td>The system cannot complete the operation now</td>
-<td><code>503 Service Unavailable</code> or a bounded <code>500</code></td>
+<td>database timeout before commit is known</td>
+<td>dependency did not answer in budget</td>
+<td>bounded retry only if operation is idempotent</td>
+<td>dependency span, timeout budget, attempt</td>
+</tr>
+<tr>
+<td>stack bug or unknown exception</td>
+<td>backend could not fulfill its contract</td>
+<td>retry only if the client contract allows it</td>
+<td>exception class, trace, deployment version</td>
 </tr>
 </tbody>
 </table>
-<p>The mapping can vary by API style, but the distinctions should not be accidental. Each category answers a different operational question: should the client fix the request, should the user sign in, should the UI explain a denial, should retries stop, or should the platform page someone because a dependency is failing?</p>
-<p>This is why a backend benefits from an internal vocabulary of failures. It does not need a huge hierarchy, but it needs enough precision that important behavior is not lost:</p>
-<ul>
-<li>validation failures, where raw input cannot become trusted application input</li>
-<li>authentication failures, where the caller has not proved identity</li>
-<li>authorization failures, where identity exists but permission does not</li>
-<li>domain rejections, where product rules reject the operation</li>
-<li>conflict or concurrency failures, where current state prevents this change</li>
-<li>infrastructure failures, where a dependency, network, database, or runtime path failed</li>
-</ul>
-<p>The trade-off is design work. A catch-all path is quicker in a small handler. A clear taxonomy pays back when clients need predictable behavior, tests need stable assertions, and operators need to separate product denials from incidents.</p>
-<h2>Worked Error Path</h2>
-<p>Keep transport details out of the core workflow. The use case should express application meaning; the HTTP adapter should translate that meaning into the API contract.</p>
+<p><code>400</code>, <code>401</code>, <code>403</code>, <code>409</code>, <code>500</code>, and <code>503</code> are protocol language at the edge. They are not a substitute for the internal classification. A conflict and a dependency timeout might both be “not successful,” but one usually tells the client to stop while the other may permit a carefully bounded retry.</p>
+<p>The trade-off is precision versus implementation effort. A catch-all handler is fast for a prototype. A small, stable vocabulary pays for itself when tests assert behavior, clients branch on problem types, and operators need to distinguish normal denials from an outage.</p>
+<h2>Keep Meaning Inside the Application</h2>
+<p>The use case should report what it discovered, not which web framework status to send:</p>
 <div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">ReviewRejected</span><span class="p">(</span><span class="ne">Exception</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">code</span><span class="p">,</span> <span class="n">message</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">code</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">retryable</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">code</span> <span class="o">=</span> <span class="n">code</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">message</span> <span class="o">=</span> <span class="n">message</span> <span class="ow">or</span> <span class="n">code</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">retryable</span> <span class="o">=</span> <span class="n">retryable</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">create_review</span><span class="p">(</span><span class="n">command</span><span class="p">):</span>
     <span class="n">course</span> <span class="o">=</span> <span class="n">courses</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">course_id</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">course</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;course_not_found&quot;</span><span class="p">)</span>
-
+    <span class="k">if</span> <span class="n">course</span><span class="o">.</span><span class="n">reviews_closed</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;reviews_closed&quot;</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">enrollments</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="n">command</span><span class="o">.</span><span class="n">course_id</span><span class="p">):</span>
         <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;not_enrolled&quot;</span><span class="p">)</span>
 
@@ -156,88 +189,94 @@
         <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;review_already_exists&quot;</span><span class="p">)</span>
 </code></pre></div>
 
-<p>Notice what this code does not do. It does not return <code>403</code>, <code>404</code>, or <code>409</code>. It names what the application discovered. That makes the use case reusable from an HTTP route, an admin task, a background job, or a test without dragging a web framework through the middle of the design.</p>
-<p>At the boundary, the HTTP adapter performs the public translation:</p>
+<p>This code can run behind an HTTP endpoint, an administration command, or an import worker. It names application meaning and leaves transport translation to an outer adapter. The adapter can choose <code>403</code> for <code>not_enrolled</code>, <code>409</code> for <code>review_already_exists</code>, and <code>404</code> for <code>course_not_found</code> according to the public contract.</p>
+<p>An unknown exception should not be reclassified as a user error merely because the handler needs a response. Preserve the exception as private diagnostic evidence and use a generic public problem for the unexpected case.</p>
+<h2>Build a Safe Public Problem</h2>
+<p>HTTP status codes alone are often too coarse for non-human API consumers. RFC 9457 defines a problem-details format with machine-readable members such as <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>, and <code>instance</code>; it uses the <code>application/problem+json</code> media type. The format is an option, not a requirement, but its separation between a stable problem type and occurrence-specific detail is a useful design pattern.</p>
 <div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">problem_from_error</span><span class="p">(</span><span class="n">error</span><span class="p">,</span> <span class="n">request_id</span><span class="p">):</span>
     <span class="n">mapping</span> <span class="o">=</span> <span class="p">{</span>
         <span class="s2">&quot;course_not_found&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">404</span><span class="p">,</span> <span class="s2">&quot;course-not-found&quot;</span><span class="p">,</span> <span class="s2">&quot;Course not found&quot;</span><span class="p">),</span>
         <span class="s2">&quot;not_enrolled&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">403</span><span class="p">,</span> <span class="s2">&quot;review-not-allowed&quot;</span><span class="p">,</span> <span class="s2">&quot;You cannot review this course&quot;</span><span class="p">),</span>
+        <span class="s2">&quot;reviews_closed&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">409</span><span class="p">,</span> <span class="s2">&quot;reviews-closed&quot;</span><span class="p">,</span> <span class="s2">&quot;Reviews are closed&quot;</span><span class="p">),</span>
         <span class="s2">&quot;review_already_exists&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">409</span><span class="p">,</span> <span class="s2">&quot;review-already-exists&quot;</span><span class="p">,</span> <span class="s2">&quot;Review already exists&quot;</span><span class="p">),</span>
     <span class="p">}</span>
-
     <span class="n">status</span><span class="p">,</span> <span class="n">problem_type</span><span class="p">,</span> <span class="n">title</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
         <span class="n">error</span><span class="o">.</span><span class="n">code</span><span class="p">,</span>
         <span class="p">(</span><span class="mi">500</span><span class="p">,</span> <span class="s2">&quot;internal-error&quot;</span><span class="p">,</span> <span class="s2">&quot;Unexpected error&quot;</span><span class="p">),</span>
     <span class="p">)</span>
-
     <span class="k">return</span> <span class="p">{</span>
-        <span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="n">status</span><span class="p">,</span>
         <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="sa">f</span><span class="s2">&quot;https://api.example.com/problems/</span><span class="si">{</span><span class="n">problem_type</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
         <span class="s2">&quot;title&quot;</span><span class="p">:</span> <span class="n">title</span><span class="p">,</span>
-        <span class="s2">&quot;request_id&quot;</span><span class="p">:</span> <span class="n">request_id</span><span class="p">,</span>
+        <span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="n">status</span><span class="p">,</span>
+        <span class="s2">&quot;instance&quot;</span><span class="p">:</span> <span class="sa">f</span><span class="s2">&quot;urn:request:</span><span class="si">{</span><span class="n">request_id</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
     <span class="p">}</span>
 </code></pre></div>
 
-<p>This shape is close to the idea behind HTTP Problem Details: a structured response that gives clients stable fields without leaking implementation details. The point is not that every API must use this exact format. It is that public error payloads are part of the API contract. Clients build UX, retry logic, support flows, and analytics around them.</p>
-<p>Infrastructure failures need one extra distinction. If the database times out, the public response should stay safe and small. The client does not need the database hostname, SQL state, stack trace, or internal retry count. Operators do. The boundary can return a stable problem response with a request ID while telemetry records the dependency span, timeout class, retry state, and exception chain.</p>
-<h2>Two Audiences, One Meaning</h2>
-<p>Every production failure has at least two audiences. The client needs a response that is stable enough to act on. The operator needs evidence that is rich enough to diagnose. A poor error design mixes these audiences together.</p>
-<p>If the API sends raw exception text to the client, it may expose table names, file paths, library versions, service names, or security-sensitive hints. It also creates accidental compatibility: a client may depend on a raw message that was never meant to be stable. If the API hides everything behind a generic error with no correlation, support has no bridge from a user report to the real trace.</p>
-<p>A better design keeps the same underlying meaning but creates two deliberate views:</p>
-<div class="codehilite"><pre><span></span><code>duplicate review conflict
-  -&gt; client view: 409, stable problem type, safe title, request id
-  -&gt; operator view: trace id, user id hash, course id, repository result, timing
+<p>The <code>type</code> is a stable identifier for client branching. The <code>title</code> is short and human-readable. A <code>detail</code> field, if included, should help the client correct the request rather than reveal a stack trace. An <code>instance</code> or request id connects this occurrence to support evidence. Clients should not parse unstable prose as if it were a code.</p>
+<p>The response is a public contract. If a mobile client uses <code>review-already-exists</code> to open the existing review, changing that type silently can break behavior even when the status remains 409. Error schemas therefore belong in the same compatibility review as success schemas.</p>
+<h2>Two Views of the Same Exit</h2>
+<p>Clients and operators need different levels of detail. Keep one semantic cause, but produce two views:</p>
+<div class="codehilite"><pre><span></span><code>duplicate review
+  client: 409 + stable type + safe title + request id
+  operator: trace id + course id + conflict source + timing
 
 database timeout
-  -&gt; client view: 503 or bounded 500, retry-safe wording, request id
-  -&gt; operator view: dependency name, timeout budget, retry count, exception class
+  client: 503 (or documented generic error) + retry guidance + request id
+  operator: dependency name + timeout budget + attempt + exception chain
 </code></pre></div>
 
-<p>The request ID or trace ID is the bridge. It lets the public response remain small while giving support a way to find the internal record. This also keeps observability aligned with the request lifecycle from the previous lesson. The failure is not an afterthought; it is an exit from a known stage.</p>
-<p>The main limit is that error semantics should not pretend to know what the system does not know. If a write may have reached the database but the client connection failed before the response, the backend should not casually say "not created" unless it can prove that. In those cases, idempotency keys, operation IDs, or follow-up reads may be needed so clients can resolve uncertainty.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Issue</strong>: Translating too early.</p>
-<p><strong>Why it is tempting</strong>: The handler has an HTTP response object nearby, so it feels natural to turn every failure into a response immediately.</p>
-<p><strong>Correction</strong>: Preserve internal meaning until the boundary that owns the public contract. Inner layers should say <code>not_enrolled</code> or <code>review_already_exists</code>; the HTTP adapter should decide <code>403</code> or <code>409</code>.</p>
-<p><strong>Issue</strong>: Collapsing product denials and platform incidents.</p>
-<p><strong>Why it is tempting</strong>: Both stop the request, so a generic error path looks simpler.</p>
-<p><strong>Correction</strong>: Separate expected business exits from unexpected operational faults. A learner who is not enrolled is not an outage. A database timeout is not a user mistake.</p>
-<p><strong>Issue</strong>: Leaking diagnostics through public errors.</p>
-<p><strong>Why it is tempting</strong>: Detailed messages make local debugging easier, and local habits often survive into production.</p>
-<p><strong>Correction</strong>: Put stable, safe meaning in the response. Put raw exception detail, stack traces, dependency metadata, and retry history in private telemetry.</p>
-<p><strong>Issue</strong>: Hiding retry semantics.</p>
-<p><strong>Why it is tempting</strong>: Teams often choose a status code without asking what the client should do next.</p>
-<p><strong>Correction</strong>: Make retry meaning explicit. Validation errors and authorization denials are usually not retryable without a change. Transient dependency failures may be retryable, but only within a budget and with idempotency protection when side effects are possible.</p>
-<p>Close the lesson and classify five failures from the review endpoint without looking back: malformed rating, missing token, not enrolled, duplicate review, and database timeout. For each one, name the internal failure class, the likely public response, and the operator evidence you would want in a trace.</p>
+<p>Returning raw exception text can reveal SQL, table names, file paths, library versions, or service topology. It also creates accidental compatibility around a message that was never designed to be stable. The OWASP guidance on error handling reinforces the boundary: detailed diagnostics belong in protected logs, not in production responses.</p>
+<p>At the same time, a generic <code>500</code> without a correlation id leaves support unable to connect “my review failed” to a trace. Record the request id before work that may fail. In the operator view, include stage, latency, dependency, safe route parameters, and a caller identifier that follows the project’s privacy policy. Never log the bearer token or raw sensitive body.</p>
+<h2>Retry Semantics and Unknown Outcomes</h2>
+<p>Retry advice is part of failure meaning. A validation error, authentication failure, and enrollment denial are normally not useful to retry unchanged. A conflict usually requires a state change or a read. A transient dependency failure may be retryable within a time and attempt budget, but a create operation also needs idempotency protection.</p>
+<p>The hardest case is an uncertain write:</p>
+<div class="codehilite"><pre><span></span><code>client sends create
+server writes row
+network fails before response
+client cannot tell whether the row exists
+</code></pre></div>
+
+<p>Calling create again can produce a duplicate unless the operation has an idempotency key or a uniqueness rule that turns the second attempt into a known conflict. Alternatively, the client can query an operation id. The honest response is not always “created” or “not created”; sometimes the system must expose a way to resolve uncertainty.</p>
+<p>Do not infer retryability from <code>5xx</code> alone. A programming bug may repeat the same failure, and a timeout after commit may make another attempt dangerous. Include retry guidance only when the operation and failure class support it. <code>Retry-After</code> can be appropriate for a documented temporary condition, but it does not make a non-idempotent side effect safe by itself.</p>
+<h2>Where Error Handling Breaks</h2>
+<p><strong>Translating too early.</strong> The repository throws an HTTP response, so a worker cannot reuse the use case. Keep application or dependency meaning inside; translate at the HTTP boundary.</p>
+<p><strong>Collapsing denial and outage.</strong> A not-enrolled result increments the same alert as a database timeout. Separate expected business exits from operational faults in metrics and alerts.</p>
+<p><strong>Leaking diagnostics.</strong> A stack trace is returned in <code>detail</code>. Keep the client message safe and put exception chains in protected telemetry.</p>
+<p><strong>Changing codes casually.</strong> A team renames <code>review-already-exists</code> to <code>duplicate</code> without a compatibility review. Treat stable problem types and extensions as public contract.</p>
+<p><strong>Claiming certainty after a timeout.</strong> The response says “not created” even though the commit outcome is unknown. Use idempotency, operation status, or a follow-up read to resolve the state.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check 1:</strong> Alice is authenticated but not enrolled. Should the client retry the same request automatically?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> No. This is a policy denial, not a transient dependency failure. The UI may explain the denial or offer enrollment, but an unchanged retry will not add permission.</p>
+<p><strong>Check 2:</strong> A database timeout occurs after the insert may have committed. Which response is most honest?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Return a safe, documented temporary/unknown outcome with a request or operation id, and provide a status lookup or idempotency mechanism. Do not assert “not created” without evidence.</p>
+<p><strong>Check 3:</strong> A client wants to branch on <code>problem.type</code>. What must the API team protect?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The type identifiers and their meanings are part of the public contract. Document them, test them, and evolve them with the same compatibility discipline as success fields.</p>
+<h2>Practice: Classify Five Exits</h2>
+<p>For the review endpoint, classify these cases: malformed JSON, missing token, not enrolled, duplicate review, and database timeout. For each case write:</p>
+<ol>
+<li>the internal failure class;</li>
+<li>a likely public status and stable problem type;</li>
+<li>whether an unchanged retry is useful;</li>
+<li>one safe operator signal.</li>
+</ol>
+<p>A good answer distinguishes input, authentication, policy, conflict, and dependency meaning; avoids raw exception details in the response; and explains any retry using idempotency or uncertainty rather than status code alone.</p>
 <h2>Connections</h2>
-<p>The previous lesson described the request lifecycle as a staged path from raw input to public response. This lesson gives names to the failure exits from that path.</p>
-<p>The next lesson on OpenAPI and schema-first contracts will make an important consequence visible: error schemas are contracts too. If clients are expected to branch on <code>problem.type</code>, <code>code</code>, or <code>status</code>, those fields deserve the same compatibility discipline as successful response bodies.</p>
-<p>This topic also connects to observability. A useful alert is rarely "many 500s happened." A better signal separates validation spikes, authorization denials, conflict rates, timeout rates, and dependency-specific failures so the team can tell product behavior from system health.</p>
+<p>Lesson 011 placed these failures on a request timeline. This lesson preserves their meaning across the inward and outward boundaries. Lesson 013 will make the error schema executable in OpenAPI, where <code>problem.type</code>, extensions, and status mappings become reviewable artifacts. The later compatibility gate will test that clients can continue to interpret these exits after a release.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://www.rfc-editor.org/rfc/rfc9457">RFC 9457: Problem Details for HTTP APIs</a><ul>
-<li>Focus: Study the standard fields for structured client-facing error payloads and how they separate public meaning from private diagnostics.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html">OWASP Error Handling Cheat Sheet</a><ul>
-<li>Focus: Review why production APIs should avoid leaking raw internal error details.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!</a><ul>
-<li>Focus: Connect failure handling, timeouts, retries, and operational behavior in production systems.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/observability-primer/">OpenTelemetry Observability Primer</a><ul>
-<li>Focus: Relate request IDs, traces, logs, and metrics to the operator view of backend failures.</li>
-</ul>
-</li>
+<li>[SPEC] <a href="https://www.rfc-editor.org/rfc/rfc9457">RFC 9457: Problem Details for HTTP APIs</a> — Focus: study stable problem types, safe detail, occurrence identifiers, and <code>application/problem+json</code>.</li>
+<li>[ARTICLE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html">OWASP Error Handling Cheat Sheet</a> — Focus: keep diagnostic implementation details out of public production errors.</li>
+<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/observability-primer/">OpenTelemetry observability primer</a> — Focus: connect request ids, traces, logs, and metrics to operator evidence.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Error handling starts by preserving failure meaning, not by choosing a status code too early.</li>
-<li>Inner layers should express application or dependency meaning; outer adapters should translate that meaning into the public protocol contract.</li>
-<li>Clients and operators need different views of the same failure, connected by request IDs, traces, and consistent classification.</li>
-<li>Error payloads are part of API design because clients use them for UX, retries, support, and compatibility decisions.</li>
+<li>Classify the failure before selecting an HTTP status; status codes are boundary language, not the whole internal meaning.</li>
+<li>Keep application and dependency failures named inside the workflow, then translate them into stable, safe public problem details.</li>
+<li>Clients need actionable contract fields; operators need richer private evidence. A request or trace id links the two views.</li>
+<li>Retry semantics depend on the failure class, operation idempotency, and whether a write outcome is known—not on <code>5xx</code> alone.</li>
 </ul>
 </section>
 
@@ -267,7 +306,7 @@ database timeout
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-04 07:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

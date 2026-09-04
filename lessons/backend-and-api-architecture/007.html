@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,15 +81,31 @@
 <section class="stack-block lesson-content-shell">
   <h1>Repositories, Units of Work, and Persistence Boundaries</h1>
 <blockquote>
-<p><strong>The core idea</strong>: Persistence boundaries let application services speak in business operations while one explicit place owns query mechanics, transaction scope, and commit timing.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>shape repository capabilities around an application question instead of mirroring a database or ORM</p>
+</li>
+<li>
+<p>choose and trace a unit-of-work boundary for a multi-write enrollment operation</p>
+</li>
+<li>
+<p>explain why a database commit cannot make an external notification atomic, and design a recoverable handoff</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A persistence boundary lets the application state its durable intent while repositories hide query mechanics and a unit of work makes the commit boundary explicit.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Imagine the <code>EnrollmentService</code> now handles paid course enrollment. The use case must check whether the learner is already enrolled, reserve a seat, create an enrollment row, and append an audit record. A quick implementation can do all of that with ORM calls directly inside the service.</p>
-<p>That version works, but it changes the meaning of the service. The code no longer reads like "enroll this learner if the business rules allow it." It reads like a mix of product policy, query construction, session state, transaction timing, and row-mapping detail. When something fails, the reader has to separate business intent from persistence machinery before they can reason about correctness.</p>
-<p>A repository and a unit of work solve two different parts of that problem. A repository gives the use case a domain-facing vocabulary for data operations. A unit of work makes the commit boundary visible: these writes succeed together, or they do not become durable together.</p>
-<p>The misconception is that these patterns are mainly about hiding the database forever. They are not. They are about making persistence decisions easier to see. Sometimes direct ORM use is fine. The patterns earn their place when query details or transaction boundaries are drowning out the use case.</p>
-<h2>The Pressure: Queries Creep Upward</h2>
-<p>Here is an ordinary version of the problem:</p>
+<p>The learning platform is adding paid enrollment. For one request, the backend must check that the learner is not already enrolled, reserve one seat, create an enrollment row, and record an audit entry. After the database commit, another component should notify the learner.</p>
+<p>The tempting implementation puts ORM calls directly in <code>EnrollmentService</code>. It can work in a small endpoint. But the service then has to speak several languages at once: product policy, SQL filters, row classes, locks, session state, and commit timing. A worker and a repair command may copy those details. A schema change can reach into policy code. A hidden commit can make one write durable while a later write fails.</p>
+<p>The stronger model separates two questions:</p>
+<div class="codehilite"><pre><span></span><code>What durable operations does this use case need?
+Which storage changes become durable together?
+</code></pre></div>
+
+<p>A repository answers the first question with an application-facing capability. A unit of work answers the second by framing one persistence transaction. They often collaborate, but they are not synonyms. A repository describes access; a unit of work coordinates a set of changes.</p>
+<h2>The Reasonable First Model</h2>
+<p>Here is a plausible first version for a course with one remaining seat:</p>
 <div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">enroll</span><span class="p">(</span><span class="n">learner_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">course_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">session</span><span class="p">):</span>
     <span class="n">course</span> <span class="o">=</span> <span class="p">(</span>
         <span class="n">session</span><span class="o">.</span><span class="n">query</span><span class="p">(</span><span class="n">CourseRow</span><span class="p">)</span>
@@ -93,21 +113,15 @@
         <span class="o">.</span><span class="n">with_for_update</span><span class="p">()</span>
         <span class="o">.</span><span class="n">one</span><span class="p">()</span>
     <span class="p">)</span>
-
     <span class="n">existing</span> <span class="o">=</span> <span class="p">(</span>
         <span class="n">session</span><span class="o">.</span><span class="n">query</span><span class="p">(</span><span class="n">EnrollmentRow</span><span class="p">)</span>
-        <span class="o">.</span><span class="n">filter</span><span class="p">(</span>
-            <span class="n">EnrollmentRow</span><span class="o">.</span><span class="n">learner_id</span> <span class="o">==</span> <span class="n">learner_id</span><span class="p">,</span>
-            <span class="n">EnrollmentRow</span><span class="o">.</span><span class="n">course_id</span> <span class="o">==</span> <span class="n">course_id</span><span class="p">,</span>
-        <span class="p">)</span>
+        <span class="o">.</span><span class="n">filter_by</span><span class="p">(</span><span class="n">learner_id</span><span class="o">=</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="o">=</span><span class="n">course_id</span><span class="p">)</span>
         <span class="o">.</span><span class="n">first</span><span class="p">()</span>
     <span class="p">)</span>
-
     <span class="k">if</span> <span class="n">existing</span><span class="p">:</span>
         <span class="k">raise</span> <span class="n">EnrollmentRejected</span><span class="p">(</span><span class="s2">&quot;already_enrolled&quot;</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">course</span><span class="o">.</span><span class="n">available_seats</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
         <span class="k">raise</span> <span class="n">EnrollmentRejected</span><span class="p">(</span><span class="s2">&quot;course_full&quot;</span><span class="p">)</span>
-
     <span class="n">course</span><span class="o">.</span><span class="n">available_seats</span> <span class="o">-=</span> <span class="mi">1</span>
     <span class="n">enrollment</span> <span class="o">=</span> <span class="n">EnrollmentRow</span><span class="p">(</span><span class="n">learner_id</span><span class="o">=</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="o">=</span><span class="n">course_id</span><span class="p">)</span>
     <span class="n">session</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">enrollment</span><span class="p">)</span>
@@ -116,107 +130,90 @@
     <span class="k">return</span> <span class="n">enrollment</span>
 </code></pre></div>
 
-<p>This code is not bad because SQL or an ORM appears. The problem is that every concern is competing in one place:</p>
-<ul>
-<li>the business rule about duplicate enrollment</li>
-<li>the capacity rule about available seats</li>
-<li>the locking choice</li>
-<li>the row model</li>
-<li>the audit write</li>
-<li>the exact commit timing</li>
-</ul>
-<p>If this use case appears in an HTTP handler, a worker, and a backfill script, those details tend to spread. If the database schema changes, application policy code changes. If transaction handling changes, every copied workflow has to be checked.</p>
-<p>The useful question is:</p>
-<div class="codehilite"><pre><span></span><code>Which persistence details should the use case be allowed to know?
-</code></pre></div>
-
-<p>The answer is rarely "none." A service may need to know that seat reservation and enrollment creation belong to one durable action. But it should not need to know every query shape and ORM session behavior just to express the workflow.</p>
-<h2>Repositories Give the Use Case a Better Language</h2>
-<p>A repository is a persistence boundary shaped around the questions and actions a use case needs. For enrollment, useful repository operations might be:</p>
+<p>This code is not wrong merely because it uses an ORM. It is useful when the service is deliberately close to one store and the transaction question is trivial. Its pressure appears when several entry points need the same operation, when the storage model changes, or when two learners can race for the final seat. The method now owns the locking choice, row mapping, uniqueness behavior, and commit. A reviewer must reconstruct the product workflow from persistence instructions.</p>
+<h2>Repositories Give the Use Case a Better Vocabulary</h2>
+<p>A repository is useful when it mediates between application intent and data-mapping mechanics. For enrollment, the application might need these capabilities:</p>
 <div class="codehilite"><pre><span></span><code>courses.get_for_enrollment(course_id)
-enrollments.exists(learner_id, course_id)
+enrollments.find_for(learner_id, course_id)
 seats.reserve(course_id)
-enrollments.create(learner_id, course_id)
-audit.append(kind, entity_id)
+enrollments.add(learner_id, course_id)
+audit.record(kind, entity_id)
 </code></pre></div>
 
-<p>That vocabulary is not generic CRUD. It is closer to the application language. The repository implementation can still use SQL, an ORM, indexes, locks, and row mappers. Those details move downward:</p>
-<div class="codehilite"><pre><span></span><code>application service
-    &quot;reserve a seat and create enrollment&quot;
-
-repository boundary
-    &quot;translate that request into queries and rows&quot;
-
-database
-    &quot;execute storage operations with indexes, locks, constraints&quot;
+<p>Those names are not a universal recipe. They are a design test: can the service state its questions without mentioning a query builder, an ORM session, or a table alias? The implementation can still use indexes, row locks, constraints, and SQL. It translates the capability and maps rows at the lower boundary.</p>
+<p>Avoid the opposite mistake, a generic repository that exposes only <code>find</code>, <code>save</code>, and <code>delete</code> for every table. Generic methods can be appropriate for simple data access, but they do not tell the application whether saving an enrollment also reserves a seat, checks uniqueness, or writes an audit record. A repository earns its cost when it localizes a change pressure or gives the use case a more truthful language.</p>
+<p>The boundary does not erase database knowledge. The database still owns facts such as a unique <code>(learner_id, course_id)</code> constraint. The repository should make that constraint's failure meaningful to the application, for example by translating a duplicate-key error into an enrollment conflict. It should not pretend that an in-memory check alone prevents a race.</p>
+<h2>A Unit of Work Makes One Commit Visible</h2>
+<p>Now consider the writes that define one successful enrollment:</p>
+<div class="codehilite"><pre><span></span><code>reserve a seat
+create the enrollment
+record the audit entry
 </code></pre></div>
 
-<p>A repository is useful when it makes the service easier to read and safer to change:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">EnrollmentService</span><span class="p">:</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">courses</span><span class="p">,</span> <span class="n">enrollments</span><span class="p">,</span> <span class="n">seats</span><span class="p">,</span> <span class="n">audit</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">courses</span> <span class="o">=</span> <span class="n">courses</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">enrollments</span> <span class="o">=</span> <span class="n">enrollments</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">seats</span> <span class="o">=</span> <span class="n">seats</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">audit</span> <span class="o">=</span> <span class="n">audit</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">enroll</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">learner_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">course_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-        <span class="n">course</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">courses</span><span class="o">.</span><span class="n">get_for_enrollment</span><span class="p">(</span><span class="n">course_id</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="n">EnrollmentRejected</span><span class="p">(</span><span class="s2">&quot;already_enrolled&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">course</span><span class="o">.</span><span class="n">has_available_seat</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="n">EnrollmentRejected</span><span class="p">(</span><span class="s2">&quot;course_full&quot;</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">seats</span><span class="o">.</span><span class="n">reserve</span><span class="p">(</span><span class="n">course_id</span><span class="p">)</span>
-        <span class="n">enrollment</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">create</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">audit</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;learner_enrolled&quot;</span><span class="p">,</span> <span class="n">enrollment</span><span class="o">.</span><span class="n">id</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">enrollment</span>
-</code></pre></div>
-
-<p>This code is not pretending the database disappeared. It is stating the business flow in terms a backend engineer can review without mentally parsing every query. The storage implementation can still be tested separately with real database behavior.</p>
-<p>The trade-off is boundary code versus clarity. A repository adds methods and files. That cost is justified when it localizes storage mechanics or gives the use case a better language. It is wasteful when it only wraps <code>save</code>, <code>find</code>, and <code>delete</code> without reducing any coupling.</p>
-<h2>Units of Work Make Commit Timing Explicit</h2>
-<p>Repositories answer "how does the use case ask for data operations?" A unit of work answers a different question: "which persistence changes belong to one commit?"</p>
-<p>Consider the enrollment writes:</p>
-<div class="codehilite"><pre><span></span><code>reserve seat
-create enrollment
-append audit record
-</code></pre></div>
-
-<p>If the seat is reserved but the enrollment row is not committed, the system can lose capacity. If enrollment is committed but the audit record is required and missing, operations may lose traceability. These writes have a shared consistency boundary.</p>
-<p>A unit of work makes that boundary visible:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">enroll</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">learner_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">course_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<p>If the first write commits and the second fails, the platform has lost a seat. If the enrollment commits but the audit entry does not, the operational record is incomplete. The application needs one database transaction for the changes that must become durable together.</p>
+<p>A unit of work is the object or boundary that collects those changes and coordinates their commit. A minimal shape is:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">enroll</span><span class="p">(</span><span class="n">learner_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">course_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
     <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">uow</span> <span class="k">as</span> <span class="n">uow</span><span class="p">:</span>
         <span class="n">course</span> <span class="o">=</span> <span class="n">uow</span><span class="o">.</span><span class="n">courses</span><span class="o">.</span><span class="n">get_for_enrollment</span><span class="p">(</span><span class="n">course_id</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">uow</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">uow</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">find_for</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">):</span>
             <span class="k">raise</span> <span class="n">EnrollmentRejected</span><span class="p">(</span><span class="s2">&quot;already_enrolled&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">course</span><span class="o">.</span><span class="n">has_available_seat</span><span class="p">:</span>
             <span class="k">raise</span> <span class="n">EnrollmentRejected</span><span class="p">(</span><span class="s2">&quot;course_full&quot;</span><span class="p">)</span>
 
         <span class="n">uow</span><span class="o">.</span><span class="n">seats</span><span class="o">.</span><span class="n">reserve</span><span class="p">(</span><span class="n">course_id</span><span class="p">)</span>
-        <span class="n">enrollment</span> <span class="o">=</span> <span class="n">uow</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">create</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">)</span>
-        <span class="n">uow</span><span class="o">.</span><span class="n">audit</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;learner_enrolled&quot;</span><span class="p">,</span> <span class="n">enrollment</span><span class="o">.</span><span class="n">id</span><span class="p">)</span>
+        <span class="n">enrollment</span> <span class="o">=</span> <span class="n">uow</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">)</span>
+        <span class="n">uow</span><span class="o">.</span><span class="n">audit</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="s2">&quot;learner_enrolled&quot;</span><span class="p">,</span> <span class="n">enrollment</span><span class="o">.</span><span class="n">id</span><span class="p">)</span>
         <span class="n">uow</span><span class="o">.</span><span class="n">commit</span><span class="p">()</span>
-
     <span class="k">return</span> <span class="n">enrollment</span>
 </code></pre></div>
 
-<p>The exact API is not the point. The point is that the reader can see when the transaction starts, which repositories participate, and when the commit happens.</p>
-<p>This also creates a cleaner place for rollback behavior. If an exception happens before <code>commit()</code>, the unit of work can roll back the transaction. If commit succeeds, the database state becomes durable. That makes the consistency story reviewable.</p>
-<p>The trade-off is ceremony versus transactional clarity. A unit of work is usually worth it for multi-write workflows, request-scoped transactions, and services that coordinate several repositories. It is often unnecessary for a simple read or a single write with no meaningful transaction question.</p>
-<h2>Worked Example: Database Commit vs External Side Effects</h2>
-<p>Now add a notification. After enrollment succeeds, the learner should receive an email or event:</p>
-<div class="codehilite"><pre><span></span><code>1. reserve seat
-2. create enrollment
-3. append audit record
-4. publish EnrollmentCreated
-</code></pre></div>
-
-<p>It is tempting to put the publish call inside the same unit of work and believe the whole operation is atomic. That is the dangerous mistake. A database transaction can roll back database writes. It cannot automatically roll back an email already sent, a payment provider call, or a message published to a broker unless you have a stronger distributed transaction mechanism.</p>
-<p>A safer shape is to commit the state change and record the side effect intent inside the same database transaction:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">uow</span><span class="p">:</span>
-    <span class="n">enrollment</span> <span class="o">=</span> <span class="n">uow</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">create</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">)</span>
+<p>The exact API is a local choice. What matters is that the reader can answer when the unit of work starts, which repositories participate, and when commit occurs. An exception before commit should leave the database transaction rolled back according to the adapter's contract. A successful commit establishes the durable database fact.</p>
+<p>A unit of work is not automatically the same as an ORM session, although an ORM session can implement one. SQLAlchemy, for example, frames <code>begin</code>, <code>commit</code>, and <code>rollback</code> around a session and tracks pending changes. Other data stores may require an explicit transaction object. Keep the architecture concept separate from the library name so the application can state its boundary honestly.</p>
+<h2>Worked Trace: Two Learners, One Seat</h2>
+<p>Concurrency makes the boundary concrete. Assume one seat remains and learners A and B submit at nearly the same time. The following is an illustrative trace; exact lock behavior depends on the database and isolation configuration.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Transaction A</th>
+<th>Transaction B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>begins the unit of work and reads the course</td>
+<td>begins and tries to read the same course</td>
+</tr>
+<tr>
+<td>2</td>
+<td>obtains the seat-row lock or conditional update right</td>
+<td>waits, or receives a failed conditional update</td>
+</tr>
+<tr>
+<td>3</td>
+<td>verifies no duplicate, reserves the last seat</td>
+<td>cannot safely treat the old seat count as current</td>
+</tr>
+<tr>
+<td>4</td>
+<td>adds enrollment and audit entry</td>
+<td>retries or returns <code>course_full</code> according to policy</td>
+</tr>
+<tr>
+<td>5</td>
+<td>commits all three database changes</td>
+<td>observes the committed state after the lock is released</td>
+</tr>
+</tbody>
+</table>
+<p>The application-level check “there is a seat” is not enough by itself. The persistence implementation needs a database-enforced strategy, such as a lock or an atomic conditional update, and a uniqueness constraint for duplicate enrollment. The repository exposes a meaningful result like <code>seat_reserved</code> or <code>course_full</code>; it does not promise that a read made earlier remains true forever.</p>
+<p>The trace also shows why commit ownership matters. If <code>seats.reserve()</code> committed internally, the service could not roll back the seat when <code>enrollments.add()</code> failed. The unit of work keeps the writes under one decision point. It does not eliminate contention; it makes the contention and its result reviewable.</p>
+<h2>Database Commit Versus External Notification</h2>
+<p>The learner should receive <code>EnrollmentCreated</code> after a successful enrollment. A naive implementation publishes the event inside the database transaction and calls both operations atomic. They are not. A database rollback cannot unsend an email or retract a message already accepted by a broker.</p>
+<p>Instead, record the intent in the same database transaction:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">uow</span> <span class="k">as</span> <span class="n">uow</span><span class="p">:</span>
+    <span class="n">enrollment</span> <span class="o">=</span> <span class="n">uow</span><span class="o">.</span><span class="n">enrollments</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">learner_id</span><span class="p">,</span> <span class="n">course_id</span><span class="p">)</span>
     <span class="n">uow</span><span class="o">.</span><span class="n">outbox</span><span class="o">.</span><span class="n">add</span><span class="p">(</span>
         <span class="n">event_type</span><span class="o">=</span><span class="s2">&quot;EnrollmentCreated&quot;</span><span class="p">,</span>
         <span class="n">payload</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;enrollment_id&quot;</span><span class="p">:</span> <span class="n">enrollment</span><span class="o">.</span><span class="n">id</span><span class="p">},</span>
@@ -224,43 +221,53 @@ append audit record
     <span class="n">uow</span><span class="o">.</span><span class="n">commit</span><span class="p">()</span>
 </code></pre></div>
 
-<p>Then a separate publisher reads the outbox table and delivers the event. This pattern does not make the world magically atomic. It makes the handoff recoverable: if the process crashes after commit but before publish, the outbox row is still there.</p>
-<p>This is where persistence boundaries connect to broader backend reliability. The unit of work defines the durable database fact. The outbox or workflow mechanism handles communication with the outside world after that fact exists.</p>
-<h2>Failure Modes and Design Limits</h2>
-<p>The first failure mode is a repository that mirrors the ORM instead of the use case. If the service still thinks in sessions, eager-loading flags, query builders, and row-specific exceptions, the boundary is not doing much.</p>
-<p>The second failure mode is a generic base repository that makes every operation look the same. A method named <code>save(entity)</code> may be fine in some systems, but it does not say whether enrollment creation should reserve a seat, enforce uniqueness, or append audit data.</p>
-<p>The third failure mode is hidden commits. If repository methods commit internally, the service cannot see which writes rise or fall together. That creates accidental partial success.</p>
-<p>The fourth failure mode is pretending a unit of work controls more than it does. It usually controls one persistence store or one transactional resource. External APIs, message brokers, and email systems need explicit delivery, retry, idempotency, or compensation strategies.</p>
-<p>The limit is that no boundary removes the need to understand the database. Constraints, isolation levels, locks, indexes, and query plans still matter. A good persistence boundary keeps those concerns localized; it does not make them irrelevant.</p>
+<p>After commit, a publisher reads the outbox and sends the event. If the process crashes between commit and publish, the outbox row remains available for a later attempt. The handoff is recoverable, but delivery can still be duplicated, delayed, or rejected. Consumers need idempotency, and the publisher needs retry and visibility rules.</p>
+<p>This boundary tells us what the unit of work can promise: the database fact and the outbox intent commit together. It cannot promise that a remote notification, payment provider, or email system shares that transaction. A later track can explore broader saga or distributed-transaction choices; this lesson only needs the boundary to remain explicit.</p>
+<h2>Design Limits and Failure Modes</h2>
+<p><strong>Repository as ORM mirror.</strong> If the service still chooses eager-loading flags, session methods, and row-specific exceptions, the repository has moved files without moving knowledge.</p>
+<p><strong>Hidden commit.</strong> A repository that commits after every <code>add</code> makes multi-write intent invisible and can create partial success. Let the unit-of-work boundary or an explicitly named transaction owner decide.</p>
+<p><strong>Generic CRUD as false safety.</strong> <code>save(enrollment)</code> does not automatically communicate seat reservation, uniqueness, or audit obligations. Use a narrower operation when those rules matter.</p>
+<p><strong>Cross-system atomicity fantasy.</strong> An outbox improves the handoff from database to broker. It does not make the broker, payment provider, and database one transaction. Retries and duplicate delivery remain part of the design.</p>
+<p><strong>Long-lived transactions.</strong> Holding a transaction open while waiting for a remote API or a human interaction increases locks and failure exposure. Keep the database unit of work around the durable decision, then coordinate external work separately.</p>
+<p>This is the trade-off: the pattern buys a readable persistence language and a visible commit boundary, but it costs interfaces, mapping code, transaction setup, and another abstraction to maintain. Direct ORM use can be the better choice for a simple read or a one-table write when no real boundary is being protected.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check 1:</strong> A repository method commits after writing the enrollment, but the audit insert happens later. What is the risk?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The writes can become partially durable. Move commit ownership to the unit of work if enrollment and audit are one consistency boundary.</p>
+<p><strong>Check 2:</strong> Two requests both read <code>available_seats = 1</code> before either writes. Which layer must enforce the race-safe outcome?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The persistence implementation needs a database-enforced strategy such as a lock or conditional update, plus application handling for a failed reservation. A repository interface alone cannot create atomicity.</p>
+<p><strong>Check 3:</strong> Why does the outbox row belong in the same unit of work as the enrollment?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> It records the event intent with the durable enrollment fact. A later publisher can retry after a crash, while the design remains honest about non-atomic external delivery.</p>
+<h2>Practice: Review a Booking Boundary</h2>
+<p>A workshop has ten seats. A web request and a CSV import must reserve seats, create bookings, and record an audit entry. A confirmation email is sent by another process. Sketch the repository capabilities, unit-of-work boundary, and one concurrency safeguard.</p>
+<p>A good answer should mention:</p>
+<ul>
+<li>both entry points call one application operation rather than copying SQL;</li>
+<li>repositories expose booking-relevant capabilities, not a generic session to the application;</li>
+<li>seat reservation, booking creation, audit, and outbox intent share one database commit when the product requires that consistency;</li>
+<li>a unique booking constraint and a lock or conditional update handle concurrent requests;</li>
+<li>the email publisher runs after commit and treats delivery as retryable and potentially duplicated;</li>
+<li>a simple read-only query may use direct data access if no meaningful persistence boundary is being protected.</li>
+</ul>
 <h2>Connections</h2>
-<p>The previous lesson on dependency injection explained how application services receive collaborators instead of constructing them. Repositories and units of work are common collaborators that the composition root wires to concrete database-backed implementations.</p>
-<p>The next lesson on SOLID principles gives vocabulary for judging these boundaries. Repositories often apply dependency inversion, but they violate the spirit of SOLID when they become broad, leaky interfaces with unclear responsibilities.</p>
-<p>Later tracks on database internals and distributed transactions will revisit the harder limits: isolation levels, deadlocks, two-phase commit, sagas, and outbox-based reliability.</p>
+<p>Lesson 006 showed how dependency injection supplies collaborators at a runtime edge. The repositories and unit of work in this lesson are those collaborators, with the composition root deciding which database-backed implementations and lifetimes to use.</p>
+<p>Lesson 008 will use SOLID as a diagnostic rather than a class-counting rule. The repository boundary is valuable only when it protects a real change pressure. Later lessons return to validation, mapping, request lifecycles, and failure semantics; each will add another reason to keep the durable boundary explicit.</p>
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] <a href="https://martinfowler.com/eaaCatalog/repository.html">Repository</a><ul>
-<li>Focus: Read repository as a collection-like persistence boundary, then compare that with use-case-oriented repositories.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://martinfowler.com/eaaCatalog/unitOfWork.html">Unit of Work</a><ul>
-<li>Focus: Study why tracking changes and coordinating commit timing are separate from query construction.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.sqlalchemy.org/en/20/orm/session_basics.html">SQLAlchemy Session Basics</a><ul>
-<li>Focus: Connect unit-of-work thinking to a concrete ORM session and transaction model.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://microservices.io/patterns/data/transactional-outbox.html">Transactional Outbox</a><ul>
-<li>Focus: Understand why database commits and message publishing need a recoverable handoff.</li>
-</ul>
-</li>
+<li>[ARTICLE] <a href="https://martinfowler.com/eaaCatalog/repository.html">Repository</a> — Focus: see how a repository mediates between domain objects and data-mapping details, then compare that idea with the use-case capabilities in this lesson.</li>
+<li>[ARTICLE] <a href="https://martinfowler.com/eaaCatalog/unitOfWork.html">Unit of Work</a> — Focus: study how a unit of work tracks changes and coordinates writing them as one business transaction.</li>
+<li>[DOC] <a href="https://docs.sqlalchemy.org/en/20/orm/session_basics.html">SQLAlchemy Session Basics</a> — Focus: inspect explicit begin, commit, rollback, session, and flush behavior in a concrete ORM.</li>
+<li>[ARTICLE] <a href="https://microservices.io/patterns/data/transactional-outbox.html">Transactional Outbox</a> — Focus: examine the recoverable handoff between a database commit and message publication, including duplicate-delivery concerns.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>Repositories are useful when they let application services speak in domain operations instead of query mechanics.</li>
-<li>Units of work are useful when they make a real commit boundary visible across related persistence changes.</li>
-<li>Database transactions do not automatically make external side effects atomic; side effects need delivery patterns such as an outbox or compensation.</li>
-<li>Persistence boundaries should localize storage complexity without pretending the database no longer matters.</li>
+<li>A repository earns its place when it gives the use case a truthful persistence vocabulary and localizes query mechanics.</li>
+<li>A unit of work makes the set of changes and the commit decision visible; it is related to a transaction but not identical to every ORM session.</li>
+<li>Concurrency needs database-enforced constraints or conditional coordination; an in-memory check alone is not a guarantee.</li>
+<li>An outbox can commit event intent with database state, but external delivery remains a separate, retryable, and possibly duplicated step.</li>
+<li>These patterns are tools for real boundaries, not mandatory wrappers around every table or query.</li>
 </ul>
 </section>
 
@@ -290,7 +297,7 @@ append audit record
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-04 07:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

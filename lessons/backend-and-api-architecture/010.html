@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,161 +81,271 @@
 <section class="stack-block lesson-content-shell">
   <h1>DTOs, Entities, and Data Mapping</h1>
 <blockquote>
-<p><strong>The core idea</strong>: DTOs and entities are boundary-shape tools: they keep accepted input, internal truth, persistence details, and public output from pretending to be the same object.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>trace one review request through request, command, entity, row, and response shapes</p>
+</li>
+<li>
+<p>choose an allowlisted mapping that prevents over-posting and response leakage</p>
+</li>
+<li>
+<p>explain when the extra mapping cost is justified and when a shared shape is acceptable</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A backend becomes easier to change when every boundary receives the smallest shape that matches its trust, business, storage, or public-contract job.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>Continue with the course review flow from the previous lesson. A learner submits a review with <code>rating</code> and <code>comment</code>. The backend validates the request, checks that the learner may review the course, stores the result, and returns a response for the client.</p>
-<p>It is tempting to pass one object through that whole path. The handler receives a review object, the service mutates it, the repository stores it, and the handler returns it. Early on, that feels efficient. Later, it becomes a coupling trap because each boundary cares about a different shape.</p>
-<p>The input boundary needs only the fields the client is allowed to send. The use case needs trusted caller context and the course id. The internal model may need review id, moderation status, timestamps, and invariants. The persistence layer may need foreign keys and storage-specific fields. The response contract may need reviewer display name and a formatted timestamp while hiding moderation internals.</p>
-<p>That is the reason DTOs and mapping exist. A data transfer object, or DTO, is a deliberately shaped object for crossing a boundary. An entity is an internal representation with identity and meaning inside the backend. Mapping is the translation step that says, "This is what may cross this boundary, and this is what must stay inside."</p>
-<p>The misconception to avoid is that DTOs are always boilerplate or always mandatory. They are valuable when boundaries have different concerns. If the API is public, security-sensitive, versioned, or likely to evolve, explicit shapes are usually worth the cost.</p>
-<h2>One Review, Four Shapes</h2>
-<p>Use the same review submission all the way through:</p>
-<div class="codehilite"><pre><span></span><code>client input
-  -&gt; request DTO
-  -&gt; application command
-  -&gt; domain or persistence model
-  -&gt; response DTO
+<p>Alice submits a review to a course:</p>
+<div class="codehilite"><pre><span></span><code>POST /courses/417/reviews
+{&quot;rating&quot;: 5, &quot;comment&quot;: &quot;Clear and practical.&quot;}
 </code></pre></div>
 
-<p>The request DTO defines what the client may send:</p>
+<p>The endpoint must do more than copy JSON into a table. It must identify Alice, attach course <code>417</code>, enforce the review policy, generate an id and timestamp, persist moderation state, and return only fields the client is allowed to see. The request body, the use case, the database row, and the response therefore answer different questions.</p>
+<p>The tempting first model is one object called <code>Review</code>:</p>
+<div class="codehilite"><pre><span></span><code>JSON -&gt; Review object -&gt; database -&gt; JSON
+</code></pre></div>
+
+<p>That model is reasonable for a private prototype. It starts to fail when a client can send <code>moderation_status</code>, when a database column is renamed, or when a mobile app begins depending on an internal field. The visible bug is often a leaked or rejected field. The deeper problem is that one shape has been asked to carry four different responsibilities.</p>
+<h2>The Small Situation and Its Initial Model</h2>
+<p>Keep Alice's request fixed while we inspect each boundary. The client knows the rating and comment. It does not know the authenticated user id chosen by the server, the database-generated review id, or an internal spam score. The route knows the course id. Authentication knows who is calling. The use case knows whether a review is allowed. The database knows how to store a row and enforce durable constraints.</p>
+<p>If a handler accepts a dictionary and passes it to an ORM constructor, every key becomes a candidate for mutation. A malicious or merely outdated client might send:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;rating&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;comment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Useful&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;reviewer_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;moderation_status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;approved&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;internal_spam_score&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>The initial model treats all keys as equally trustworthy. The observation that changes the model is simple: those fields came from different authorities. A request shape must allowlist client-controlled fields instead of inheriting every field from the internal model. This is the same mass-assignment pressure described by OWASP: bind only fields that are safe for the caller to set. A DTO is useful here because its field list makes that decision visible.</p>
+<h2>Five Shapes, Five Jobs</h2>
+<p>The track blueprint asks us to trace five shapes. They are teaching categories, not a requirement that every codebase create five classes.</p>
+<table>
+<thead>
+<tr>
+<th>Shape</th>
+<th>Who supplies it?</th>
+<th>What it may contain</th>
+<th>What it must not decide</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request DTO</td>
+<td>HTTP client, after parsing</td>
+<td><code>rating</code>, <code>comment</code></td>
+<td>caller identity, ownership, moderation, generated values</td>
+</tr>
+<tr>
+<td>Application command</td>
+<td>handler plus trusted context</td>
+<td>user id, course id, accepted values</td>
+<td>database column names or HTTP objects</td>
+</tr>
+<tr>
+<td>Domain entity</td>
+<td>use case and domain rules</td>
+<td>identity, invariants, review state, behavior</td>
+<td>JSON naming or persistence mechanics</td>
+</tr>
+<tr>
+<td>Persistence row/model</td>
+<td>repository and database</td>
+<td>primary/foreign keys, storage timestamps, indexes, audit columns</td>
+<td>public exposure policy</td>
+</tr>
+<tr>
+<td>Response DTO</td>
+<td>response mapper</td>
+<td>stable public fields and display values</td>
+<td>internal workflow or secrets</td>
+</tr>
+</tbody>
+</table>
+<p>In plain English, mapping is a controlled handoff. In this scenario, it is the explicit construction of the next shape from the previous shape plus facts owned by the next boundary. The technical names are DTO (data transfer object), entity (an object with identity and business meaning), and mapper (the code that performs the handoff).</p>
+<h2>The Mechanism Step by Step</h2>
+<h3>1. Parse into a request DTO</h3>
+<p>The edge parses JSON and validates the request contract. A Pydantic-like model can reject a missing rating or wrong type and can be configured so unexpected fields do not silently become application input. The result is still request data; validation does not make Alice authorized.</p>
 <div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">CreateReviewRequest</span><span class="p">:</span>
     <span class="n">rating</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">comment</span><span class="p">:</span> <span class="nb">str</span>
+
+<span class="n">request_dto</span> <span class="o">=</span> <span class="n">CreateReviewRequest</span><span class="p">(</span><span class="n">rating</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">comment</span><span class="o">=</span><span class="s2">&quot;Clear and practical.&quot;</span><span class="p">)</span>
 </code></pre></div>
 
-<p>Notice what is absent. The client does not send <code>reviewer_id</code>, <code>created_at</code>, <code>is_moderated</code>, <code>internal_spam_score</code>, or <code>course_id</code> if that value comes from the route. That absence is design, not omission. The request DTO narrows the input contract so the client cannot accidentally or maliciously control fields the backend owns.</p>
-<p>The application command is a different shape because the use case needs more than the raw body:</p>
+<p>The field list is an allowlist. <code>reviewer_id</code>, <code>course_id</code>, <code>created_at</code>, and moderation fields are absent on purpose. If <code>course_id</code> is taken from the route, accepting a second body copy would create an avoidable conflict.</p>
+<h3>2. Add trusted context to an application command</h3>
+<p>The handler combines the validated values with facts established elsewhere:</p>
 <div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">CreateReviewCommand</span><span class="p">:</span>
     <span class="n">user_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">course_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">rating</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">comment</span><span class="p">:</span> <span class="nb">str</span>
+
+<span class="n">command</span> <span class="o">=</span> <span class="n">CreateReviewCommand</span><span class="p">(</span>
+    <span class="n">user_id</span><span class="o">=</span><span class="n">auth_context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span>       <span class="c1"># Alice, established by authentication</span>
+    <span class="n">course_id</span><span class="o">=</span><span class="n">http_request</span><span class="o">.</span><span class="n">path_params</span><span class="p">[</span><span class="s2">&quot;course_id&quot;</span><span class="p">],</span>  <span class="c1"># 417, from the route</span>
+    <span class="n">rating</span><span class="o">=</span><span class="n">request_dto</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
+    <span class="n">comment</span><span class="o">=</span><span class="n">request_dto</span><span class="o">.</span><span class="n">comment</span><span class="p">,</span>
+<span class="p">)</span>
 </code></pre></div>
 
-<p>This object combines accepted input with trusted context. The client supplied the rating and comment. The route supplied the course id. Authentication supplied the user id. The use case can now work with a command that means "this known learner is attempting to review this known course."</p>
-<p>The internal review model may include facts the client should never control:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Review</span><span class="p">:</span>
-    <span class="nb">id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">course_id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">reviewer_id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">rating</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">comment</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">moderation_status</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">created_at</span><span class="p">:</span> <span class="n">datetime</span>
+<p>The command is meaningful to the use case: “Alice is attempting to review course 417.” It does not carry a framework request, headers, or raw JSON. This reduces the chance that domain code accidentally reads transport-specific details. It also makes a second entry point, such as a moderation worker, able to call the use case with the same business input.</p>
+<h3>3. Construct an entity after domain decisions</h3>
+<p>The use case loads the course and enrollment facts, then applies policy. Suppose Alice is enrolled and reviews are open. The use case creates an internal entity:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">review</span> <span class="o">=</span> <span class="n">Review</span><span class="p">(</span>
+    <span class="nb">id</span><span class="o">=</span><span class="s2">&quot;rv_8f2&quot;</span><span class="p">,</span>                 <span class="c1"># generated by the backend; illustrative id</span>
+    <span class="n">course_id</span><span class="o">=</span><span class="n">command</span><span class="o">.</span><span class="n">course_id</span><span class="p">,</span>
+    <span class="n">reviewer_id</span><span class="o">=</span><span class="n">command</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span>
+    <span class="n">rating</span><span class="o">=</span><span class="n">command</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
+    <span class="n">comment</span><span class="o">=</span><span class="n">command</span><span class="o">.</span><span class="n">comment</span><span class="o">.</span><span class="n">strip</span><span class="p">(),</span>
+    <span class="n">moderation_status</span><span class="o">=</span><span class="s2">&quot;pending&quot;</span><span class="p">,</span>
+    <span class="n">created_at</span><span class="o">=</span><span class="n">clock</span><span class="o">.</span><span class="n">now</span><span class="p">(),</span>
+<span class="p">)</span>
 </code></pre></div>
 
-<p>The response DTO is another deliberate shape:</p>
+<p>The id and timestamp above are illustrative values, not an observed production result. The entity can enforce behavior such as “rating must be between 1 and 5” or “a submitted review cannot be edited after moderation.” Its identity lets the use case distinguish this review from another review with the same text. An entity is not merely a bag of fields, although a small application may represent it with a dataclass or another simple record.</p>
+<h3>4. Map the entity to a persistence row</h3>
+<p>The repository translates business names to storage names. A row may use snake-case columns, foreign keys, a database timestamp, and an audit version:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">row</span> <span class="o">=</span> <span class="n">ReviewRow</span><span class="p">(</span>
+    <span class="n">review_id</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">id</span><span class="p">,</span>
+    <span class="n">course_id</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">course_id</span><span class="p">,</span>
+    <span class="n">reviewer_id</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">reviewer_id</span><span class="p">,</span>
+    <span class="n">rating</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
+    <span class="n">comment_text</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">comment</span><span class="p">,</span>
+    <span class="n">moderation_state</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">moderation_status</span><span class="p">,</span>
+    <span class="n">created_at_utc</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">created_at</span><span class="p">,</span>
+    <span class="n">row_version</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="n">reviews</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="n">row</span><span class="p">)</span>
+<span class="n">uow</span><span class="o">.</span><span class="n">commit</span><span class="p">()</span>
+</code></pre></div>
+
+<p>An ORM can map a Python class to a table, but the ORM mapping does not define the public API. SQLAlchemy’s documentation, for example, describes mapped classes as classes associated with table metadata and a mapper; that association is a persistence concern. Whether the mapped class is also used as a domain entity is a local design choice, not a promise made by the ORM.</p>
+<h3>5. Map the committed result to a response DTO</h3>
+<p>After commit, the response mapper chooses the public contract:</p>
 <div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">ReviewResponse</span><span class="p">:</span>
     <span class="nb">id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">rating</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">comment</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">reviewer_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">created_at</span><span class="p">:</span> <span class="nb">str</span>
+
+<span class="n">response</span> <span class="o">=</span> <span class="n">ReviewResponse</span><span class="p">(</span>
+    <span class="nb">id</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">id</span><span class="p">,</span>
+    <span class="n">rating</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
+    <span class="n">comment</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">comment</span><span class="p">,</span>
+    <span class="n">reviewer_name</span><span class="o">=</span><span class="s2">&quot;Alice&quot;</span><span class="p">,</span>              <span class="c1"># display projection, not reviewer_id</span>
+    <span class="n">created_at</span><span class="o">=</span><span class="n">review</span><span class="o">.</span><span class="n">created_at</span><span class="o">.</span><span class="n">isoformat</span><span class="p">(),</span>
+<span class="p">)</span>
 </code></pre></div>
 
-<p>It may include display information that is useful to the client and omit internal workflow state. The point is not the class names. The point is that each boundary gets a shape that matches its job.</p>
-<h2>Entities Are Internal, Not Public Promises</h2>
-<p>The word "entity" is overloaded. In domain modeling, an entity is often an object with identity and business meaning. In many frameworks, an entity also means an ORM-backed persistence object. Those may overlap, but they are not automatically the same thing.</p>
-<p>That matters because a persistence entity is usually shaped by storage needs:</p>
+<p><code>moderation_status</code>, <code>internal_spam_score</code>, <code>row_version</code>, and database column names do not cross this boundary. If version 2 wants a nested <code>reviewer</code> object, it can use a second mapper while the internal entity and row remain unchanged:</p>
+<div class="codehilite"><pre><span></span><code>Review entity -&gt; v1 response mapper -&gt; {reviewerName: &quot;Alice&quot;}
+             -&gt; v2 response mapper -&gt; {reviewer: {displayName: &quot;Alice&quot;}}
+</code></pre></div>
+
+<p>The mapper is not security by itself. A bug in the mapper can still expose data, and authorization must happen before mapping. The mapper does make the exposure rule reviewable and testable.</p>
+<h2>A Worked Trace With Intermediate State</h2>
+<p>Read the same request as a state table. Each row records what changed and what authority was added.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Current shape/state</th>
+<th>New fact or transformation</th>
+<th>Fields still excluded</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>raw JSON and route</td>
+<td>bytes parsed; route says course 417</td>
+<td>identity, id, moderation</td>
+</tr>
+<tr>
+<td>1</td>
+<td>request DTO</td>
+<td>rating <code>5</code>, trimmed comment accepted</td>
+<td>user id, internal fields</td>
+</tr>
+<tr>
+<td>2</td>
+<td>command</td>
+<td>authentication adds Alice; route adds 417</td>
+<td>storage names, response display fields</td>
+</tr>
+<tr>
+<td>3</td>
+<td>entity</td>
+<td>policy permits review; id, timestamp, <code>pending</code> state created</td>
+<td>JSON aliases, row version</td>
+</tr>
+<tr>
+<td>4</td>
+<td>row/model</td>
+<td>repository chooses column names; transaction commits</td>
+<td>public-only presentation fields</td>
+</tr>
+<tr>
+<td>5</td>
+<td>response DTO</td>
+<td>mapper exposes id, rating, comment, display name, ISO timestamp</td>
+<td>moderation score, audit metadata</td>
+</tr>
+</tbody>
+</table>
+<p>This table prevents a common mistake: saying “the object is validated” without asking which properties were validated and who supplied them. At step 1, the rating has a structural and domain range. At step 2, Alice’s identity is trusted for this request, but enrollment still belongs to the use case. At step 4, the database is the authority for durable uniqueness and foreign-key checks. At step 5, the response is a projection, not a copy.</p>
+<h2>Where the Mapping Model Breaks</h2>
+<p><strong>Over-posting.</strong> A broad binder copies every JSON key into an entity. The signal is a client-controlled field changing ownership, moderation, or audit state. Fix the request DTO with an allowlist and add a test that sends an unexpected field.</p>
+<p><strong>Response leakage.</strong> A handler returns an ORM object directly. The signal is a new internal column appearing in API output or a relationship causing an unexpectedly large query. Fix the response mapper and test the exact public field set.</p>
+<p><strong>Lossy mapping.</strong> The entity contains information needed for a later decision, but a mapper drops it before that decision runs. The signal is a downstream rule trying to recover data from a display string. Map to an application command before domain work, and map to a response only after the decision is complete.</p>
+<p><strong>Stale mapper.</strong> A field is renamed internally, but one mapper still reads the old name. The signal is a runtime attribute error or a response silently showing a default. Keep mapper tests close to the contract and fail loudly when a required source field is absent.</p>
+<p><strong>False equivalence.</strong> Two classes happen to contain the same fields today, so a developer treats them as interchangeable forever. Equality of fields is an observation about this version, not proof that the audiences, lifecycles, or authorities are equal.</p>
+<h2>Cost, Limits, and Signals</h2>
+<p>Explicit mapping buys allowlisted input, stable output, clearer authority, and room for independent evolution. The trade-off is additional code, tests, allocations, and sometimes an extra query for display data such as <code>reviewer_name</code>. A mapper also cannot make a transaction atomic, authorize a caller, or repair an incorrect domain rule.</p>
+<p>Use one shared shape when the boundary is genuinely private, short-lived, and governed by the same owner; the input and output fields have the same trust and lifecycle; and there is no sensitive or generated state. Use separate shapes when a public or versioned API, multiple clients, security-sensitive fields, independent persistence evolution, or distinct domain behavior creates change pressure.</p>
+<p>The useful signal is not “how many classes do we have?” It is a boundary mismatch: a client can set a server-owned field, a schema change unexpectedly breaks a client, a database concern appears in domain code, or a response exposes more than the product promise. Those signals justify another shape. If no mismatch exists, another wrapper may be ceremony.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check 1:</strong> The client sends <code>{"rating": 4, "comment": "Good", "moderation_status": "approved"}</code>. Which step should reject or ignore <code>moderation_status</code>?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The request boundary should reject or ignore it according to the API’s unknown-field policy. The request DTO allowlists client-controlled fields; the entity must not be populated from that key.</p>
+<p><strong>Check 2:</strong> The course id appears both in the URL (<code>417</code>) and in the body (<code>999</code>). Which value should the command use?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Use the route value if the endpoint’s contract identifies the resource in the path, and do not accept a competing body field. One authoritative source prevents ambiguous mapping.</p>
+<p><strong>Check 3:</strong> The database adds <code>moderation_state</code> tomorrow. What should a stable v1 client observe?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> Nothing unless the public contract intentionally adds that field. The row and entity may change while the v1 response mapper keeps its allowlisted output.</p>
+<h2>Trace It Yourself: Product Feedback</h2>
+<p>A product team adds a second endpoint for feedback imported from a partner file. The file contains <code>external_author</code>, <code>rating</code>, <code>comment</code>, and <code>received_at</code>; it does not contain an authenticated user id. Trace the import through a safe design.</p>
+<p>A good answer should mention:</p>
 <ul>
-<li>database primary keys</li>
-<li>foreign keys</li>
-<li>lazy-loaded relationships</li>
-<li>audit fields</li>
-<li>moderation columns</li>
-<li>internal flags</li>
-<li>timestamps in storage format</li>
+<li>an import DTO that allowlists file fields and records the source format;</li>
+<li>an application command that adds a trusted partner id and a course id resolved by the import workflow;</li>
+<li>an entity that generates the local id, normalizes the comment, and chooses a moderation state;</li>
+<li>a persistence row that uses local foreign keys and transaction-owned timestamps;</li>
+<li>a response or report DTO that exposes only fields promised to the consuming product;</li>
+<li>a decision about whether <code>external_author</code> is public display data or internal provenance, with the reason stated.</li>
 </ul>
-<p>All of those can be correct internally and still wrong as an API response. Returning an ORM object directly from a handler silently turns internal structure into public contract:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">create_review_handler</span><span class="p">(</span><span class="n">request</span><span class="p">):</span>
-    <span class="n">review</span> <span class="o">=</span> <span class="n">service</span><span class="o">.</span><span class="n">create_review</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">review</span>  <span class="c1"># risky: internal shape leaks outward</span>
-</code></pre></div>
-
-<p>Now a database rename can break clients. A moderation flag can leak. A relationship can serialize too much data. A field added for internal workflow can become hard to remove because a mobile client started depending on it.</p>
-<p>Keeping entities internal is not about ceremony. It preserves the backend's ability to evolve. The public API can stay stable while the database schema, domain model, or persistence strategy changes behind a mapping boundary.</p>
-<p>The trade-off is extra translation code. That translation is worth it when the boundary protects security, versioning, or long-lived client contracts. It may be unnecessary for tiny internal tools where the shape is genuinely private and short-lived.</p>
-<h2>Worked Mapping Path</h2>
-<p>Here is the course review flow as a concrete mapping path:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">create_review_handler</span><span class="p">(</span><span class="n">http_request</span><span class="p">,</span> <span class="n">auth_context</span><span class="p">):</span>
-    <span class="n">body</span> <span class="o">=</span> <span class="n">parse_json</span><span class="p">(</span><span class="n">http_request</span><span class="o">.</span><span class="n">body</span><span class="p">)</span>
-    <span class="n">dto</span> <span class="o">=</span> <span class="n">CreateReviewRequest</span><span class="p">(</span>
-        <span class="n">rating</span><span class="o">=</span><span class="n">body</span><span class="p">[</span><span class="s2">&quot;rating&quot;</span><span class="p">],</span>
-        <span class="n">comment</span><span class="o">=</span><span class="n">body</span><span class="p">[</span><span class="s2">&quot;comment&quot;</span><span class="p">],</span>
-    <span class="p">)</span>
-
-    <span class="n">command</span> <span class="o">=</span> <span class="n">CreateReviewCommand</span><span class="p">(</span>
-        <span class="n">user_id</span><span class="o">=</span><span class="n">auth_context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span>
-        <span class="n">course_id</span><span class="o">=</span><span class="n">http_request</span><span class="o">.</span><span class="n">path_params</span><span class="p">[</span><span class="s2">&quot;course_id&quot;</span><span class="p">],</span>
-        <span class="n">rating</span><span class="o">=</span><span class="n">dto</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
-        <span class="n">comment</span><span class="o">=</span><span class="n">dto</span><span class="o">.</span><span class="n">comment</span><span class="p">,</span>
-    <span class="p">)</span>
-
-    <span class="n">review</span> <span class="o">=</span> <span class="n">create_review</span><span class="p">(</span><span class="n">command</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">review_to_response</span><span class="p">(</span><span class="n">review</span><span class="p">)</span>
-</code></pre></div>
-
-<p>The mapper from internal review to response can make exposure rules explicit:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">review_to_response</span><span class="p">(</span><span class="n">review</span><span class="p">):</span>
-    <span class="k">return</span> <span class="p">{</span>
-        <span class="s2">&quot;id&quot;</span><span class="p">:</span> <span class="n">review</span><span class="o">.</span><span class="n">id</span><span class="p">,</span>
-        <span class="s2">&quot;rating&quot;</span><span class="p">:</span> <span class="n">review</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
-        <span class="s2">&quot;comment&quot;</span><span class="p">:</span> <span class="n">review</span><span class="o">.</span><span class="n">comment</span><span class="p">,</span>
-        <span class="s2">&quot;reviewerName&quot;</span><span class="p">:</span> <span class="n">review</span><span class="o">.</span><span class="n">reviewer_display_name</span><span class="p">,</span>
-        <span class="s2">&quot;createdAt&quot;</span><span class="p">:</span> <span class="n">review</span><span class="o">.</span><span class="n">created_at</span><span class="o">.</span><span class="n">isoformat</span><span class="p">(),</span>
-    <span class="p">}</span>
-</code></pre></div>
-
-<p>This mapping decides what the client sees. It also gives the backend a stable place to handle API evolution. Suppose the product later adds moderation status, internal spam scoring, or reviewer reputation. Those fields can exist internally without automatically crossing the public boundary.</p>
-<p>Versioning becomes easier too. A <code>v1</code> response may keep <code>reviewerName</code>, while a later response adds a richer <code>reviewer</code> object. The backend can support both response mappers without forcing the internal entity to imitate either public shape.</p>
-<div class="codehilite"><pre><span></span><code>internal review model
-     |
-     +--&gt; v1 response mapper
-     |
-     +--&gt; v2 response mapper
-</code></pre></div>
-
-<p>The practical rule is: map explicitly when the boundary has a different audience, trust level, lifecycle, or compatibility promise.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Issue</strong>: Creating DTOs that mirror entities forever.</p>
-<p><strong>Clarification / Fix</strong>: Start from the boundary question. What is this shape restricting, stabilizing, or hiding? If the answer is nothing, the DTO may be ceremony. If the answer is input trust, public compatibility, or security, the mapper is doing real work.</p>
-<p><strong>Issue</strong>: Letting clients set internal fields through broad request models.</p>
-<p><strong>Clarification / Fix</strong>: Keep request DTOs smaller than internal models. Fields such as <code>reviewer_id</code>, <code>created_at</code>, moderation status, and internal scores should come from trusted backend context or internal workflow.</p>
-<p><strong>Issue</strong>: Returning persistence models directly from handlers.</p>
-<p><strong>Clarification / Fix</strong>: Treat database and ORM shapes as internal implementation details. Use response mapping to choose the public contract deliberately.</p>
-<p><strong>Issue</strong>: Mapping so early that domain code only sees transport vocabulary.</p>
-<p><strong>Clarification / Fix</strong>: Translate HTTP input into an application command before the use case. Domain code should receive meaningful business input, not raw web framework objects.</p>
-<p>Close the lesson and draw the review flow from memory. Label which shape is accepted input, which shape is trusted command, which shape is internal truth, and which shape is public output. If one object crosses every boundary unchanged, name exactly what coupling you are accepting.</p>
+<p>If the importer and HTTP endpoint truly share the same command after their separate input mappings, that is a useful reuse point. Reusing the command does not require reusing the request DTO or the response DTO.</p>
 <h2>Connections</h2>
-<p>The previous lesson showed that validation follows boundary knowledge. This lesson shows the companion idea: data shapes should follow boundary responsibility.</p>
-<p>The next lesson follows the full request lifecycle. DTOs and mapping are the visible shape changes inside that lifecycle: raw HTTP becomes accepted input, accepted input becomes a command, internal results become a public response.</p>
-<p>This also connects back to API versioning. Stable public contracts are much easier to preserve when response mapping is deliberate instead of an accidental serialization of internal objects.</p>
+<p>Lesson 009 placed validation at the boundary that owns the needed knowledge. This lesson adds the shape rule: a boundary should also receive a representation that contains only the facts it is allowed to interpret. Lesson 011 will place these transformations on a complete request timeline, including failure exits and telemetry. Lesson 004’s versioning work explains why a response mapper is a useful compatibility seam rather than an ornamental class.</p>
 <h2>Resources</h2>
 <ul>
-<li>[ARTICLE] <a href="https://martinfowler.com/eaaCatalog/dataTransferObject.html">Data Transfer Object</a><ul>
-<li>Focus: Use DTOs as boundary-crossing objects, not as generic extra classes.</li>
-</ul>
-</li>
-<li>[ARTICLE] <a href="https://martinfowler.com/eaaCatalog/dataMapper.html">Data Mapper</a><ul>
-<li>Focus: Compare boundary mapping with the broader separation between object models and persistence structures.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://docs.pydantic.dev/latest/">Pydantic Documentation</a><ul>
-<li>Focus: See a practical tool for explicit request and response models in Python backends.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://www.manning.com/books/api-design-patterns">API Design Patterns</a><ul>
-<li>Focus: Connect response shape, resource contracts, and API evolution decisions.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://pydantic.dev/docs/validation/latest/concepts/models/">Pydantic models</a> — Focus: see how untrusted data is parsed into typed, validated model instances.</li>
+<li>[DOC] <a href="https://pydantic.dev/docs/validation/latest/concepts/serialization/">Pydantic serialization</a> — Focus: compare explicit serialization choices with accidental object exposure.</li>
+<li>[DOC] <a href="https://docs.sqlalchemy.org/en/20/orm/">SQLAlchemy ORM</a> — Focus: distinguish ORM class-to-table mapping from an API response contract.</li>
+<li>[ARTICLE] <a href="https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html">OWASP Mass Assignment Cheat Sheet</a> — Focus: use allowlists for fields a caller may bind.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>One data shape rarely serves input acceptance, business workflow, persistence, and public output equally well.</li>
-<li>Request DTOs restrict what clients may send; response DTOs define what the API promises to expose.</li>
-<li>Entities and persistence models are internal representations, not automatic public contracts.</li>
-<li>Mapping is worthwhile when it protects trust, versioning, compatibility, or security across a boundary.</li>
+<li>A request DTO, command, entity, row, and response DTO may describe the same review while serving different authorities and lifecycles.</li>
+<li>Mapping is an explicit trust and contract decision: add facts owned by the next boundary and exclude fields that boundary must not control or expose.</li>
+<li>An ORM mapping can be useful for persistence without becoming a public API shape; response serialization should be deliberate and allowlisted.</li>
+<li>Separate shapes cost code and tests, so introduce them when mismatch signals—over-posting, leakage, coupling, or independent evolution—make the boundary valuable.</li>
 </ul>
 </section>
 
@@ -261,7 +375,7 @@
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-04 07:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>

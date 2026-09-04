@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="../../css/style.css" />
     <script src="../../js/site.js" defer></script>
     
+
+
   </head>
   <body class="lesson-reading">
     <header class="site-header">
@@ -27,6 +29,8 @@
         <a class="brand" href="../../index.html">Home</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../learning.html">Learning</a>
+        <span class="path-separator" aria-hidden="true">/</span>
+        <a href="../../wiki/index.html">Wiki</a>
         <span class="path-separator" aria-hidden="true">/</span>
         <a href="../../links.html">Links</a>
         
@@ -77,133 +81,321 @@
 <section class="stack-block lesson-content-shell">
   <h1>Request Lifecycles Through the Backend</h1>
 <blockquote>
-<p><strong>The core idea</strong>: A backend request lifecycle is a sequence of trust upgrades, shape changes, decisions, and exits; each stage should leave clearer assumptions for the next one.</p>
+<p><strong>By the end of this lesson, you will be able to...</strong></p>
+<ul>
+<li>
+<p>trace a request from bytes and token to response, naming the state and assumption at each stage</p>
+</li>
+<li>
+<p>place parsing, authentication, validation, business decisions, persistence, mapping, and serialization in the right part of the path</p>
+</li>
+<li>
+<p>predict where a request exits on success or failure and identify the signal that explains the exit</p>
+</li>
+</ul>
+<p><strong>Idea in one sentence:</strong> A request lifecycle is a sequence of trust upgrades, shape changes, decisions, and exits; each stage must leave an honest assumption for the next stage.</p>
 </blockquote>
 <h2>Core Insight</h2>
-<p>When someone says "the endpoint handles the request," it is easy to picture one function: the route runs, some code executes, and a response comes back. That picture is too small for a real backend. The handler is only one stage in a longer path.</p>
-<p>Use the same course review example from the previous lessons. A learner sends <code>POST /courses/42/reviews</code> with an authorization token and a JSON body. At the network edge, the system has bytes, headers, and uncertainty. By the time the use case runs, the backend should have a known caller, a parsed route, validated input, trace context, and a command that means something in the application.</p>
-<p>That is the useful mental model: a request lifecycle is not a chain of arbitrary framework hooks. It is a sequence of transformations. Each stage narrows uncertainty, adds context, changes shape, or chooses an exit. Parsing turns bytes into an HTTP request. Authentication turns a token into caller context. Validation turns raw input into accepted input. Mapping turns transport data into an application command. The use case turns the command into a business result or business failure.</p>
-<p>The misconception to correct is that lifecycle design is just middleware order. Middleware order matters, but the deeper issue is responsibility. Early stages are good for cross-cutting and boundary concerns. Middle stages translate between transport and application meaning. Inner stages make business decisions. Outward stages translate results and failures back into the public API contract.</p>
-<p>Once you see the lifecycle this way, backend bugs become easier to locate. Instead of asking "why did the endpoint fail?", you can ask, "Which stage had the wrong assumption about the request?"</p>
-<h2>The Request Timeline</h2>
-<p>Here is a healthy review submission path:</p>
-<div class="codehilite"><pre><span></span><code>1. Network/framework receives bytes.
-2. HTTP layer parses method, path, headers, and body.
-3. Trace and request-id middleware attaches correlation context.
-4. Auth middleware validates the token and creates caller context.
-5. Rate or abuse controls may reject obvious excess traffic.
-6. Schema validation accepts rating and comment shape.
-7. Handler maps request DTO + auth context into a command.
-8. Use case checks enrollment, course state, and duplicate review rules.
-9. Repository/unit of work persists the review.
-10. Mapper turns internal result into public response DTO.
-11. Serializer writes status, headers, and response body.
+<p>Imagine Alice submits a review:</p>
+<div class="codehilite"><pre><span></span><code>POST /courses/42/reviews
+Authorization: Bearer &lt;token&gt;
+{&quot;rating&quot;: 5, &quot;comment&quot;: &quot;Clear and practical.&quot;}
 </code></pre></div>
 
-<p>The exact names vary by framework, but the responsibilities recur. The request is not the same object at every step. It accumulates meaning.</p>
+<p>Saying “the endpoint handles it” hides most of the work. At the network edge, the backend has bytes and an unverified token. It does not yet know that the method is allowed, that the JSON is well formed, that Alice is the caller, or that Alice may review course 42. A successful response is the result of several controlled handoffs.</p>
+<p>The reasonable initial model is a single function:</p>
+<div class="codehilite"><pre><span></span><code>request -&gt; controller -&gt; database -&gt; response
+</code></pre></div>
+
+<p>This model works for a tiny private service. It becomes misleading when one stage needs an assumption another stage has not established. A middleware component may know how to parse a token but not whether Alice is enrolled. A domain rule may know whether reviews are open but should not know how an Express response object works. The pressure is not “we need more folders.” The pressure is that different decisions require different knowledge.</p>
+<h2>The Moving Parts and Their Knowledge</h2>
+<p>Use one stable vocabulary for the path:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Receives</th>
+<th>Produces</th>
+<th>It is allowed to decide</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP parser</td>
+<td>bytes, method, path, headers</td>
+<td>parsed request</td>
+<td>whether the transport is syntactically readable</td>
+</tr>
+<tr>
+<td>Correlation middleware</td>
+<td>parsed request</td>
+<td>request id and trace context</td>
+<td>how this request is identified in telemetry</td>
+</tr>
+<tr>
+<td>Authentication</td>
+<td>credentials or token</td>
+<td>caller context</td>
+<td>whether credentials establish Alice’s identity</td>
+</tr>
+<tr>
+<td>Boundary validation</td>
+<td>body and route values</td>
+<td>request DTO</td>
+<td>whether the input matches the accepted shape</td>
+</tr>
+<tr>
+<td>Handler/adapter</td>
+<td>DTO, route, caller context</td>
+<td>application command</td>
+<td>how transport facts become use-case input</td>
+</tr>
+<tr>
+<td>Use case</td>
+<td>command and repositories</td>
+<td>domain result or rejection</td>
+<td>whether Alice may perform the review and what changes</td>
+</tr>
+<tr>
+<td>Repository/unit of work</td>
+<td>entity and transaction</td>
+<td>committed or failed persistence</td>
+<td>how durable state is read and written</td>
+</tr>
+<tr>
+<td>Response mapper</td>
+<td>domain result</td>
+<td>response DTO</td>
+<td>which public fields and names are exposed</td>
+</tr>
+<tr>
+<td>Serializer</td>
+<td>status, headers, DTO</td>
+<td>bytes on the wire</td>
+<td>how the already-decided result is encoded</td>
+</tr>
+</tbody>
+</table>
+<p>These are responsibilities, not mandatory classes. Express describes an application as a series of middleware calls in the request-response cycle, and other frameworks expose similar pipelines. The architectural question is what each stage can know and what it must leave for later stages.</p>
+<h2>The Starting State</h2>
+<p>Before any application code runs, treat the request as untrusted:</p>
+<div class="codehilite"><pre><span></span><code>method:        unknown to application policy
+path:          raw text
+headers:       untrusted strings
+body:          bytes
+caller:        unknown
+course:        not loaded
+trace_id:      absent or not yet normalized
+</code></pre></div>
+
+<p>The first stage parses the HTTP envelope. It can reject an unsupported method, malformed transfer, or invalid JSON. Parsing does not prove that the caller is Alice. It only changes bytes into a structure the next stage can inspect.</p>
+<p>The correlation stage creates a request id such as <code>req_7c1</code> and attaches a trace context. This value is for joining logs and spans; it is not an authorization credential. Keeping those roles separate prevents a debugging identifier from becoming accidental authority.</p>
+<h2>The Mechanism Step by Step</h2>
+<h3>1. Parse and correlate</h3>
+<p>The parser reads the method, route parameter <code>course_id=42</code>, headers, and body. The correlation middleware records <code>req_7c1</code> before work that may fail. If JSON is malformed, the request exits now with a client-facing syntax error and a trace entry showing the parser failure.</p>
 <div class="codehilite"><pre><span></span><code>bytes
-  -&gt; HTTP request
-  -&gt; authenticated request
-  -&gt; validated DTO
-  -&gt; application command
-  -&gt; domain result
-  -&gt; public response
+  -&gt; parsed HTTP request
+  -&gt; request + trace_id=req_7c1
 </code></pre></div>
 
-<p>This helps explain why placement matters. If a handler receives raw JSON and a raw token, too much uncertainty has leaked inward. If middleware tries to decide whether the learner is enrolled in a course, too much domain knowledge has leaked outward.</p>
-<p>The trade-off is explicitness versus convenience. A flat handler that parses, authenticates, validates, checks business rules, writes the database, and formats the response is quick to write. A staged lifecycle is easier to reason about when the endpoint grows, fails, or needs to be observed in production.</p>
-<h2>Worked Lifecycle: Create a Review</h2>
-<p>The handler should be a boundary adapter, not the owner of every decision. A useful shape looks like this:</p>
-<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">create_review_endpoint</span><span class="p">(</span><span class="n">http_request</span><span class="p">,</span> <span class="n">auth_context</span><span class="p">):</span>
-    <span class="n">dto</span> <span class="o">=</span> <span class="n">parse_and_validate_body</span><span class="p">(</span><span class="n">http_request</span><span class="o">.</span><span class="n">body</span><span class="p">)</span>
-
-    <span class="n">command</span> <span class="o">=</span> <span class="n">CreateReviewCommand</span><span class="p">(</span>
-        <span class="n">user_id</span><span class="o">=</span><span class="n">auth_context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span>
-        <span class="n">course_id</span><span class="o">=</span><span class="n">http_request</span><span class="o">.</span><span class="n">path_params</span><span class="p">[</span><span class="s2">&quot;course_id&quot;</span><span class="p">],</span>
-        <span class="n">rating</span><span class="o">=</span><span class="n">dto</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
-        <span class="n">comment</span><span class="o">=</span><span class="n">dto</span><span class="o">.</span><span class="n">comment</span><span class="p">,</span>
-    <span class="p">)</span>
-
-    <span class="n">result</span> <span class="o">=</span> <span class="n">create_review</span><span class="p">(</span><span class="n">command</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">review_to_response</span><span class="p">(</span><span class="n">result</span><span class="p">)</span>
+<p>The important intermediate state is not the framework object. It is the new assumption: later stages may read structured transport data, but they still cannot trust the caller or the body’s business meaning.</p>
+<h3>2. Authenticate</h3>
+<p>Authentication validates the bearer token and produces caller context:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">auth_context</span> <span class="o">=</span> <span class="n">authenticate</span><span class="p">(</span><span class="n">http_request</span><span class="o">.</span><span class="n">headers</span><span class="p">[</span><span class="s2">&quot;Authorization&quot;</span><span class="p">])</span>
+<span class="c1"># auth_context = CallerContext(user_id=&quot;alice&quot;)</span>
 </code></pre></div>
 
-<p>This endpoint does not decide whether Alice may review course 42. It adapts HTTP facts into application input. The use case owns the workflow:</p>
+<p>If the token is missing or invalid, the path exits with an authentication failure. No enrollment query should run, because the system has no established subject for that query. A valid identity still does not imply permission to review course 42; it only changes <code>caller</code> from unknown to Alice.</p>
+<h3>3. Apply cross-cutting controls</h3>
+<p>Rate limits, request-size limits, or abuse controls may reject the request before business work. These controls protect shared resources and usually use route, caller, or network signals. They should not decide product facts such as enrollment unless they have deliberately been given that responsibility.</p>
+<p>The ordering is consequential. A body-size limit before parsing can stop an expensive parse. Authentication before a per-user quota supplies a caller key. A domain check before authentication would have no trustworthy user id. The right order follows dependencies between assumptions, not a framework convention.</p>
+<h3>4. Validate the boundary shape</h3>
+<p>The body becomes a request DTO:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">request_dto</span> <span class="o">=</span> <span class="n">CreateReviewRequest</span><span class="p">(</span>
+    <span class="n">rating</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span>
+    <span class="n">comment</span><span class="o">=</span><span class="s2">&quot;Clear and practical.&quot;</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>The DTO allowlists client-controlled fields and checks structural constraints such as integer type, rating range, and comment length. It may trim whitespace or normalize a known representation. It must not decide whether Alice is enrolled. That fact requires product state and belongs later.</p>
+<p>At this point the state is:</p>
+<div class="codehilite"><pre><span></span><code>trace_id: req_7c1
+caller:   alice (authenticated)
+route:    course 42
+input:    validated rating=5, comment=&quot;Clear and practical.&quot;
+</code></pre></div>
+
+<p>The phrase “validated request” now has a precise scope. It means the accepted shape is known. It does not mean the action is authorized or durable.</p>
+<h3>5. Adapt transport facts into a command</h3>
+<p>The handler combines the DTO with trusted context and route data:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">command</span> <span class="o">=</span> <span class="n">CreateReviewCommand</span><span class="p">(</span>
+    <span class="n">user_id</span><span class="o">=</span><span class="n">auth_context</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span>
+    <span class="n">course_id</span><span class="o">=</span><span class="n">http_request</span><span class="o">.</span><span class="n">path_params</span><span class="p">[</span><span class="s2">&quot;course_id&quot;</span><span class="p">],</span>
+    <span class="n">rating</span><span class="o">=</span><span class="n">request_dto</span><span class="o">.</span><span class="n">rating</span><span class="p">,</span>
+    <span class="n">comment</span><span class="o">=</span><span class="n">request_dto</span><span class="o">.</span><span class="n">comment</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>The command says, “Alice is attempting to create a review for course 42.” It contains no raw headers, response methods, or framework-specific request object. A batch importer could construct the same kind of command from a file adapter, with a different authority policy.</p>
+<h3>6. Run the use case</h3>
+<p>The use case loads the facts needed for the business decision:</p>
 <div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">create_review</span><span class="p">(</span><span class="n">command</span><span class="p">):</span>
     <span class="n">course</span> <span class="o">=</span> <span class="n">courses</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">course_id</span><span class="p">)</span>
     <span class="n">enrollment</span> <span class="o">=</span> <span class="n">enrollments</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="n">command</span><span class="o">.</span><span class="n">user_id</span><span class="p">,</span> <span class="n">command</span><span class="o">.</span><span class="n">course_id</span><span class="p">)</span>
 
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">enrollment</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;not_enrolled&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">course</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;course_not_found&quot;</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">course</span><span class="o">.</span><span class="n">reviews_closed</span><span class="p">:</span>
         <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;reviews_closed&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">enrollment</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">ReviewRejected</span><span class="p">(</span><span class="s2">&quot;not_enrolled&quot;</span><span class="p">)</span>
 
-    <span class="n">review</span> <span class="o">=</span> <span class="n">reviews</span><span class="o">.</span><span class="n">create_once</span><span class="p">(</span><span class="n">command</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">review</span>
+    <span class="k">return</span> <span class="n">reviews</span><span class="o">.</span><span class="n">create_once</span><span class="p">(</span><span class="n">command</span><span class="p">)</span>
 </code></pre></div>
 
-<p>Now the lifecycle has clean stages. The endpoint speaks HTTP and DTOs. The use case speaks product meaning. The repository and unit of work speak persistence. The response mapper speaks public API shape.</p>
-<p>The same use case could later be called from an admin tool, a queue consumer, or a batch import with a different adapter. That is the benefit of keeping transport details out of the center. The use case needs a command, not an Express request, a Django request, or an ASP.NET controller object.</p>
-<h2>Failure Exits Are Part of the Lifecycle</h2>
-<p>A lifecycle is incomplete if it only describes the happy path. Many of the most important backend behaviors happen on exits:</p>
-<div class="codehilite"><pre><span></span><code>bad JSON                  -&gt; schema boundary exits with 400
-missing token             -&gt; auth boundary exits with 401
-not enrolled              -&gt; use case exits with domain rejection
-duplicate review race     -&gt; persistence boundary exits with conflict
-database timeout          -&gt; dependency failure exits through error mapper
+<p>The use case is the first stage that can answer “may Alice do this here?” It may also apply a duplicate-review policy. It should not write the HTTP status directly. Its result or named rejection will be translated outward by an adapter.</p>
+<h3>7. Commit durable state</h3>
+<p><code>reviews.create_once</code> creates an entity and asks the repository to persist it inside a unit of work. A unique database constraint can still reject a duplicate when two requests race. That is not a contradiction: the use case expresses product intent, while persistence protects the invariant at the commit point.</p>
+<div class="codehilite"><pre><span></span><code>entity created -&gt; INSERT attempted -&gt; constraint checked -&gt; commit succeeds
 </code></pre></div>
 
-<p>Each failure should be translated at the boundary that can preserve its meaning for the next audience. The use case can raise <code>ReviewRejected("not_enrolled")</code>; the HTTP boundary can translate that into the API's chosen status and problem payload. The database adapter can catch a unique constraint violation and turn it into a duplicate-review conflict. Observability can keep the trace, request id, dependency timings, and internal cause.</p>
-<p>That is why the next lesson focuses on error semantics. For now, the lifecycle lesson should make one point clear: errors do not live outside the request path. They are named exits from the same path.</p>
-<p>Good observability follows the same shape. A useful trace might show:</p>
-<div class="codehilite"><pre><span></span><code>http.receive
-  auth.validate
-  request.validate
-  review.create
-  db.insert_review
-  response.map
+<p>Until commit succeeds, the response must not claim that the review is durable. If the database times out, the lifecycle takes a dependency-failure exit. The unit of work owns rollback or cleanup according to the persistence design; the handler does not guess.</p>
+<h3>8. Map and serialize outward</h3>
+<p>After a successful commit, the mapper creates the public response DTO. It may format the timestamp and include a display name, while omitting internal moderation state. The serializer then chooses the HTTP status, headers, and bytes. Serialization is the last translation; it should not perform a new business decision.</p>
+<div class="codehilite"><pre><span></span><code><span class="n">response_dto</span> <span class="o">=</span> <span class="n">review_to_response</span><span class="p">(</span><span class="n">review</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">serialize</span><span class="p">(</span><span class="n">status</span><span class="o">=</span><span class="mi">201</span><span class="p">,</span> <span class="n">body</span><span class="o">=</span><span class="n">response_dto</span><span class="p">)</span>
 </code></pre></div>
 
-<p>When latency spikes, the team can ask which stage expanded. When a request is rejected, the team can ask which boundary rejected it and whether that boundary had the right knowledge.</p>
-<h2>Operational Failure Modes</h2>
-<p><strong>Issue</strong>: Treating the controller as the real start of the request.</p>
-<p><strong>Clarification / Fix</strong>: Draw the path from socket to response. Include parsing, correlation, authentication, rate controls, validation, error mapping, and serialization. Many bugs live before or after the handler.</p>
-<p><strong>Issue</strong>: Putting domain decisions into early middleware.</p>
-<p><strong>Clarification / Fix</strong>: Keep early middleware focused on cross-cutting and boundary concerns. Domain rules that need product state belong in the application or domain workflow.</p>
-<p><strong>Issue</strong>: Passing framework objects deep into the application.</p>
-<p><strong>Clarification / Fix</strong>: Translate transport-specific data into an application command at the boundary. Inner code should not depend on web framework request or response classes.</p>
-<p><strong>Issue</strong>: Observing only the use case while ignoring lifecycle stages around it.</p>
-<p><strong>Clarification / Fix</strong>: Instrument the path as stages. Auth, validation, dependency calls, and response mapping can each be the source of correctness, latency, or rejection behavior.</p>
-<p>Close the lesson and reconstruct the review request lifecycle from memory. For each stage, name the input shape, the output shape, and the assumption it gives the next stage. If you cannot say what changed at a stage, that stage is probably unclear in the design.</p>
+<p>The outward path reverses the inward path: internal result becomes public shape, then public shape becomes wire representation. A response mapper is a compatibility seam; a serializer is a transport operation.</p>
+<h2>A Complete Trace</h2>
+<p>Here is the successful request as a state trace. Values are illustrative.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>State after the step</th>
+<th>New assumption</th>
+<th>Possible exit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>bytes + token</td>
+<td>nothing trusted</td>
+<td>malformed transport</td>
+</tr>
+<tr>
+<td>1</td>
+<td>parsed request + <code>req_7c1</code></td>
+<td>syntax and correlation available</td>
+<td>400 parse error</td>
+</tr>
+<tr>
+<td>2</td>
+<td>caller <code>alice</code></td>
+<td>token identifies a caller</td>
+<td>401 authentication error</td>
+</tr>
+<tr>
+<td>3</td>
+<td>request DTO</td>
+<td>body shape is accepted</td>
+<td>400 validation error</td>
+</tr>
+<tr>
+<td>4</td>
+<td>review command for <code>(alice, 42)</code></td>
+<td>use case has meaningful input</td>
+<td>adapter/programming error</td>
+</tr>
+<tr>
+<td>5</td>
+<td>course and enrollment loaded</td>
+<td>business facts available</td>
+<td>not found / forbidden / closed</td>
+</tr>
+<tr>
+<td>6</td>
+<td>review entity pending commit</td>
+<td>product decision passed</td>
+<td>duplicate or dependency failure</td>
+</tr>
+<tr>
+<td>7</td>
+<td>row committed</td>
+<td>durable state exists</td>
+<td>commit failure</td>
+</tr>
+<tr>
+<td>8</td>
+<td>response DTO and <code>201</code></td>
+<td>public projection chosen</td>
+<td>serialization failure</td>
+</tr>
+</tbody>
+</table>
+<p>The table is a debugging tool. If a log says “validated” but the request failed at step 5, the failure is not a schema problem. If a client sees a 201 while step 7 never committed, the lifecycle has reported success too early.</p>
+<h2>Failure Exits Are First-Class Paths</h2>
+<p>There is no single “error path.” Each exit occurs at a stage with a different audience and recovery meaning:</p>
+<div class="codehilite"><pre><span></span><code>malformed JSON          -&gt; parser/validation exit
+missing or bad token    -&gt; authentication exit
+course not found        -&gt; application policy exit
+not enrolled            -&gt; authorization/domain exit
+duplicate race          -&gt; persistence integrity exit
+database timeout        -&gt; dependency exit
+response encoding error -&gt; serialization exit
+</code></pre></div>
+
+<p>The use case can raise <code>ReviewRejected("not_enrolled")</code> without knowing whether the API uses 403 or another contract. The boundary adapter translates that reason into the public error model. Meanwhile, telemetry should retain the trace id, stage, latency, and safe internal cause. The next lesson will classify these failures in more detail; this lesson establishes where they occur.</p>
+<h2>Trade-off: Explicit Stages Versus a Flat Handler</h2>
+<p>A staged lifecycle improves ownership, testability, and diagnosis. It costs more wiring, more interfaces, and more places to maintain an explicit contract. A tiny internal endpoint may reasonably combine parsing, mapping, and response creation when one team owns the whole private shape. The boundary becomes worth separating when multiple callers, public clients, independent release schedules, sensitive fields, or production diagnosis create pressure.</p>
+<p>The lifecycle does not make every failure recoverable. Authentication can succeed while the database is unavailable. Validation can pass while a race violates a uniqueness rule. Tracing can show where latency grew but cannot make a slow dependency faster. The signal to watch is a mismatch between a stage’s claim and its evidence: a use case receives raw transport data, a middleware decision depends on product state it cannot load, or a success response appears before commit telemetry.</p>
+<h2>Common Confusions</h2>
+<p><strong>“Middleware order is the architecture.”</strong> Order matters because assumptions flow forward, but names and registration order do not assign business ownership. Draw the knowledge dependency first; then choose the framework order that satisfies it.</p>
+<p><strong>“Authentication means the action is allowed.”</strong> Authentication establishes who presented valid credentials. Authorization and domain policy still decide whether Alice may review this course.</p>
+<p><strong>“The handler should catch everything.”</strong> The handler can translate known application outcomes into HTTP. It should not erase persistence causes or turn every dependency timeout into a successful response.</p>
+<p><strong>“Observability is outside the request.”</strong> Request ids, spans, and stage timings are produced while the request moves. If instrumentation starts only inside the use case, parser and serialization failures become invisible.</p>
+<h2>Check Your Understanding</h2>
+<p><strong>Check 1:</strong> The token is valid, but Alice is not enrolled. At which stage should the request be rejected, and why not in authentication?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The use case or authorization policy should reject it after loading enrollment. Authentication proves Alice’s identity; it does not know the course-specific permission.</p>
+<p><strong>Check 2:</strong> Two valid requests pass the enrollment check and race to create the same review. Which stage must still protect the invariant?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The persistence boundary must enforce uniqueness at commit time. A pre-check is useful for an early explanation but cannot replace a durable constraint under concurrency.</p>
+<p><strong>Check 3:</strong> A trace has <code>request.validate</code> but no <code>response.map</code>, and the client receives a 500. What does that observation suggest?</p>
+<p><strong>Think first, then reveal.</strong></p>
+<p><strong>Answer:</strong> The failure may be in the outward mapping or serialization stage. The missing span narrows the investigation; it does not prove the mapper is the cause, so inspect the error and stage timing next.</p>
+<h2>Trace It Yourself: A Rejected Request</h2>
+<p>Use this input:</p>
+<div class="codehilite"><pre><span></span><code>POST /courses/42/reviews
+Authorization: Bearer valid-token-for-alice
+{&quot;rating&quot;: 6, &quot;comment&quot;: &quot;Useful&quot;}
+</code></pre></div>
+
+<p>Assume the request DTO accepts only ratings 1–5. Write the lifecycle until it exits. Then change the rating to 5 and assume Alice is not enrolled. Write the second trace.</p>
+<p>A good answer should:</p>
+<ul>
+<li>create correlation context before the rejection is recorded;</li>
+<li>distinguish authentication success from input validation failure;</li>
+<li>stop the first trace before command creation because rating <code>6</code> violates the request contract;</li>
+<li>let the second trace create a command and reach the use case before rejecting <code>not_enrolled</code>;</li>
+<li>state which public status/problem mapping and telemetry fields would preserve each failure’s meaning.</li>
+</ul>
 <h2>Connections</h2>
-<p>The previous lesson explained why request DTOs, commands, internal models, and response DTOs should not collapse into one object. This lesson places those shapes on the full request timeline.</p>
-<p>The next lesson goes deeper on error handling. It will take the failure exits from this lifecycle and ask how their meaning should be classified, translated, and observed.</p>
-<p>Request lifecycle thinking also connects back to validation. Validation is not a single location; it is one stage in a larger path that turns raw input into trusted application input.</p>
+<p>Lesson 009 placed validation where the required knowledge exists; lesson 010 showed the shape changes that this timeline now orders. Lesson 012 will classify the exits here into safe client responses, retry meaning, logs, metrics, and traces. The capstone later asks you to defend this complete path as one service-boundary design.</p>
 <h2>Resources</h2>
 <ul>
-<li>[DOC] <a href="https://expressjs.com/en/guide/using-middleware.html">Express Middleware Guide</a><ul>
-<li>Focus: Review middleware as ordered request pipeline stages, especially how earlier stages affect later assumptions.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://learn.microsoft.com/en-us/aspnet/core/fundamentals/middleware/">ASP.NET Core Middleware</a><ul>
-<li>Focus: Compare another framework's explicit pipeline model and how ordering shapes request behavior.</li>
-</ul>
-</li>
-<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/observability-primer/">OpenTelemetry Observability Primer</a><ul>
-<li>Focus: Connect lifecycle stages to traces, spans, logs, and metrics.</li>
-</ul>
-</li>
-<li>[BOOK] <a href="https://pragprog.com/titles/mnee2/release-it-second-edition/">Release It!</a><ul>
-<li>Focus: Relate request paths, failures, timeouts, and production resilience.</li>
-</ul>
-</li>
+<li>[DOC] <a href="https://expressjs.com/en/guide/using-middleware/">Express: Using middleware</a> — Focus: see middleware as ordered functions in a request-response cycle and note when control must pass onward.</li>
+<li>[DOC] <a href="https://learn.microsoft.com/en-us/aspnet/core/fundamentals/middleware/">ASP.NET Core middleware</a> — Focus: compare how another framework makes pipeline ordering and short-circuiting explicit.</li>
+<li>[DOC] <a href="https://opentelemetry.io/docs/concepts/observability-primer/">OpenTelemetry observability primer</a> — Focus: connect lifecycle stages to traces, spans, logs, and metrics.</li>
 </ul>
 <h2>Key Takeaways</h2>
 <ul>
-<li>A backend request lifecycle is a staged path from raw input to public response, not just a route handler.</li>
-<li>Each stage should narrow uncertainty, add context, change shape, make a decision, or translate an exit.</li>
-<li>Boundary adapters should translate transport data into application commands; use cases should own business workflow.</li>
-<li>Failure exits and observability are part of the lifecycle, not separate afterthoughts.</li>
+<li>A request is not one object: it moves from bytes to parsed input, caller context, DTO, command, domain result, and public response.</li>
+<li>Each stage narrows uncertainty, adds trusted context, makes a decision, persists a fact, or translates a result; it should not claim knowledge it does not own.</li>
+<li>Failure exits are part of the lifecycle. Their stage determines their meaning, response mapping, and diagnostic evidence.</li>
+<li>Explicit stages cost wiring, but they make ownership, ordering, latency, and incorrect assumptions inspectable.</li>
 </ul>
 </section>
 
@@ -233,7 +425,7 @@ database timeout          -&gt; dependency failure exits through error mapper
 
     <footer class="site-footer">
       <p>
-        Generated on 2026-07-01 12:41 UTC | @jepemo | Built with
+        Generated on 2026-09-04 07:39 UTC | @jepemo | Built with
         <a href="https://github.com/jepemo/mystuff-cli" target="_blank">mystuff-cli</a>
       </p>
     </footer>
